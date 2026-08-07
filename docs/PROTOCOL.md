@@ -85,7 +85,8 @@ that split requires no message redesign.
 Semantics required by FR-3.x: **a sync succeeds only when the destination
 OS clipboard was updated.**
 
-Baseline flow (small payloads — expected common case for text):
+Inline flow (content ≤ `CLIPBOARD_INLINE_MAX_BYTES` = 64 KiB — the common
+case; ADR 0005):
 
 ```
 A observes local clipboard change, creates ClipboardItem
@@ -95,13 +96,15 @@ B        validates length + hash, writes OS clipboard (bounded retries)
 B -> A   ClipboardApplied   { id, result }        // success or typed failure
 ```
 
-Large-payload flow (reserved; threshold and final message set fixed by ADR —
-deferred decision 4):
+Offered flow (larger items, up to `MAX_CLIPBOARD_TEXT_BYTES` = 4 MiB;
+oversized items are rejected gracefully — no chunking, per ADR 0005):
 
 ```
 A -> B   ClipboardOffer     { id, content_type, content_length, content_hash }
-B -> A   ClipboardAccept | ClipboardDecline
-A -> B   ClipboardData      (possibly chunked)
+B -> A   ClipboardAccept | ClipboardDecline   // decline carries a typed
+                                              // reason; already-have-hash
+                                              // counts as a sync success
+A -> B   ClipboardData
 B -> A   ClipboardApplied
 ```
 
@@ -156,8 +159,8 @@ PointerScroll                    { dx, dy, sequence }
 
 | Constant | Notes |
 |----------|-------|
-| Serialization format | Deferred decision 1 |
-| Default TCP port | Deferred decision 6; documented centrally once chosen |
-| `MAX_FRAME_SIZE`, max clipboard text size, per-field maxima | Named constants in `crossover-protocol`, referenced by tests |
-| Large-payload threshold | With deferred decision 4 |
-| Keepalive interval / timeout | Fixed during Phase 1 |
+| Serialization format | postcard (ADR 0001) |
+| Default TCP port | 27677 (ADR 0004), `DEFAULT_PORT` in `crossover-protocol` |
+| Frame body maximum | 4 MiB + 64 KiB (ADR 0005): one maximum clipboard item plus envelope per frame |
+| Max clipboard text / inline threshold | 4 MiB / 64 KiB (ADR 0005), named constants in `crossover-protocol` |
+| Keepalive interval / timeout | 5 s / 15 s defaults in `crossover-core::supervision` |
