@@ -6,6 +6,7 @@ members = [
     "crates/crossover-platform-windows",
     "crates/crossover-protocol",
     "crates/crossover-security",
+    "tools/test-peer",
 ]
 resolver = "3"
 
