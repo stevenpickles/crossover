@@ -295,6 +295,7 @@ dependencies = [
  "crossover-platform",
  "crossover-protocol",
  "crossover-security",
+ "proptest",
  "thiserror",
  "tokio",
  "tokio-rustls",

@@ -7,10 +7,15 @@
 //! (docs/ARCHITECTURE.md §2, §5).
 
 pub mod net;
+pub mod supervision;
 
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
     connect,
+};
+pub use supervision::{
+    DisconnectReason, KeepaliveConfig, ReconnectPolicy, SessionEvent, SupervisorConfig,
+    SupervisorHandle, run_session, supervise_outbound,
 };
 
 /// One-line statement of this crate's responsibility.

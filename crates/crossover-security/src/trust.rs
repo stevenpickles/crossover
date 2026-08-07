@@ -223,7 +223,12 @@ struct StoredTrustStoreV1 {
 }
 
 /// The set of trusted peers, indexed by credential fingerprint.
-#[derive(Debug, Default)]
+///
+/// `Clone` supports snapshot semantics: long-lived tasks clone the store
+/// under a short lock and build TLS configs from the snapshot, so trust
+/// changes apply to every subsequent establishment without locks held
+/// across awaits.
+#[derive(Debug, Default, Clone)]
 pub struct TrustStore {
     peers: Vec<TrustedPeer>,
 }
