@@ -59,5 +59,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "input"
+path = "fuzz_targets/input.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
