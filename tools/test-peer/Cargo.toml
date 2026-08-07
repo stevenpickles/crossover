@@ -23,7 +23,9 @@ tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 crossover-core = { workspace = true }
+crossover-platform = { workspace = true, features = ["fakes"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true }
 
 [lints]
 workspace = true
