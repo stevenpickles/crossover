@@ -22,6 +22,8 @@ crossover-platform-windows = { path = "crates/crossover-platform-windows" }
 crossover-protocol = { path = "crates/crossover-protocol" }
 crossover-security = { path = "crates/crossover-security" }
 
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 
 # `unsafe_code = "forbid"` enforces NFR-6 (docs/SPECIFICATION.md). Platform
