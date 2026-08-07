@@ -101,6 +101,22 @@ cargo test --workspace
 ```
 
 The `fuzz-smoke` job runs every fuzz target briefly on each change.
+
+The `coverage` job measures line/region/branch coverage with
+`cargo-llvm-cov` on Windows (the only leg where the real-OS platform code
+runs), publishes the browsable HTML as a build artifact, and prints the
+per-file summary to the job page. Locally:
+
+```
+cargo llvm-cov --workspace --html      # target/llvm-cov/html/index.html
+cargo llvm-cov report --summary-only   # per-file table
+```
+
+Coverage is **reported, not gated**. A percentage threshold rewards tests
+written to move a number; the useful question is which paths a change
+leaves unexercised, which the report answers directly. Low branch
+coverage in error-handling code is a standing invitation to add
+fault-injection cases (docs/TESTING.md §1.5), not a build failure.
 Added as the project matures: `cargo audit` and `cargo deny` (dependency
 and license policy), documentation build, MSRV check, protocol
 compatibility tests across supported versions.
