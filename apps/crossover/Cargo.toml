@@ -10,8 +10,13 @@ repository.workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true }
 crossover-core = { workspace = true }
+crossover-platform = { workspace = true }
+crossover-protocol = { workspace = true }
+crossover-security = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 # Windows-only so non-Windows CI builds the app without the platform crate.
 [target.'cfg(windows)'.dependencies]
