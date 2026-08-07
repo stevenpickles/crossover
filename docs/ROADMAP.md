@@ -1,6 +1,7 @@
 # Crossover Roadmap
 
-> **Current phase: 0 — Repository Foundation** (not started)
+> **Current phase: 1 — Secure Peer Connection** (not started; the four
+> prerequisite ADRs are the entry work)
 >
 > Update this marker when a phase's exit criteria are verified. Do not begin
 > a later phase because time remains — complete and validate exit criteria
@@ -14,7 +15,7 @@ Phase 2), not remote input.
 
 ---
 
-## Phase 0 — Repository Foundation
+## Phase 0 — Repository Foundation (completed 2026-08-07)
 
 **Goal:** a professional Rust workspace that builds and tests on all three
 desktop OSes, with the documentation and decision framework in place.
@@ -28,14 +29,17 @@ Deliverables:
 - GitHub Actions: fmt/clippy/build/test on Windows, Linux, macOS
 - structured logging foundation (tracing) wired into the app skeleton
 - error-handling conventions established (thiserror/app-boundary pattern)
-- ADRs recorded for any deferred decisions that Phase 1 needs
-  ([adr/README.md](adr/README.md))
+- ADR framework in place ([adr/README.md](adr/README.md)); the decisions
+  Phase 1 depends on are recorded as its prerequisite ADRs at Phase 1 entry
 - README kept current
 
 Exit criteria:
 
 - `cargo build/test/fmt --check/clippy` pass on all three OSes in CI
 - No clipboard/input/network functionality exists yet — that is correct
+
+Verified 2026-08-07: CI green on ubuntu/windows/macos for `dev` at the
+Phase 0 tip (runs 31185855135, 31186123879).
 
 ## Phase 1 — Secure Peer Connection
 
