@@ -5,6 +5,10 @@
 //! testable (and fuzzable) without sockets. Wire-level invariants are
 //! specified in `docs/PROTOCOL.md`; layering rules in `docs/ARCHITECTURE.md`.
 
+pub mod framing;
+
+pub use framing::{FrameDecoder, RawFrame, encode_frame};
+
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =
     "wire messages, framing, versioning, and validation (docs/PROTOCOL.md)";
