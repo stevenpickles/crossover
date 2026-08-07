@@ -85,6 +85,12 @@ that split requires no message redesign.
 Semantics required by FR-3.x: **a sync succeeds only when the destination
 OS clipboard was updated.**
 
+*When* a transaction starts is trigger-driven, not change-driven
+(ADR 0006): observation of a local change does not itself transmit.
+A settled-change debounce triggers transmission in Phase 2, control
+transfer becomes the primary trigger in Phase 5, and session
+establishment re-announces after a gap.
+
 Inline flow (content ≤ `CLIPBOARD_INLINE_MAX_BYTES` = 64 KiB — the common
 case; ADR 0005):
 
