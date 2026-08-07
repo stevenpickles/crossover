@@ -15,6 +15,10 @@ on:
   pull_request:
   push:
     branches: [dev, main, "feature/**"]
+  schedule:
+    # A new advisory can land against unchanged code, so the dependency
+    # audit needs a heartbeat rather than only running on pushes.
+    - cron: "17 6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -55,6 +59,28 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # Dependency policy (deny.toml, docs/ARCHITECTURE.md §7): RustSec
+  # advisories, license compatibility, and source provenance. This one
+  # DOES gate — unlike coverage, a vulnerable or unmaintained dependency
+  # is a defect with a known fix, and the whole point is to hear about it
+  # before shipping rather than after. It runs on one OS because the
+  # dependency graph it inspects is the workspace's, not a platform's.
+  dependencies:
+    name: dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+        with:
+          tool: cargo-deny
+
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny --all-features check
 
   # Coverage is reported, never gated: a percentage threshold rewards
   # tests written to move a number. The HTML artifact makes "what is
@@ -101,7 +127,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the browsable report
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-html
           path: |

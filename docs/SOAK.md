@@ -150,6 +150,24 @@ It reports, per machine: transactions closed by result, latency
 percentiles (p50/p95/max), retry counts, contention events, disconnects
 and reconnects, and any error-level line.
 
+### Measured baseline (2026-08-07, two Windows machines on one LAN)
+
+The Phase 2 closure run, for comparison rather than as a target — a
+different network or machine will differ, and that is fine:
+
+| | Value |
+|---|---|
+| Transaction latency (p50) | 4–6 ms |
+| `read_busy` events | 0–1 per run |
+| Peak clipboard writes/sec | 3 |
+| `Set-Clipboard` failures in other apps | none |
+| Items transmitted per 200 rapid copies | ~15 |
+
+That last row is the one worth internalizing: with the settle window
+(ADR 0006), most copies in a rapid burst never travel, because they were
+superseded before the clipboard settled. Fewer items transmitted is the
+design working, not sync failing. Verify by *content*, never by count.
+
 What good looks like:
 
 - `applied` accounts for essentially every transaction; a handful of

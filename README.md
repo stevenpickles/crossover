@@ -6,12 +6,13 @@ larger workstation, without weakening the security boundary between them.
 
 **Move. Type. Copy. Paste.**
 
-> **Status: Phase 1 (Secure Peer Connection) complete.** Two machines can
-> pair with a typed one-time code, hold a mutually authenticated TLS 1.3
-> session with automatic reconnection, and revoke trust — all driven by
-> the `crossover` CLI. Next up: Phase 2 — Reliable Text Clipboard. The
-> [roadmap](docs/ROADMAP.md) carries the authoritative current-phase
-> marker.
+> **Status: Phase 2 (Reliable Text Clipboard) complete — the Secure
+> Clipboard Prototype works.** Two Windows machines pair with a typed
+> one-time code, hold a mutually authenticated TLS 1.3 session with
+> automatic reconnection, and synchronize the text clipboard in both
+> directions: copy on one, paste on the other. Next up: Phase 3 — Remote
+> Mouse. The [roadmap](docs/ROADMAP.md) carries the authoritative
+> current-phase marker.
 
 ## What it will do
 
