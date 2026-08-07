@@ -1,9 +1,19 @@
 //! Windows implementations of the `crossover-platform` traits.
 //!
-//! Currently an empty shell: Win32 implementations land behind
-//! `#[cfg(windows)]` in later phases. The crate itself must compile on all
-//! platforms so tri-OS CI can build the whole workspace
-//! (docs/ARCHITECTURE.md §2, §4; platform risks in docs/SPECIFICATION.md §6).
+//! Win32 implementations live behind `#[cfg(windows)]`; on other targets
+//! the crate compiles as an empty shell so tri-OS CI can build the whole
+//! workspace (docs/ARCHITECTURE.md §2, §4; platform risks in
+//! docs/SPECIFICATION.md §6).
+//!
+//! This is the workspace's designated home for `unsafe` (Win32 FFI): every
+//! unsafe block carries a SAFETY comment and is exercised by platform tests
+//! on Windows CI (NFR-6, docs/TESTING.md §1.6).
+
+#[cfg(windows)]
+pub mod secure_storage;
+
+#[cfg(windows)]
+pub use secure_storage::DpapiSecureStorage;
 
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =
