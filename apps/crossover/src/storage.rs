@@ -30,6 +30,29 @@ pub fn open_secure_storage() -> anyhow::Result<Box<dyn SecureStorage>> {
     }
 }
 
+/// Open the platform clipboard provider.
+///
+/// # Errors
+///
+/// On Windows, if clipboard observation cannot be established. On other
+/// platforms, always — their providers arrive in Phase 7.
+pub fn open_clipboard_provider()
+-> anyhow::Result<std::sync::Arc<dyn crossover_platform::ClipboardProvider>> {
+    #[cfg(windows)]
+    {
+        use anyhow::Context;
+        let provider = crossover_platform_windows::WindowsClipboard::new()
+            .context("starting clipboard observation")?;
+        Ok(std::sync::Arc::new(provider))
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!(
+            "the clipboard is not implemented for this platform yet              (Windows first; macOS/Linux arrive in Phase 7 — docs/ROADMAP.md)"
+        )
+    }
+}
+
 /// Resolve the local device name: `--name` flag, else the machine's
 /// hostname-ish environment, else a fixed fallback — truncated on a char
 /// boundary to the identity bound.
