@@ -5,15 +5,24 @@
 //! diagnostics go to structured logs (docs/ARCHITECTURE.md §9, §10).
 
 use std::io::Write as _;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crossover_core::pairing::{PairingListener, pair_with};
+use crossover_core::supervision::{
+    KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
+};
+use crossover_core::{LocalNode, SessionListener, SessionOptions};
+use crossover_platform::SecureStorage;
 use crossover_protocol::DEFAULT_PORT;
 use crossover_security::pairing::{PairedPeer, PairingCode, PairingIdentity};
-use crossover_security::{DeviceIdentity, TrustStore, TrustedPeer};
+use crossover_security::{
+    CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TrustStore, TrustedPeer,
+};
 
 use crate::storage::open_secure_storage;
 
@@ -182,6 +191,219 @@ pub fn status(device_name: &str) -> anyhow::Result<()> {
          is implemented."
     );
     Ok(())
+}
+
+/// `crossover run [--listen [--bind <addr>]] [--connect <addr>]`
+///
+/// Foreground session maintenance (docs/ROADMAP.md Phase 1): accept
+/// trusted peers, keep an outbound session alive with reconnect, log
+/// every establishment and loss, and stop on Ctrl-C. Clipboard and input
+/// engines attach to these sessions in later phases.
+pub async fn run(
+    device_name: &str,
+    listen_bind: Option<String>,
+    connect: Option<String>,
+) -> anyhow::Result<()> {
+    let storage: Arc<dyn SecureStorage> = Arc::from(open_secure_storage()?);
+    let (identity, generated) = DeviceIdentity::load_or_generate(&*storage, device_name)
+        .context("loading device identity")?;
+    if generated {
+        println!(
+            "Generated a new device identity for \"{}\".",
+            identity.device_name()
+        );
+    }
+    let certified = CertifiedIdentity::from_identity(&identity).context("certifying identity")?;
+
+    let store = TrustStore::load(&*storage).context("loading trust store")?;
+    anyhow::ensure!(
+        !store.peers().is_empty(),
+        "no trusted peers - pair one first with `crossover pair`"
+    );
+
+    println!(
+        "Running as \"{}\" ({} trusted peer(s)); fingerprint {}",
+        identity.device_name(),
+        store.peers().len(),
+        identity.spki_fingerprint()?
+    );
+
+    // Outbound role: supervised session with automatic reconnect.
+    let (handle, events) = match &connect {
+        Some(addr) => {
+            println!("Maintaining an outbound session to {addr}.");
+            let (handle, events) = supervise_outbound(
+                addr.clone(),
+                identity.clone(),
+                certified.clone(),
+                Arc::new(RwLock::new(store.clone())),
+                SupervisorConfig::default(),
+            );
+            (Some(handle), Some(events))
+        }
+        None => (None, None),
+    };
+
+    // Inbound role: accept loop, one session at a time (two-machine scope).
+    let listener = match &listen_bind {
+        Some(bind) => {
+            let listener = SessionListener::bind(bind.as_str())
+                .await
+                .with_context(|| format!("binding listener on {bind}"))?;
+            println!("Listening for trusted peers on {}.", listener.local_addr()?);
+            Some(listener)
+        }
+        None => None,
+    };
+
+    println!("Press Ctrl-C to stop.");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.context("waiting for Ctrl-C")?;
+            println!("Shutting down.");
+            if let Some(handle) = &handle {
+                handle.shutdown();
+            }
+        }
+        () = listener_loop(listener.as_ref(), &identity, &certified, &storage) => {}
+        () = outbound_event_loop(events, &storage) => {}
+    }
+    Ok(())
+}
+
+/// Accept trusted peers forever; each session runs the shared session
+/// loop (pings answered, frames logged) until it ends, then accept again.
+async fn listener_loop(
+    listener: Option<&SessionListener>,
+    identity: &DeviceIdentity,
+    certified: &CertifiedIdentity,
+    storage: &Arc<dyn SecureStorage>,
+) {
+    let Some(listener) = listener else {
+        return std::future::pending().await;
+    };
+    let options = SessionOptions::default();
+    let keepalive = KeepaliveConfig::default();
+    loop {
+        // Fresh trust per accept: pairings and revocations made by other
+        // crossover invocations apply to every new connection.
+        let trust = match TrustStore::load(&**storage) {
+            Ok(trust) => trust,
+            Err(error) => {
+                tracing::error!(error = %error, "trust store unreadable; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let local = LocalNode {
+            identity,
+            certified,
+            trust: &trust,
+        };
+        match listener.accept(&local, &options).await {
+            Ok(session) => {
+                let info = session.info().clone();
+                println!(
+                    "Session established with \"{}\" (inbound).",
+                    info.peer_device_name
+                );
+                touch_last_connected(&**storage, info.peer_fingerprint);
+
+                let (events_tx, mut events_rx) = mpsc::channel(16);
+                let (_outbound_tx, mut outbound_rx) = mpsc::channel::<(u16, Vec<u8>)>(1);
+                let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+                let drain = tokio::spawn(async move {
+                    while let Some(event) = events_rx.recv().await {
+                        if let SessionEvent::Frame(frame) = event {
+                            tracing::debug!(
+                                message_type = frame.message_type,
+                                byte_count = frame.payload.len(),
+                                "application frame (no engine attached yet)"
+                            );
+                        }
+                    }
+                });
+                let reason = run_session(
+                    session,
+                    &events_tx,
+                    &mut outbound_rx,
+                    &mut shutdown_rx,
+                    &keepalive,
+                )
+                .await;
+                drop(events_tx);
+                let _ = drain.await;
+                println!(
+                    "Session with \"{}\" ended: {reason}.",
+                    info.peer_device_name
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "inbound session failed");
+                // Avoid a hot loop if the failure is instantaneous.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+/// Narrate the outbound supervisor events; pends forever when there is no
+/// outbound role.
+async fn outbound_event_loop(
+    events: Option<mpsc::Receiver<SessionEvent>>,
+    storage: &Arc<dyn SecureStorage>,
+) {
+    let Some(mut events) = events else {
+        return std::future::pending().await;
+    };
+    while let Some(event) = events.recv().await {
+        match event {
+            SessionEvent::Established(info) => {
+                println!(
+                    "Session established with \"{}\" (outbound).",
+                    info.peer_device_name
+                );
+                touch_last_connected(&**storage, info.peer_fingerprint);
+            }
+            SessionEvent::Disconnected {
+                reason, retry_in, ..
+            } => match retry_in {
+                Some(delay) => println!(
+                    "Outbound session ended ({reason}); retrying in {}s.",
+                    delay.as_secs_f32()
+                ),
+                None => println!("Outbound session ended ({reason})."),
+            },
+            SessionEvent::ConnectFailed { error, retry_in } => {
+                println!(
+                    "Connect failed ({error}); retrying in {}s.",
+                    retry_in.as_secs_f32()
+                );
+            }
+            SessionEvent::Frame(frame) => {
+                tracing::debug!(
+                    message_type = frame.message_type,
+                    byte_count = frame.payload.len(),
+                    "application frame (no engine attached yet)"
+                );
+            }
+        }
+    }
+}
+
+/// Best-effort bookkeeping: record a successful connection in the trust
+/// store. Failure is logged, never fatal - bookkeeping must not kill a
+/// healthy session.
+fn touch_last_connected(storage: &dyn SecureStorage, fingerprint: SpkiFingerprint) {
+    let result = TrustStore::load(storage).and_then(|mut store| {
+        if store.record_connection(fingerprint) {
+            store.save(storage)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        tracing::warn!(error = %error, "could not record last-connected time");
+    }
 }
 
 fn local_pairing_identity(identity: &DeviceIdentity) -> anyhow::Result<PairingIdentity> {
