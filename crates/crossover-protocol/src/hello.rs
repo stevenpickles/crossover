@@ -30,6 +30,10 @@ pub enum MessageType {
     Ping = 2,
     /// Keepalive answer (CONTROL class, empty payload).
     Pong = 3,
+    /// Pairing: SPAKE2 exchange element (plain-TCP ceremony, ADR 0002).
+    PairingStart = 4,
+    /// Pairing: MAC-authenticated identity claim.
+    PairingConfirm = 5,
 }
 
 impl MessageType {
@@ -42,6 +46,8 @@ impl MessageType {
             1 => Some(Self::Hello),
             2 => Some(Self::Ping),
             3 => Some(Self::Pong),
+            4 => Some(Self::PairingStart),
+            5 => Some(Self::PairingConfirm),
             _ => None,
         }
     }
@@ -242,7 +248,13 @@ mod tests {
 
     #[test]
     fn wire_values_round_trip_for_all_known_types() {
-        for ty in [MessageType::Hello, MessageType::Ping, MessageType::Pong] {
+        for ty in [
+            MessageType::Hello,
+            MessageType::Ping,
+            MessageType::Pong,
+            MessageType::PairingStart,
+            MessageType::PairingConfirm,
+        ] {
             assert_eq!(MessageType::from_wire(ty.wire()), Some(ty));
         }
     }

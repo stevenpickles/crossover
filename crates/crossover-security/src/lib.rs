@@ -6,10 +6,15 @@
 //! invariants live in `docs/SECURITY.md`; layering in `docs/ARCHITECTURE.md`.
 
 pub mod identity;
+pub mod pairing;
 pub mod tls;
 pub mod trust;
 
 pub use identity::{DeviceIdentity, IdentityError, SpkiFingerprint};
+pub use pairing::{
+    ConfirmParts, PairedPeer, PairingCeremony, PairingCode, PairingError, PairingIdentity,
+    PairingRole,
+};
 pub use tls::{
     CertifiedIdentity, TlsError, certificate_spki_fingerprint, client_tls_config, server_tls_config,
 };

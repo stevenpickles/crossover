@@ -7,12 +7,14 @@
 //! (docs/ARCHITECTURE.md §2, §5).
 
 pub mod net;
+pub mod pairing;
 pub mod supervision;
 
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
     connect,
 };
+pub use pairing::{PairingDriveError, PairingListener, pair_with};
 pub use supervision::{
     DisconnectReason, KeepaliveConfig, ReconnectPolicy, SessionEvent, SupervisorConfig,
     SupervisorHandle, run_session, supervise_outbound,
