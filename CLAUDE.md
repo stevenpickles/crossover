@@ -59,5 +59,9 @@ never let code and specification diverge silently.
 ## Conventions
 
 - Base branch for PRs: `main`
-- Feature branches: `feature/<issue-number>/<short-description>`
+- Feature branches: `feature/<n>/<short-description>`, where `<n>` increments
+  sequentially per feature. One focused feature per branch, so the branch
+  history alone tells the story of what has been developed.
+- Commit granularly, grouped by purpose; messages lead with *why* the change
+  is made. No AI attribution trailers/footers in commits or PRs.
 - License: MIT
