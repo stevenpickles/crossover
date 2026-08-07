@@ -129,6 +129,15 @@ bidirectional clipboard updates with zero corruption, zero sync loops, zero
 silent failures, zero crashes**, and a diagnostic for every ultimately
 failed update.
 
+## 3.1 Two-machine soak
+
+The stress gate is hermetic by design. Real clipboards, a real network,
+and two independent machines are covered by the manual soak in
+[SOAK.md](SOAK.md), whose output is a report to interpret rather than a
+build verdict — a live desktop can always interfere, and a red build
+that says nothing about Crossover is worse than no build at all.
+`tools/soak-report.py` summarizes the structured logs from both sides.
+
 ## 4. Performance measurement
 
 Numeric latency targets are established by measurement (NFR-5).
