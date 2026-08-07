@@ -1,7 +1,7 @@
 # Crossover Roadmap
 
-> **Current phase: 1 — Secure Peer Connection** (not started; the four
-> prerequisite ADRs are the entry work)
+> **Current phase: 1 — Secure Peer Connection** (in progress — the four
+> prerequisite ADRs are recorded; implementation is next)
 >
 > Update this marker when a phase's exit criteria are verified. Do not begin
 > a later phase because time remains — complete and validate exit criteria
