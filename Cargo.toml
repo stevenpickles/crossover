@@ -38,7 +38,7 @@ clap = { version = "4", features = ["derive"] }
 # the DER *encode* traits (which produce the SPKI bytes our identity is
 # pinned to, ADR 0003) live behind it.
 ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
-getrandom = "0.3"
+getrandom = "0.4"
 hmac = "0.13"
 # default-features = false drops postcard's heapless-cas default, which
 # pulls the unmaintained atomic-polyfill (RUSTSEC advisory) through
