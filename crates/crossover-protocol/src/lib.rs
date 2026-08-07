@@ -8,6 +8,7 @@
 pub mod clipboard;
 pub mod framing;
 pub mod hello;
+pub mod input;
 pub mod pairing;
 pub mod version;
 
@@ -17,6 +18,7 @@ pub use clipboard::{
 };
 pub use framing::{FrameDecoder, RawFrame, encode_frame};
 pub use hello::{FeatureFlags, Hello, MessageType, OsFamily};
+pub use input::{InputBatch, ReleaseAllInput, WireButton, WireInputEvent};
 pub use pairing::{PairingConfirm, PairingStart};
 pub use version::{PROTOCOL_VERSION, VersionRange, negotiate};
 

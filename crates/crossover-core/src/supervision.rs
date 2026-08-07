@@ -427,7 +427,9 @@ async fn dispatch_frame(
             | MessageType::ClipboardAccept
             | MessageType::ClipboardDecline
             | MessageType::ClipboardData
-            | MessageType::ClipboardApplied,
+            | MessageType::ClipboardApplied
+            | MessageType::InputBatch
+            | MessageType::ReleaseAllInput,
         )
         // Not a control message: the application owns dispatch (and
         // validity) of everything else.

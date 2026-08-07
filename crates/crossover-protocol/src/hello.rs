@@ -44,6 +44,11 @@ pub enum MessageType {
     ClipboardData = 9,
     /// Clipboard: destination verdict — the only definition of success.
     ClipboardApplied = 10,
+    /// Input: an ordered batch of pointer (later keyboard) events.
+    InputBatch = 11,
+    /// Input: release everything the destination believes is held
+    /// (FR-4.4).
+    ReleaseAllInput = 12,
 }
 
 impl MessageType {
@@ -63,6 +68,8 @@ impl MessageType {
             8 => Some(Self::ClipboardDecline),
             9 => Some(Self::ClipboardData),
             10 => Some(Self::ClipboardApplied),
+            11 => Some(Self::InputBatch),
+            12 => Some(Self::ReleaseAllInput),
             _ => None,
         }
     }
@@ -274,6 +281,8 @@ mod tests {
             MessageType::ClipboardDecline,
             MessageType::ClipboardData,
             MessageType::ClipboardApplied,
+            MessageType::InputBatch,
+            MessageType::ReleaseAllInput,
         ] {
             assert_eq!(MessageType::from_wire(ty.wire()), Some(ty));
         }
