@@ -1,0 +1,15 @@
+[package]
+name = "crossover-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossover-platform = { workspace = true }
+crossover-protocol = { workspace = true }
+crossover-security = { workspace = true }
+
+[lints]
+workspace = true
