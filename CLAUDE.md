@@ -5,9 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 Crossover: secure keyboard/mouse/clipboard sharing between computers (a
-Synergy-like tool), implemented in Rust. Currently in the **specification
-phase** — no code yet. Check the current-phase marker at the top of
-`docs/ROADMAP.md` before doing project work.
+Synergy-like tool), implemented in Rust. The authoritative record of
+project state is the current-phase marker at the top of `docs/ROADMAP.md`
+— check it before doing project work.
 
 ## Source of truth
 
