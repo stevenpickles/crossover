@@ -22,7 +22,7 @@
 //!   up, which only matters during genuinely simultaneous copies.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -37,6 +37,43 @@ use crossover_protocol::hello::MessageType;
 /// prevention. Notifications coalesce, so a small window suffices; the
 /// bound keeps memory fixed (NFR-1).
 const APPLIED_HASH_MEMORY: usize = 8;
+
+/// Clipboard engine tuning. Grouped because both knobs are timing
+/// policy, and tests need to shrink them without pretending the
+/// production defaults are different.
+#[derive(Debug, Clone, Default)]
+pub struct ClipboardConfig {
+    /// Bounded retry for `Busy` clipboard writes (FR-3.4).
+    pub retry: RetryPolicy,
+    /// Quiet period before staged content is transmitted (ADR 0006).
+    pub transmit_debounce: Duration,
+}
+
+impl ClipboardConfig {
+    /// Production defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            retry: RetryPolicy::default(),
+            transmit_debounce: TRANSMIT_DEBOUNCE,
+        }
+    }
+}
+
+/// How long the local clipboard must stay unchanged before Crossover
+/// reads it and transmits (ADR 0006).
+///
+/// The window gates the **read**, not merely the send. Reading takes the
+/// machine-global clipboard lock exactly as writing does, so reacting to
+/// every change notification is itself the contention: the two-machine
+/// soak showed hundreds of failed opens per run while another
+/// application copied at 3 Hz, and a comparable number of that
+/// application's own copies failing in return. Waiting for the clipboard
+/// to settle collapses a burst into a single lock acquisition.
+///
+/// Control transfer becomes the primary trigger in Phase 5; this
+/// debounce carries Phase 2 and remains the fallback afterwards.
+pub const TRANSMIT_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// Retry policy for `Busy` clipboard writes (FR-3.4): centrally defined,
 /// bounded attempts, bounded total time (ADR 0005 requires exactly this
@@ -128,6 +165,13 @@ pub enum Action {
         /// How long to wait.
         delay: Duration,
     },
+    /// Call [`ClipboardEngine::on_settle_due`] after `delay` unless a
+    /// newer change resets it (ADR 0006). Restarting an existing timer is
+    /// expected: the driver keeps only the latest.
+    ScheduleSettle {
+        /// How long the clipboard must stay quiet.
+        delay: Duration,
+    },
 }
 
 /// An inbound clipboard message, decoded by the driver.
@@ -180,19 +224,37 @@ impl InboundMessage {
 }
 
 /// Outbound transaction state.
+///
+/// `started` stamps when the local observation entered the pipeline, so
+/// transaction latency is computed entirely on the originating machine's
+/// clock — no cross-machine skew enters the measurement.
 #[derive(Debug)]
 enum Outbound {
     /// Offer sent; awaiting Accept/Decline.
-    AwaitingAccept { data: ClipboardData },
+    AwaitingAccept {
+        data: ClipboardData,
+        started: Instant,
+    },
     /// Data sent; awaiting Applied.
-    AwaitingApplied { meta: ClipboardMeta },
+    AwaitingApplied {
+        meta: ClipboardMeta,
+        started: Instant,
+    },
 }
 
 impl Outbound {
     fn meta(&self) -> ClipboardMeta {
         match self {
-            Self::AwaitingAccept { data } => data.meta,
-            Self::AwaitingApplied { meta } => *meta,
+            Self::AwaitingAccept { data, .. } => data.meta,
+            Self::AwaitingApplied { meta, .. } => *meta,
+        }
+    }
+
+    fn started(&self) -> Instant {
+        match self {
+            Self::AwaitingAccept { started, .. } | Self::AwaitingApplied { started, .. } => {
+                *started
+            }
         }
     }
 }
@@ -210,7 +272,7 @@ struct PendingWrite {
 pub struct ClipboardEngine {
     /// Our device id — the `origin` stamped on items we mint.
     origin: Uuid,
-    retry: RetryPolicy,
+    config: ClipboardConfig,
     /// Local observation counter (conflict ordering).
     next_sequence: u64,
     /// Hash of the last content this engine knows to be on the local
@@ -231,10 +293,10 @@ pub struct ClipboardEngine {
 impl ClipboardEngine {
     /// A fresh engine for `origin` (our device id).
     #[must_use]
-    pub fn new(origin: Uuid, retry: RetryPolicy) -> Self {
+    pub fn new(origin: Uuid, config: ClipboardConfig) -> Self {
         Self {
             origin,
-            retry,
+            config,
             next_sequence: 0,
             current_local_hash: None,
             applied_hashes: VecDeque::new(),
@@ -244,8 +306,23 @@ impl ClipboardEngine {
         }
     }
 
-    /// The provider signaled a change: read the current state.
+    /// The provider signaled a change.
+    ///
+    /// Deliberately does **not** read: reading takes the machine-global
+    /// clipboard lock, and a notification only means "something changed",
+    /// which during a burst is true many times per second. Wait for quiet
+    /// (ADR 0006), then read once.
     pub fn on_local_change(&mut self) -> Vec<Action> {
+        if self.config.transmit_debounce.is_zero() {
+            return vec![Action::ReadClipboard];
+        }
+        vec![Action::ScheduleSettle {
+            delay: self.config.transmit_debounce,
+        }]
+    }
+
+    /// The settle window elapsed: now read the clipboard, once.
+    pub fn on_settle_due(&mut self) -> Vec<Action> {
         vec![Action::ReadClipboard]
     }
 
@@ -284,6 +361,9 @@ impl ClipboardEngine {
             ContentType::Utf8Text,
             text.into_bytes(),
         );
+        // The read only happens after the clipboard has settled, so
+        // whatever we just read is the content worth sending: transmit
+        // it directly.
         self.start_outbound(data)
     }
 
@@ -331,8 +411,8 @@ impl ClipboardEngine {
                 }))]
             }
             Err(retryable) => {
-                if retryable && pending.attempts_made < self.retry.max_attempts {
-                    let delay = self.retry.delay;
+                if retryable && pending.attempts_made < self.config.retry.max_attempts {
+                    let delay = self.config.retry.delay;
                     tracing::debug!(
                         clipboard_id = %id,
                         attempt_count = pending.attempts_made,
@@ -378,7 +458,8 @@ impl ClipboardEngine {
         self.outbound = None;
         self.expecting_data = None;
         // Ask the driver to re-read: the clipboard may have changed while
-        // disconnected, and re-reading routes through the normal dedup.
+        // disconnected, and re-reading routes through the normal dedup
+        // (and then through the debounce, like any other observation).
         self.current_local_hash = None;
         vec![Action::ReadClipboard]
     }
@@ -406,11 +487,12 @@ impl ClipboardEngine {
             );
         }
         let meta = data.meta;
+        let started = Instant::now();
         if meta.content_length <= CLIPBOARD_INLINE_MAX_BYTES as u64 {
-            self.outbound = Some(Outbound::AwaitingApplied { meta });
+            self.outbound = Some(Outbound::AwaitingApplied { meta, started });
             vec![Action::Send(OutboundMessage::Data(data))]
         } else {
-            self.outbound = Some(Outbound::AwaitingAccept { data });
+            self.outbound = Some(Outbound::AwaitingAccept { data, started });
             vec![Action::Send(OutboundMessage::Offer(ClipboardOffer {
                 meta,
             }))]
@@ -440,9 +522,9 @@ impl ClipboardEngine {
 
     fn on_peer_accept(&mut self, id: Uuid) -> Vec<Action> {
         match self.outbound.take() {
-            Some(Outbound::AwaitingAccept { data }) if data.meta.id == id => {
+            Some(Outbound::AwaitingAccept { data, started }) if data.meta.id == id => {
                 let meta = data.meta;
-                self.outbound = Some(Outbound::AwaitingApplied { meta });
+                self.outbound = Some(Outbound::AwaitingApplied { meta, started });
                 vec![Action::Send(OutboundMessage::Data(data))]
             }
             other => {
@@ -455,7 +537,8 @@ impl ClipboardEngine {
 
     fn on_peer_decline(&mut self, decline: &ClipboardDecline) -> Vec<Action> {
         match self.outbound.take() {
-            Some(Outbound::AwaitingAccept { data }) if data.meta.id == decline.id => {
+            Some(Outbound::AwaitingAccept { data, started }) if data.meta.id == decline.id => {
+                let latency_ms = elapsed_ms(started);
                 let outcome = match decline.reason {
                     // Success-shaped: the peer already has the content, or
                     // a newer item won the race.
@@ -466,6 +549,7 @@ impl ClipboardEngine {
                     clipboard_id = %decline.id,
                     reason = ?decline.reason,
                     result = outcome,
+                    latency_ms,
                     "clipboard offer resolved"
                 );
                 Vec::new()
@@ -538,16 +622,21 @@ impl ClipboardEngine {
 
     fn on_peer_applied(&mut self, applied: &ClipboardApplied) -> Vec<Action> {
         match self.outbound.take() {
-            Some(Outbound::AwaitingApplied { meta }) if meta.id == applied.id => {
+            Some(Outbound::AwaitingApplied { meta, started }) if meta.id == applied.id => {
                 let outcome = match applied.result {
                     ApplyResult::Applied => "applied",
                     ApplyResult::Superseded => "superseded",
                     ApplyResult::ClipboardUnavailable => "clipboard_unavailable",
                     ApplyResult::ContentRejected => "content_rejected",
                 };
+                // Round trip measured on this machine's clock alone:
+                // local observation through the destination's verdict
+                // (docs/TESTING.md §4 — the number Phase 6 will want).
                 tracing::info!(
                     clipboard_id = %applied.id,
                     result = outcome,
+                    byte_count = meta.content_length,
+                    latency_ms = elapsed_ms(started),
                     "clipboard transaction closed"
                 );
                 Vec::new()
@@ -570,9 +659,14 @@ impl ClipboardEngine {
         let inbound_wins =
             (inbound.sequence, inbound.origin.as_bytes()) > (ours.sequence, ours.origin.as_bytes());
         if inbound_wins {
+            let latency_ms = self
+                .outbound
+                .as_ref()
+                .map_or(0, |o| elapsed_ms(o.started()));
             tracing::info!(
                 clipboard_id = %ours.id,
                 result = "superseded",
+                latency_ms,
                 "outbound item lost the conflict race; converging on the peer's item"
             );
             self.outbound = None;
@@ -595,6 +689,11 @@ impl ClipboardEngine {
     }
 }
 
+/// Milliseconds since `started`, saturating into `u64` for logging.
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
@@ -604,15 +703,28 @@ mod tests {
         ClipboardOffer, ContentType, DeclineReason, content_hash,
     };
 
-    use super::{Action, ClipboardEngine, InboundMessage, OutboundMessage, RetryPolicy};
+    use std::time::Duration;
+
+    use super::{
+        Action, ClipboardConfig, ClipboardEngine, InboundMessage, OutboundMessage, RetryPolicy,
+    };
 
     fn engine(origin_fill: u8) -> ClipboardEngine {
-        ClipboardEngine::new(Uuid::from_bytes([origin_fill; 16]), RetryPolicy::default())
+        ClipboardEngine::new(Uuid::from_bytes([origin_fill; 16]), ClipboardConfig::new())
     }
 
+    /// Copy locally and fire the transmit trigger, since these tests are
+    /// about what travels, not about debounce timing (which has its own
+    /// tests below).
+    /// A change schedules the settle window; only then do we read
+    /// (ADR 0006). These tests care what travels, not about timing.
     fn copy(engine: &mut ClipboardEngine, text: &str) -> Vec<Action> {
-        let actions = engine.on_local_change();
-        assert_eq!(actions, vec![Action::ReadClipboard]);
+        let scheduled = engine.on_local_change();
+        assert!(
+            matches!(scheduled.as_slice(), [Action::ScheduleSettle { .. }]),
+            "a change should schedule a settle, not read now: {scheduled:?}"
+        );
+        assert_eq!(engine.on_settle_due(), vec![Action::ReadClipboard]);
         engine.on_local_read(Some(text.to_owned()))
     }
 
@@ -690,9 +802,14 @@ mod tests {
         ));
 
         // The provider now notifies for our own write (the contract
-        // term); the engine must stay silent.
+        // term); the engine must stay silent. The notification schedules
+        // a settle, the read happens after it, and the loop guard bites.
         let actions = receiver.on_local_change();
-        assert_eq!(actions, vec![Action::ReadClipboard]);
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::ScheduleSettle { .. }]
+        ));
+        assert_eq!(receiver.on_settle_due(), vec![Action::ReadClipboard]);
         let actions = receiver.on_local_read(Some("from peer".to_owned()));
         assert!(
             actions.is_empty(),
@@ -706,7 +823,13 @@ mod tests {
             max_attempts: 3,
             delay: std::time::Duration::from_millis(50),
         };
-        let mut e = ClipboardEngine::new(Uuid::from_bytes([0xBB; 16]), policy);
+        let mut e = ClipboardEngine::new(
+            Uuid::from_bytes([0xBB; 16]),
+            ClipboardConfig {
+                retry: policy,
+                ..ClipboardConfig::new()
+            },
+        );
         let item = ClipboardData::from_content(
             Uuid::new_v4(),
             Uuid::from_bytes([0xAA; 16]),
@@ -815,6 +938,10 @@ mod tests {
                         Action::WriteClipboard { id, text } => {
                             self.pending_write = Some((id, text));
                         }
+                        Action::ScheduleSettle { .. } => {
+                            let read = self.engine.on_settle_due();
+                            self.drive(read, outbox);
+                        }
                         Action::ReadClipboard | Action::ScheduleRetry { .. } => {}
                     }
                 }
@@ -918,9 +1045,53 @@ mod tests {
         let actions = e.on_session_established();
         assert_eq!(actions, vec![Action::ReadClipboard]);
         // The established reset cleared the dedup hash, so the same
-        // content ships again for post-gap convergence.
-        let actions = e.on_local_read(Some("persistent".to_owned()));
-        assert_eq!(sent(&actions).len(), 1);
+        // content travels again for post-gap convergence.
+        assert_eq!(
+            sent(&e.on_local_read(Some("persistent".to_owned()))).len(),
+            1
+        );
+    }
+
+    /// ADR 0006: a burst of notifications costs one clipboard *read*,
+    /// not one per notification. Reading takes the machine-global lock,
+    /// so reacting to every notification is itself the contention the
+    /// two-machine soak exposed.
+    #[test]
+    fn a_burst_of_changes_reads_the_clipboard_once() {
+        let mut e = engine(0xAA);
+
+        for i in 0..10 {
+            let actions = e.on_local_change();
+            assert!(
+                matches!(actions.as_slice(), [Action::ScheduleSettle { .. }]),
+                "notification {i} read the clipboard immediately: {actions:?}"
+            );
+        }
+
+        // The window elapses once: one read, then one send of whatever
+        // the clipboard settled on.
+        assert_eq!(e.on_settle_due(), vec![Action::ReadClipboard]);
+        let actions = e.on_local_read(Some("settled content".to_owned()));
+        let msgs = sent(&actions);
+        assert_eq!(msgs.len(), 1);
+        let OutboundMessage::Data(data) = msgs[0] else {
+            panic!("expected inline data");
+        };
+        assert_eq!(data.content, b"settled content");
+    }
+
+    #[test]
+    fn zero_debounce_reads_eagerly() {
+        let mut e = ClipboardEngine::new(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig {
+                transmit_debounce: Duration::ZERO,
+                ..ClipboardConfig::new()
+            },
+        );
+        // The escape hatch for callers who want no wait at all.
+        assert_eq!(e.on_local_change(), vec![Action::ReadClipboard]);
+        assert_eq!(sent(&e.on_local_read(Some("eager".to_owned()))).len(), 1);
     }
 
     #[test]

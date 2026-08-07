@@ -53,6 +53,7 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0003](0003-device-identity-credential.md) | Device identity: Ed25519 pinned by SPKI in self-signed cert | Accepted |
 | [0004](0004-default-tcp-port.md) | Default TCP port: 27677 | Accepted |
 | [0005](0005-clipboard-transaction-flow.md) | Clipboard transactions: 2-message inline, Offer/Accept above 64 KiB | Accepted |
+| [0006](0006-clipboard-transmission-triggers.md) | Clipboard transmission is trigger-driven, not change-driven | Accepted |
 
 ## Known decisions awaiting an ADR
 
