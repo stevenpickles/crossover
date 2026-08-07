@@ -1,0 +1,45 @@
+# Dependabot version updates (docs/TESTING.md §2).
+#
+# Complements the `dependencies` CI job rather than duplicating it:
+# cargo-deny blocks a merge when the current tree violates policy;
+# Dependabot proposes the upgrade that fixes it, and keeps pins current
+# before they become a problem.
+version: 2
+
+updates:
+  # GitHub Actions are SHA-pinned for supply-chain reasons, which means
+  # nothing tells us when a pin goes stale — the upload-artifact Node 20
+  # deprecation was noticed by reading a build log. Dependabot updates
+  # the SHA and its trailing version comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Grouped so a quiet week is one reviewable PR rather than a dozen.
+    # Security fixes still arrive individually and immediately via
+    # Dependabot security updates.
+    groups:
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 5
+
+  # The fuzz crate lives outside the workspace (cargo-fuzz convention),
+  # so its lockfile needs its own entry.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: monthly
+    groups:
+      fuzz-deps:
+        patterns: ["*"]
+    open-pull-requests-limit: 2
