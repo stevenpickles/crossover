@@ -12,7 +12,7 @@ pub mod net;
 pub mod pairing;
 pub mod supervision;
 
-pub use clipboard::{ClipboardEngine, RetryPolicy as ClipboardRetryPolicy};
+pub use clipboard::{ClipboardConfig, ClipboardEngine, RetryPolicy as ClipboardRetryPolicy};
 pub use clipboard_driver::{ClipboardSyncDriver, SyncCommand, SyncEvent, clipboard_sync};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
