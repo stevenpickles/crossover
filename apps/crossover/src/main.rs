@@ -7,19 +7,27 @@
 //! return typed errors; this binary attaches operational context via
 //! `anyhow` and renders concise user-facing messages.
 
+mod commands;
 mod logging;
+mod storage;
 
 use anyhow::bail;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use uuid::Uuid;
 
 /// Secure keyboard, mouse, and clipboard sharing between trusted computers.
 ///
-/// The CLI surface required by FR-7.1 (docs/SPECIFICATION.md). Subcommands
-/// are stubs until their roadmap phase arrives; each names the phase that
-/// implements it so failures are actionable rather than mysterious.
+/// The CLI surface required by FR-7.1 (docs/SPECIFICATION.md). Remaining
+/// stubs name the phase that implements them so failures are actionable
+/// rather than mysterious.
 #[derive(Debug, Parser)]
 #[command(name = "crossover", version, about, propagate_version = true)]
 struct Cli {
+    /// Device name for this machine (defaults to the hostname). Used when
+    /// the identity is first generated; ignored afterwards.
+    #[arg(long, global = true)]
+    name: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -28,15 +36,44 @@ struct Cli {
 enum Command {
     /// Run Crossover in the foreground (clipboard sync arrives in Phase 2).
     Run,
-    /// Pair this computer with a trusted peer (Phase 1).
-    Pair,
-    /// List trusted peers (Phase 1).
-    Peers,
-    /// Report connection and session status (Phase 1).
+    /// Pair this computer with a trusted peer (ADR 0002).
+    Pair(PairArgs),
+    /// List trusted peers, or manage them with a subcommand.
+    Peers {
+        #[command(subcommand)]
+        action: Option<PeersAction>,
+    },
+    /// Report identity and trust status.
     Status,
 }
 
-fn main() -> anyhow::Result<()> {
+#[derive(Debug, Args)]
+struct PairArgs {
+    /// Address of the machine that ran `crossover pair --listen`
+    /// (e.g. 192.168.1.25:27677). You will be prompted for its code.
+    #[arg(required_unless_present = "listen", conflicts_with = "listen")]
+    address: Option<String>,
+
+    /// Listen for one pairing attempt and display a one-time code.
+    #[arg(long)]
+    listen: bool,
+
+    /// Bind address for --listen (default 0.0.0.0:27677).
+    #[arg(long, conflicts_with = "address")]
+    bind: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum PeersAction {
+    /// Revoke a trusted peer by device id (`crossover peers` lists them).
+    Remove {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     // Parse first so `--help`/`--version` exit without emitting log lines.
     let cli = Cli::parse();
     logging::init()?;
@@ -47,28 +84,38 @@ fn main() -> anyhow::Result<()> {
         command = ?cli.command,
         "starting"
     );
+
+    let device_name = storage::resolve_device_name(cli.name);
     match cli.command {
-        Command::Run => not_yet("run", "Phase 2 (Reliable Text Clipboard)"),
-        Command::Pair => not_yet("pair", "Phase 1 (Secure Peer Connection)"),
-        Command::Peers => not_yet("peers", "Phase 1 (Secure Peer Connection)"),
-        Command::Status => not_yet("status", "Phase 1 (Secure Peer Connection)"),
+        Command::Run => not_yet("run", "the Phase 1 run-loop slice"),
+        Command::Pair(args) => match args.address {
+            Some(address) => commands::pair_connect(&device_name, &address).await,
+            None => commands::pair_listen(&device_name, args.bind).await,
+        },
+        Command::Peers { action } => match action {
+            None => commands::peers_list(),
+            Some(PeersAction::Remove { device_id }) => commands::peers_remove(device_id),
+        },
+        Command::Status => commands::status(&device_name),
     }
 }
 
-/// Stub failure for commands whose roadmap phase has not been reached.
+/// Stub failure for functionality whose slice has not been reached.
 ///
 /// Failing (rather than exiting 0 after a message) keeps scripting honest:
 /// nothing that did not happen reports success.
-fn not_yet(command: &str, phase: &str) -> anyhow::Result<()> {
+fn not_yet(command: &str, arrives_in: &str) -> anyhow::Result<()> {
     bail!(
-        "`crossover {command}` is not implemented yet — it arrives in {phase}; see docs/ROADMAP.md"
+        "`crossover {command}` is not implemented yet — it arrives in {arrives_in}; \
+         see docs/ROADMAP.md"
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
     use clap::Parser;
+
+    use super::{Cli, Command, PeersAction};
 
     // Catches invalid clap derive configurations (conflicting flags,
     // ambiguous subcommands) at test time instead of first invocation.
@@ -79,23 +126,54 @@ mod tests {
     }
 
     #[test]
-    fn all_stub_subcommands_parse() {
-        for (argv, expected) in [
-            ("run", "Run"),
-            ("pair", "Pair"),
-            ("peers", "Peers"),
-            ("status", "Status"),
-        ] {
-            let cli = Cli::try_parse_from(["crossover", argv])
-                .unwrap_or_else(|e| panic!("`{argv}` failed to parse: {e}"));
-            let name = match cli.command {
-                Command::Run => "Run",
-                Command::Pair => "Pair",
-                Command::Peers => "Peers",
-                Command::Status => "Status",
-            };
-            assert_eq!(name, expected);
-        }
+    fn pair_requires_address_or_listen_but_not_both() {
+        assert!(Cli::try_parse_from(["crossover", "pair"]).is_err());
+        assert!(Cli::try_parse_from(["crossover", "pair", "10.0.0.2:27677", "--listen"]).is_err());
+        // --bind only makes sense while listening.
+        assert!(
+            Cli::try_parse_from(["crossover", "pair", "10.0.0.2:27677", "--bind", "x"]).is_err()
+        );
+
+        let cli = Cli::try_parse_from(["crossover", "pair", "10.0.0.2:27677"]).unwrap();
+        let Command::Pair(args) = cli.command else {
+            panic!("expected pair");
+        };
+        assert_eq!(args.address.as_deref(), Some("10.0.0.2:27677"));
+
+        let cli = Cli::try_parse_from(["crossover", "pair", "--listen", "--bind", "0.0.0.0:1234"])
+            .unwrap();
+        let Command::Pair(args) = cli.command else {
+            panic!("expected pair");
+        };
+        assert!(args.listen);
+        assert_eq!(args.bind.as_deref(), Some("0.0.0.0:1234"));
+    }
+
+    #[test]
+    fn peers_parses_bare_and_remove_forms() {
+        let cli = Cli::try_parse_from(["crossover", "peers"]).unwrap();
+        assert!(matches!(cli.command, Command::Peers { action: None }));
+
+        let id = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8";
+        let cli = Cli::try_parse_from(["crossover", "peers", "remove", id]).unwrap();
+        let Command::Peers {
+            action: Some(PeersAction::Remove { device_id }),
+        } = cli.command
+        else {
+            panic!("expected peers remove");
+        };
+        assert_eq!(device_id.to_string(), id);
+
+        // A non-UUID id is rejected at parse time.
+        assert!(Cli::try_parse_from(["crossover", "peers", "remove", "not-a-uuid"]).is_err());
+    }
+
+    #[test]
+    fn global_name_flag_applies_across_subcommands() {
+        let cli = Cli::try_parse_from(["crossover", "--name", "left", "status"]).unwrap();
+        assert_eq!(cli.name.as_deref(), Some("left"));
+        let cli = Cli::try_parse_from(["crossover", "status", "--name", "left"]).unwrap();
+        assert_eq!(cli.name.as_deref(), Some("left"));
     }
 
     #[test]
