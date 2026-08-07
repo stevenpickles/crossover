@@ -7,10 +7,12 @@
 
 pub mod framing;
 pub mod hello;
+pub mod pairing;
 pub mod version;
 
 pub use framing::{FrameDecoder, RawFrame, encode_frame};
 pub use hello::{FeatureFlags, Hello, MessageType, OsFamily};
+pub use pairing::{PairingConfirm, PairingStart};
 pub use version::{PROTOCOL_VERSION, VersionRange, negotiate};
 
 /// One-line statement of this crate's responsibility.
