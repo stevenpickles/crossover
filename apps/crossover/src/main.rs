@@ -11,7 +11,6 @@ mod commands;
 mod logging;
 mod storage;
 
-use anyhow::bail;
 use clap::{Args, Parser, Subcommand};
 use uuid::Uuid;
 
@@ -35,7 +34,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run Crossover in the foreground (clipboard sync arrives in Phase 2).
-    Run,
+    Run(RunArgs),
     /// Pair this computer with a trusted peer (ADR 0002).
     Pair(PairArgs),
     /// List trusted peers, or manage them with a subcommand.
@@ -45,6 +44,23 @@ enum Command {
     },
     /// Report identity and trust status.
     Status,
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    /// Accept inbound sessions from trusted peers.
+    #[arg(long)]
+    listen: bool,
+
+    /// Bind address for --listen (default 0.0.0.0:27677).
+    /// (Validated in code: requires --listen; `requires=` cannot express
+    /// this against a defaulted bool flag.)
+    #[arg(long)]
+    bind: Option<String>,
+
+    /// Maintain an outbound session to this peer address.
+    #[arg(long)]
+    connect: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -87,7 +103,22 @@ async fn main() -> anyhow::Result<()> {
 
     let device_name = storage::resolve_device_name(cli.name);
     match cli.command {
-        Command::Run => not_yet("run", "the Phase 1 run-loop slice"),
+        Command::Run(args) => {
+            if !args.listen && args.connect.is_none() {
+                anyhow::bail!(
+                    "`crossover run` needs a role: --listen to accept trusted peers,                      --connect <address> to dial one, or both"
+                );
+            }
+            if args.bind.is_some() && !args.listen {
+                anyhow::bail!("--bind only applies with --listen");
+            }
+            let listen_bind = args.listen.then(|| {
+                args.bind
+                    .clone()
+                    .unwrap_or_else(|| format!("0.0.0.0:{}", crossover_protocol::DEFAULT_PORT))
+            });
+            commands::run(&device_name, listen_bind, args.connect).await
+        }
         Command::Pair(args) => match args.address {
             Some(address) => commands::pair_connect(&device_name, &address).await,
             None => commands::pair_listen(&device_name, args.bind).await,
@@ -98,17 +129,6 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Status => commands::status(&device_name),
     }
-}
-
-/// Stub failure for functionality whose slice has not been reached.
-///
-/// Failing (rather than exiting 0 after a message) keeps scripting honest:
-/// nothing that did not happen reports success.
-fn not_yet(command: &str, arrives_in: &str) -> anyhow::Result<()> {
-    bail!(
-        "`crossover {command}` is not implemented yet — it arrives in {arrives_in}; \
-         see docs/ROADMAP.md"
-    )
 }
 
 #[cfg(test)]
