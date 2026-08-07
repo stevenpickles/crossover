@@ -420,9 +420,18 @@ async fn dispatch_frame(
         Some(MessageType::PairingStart | MessageType::PairingConfirm) => {
             violation("pairing message on an established session")
         }
+        // Clipboard traffic belongs to the engine, which consumes it as
+        // Frame events (attached in the wiring slice).
+        Some(
+            MessageType::ClipboardOffer
+            | MessageType::ClipboardAccept
+            | MessageType::ClipboardDecline
+            | MessageType::ClipboardData
+            | MessageType::ClipboardApplied,
+        )
         // Not a control message: the application owns dispatch (and
         // validity) of everything else.
-        None => {
+        | None => {
             if events.send(SessionEvent::Frame(frame)).await.is_err() {
                 Some(DisconnectReason::ShutdownRequested)
             } else {

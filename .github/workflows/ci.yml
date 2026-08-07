@@ -89,7 +89,8 @@ jobs:
         # which would build the fuzz targets for musl, where ASan rejects
         # the statically linked CRT.
         run: |
-          for target in frame_decoder hello pairing_start pairing_confirm; do
+          for target in frame_decoder hello pairing_start pairing_confirm \
+                        clipboard_data clipboard_control; do
             cargo +nightly fuzz run "$target" \
               --target x86_64-unknown-linux-gnu \
               -- -max_total_time=20 -print_final_stats=1

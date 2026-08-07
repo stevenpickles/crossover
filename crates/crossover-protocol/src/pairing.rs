@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::ProtocolError;
+use crate::decode_strict;
 use crate::hello::MAX_DEVICE_NAME_BYTES;
 
 /// Bound on the SPAKE2 exchange message (an Ed25519 group element plus
@@ -127,22 +128,6 @@ impl PairingConfirm {
         message.validate()?;
         Ok(message)
     }
-}
-
-fn decode_strict<'a, T: Deserialize<'a>>(
-    payload: &'a [u8],
-    what: &str,
-) -> Result<T, ProtocolError> {
-    let (value, rest): (T, &[u8]) =
-        postcard::take_from_bytes(payload).map_err(|e| ProtocolError::Malformed {
-            reason: format!("undecodable {what} payload: {e}"),
-        })?;
-    if !rest.is_empty() {
-        return Err(ProtocolError::Malformed {
-            reason: format!("{} trailing bytes after {what} payload", rest.len()),
-        });
-    }
-    Ok(value)
 }
 
 #[cfg(test)]
