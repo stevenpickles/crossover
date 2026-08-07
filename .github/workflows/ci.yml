@@ -55,3 +55,36 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # Short fuzz runs on every change (docs/TESTING.md §1.3): arbitrary
+  # network bytes must never panic the parsers. Extended runs are a later,
+  # scheduled concern; this catches regressions cheaply. One OS suffices —
+  # the parsers are platform-independent by construction.
+  fuzz-smoke:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      - name: Install nightly toolchain (sanitizer builds)
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Fuzz every parser briefly
+        run: |
+          for target in frame_decoder hello pairing_start pairing_confirm; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=20 -print_final_stats=1
+          done
