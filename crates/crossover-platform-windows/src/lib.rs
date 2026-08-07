@@ -10,8 +10,12 @@
 //! on Windows CI (NFR-6, docs/TESTING.md §1.6).
 
 #[cfg(windows)]
+pub mod clipboard;
+#[cfg(windows)]
 pub mod secure_storage;
 
+#[cfg(windows)]
+pub use clipboard::WindowsClipboard;
 #[cfg(windows)]
 pub use secure_storage::DpapiSecureStorage;
 
