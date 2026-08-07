@@ -84,7 +84,13 @@ jobs:
           tool: cargo-fuzz
 
       - name: Fuzz every parser briefly
+        # --target is explicit because cargo-fuzz defaults to its OWN
+        # compile-time triple, and the prebuilt binary is musl-linked —
+        # which would build the fuzz targets for musl, where ASan rejects
+        # the statically linked CRT.
         run: |
           for target in frame_decoder hello pairing_start pairing_confirm; do
-            cargo +nightly fuzz run "$target" -- -max_total_time=20 -print_final_stats=1
+            cargo +nightly fuzz run "$target" \
+              --target x86_64-unknown-linux-gnu \
+              -- -max_total_time=20 -print_final_stats=1
           done
