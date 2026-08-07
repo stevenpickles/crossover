@@ -1,0 +1,57 @@
+# Tri-OS CI gate — docs/TESTING.md §2, docs/ROADMAP.md Phase 0 exit criteria.
+#
+# Runs the four required checks on Windows, Linux, and macOS so that
+# platform-independent crates can never silently grow an OS-specific
+# dependency (NFR-4). The toolchain version is deliberately absent here:
+# rustup auto-installs the version pinned in rust-toolchain.toml, keeping a
+# single source of truth for the toolchain.
+#
+# Third-party actions are pinned to full commit SHAs (supply-chain hygiene,
+# consistent with the dependency policy in docs/ARCHITECTURE.md §7).
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: ci (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # An OS-specific failure should not mask results on the other OSes.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint (warnings denied)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
