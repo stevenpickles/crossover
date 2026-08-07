@@ -22,7 +22,7 @@
 //!   up, which only matters during genuinely simultaneous copies.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -180,19 +180,37 @@ impl InboundMessage {
 }
 
 /// Outbound transaction state.
+///
+/// `started` stamps when the local observation entered the pipeline, so
+/// transaction latency is computed entirely on the originating machine's
+/// clock — no cross-machine skew enters the measurement.
 #[derive(Debug)]
 enum Outbound {
     /// Offer sent; awaiting Accept/Decline.
-    AwaitingAccept { data: ClipboardData },
+    AwaitingAccept {
+        data: ClipboardData,
+        started: Instant,
+    },
     /// Data sent; awaiting Applied.
-    AwaitingApplied { meta: ClipboardMeta },
+    AwaitingApplied {
+        meta: ClipboardMeta,
+        started: Instant,
+    },
 }
 
 impl Outbound {
     fn meta(&self) -> ClipboardMeta {
         match self {
-            Self::AwaitingAccept { data } => data.meta,
-            Self::AwaitingApplied { meta } => *meta,
+            Self::AwaitingAccept { data, .. } => data.meta,
+            Self::AwaitingApplied { meta, .. } => *meta,
+        }
+    }
+
+    fn started(&self) -> Instant {
+        match self {
+            Self::AwaitingAccept { started, .. } | Self::AwaitingApplied { started, .. } => {
+                *started
+            }
         }
     }
 }
@@ -406,11 +424,12 @@ impl ClipboardEngine {
             );
         }
         let meta = data.meta;
+        let started = Instant::now();
         if meta.content_length <= CLIPBOARD_INLINE_MAX_BYTES as u64 {
-            self.outbound = Some(Outbound::AwaitingApplied { meta });
+            self.outbound = Some(Outbound::AwaitingApplied { meta, started });
             vec![Action::Send(OutboundMessage::Data(data))]
         } else {
-            self.outbound = Some(Outbound::AwaitingAccept { data });
+            self.outbound = Some(Outbound::AwaitingAccept { data, started });
             vec![Action::Send(OutboundMessage::Offer(ClipboardOffer {
                 meta,
             }))]
@@ -440,9 +459,9 @@ impl ClipboardEngine {
 
     fn on_peer_accept(&mut self, id: Uuid) -> Vec<Action> {
         match self.outbound.take() {
-            Some(Outbound::AwaitingAccept { data }) if data.meta.id == id => {
+            Some(Outbound::AwaitingAccept { data, started }) if data.meta.id == id => {
                 let meta = data.meta;
-                self.outbound = Some(Outbound::AwaitingApplied { meta });
+                self.outbound = Some(Outbound::AwaitingApplied { meta, started });
                 vec![Action::Send(OutboundMessage::Data(data))]
             }
             other => {
@@ -455,7 +474,8 @@ impl ClipboardEngine {
 
     fn on_peer_decline(&mut self, decline: &ClipboardDecline) -> Vec<Action> {
         match self.outbound.take() {
-            Some(Outbound::AwaitingAccept { data }) if data.meta.id == decline.id => {
+            Some(Outbound::AwaitingAccept { data, started }) if data.meta.id == decline.id => {
+                let latency_ms = elapsed_ms(started);
                 let outcome = match decline.reason {
                     // Success-shaped: the peer already has the content, or
                     // a newer item won the race.
@@ -466,6 +486,7 @@ impl ClipboardEngine {
                     clipboard_id = %decline.id,
                     reason = ?decline.reason,
                     result = outcome,
+                    latency_ms,
                     "clipboard offer resolved"
                 );
                 Vec::new()
@@ -538,16 +559,21 @@ impl ClipboardEngine {
 
     fn on_peer_applied(&mut self, applied: &ClipboardApplied) -> Vec<Action> {
         match self.outbound.take() {
-            Some(Outbound::AwaitingApplied { meta }) if meta.id == applied.id => {
+            Some(Outbound::AwaitingApplied { meta, started }) if meta.id == applied.id => {
                 let outcome = match applied.result {
                     ApplyResult::Applied => "applied",
                     ApplyResult::Superseded => "superseded",
                     ApplyResult::ClipboardUnavailable => "clipboard_unavailable",
                     ApplyResult::ContentRejected => "content_rejected",
                 };
+                // Round trip measured on this machine's clock alone:
+                // local observation through the destination's verdict
+                // (docs/TESTING.md §4 — the number Phase 6 will want).
                 tracing::info!(
                     clipboard_id = %applied.id,
                     result = outcome,
+                    byte_count = meta.content_length,
+                    latency_ms = elapsed_ms(started),
                     "clipboard transaction closed"
                 );
                 Vec::new()
@@ -570,9 +596,14 @@ impl ClipboardEngine {
         let inbound_wins =
             (inbound.sequence, inbound.origin.as_bytes()) > (ours.sequence, ours.origin.as_bytes());
         if inbound_wins {
+            let latency_ms = self
+                .outbound
+                .as_ref()
+                .map_or(0, |o| elapsed_ms(o.started()));
             tracing::info!(
                 clipboard_id = %ours.id,
                 result = "superseded",
+                latency_ms,
                 "outbound item lost the conflict race; converging on the peer's item"
             );
             self.outbound = None;
@@ -593,6 +624,11 @@ impl ClipboardEngine {
         }
         self.applied_hashes.push_back(hash);
     }
+}
+
+/// Milliseconds since `started`, saturating into `u64` for logging.
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
