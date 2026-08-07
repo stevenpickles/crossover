@@ -54,13 +54,15 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0004](0004-default-tcp-port.md) | Default TCP port: 27677 | Accepted |
 | [0005](0005-clipboard-transaction-flow.md) | Clipboard transactions: 2-message inline, Offer/Accept above 64 KiB | Accepted |
 | [0006](0006-clipboard-transmission-triggers.md) | Clipboard transmission is trigger-driven, not change-driven | Accepted |
+| [0007](0007-windows-input-capture.md) | Windows input: hooks to suppress, Raw Input for motion, SendInput to inject | Accepted |
 
 ## Known decisions awaiting an ADR
 
-These are deliberately **deferred** by the specification suite. Each must be
-resolved by ADR before the phase that depends on it (see
-[docs/ROADMAP.md](../ROADMAP.md)):
+None outstanding. Every decision the specification suite deliberately
+deferred has now been recorded — wire format (0001), pairing mechanism
+(0002), identity credential (0003), default port (0004), clipboard
+transaction flow (0005), and Windows input capture (0007); 0006 was
+raised by evidence rather than deferred.
 
-1. **Windows input capture approach** — low-level hooks vs. Raw Input, and the
-   injection strategy. Required before Phase 3. See risk notes in
-   [docs/SPECIFICATION.md](../SPECIFICATION.md).
+New entries belong here when a decision is identified but not yet made,
+so that the gap is visible rather than implicit.

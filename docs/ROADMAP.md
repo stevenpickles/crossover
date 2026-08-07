@@ -1,7 +1,7 @@
 # Crossover Roadmap
 
-> **Current phase: 3 — Remote Mouse** (not started; the Windows
-> input-capture ADR is the entry work)
+> **Current phase: 3 — Remote Mouse** (in progress — the input-capture
+> ADR is recorded; implementation is next)
 >
 > Update this marker when a phase's exit criteria are verified. Do not begin
 > a later phase because time remains — complete and validate exit criteria
@@ -147,11 +147,12 @@ and remains the fallback.
 **Goal:** control the second computer's pointer.
 
 Deliverables: mouse capture and injection behind platform traits
-(prerequisite ADR: Windows input capture approach, deferred decision 5;
-respect hook-timeout budget R-2); pointer transport with coalescing;
-buttons and wheel; coordinate abstraction (DPI-aware, R-3); button state
-tracking with `ReleaseAllInput`; **explicit** control switching via CLI
-command or hotkey — no edge detection yet.
+(ADR 0007: hooks suppress, Raw Input supplies motion, `SendInput`
+injects with tagged events; respect the hook-timeout budget R-2);
+pointer transport with coalescing; buttons and wheel; coordinate
+abstraction (DPI-aware, R-3); button state tracking with
+`ReleaseAllInput`; **explicit** control switching via CLI command or
+hotkey — no edge detection yet.
 
 Exit criteria: second machine controllable with first machine's mouse;
 repeated activate/deactivate cycles never leave stuck buttons (fault-
