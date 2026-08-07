@@ -34,6 +34,16 @@ pub enum MessageType {
     PairingStart = 4,
     /// Pairing: MAC-authenticated identity claim.
     PairingConfirm = 5,
+    /// Clipboard: announce a large item (ADR 0005 offered flow).
+    ClipboardOffer = 6,
+    /// Clipboard: accept an offered item.
+    ClipboardAccept = 7,
+    /// Clipboard: decline an offered item (typed reason).
+    ClipboardDecline = 8,
+    /// Clipboard: the item itself (inline flow, or after an accept).
+    ClipboardData = 9,
+    /// Clipboard: destination verdict — the only definition of success.
+    ClipboardApplied = 10,
 }
 
 impl MessageType {
@@ -48,6 +58,11 @@ impl MessageType {
             3 => Some(Self::Pong),
             4 => Some(Self::PairingStart),
             5 => Some(Self::PairingConfirm),
+            6 => Some(Self::ClipboardOffer),
+            7 => Some(Self::ClipboardAccept),
+            8 => Some(Self::ClipboardDecline),
+            9 => Some(Self::ClipboardData),
+            10 => Some(Self::ClipboardApplied),
             _ => None,
         }
     }
@@ -254,6 +269,11 @@ mod tests {
             MessageType::Pong,
             MessageType::PairingStart,
             MessageType::PairingConfirm,
+            MessageType::ClipboardOffer,
+            MessageType::ClipboardAccept,
+            MessageType::ClipboardDecline,
+            MessageType::ClipboardData,
+            MessageType::ClipboardApplied,
         ] {
             assert_eq!(MessageType::from_wire(ty.wire()), Some(ty));
         }
