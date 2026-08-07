@@ -1,7 +1,8 @@
 # Crossover Roadmap
 
-> **Current phase: 3 — Remote Mouse** (in progress — the input-capture
-> ADR is recorded; implementation is next)
+> **Current phase: 3 — Remote Mouse** (in progress — Windows pointer
+> injection and capture are implemented; explicit control switching and
+> the phase exit criteria are next)
 >
 > Update this marker when a phase's exit criteria are verified. Do not begin
 > a later phase because time remains — complete and validate exit criteria
