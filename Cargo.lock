@@ -330,6 +330,7 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "sha2",
  "thiserror",
  "uuid",
 ]
