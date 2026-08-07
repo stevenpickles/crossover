@@ -249,3 +249,27 @@ living exemplar.
   context (anyhow-style), rendering concise user-facing messages while
   structured logs retain detail (FR-7.3). The `anyhow` dependency arrives
   when `main` first becomes fallible (CLI slice), not before.
+
+## 10. Logging conventions
+
+`tracing` is wired from Phase 0 (FR-7.3); the subscriber is installed once
+in `apps/crossover/src/logging.rs`. Conventions:
+
+- **Metadata only.** Clipboard contents and private key material never
+  appear in logs at any level (FR-7.4). Clipboard transactions log
+  `clipboard_id`, `content_type`, `byte_count`, `content_hash`,
+  `origin_peer`, `attempt_count`, `result`, `latency_ms` — never payloads.
+- **Canonical field names**, snake_case, reused verbatim across crates so
+  log lines correlate: `peer_id`, `session_id`, `message_id`,
+  `clipboard_id`, `protocol_version`, `state`, `latency_ms`, `error`,
+  `command`. Values go in fields; the event message is the human summary.
+- **Spans scope lifecycles**: one span per connection session (carrying
+  `session_id` and `peer_id`), per clipboard transaction, per control
+  transfer. Events inside inherit those fields — no re-stating.
+- **Levels**: `info` — important state transitions (the NFR-3 observability
+  floor); `debug` — protocol detail; `trace` — per-event input chatter;
+  `warn`/`error` — observable failures, carrying an `error` field.
+- **Filtering** via `RUST_LOG` (env-filter), defaulting to `info`. Logging
+  must not materially degrade input responsiveness (NFR-5): the hot input
+  path logs at `trace`, and tracing's static max-level features may cap
+  release builds if measurement warrants.
