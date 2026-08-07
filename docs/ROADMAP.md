@@ -1,7 +1,7 @@
 # Crossover Roadmap
 
-> **Current phase: 2 — Reliable Text Clipboard** (not started; the
-> clipboard-flow ADR is the entry work)
+> **Current phase: 2 — Reliable Text Clipboard** (in progress — the
+> clipboard-flow ADR is recorded; implementation is next)
 >
 > Update this marker when a phase's exit criteria are verified. Do not begin
 > a later phase because time remains — complete and validate exit criteria
