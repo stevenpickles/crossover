@@ -2,9 +2,9 @@
 //! sync driver, engine, and fake provider — driven over real localhost
 //! TCP+TLS against the foreign test peer (docs/TESTING.md §1.4, §1.5).
 //!
-//! The wiring here (run_session events → driver events, driver commands →
-//! session outbound) is exactly the shape the app adopts in the next
-//! slice, proven hardware-free first.
+//! The wiring here (`run_session` events → driver events, driver
+//! commands → session outbound) is exactly the shape the app adopts in
+//! the next slice, proven hardware-free first.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +33,7 @@ struct AppSide {
     _shutdown: watch::Sender<bool>,
 }
 
-async fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
+fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
     let clipboard = Arc::new(InMemoryClipboard::new());
     let (driver, sync_events, mut sync_commands) = clipboard_sync(
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
@@ -121,12 +121,10 @@ async fn connected_pair() -> (AppSide, TestConnection) {
     let addr = listener.local_addr().unwrap();
 
     let peer_hello = peer.hello();
-    let (side, conn) = tokio::join!(spawn_app_side(listener, app), async move {
-        let mut conn = TestConnection::connect(addr, &peer).await.unwrap();
-        conn.send_hello(&peer_hello).await.unwrap();
-        let _app_hello = conn.expect_hello().await.unwrap();
-        conn
-    });
+    let side = spawn_app_side(listener, app);
+    let mut conn = TestConnection::connect(addr, &peer).await.unwrap();
+    conn.send_hello(&peer_hello).await.unwrap();
+    let _app_hello = conn.expect_hello().await.unwrap();
     (side, conn)
 }
 
@@ -188,7 +186,7 @@ async fn peer_item_lands_on_the_clipboard_and_is_acked() {
     );
 }
 
-/// App→peer: a local copy crosses the wire as valid ClipboardData; the
+/// App→peer: a local copy crosses the wire as valid `ClipboardData`; the
 /// peer's ack closes the transaction (no retransmission).
 #[tokio::test]
 async fn local_copy_reaches_the_peer_as_data() {
@@ -251,7 +249,7 @@ async fn duplicate_content_is_acked_without_reapplication() {
 }
 
 /// Clipboard contention at the destination: bounded retries burn through,
-/// then the honest ClipboardUnavailable verdict crosses the wire.
+/// then the honest `ClipboardUnavailable` verdict crosses the wire.
 #[tokio::test]
 async fn contended_destination_reports_unavailable_after_retries() {
     let (side, mut conn) = connected_pair().await;
