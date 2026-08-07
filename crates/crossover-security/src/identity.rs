@@ -69,8 +69,9 @@ pub enum IdentityError {
 /// SHA-256 fingerprint of the identity key's SPKI DER encoding (ADR 0003).
 ///
 /// This is the value the trust store pins and diagnostics display.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SpkiFingerprint([u8; 32]);
+/// Serializable for trust-store persistence; contains no secret material.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SpkiFingerprint(pub(crate) [u8; 32]);
 
 impl SpkiFingerprint {
     /// Raw fingerprint bytes.
@@ -289,14 +290,14 @@ impl fmt::Debug for DeviceIdentity {
     }
 }
 
-fn validate_device_name(name: &str) -> Result<(), IdentityError> {
+pub(crate) fn validate_device_name(name: &str) -> Result<(), IdentityError> {
     if name.is_empty() || name.len() > MAX_DEVICE_NAME_BYTES {
         return Err(IdentityError::InvalidDeviceName { got: name.len() });
     }
     Ok(())
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
