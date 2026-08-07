@@ -43,10 +43,13 @@ state machine (never two owners, never zero owners after convergence).
 ### 1.3 Fuzzing
 
 Every network-facing parse path in `crossover-protocol` has a fuzz target
-(cargo-fuzz). Goals: arbitrary bytes never panic, never allocate
-unboundedly, never corrupt state; invalid sequences fail safely into the
-fail-closed path ([PROTOCOL.md](PROTOCOL.md) §7). CI runs a short fuzz
-smoke; longer runs are scheduled.
+(cargo-fuzz, in `fuzz/`). Goals: arbitrary bytes never panic, never
+allocate unboundedly, never corrupt state; invalid sequences fail safely
+into the fail-closed path ([PROTOCOL.md](PROTOCOL.md) §7). Decode targets
+also assert re-decode equality: anything that decodes must survive an
+encode → decode round trip unchanged. CI runs a short smoke of every
+target on each change (`fuzz-smoke` job); longer runs are scheduled
+later.
 
 ### 1.4 Integration via the headless test peer
 
@@ -97,8 +100,9 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Added as the project matures: `cargo audit` and `cargo deny` (dependency and
-license policy), documentation build, fuzz smoke, MSRV check, protocol
+The `fuzz-smoke` job runs every fuzz target briefly on each change.
+Added as the project matures: `cargo audit` and `cargo deny` (dependency
+and license policy), documentation build, MSRV check, protocol
 compatibility tests across supported versions.
 
 ## 3. Phase-gate testing
