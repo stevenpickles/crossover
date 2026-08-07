@@ -14,6 +14,12 @@ exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
+# Nothing here is published to crates.io: this is one application in one
+# repository, and the crate split exists for internal boundaries
+# (docs/ARCHITECTURE.md §3), not distribution. Declaring it prevents an
+# accidental `cargo publish` and lets dependency policy distinguish our
+# path dependencies from real wildcard requirements.
+publish = false
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -31,7 +37,10 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 getrandom = "0.3"
 hmac = "0.12"
-postcard = { version = "1", features = ["use-std"] }
+# default-features = false drops postcard's heapless-cas default, which
+# pulls the unmaintained atomic-polyfill (RUSTSEC advisory) through
+# heapless 0.7. Crossover is a std application and never needed it.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 proptest = "1"
 # ring backends (not aws-lc-rs): pure prebuilt-asm builds on all three CI
 # OSes with no CMake/NASM toolchain requirements.

@@ -1,1 +1,4 @@
 /target
+
+# Soak run logs (docs/SOAK.md) — machine-specific, not artifacts
+soak*.log
