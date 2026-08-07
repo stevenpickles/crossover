@@ -340,38 +340,8 @@ pub async fn run_session(
                 match received {
                     Ok(frame) => {
                         last_rx = Instant::now();
-                        match MessageType::from_wire(frame.message_type) {
-                            Some(MessageType::Ping) => {
-                                if !frame.payload.is_empty() {
-                                    break DisconnectReason::ProtocolViolation {
-                                        reason: "Ping with non-empty payload".to_owned(),
-                                    };
-                                }
-                                if let Err(e) =
-                                    writer.send(MessageType::Pong.wire(), &[]).await
-                                {
-                                    break transport_reason(&e);
-                                }
-                            }
-                            Some(MessageType::Pong) => {
-                                if !frame.payload.is_empty() {
-                                    break DisconnectReason::ProtocolViolation {
-                                        reason: "Pong with non-empty payload".to_owned(),
-                                    };
-                                }
-                            }
-                            Some(MessageType::Hello) => {
-                                break DisconnectReason::ProtocolViolation {
-                                    reason: "Hello after establishment".to_owned(),
-                                };
-                            }
-                            // Not a control message: the application owns
-                            // dispatch (and validity) of everything else.
-                            None => {
-                                if events.send(SessionEvent::Frame(frame)).await.is_err() {
-                                    break DisconnectReason::ShutdownRequested;
-                                }
-                            }
+                        if let Some(reason) = dispatch_frame(frame, &mut writer, events).await {
+                            break reason;
                         }
                     }
                     Err(SessionError::PeerClosed) => break DisconnectReason::PeerClosed,
@@ -413,6 +383,53 @@ pub async fn run_session(
         }
     }
     reason
+}
+
+/// Dispatch one inbound frame: control messages are handled here, app
+/// frames become events. `Some(reason)` ends the session.
+async fn dispatch_frame(
+    frame: crossover_protocol::RawFrame,
+    writer: &mut crate::net::SessionWriter,
+    events: &mpsc::Sender<SessionEvent>,
+) -> Option<DisconnectReason> {
+    let violation = |reason: &str| {
+        Some(DisconnectReason::ProtocolViolation {
+            reason: reason.to_owned(),
+        })
+    };
+    match MessageType::from_wire(frame.message_type) {
+        Some(MessageType::Ping) => {
+            if !frame.payload.is_empty() {
+                return violation("Ping with non-empty payload");
+            }
+            match writer.send(MessageType::Pong.wire(), &[]).await {
+                Ok(_) => None,
+                Err(e) => Some(transport_reason(&e)),
+            }
+        }
+        Some(MessageType::Pong) => {
+            if frame.payload.is_empty() {
+                None
+            } else {
+                violation("Pong with non-empty payload")
+            }
+        }
+        Some(MessageType::Hello) => violation("Hello after establishment"),
+        // Pairing happens on a plain-TCP ceremony before trust exists; on
+        // an established session it is a violation.
+        Some(MessageType::PairingStart | MessageType::PairingConfirm) => {
+            violation("pairing message on an established session")
+        }
+        // Not a control message: the application owns dispatch (and
+        // validity) of everything else.
+        None => {
+            if events.send(SessionEvent::Frame(frame)).await.is_err() {
+                Some(DisconnectReason::ShutdownRequested)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn transport_reason(error: &SessionError) -> DisconnectReason {
