@@ -145,6 +145,12 @@ are binding; "should" requirements are strong defaults changeable by ADR.
 
 - **FR-3.1** Clipboard synchronization must observe the actual operating
   system clipboard. It must not depend on intercepting keyboard shortcuts.
+- **FR-3.1a** Crossover must be a good neighbour on the clipboard: the OS
+  clipboard is a machine-global lock, so Crossover must not hold it
+  longer than an operation needs, nor take it more often than the user
+  can benefit from. Transmission is therefore trigger-driven
+  (ADR 0006), and intermediate states no user can paste are not written
+  at all.
 - **FR-3.2** A synchronization operation succeeds only when the destination
   operating-system clipboard has been updated — not when bytes were written
   to a socket. Success must be acknowledged end to end.
