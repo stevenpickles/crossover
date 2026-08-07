@@ -363,6 +363,29 @@ mod tests {
         );
     }
 
+    /// The identity is the SPKI fingerprint (ADR 0003), so its bytes are
+    /// a compatibility surface, not an implementation detail: if a
+    /// dependency upgrade changes how the key is DER-encoded, every
+    /// paired device stops recognising this one. A fixed key pinned to
+    /// its known fingerprint turns that into a test failure instead of a
+    /// field report.
+    #[test]
+    fn spki_fingerprint_is_stable_for_a_known_key() {
+        // A fixed, non-secret seed: this key exists only in this test.
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let identity = DeviceIdentity {
+            device_id: uuid::Uuid::from_bytes([0x01; 16]),
+            device_name: "fixture".to_owned(),
+            created_at_unix: 0,
+            signing_key: signing,
+        };
+        assert_eq!(
+            identity.spki_fingerprint().unwrap().to_string(),
+            "9a82517f9af19416d98fdbcf193726b3a95c0b6fec1d51884bf3e1b739ba2ef4",
+            "SPKI encoding changed: every existing pairing would break"
+        );
+    }
+
     #[test]
     fn distinct_identities_have_distinct_fingerprints() {
         let a = DeviceIdentity::generate("a").unwrap();
