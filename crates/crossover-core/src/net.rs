@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
@@ -166,6 +166,90 @@ impl EstablishedSession {
     /// [`SessionError::Io`] if shutdown fails.
     pub async fn close(mut self) -> Result<(), SessionError> {
         self.stream.shutdown().await?;
+        Ok(())
+    }
+
+    /// Split into independently owned read and write halves, so a session
+    /// loop can `select!` over inbound frames and outbound sends without
+    /// fighting over one `&mut self` (supervision, and later the clipboard
+    /// engine, need exactly this).
+    #[must_use]
+    pub fn split(self) -> (SessionReader, SessionWriter) {
+        let (read, write) = tokio::io::split(self.stream);
+        (
+            SessionReader {
+                read,
+                decoder: self.decoder,
+                info: self.info.clone(),
+            },
+            SessionWriter {
+                write,
+                next_message_id: self.next_message_id,
+                info: self.info,
+            },
+        )
+    }
+}
+
+/// The receiving half of a split session.
+pub struct SessionReader {
+    read: tokio::io::ReadHalf<TlsStream<TcpStream>>,
+    decoder: FrameDecoder,
+    info: SessionInfo,
+}
+
+impl SessionReader {
+    /// Facts about this session.
+    #[must_use]
+    pub fn info(&self) -> &SessionInfo {
+        &self.info
+    }
+
+    /// Receive the next complete frame.
+    ///
+    /// # Errors
+    ///
+    /// As [`EstablishedSession::recv`].
+    pub async fn recv(&mut self) -> Result<RawFrame, SessionError> {
+        read_frame(&mut self.read, &mut self.decoder).await
+    }
+}
+
+/// The sending half of a split session.
+pub struct SessionWriter {
+    write: tokio::io::WriteHalf<TlsStream<TcpStream>>,
+    next_message_id: u64,
+    info: SessionInfo,
+}
+
+impl SessionWriter {
+    /// Facts about this session.
+    #[must_use]
+    pub fn info(&self) -> &SessionInfo {
+        &self.info
+    }
+
+    /// Send one frame; returns the assigned message id.
+    ///
+    /// # Errors
+    ///
+    /// As [`EstablishedSession::send`].
+    pub async fn send(&mut self, message_type: u16, payload: &[u8]) -> Result<u64, SessionError> {
+        let message_id = self.next_message_id;
+        let frame = encode_frame(message_type, message_id, payload)?;
+        self.write.write_all(&frame).await?;
+        self.write.flush().await?;
+        self.next_message_id += 1;
+        Ok(message_id)
+    }
+
+    /// Gracefully shut down the write direction.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Io`] if shutdown fails.
+    pub async fn close(&mut self) -> Result<(), SessionError> {
+        self.write.shutdown().await?;
         Ok(())
     }
 }
@@ -344,7 +428,7 @@ async fn establish(
 }
 
 /// Read one frame from the stream, growing the decoder as bytes arrive.
-async fn read_frame<S: AsyncRead + AsyncWrite + Unpin>(
+async fn read_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     decoder: &mut FrameDecoder,
 ) -> Result<RawFrame, SessionError> {

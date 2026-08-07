@@ -25,6 +25,11 @@ pub const MAX_DEVICE_NAME_BYTES: usize = 64;
 pub enum MessageType {
     /// Session establishment ([`Hello`]).
     Hello = 1,
+    /// Keepalive probe (CONTROL class, empty payload). Sent on an idle
+    /// session; the peer answers with [`MessageType::Pong`].
+    Ping = 2,
+    /// Keepalive answer (CONTROL class, empty payload).
+    Pong = 3,
 }
 
 impl MessageType {
@@ -35,6 +40,8 @@ impl MessageType {
     pub const fn from_wire(raw: u16) -> Option<Self> {
         match raw {
             1 => Some(Self::Hello),
+            2 => Some(Self::Ping),
+            3 => Some(Self::Pong),
             _ => None,
         }
     }
@@ -229,6 +236,15 @@ mod tests {
         assert_eq!(MessageType::from_wire(0), None);
         assert_eq!(MessageType::from_wire(0xFFFF), None);
         assert_eq!(MessageType::from_wire(1), Some(MessageType::Hello));
+        assert_eq!(MessageType::from_wire(2), Some(MessageType::Ping));
+        assert_eq!(MessageType::from_wire(3), Some(MessageType::Pong));
+    }
+
+    #[test]
+    fn wire_values_round_trip_for_all_known_types() {
+        for ty in [MessageType::Hello, MessageType::Ping, MessageType::Pong] {
+            assert_eq!(MessageType::from_wire(ty.wire()), Some(ty));
+        }
     }
 
     #[test]
