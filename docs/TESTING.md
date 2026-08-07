@@ -108,6 +108,16 @@ is a defect with a known fix. It also runs on a daily schedule, since a
 new advisory can land against unchanged code. Locally: `cargo deny
 check`.
 
+GitHub's own services cover what a build-time check cannot. Dependabot
+alerts and security updates watch the GitHub Advisory Database and open
+fix PRs when an advisory lands against unchanged code; `cargo-deny`
+blocks the merge, Dependabot proposes the upgrade. Version updates
+(`.github/dependabot.yml`) additionally keep SHA-pinned actions current,
+which is otherwise invisible until a runner deprecation warning appears
+in a log. Secret scanning with push protection is enabled on the
+repository — relevant here because Crossover handles key material, and a
+committed private key is unrecoverable once pushed.
+
 The `fuzz-smoke` job runs every fuzz target briefly on each change.
 
 The `coverage` job measures line/region/branch coverage with
