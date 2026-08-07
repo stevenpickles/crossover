@@ -19,6 +19,14 @@ use uuid::Uuid;
 use crate::ProtocolError;
 use crate::decode_strict;
 
+/// SHA-256 of clipboard content — the identity that dedup and loop
+/// prevention key on. Exposed so the engine hashes local observations
+/// identically to the wire layer without its own crypto dependency.
+#[must_use]
+pub fn content_hash(content: &[u8]) -> [u8; 32] {
+    Sha256::digest(content).into()
+}
+
 /// Content at or below this rides the inline flow; above it, the offered
 /// flow (ADR 0005).
 pub const CLIPBOARD_INLINE_MAX_BYTES: usize = 64 * 1024;
@@ -137,6 +145,10 @@ pub enum DeclineReason {
     TooLarge,
     /// The receiver cannot take an item right now.
     NotReady,
+    /// A newer item (by the deterministic conflict order, FR-3.5) has
+    /// superseded this one; synchronization converges on the newer item.
+    /// A success-shaped outcome, not a failure.
+    Superseded,
 }
 
 /// Decline an offered item.
@@ -169,7 +181,7 @@ impl ClipboardData {
         content_type: ContentType,
         content: Vec<u8>,
     ) -> Self {
-        let digest: [u8; 32] = Sha256::digest(&content).into();
+        let digest = content_hash(&content);
         Self {
             meta: ClipboardMeta {
                 id,
@@ -254,6 +266,10 @@ pub enum ApplyResult {
     ClipboardUnavailable,
     /// The destination refused the content (validation failed locally).
     ContentRejected,
+    /// A newer item (by the deterministic conflict order, FR-3.5) won the
+    /// race; the destination kept the newer content. Closes the losing
+    /// transaction as converged, not failed.
+    Superseded,
 }
 
 /// Close a transaction: what happened at the destination.
@@ -409,6 +425,7 @@ mod tests {
             DeclineReason::AlreadyHave,
             DeclineReason::TooLarge,
             DeclineReason::NotReady,
+            DeclineReason::Superseded,
         ] {
             let decline = ClipboardDecline {
                 id: Uuid::from_bytes([0x44; 16]),
@@ -424,6 +441,7 @@ mod tests {
             ApplyResult::Applied,
             ApplyResult::ClipboardUnavailable,
             ApplyResult::ContentRejected,
+            ApplyResult::Superseded,
         ] {
             let applied = ClipboardApplied {
                 id: Uuid::from_bytes([0x55; 16]),
