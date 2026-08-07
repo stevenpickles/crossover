@@ -48,7 +48,7 @@ What becomes easier, what becomes harder, what risks are accepted.
 
 | ADR | Title | Status |
 |-----|-------|--------|
-| — | *(none recorded yet)* | — |
+| [0001](0001-wire-serialization-format.md) | Wire serialization format: postcard | Accepted |
 
 ## Known decisions awaiting an ADR
 
@@ -56,10 +56,7 @@ These are deliberately **deferred** by the specification suite. Each must be
 resolved by ADR before the phase that depends on it (see
 [docs/ROADMAP.md](../ROADMAP.md)):
 
-1. **Wire serialization format** — postcard vs. CBOR vs. MessagePack vs.
-   Protocol Buffers. Required before Phase 1. See
-   [docs/PROTOCOL.md](../PROTOCOL.md) for selection criteria.
-2. **Pairing verification mechanism** — short authentication string (SAS)
+1. **Pairing verification mechanism** — short authentication string (SAS)
    comparison vs. a PAKE (e.g., SPAKE2) with a short shared code. Required
    before Phase 1. See [docs/SECURITY.md](../SECURITY.md).
 3. **Device identity credential form** — raw public key vs. self-signed
