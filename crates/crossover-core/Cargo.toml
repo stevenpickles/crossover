@@ -11,5 +11,17 @@ crossover-platform = { workspace = true }
 crossover-protocol = { workspace = true }
 crossover-security = { workspace = true }
 
+# The net module (docs/ARCHITECTURE.md §3.1: networking folded into
+# core::net until a second transport appears). State machines stay pure;
+# I/O is confined to net.
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true
