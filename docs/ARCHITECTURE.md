@@ -194,7 +194,7 @@ IDLE → CONNECTING → AUTHENTICATING → NEGOTIATING → ESTABLISHED
 | Logging | tracing + tracing-subscriber | Structured from first commit |
 | CLI | clap | |
 | Config | TOML, versioned schema | |
-| Errors | thiserror in library crates, contextual (anyhow-style) at app boundary | Security errors distinguishable from network/protocol/clipboard/input/config errors |
+| Errors | thiserror in library crates, contextual (anyhow-style) at app boundary | Conventions and exemplar: §9 |
 
 Dependency policy: dependencies are welcome for mature commodity
 functionality; each meaningful one is evaluated for maintenance, security
@@ -222,3 +222,30 @@ right = "workstation-right"
 
 Validated on load with actionable errors; deterministic defaults; no private
 keys in this file (they live in `SecureStorage`).
+
+## 9. Error-handling conventions
+
+Established while the workspace was empty so later work copies a convention
+instead of inventing one. `ProtocolError` in `crossover-protocol` is the
+living exemplar.
+
+- **Library crates define typed errors** with `thiserror`: one
+  `#[non_exhaustive]` enum per cohesive failure domain. Variants carry the
+  data an actionable diagnostic needs (FR-7.1) — numbers and identifiers as
+  fields, not pre-formatted strings.
+- **Causal chains are preserved.** Underlying failures are wrapped with
+  `#[source]`/`#[from]`; a cause is never flattened into a message string.
+- **Security failures stay distinguishable.** Authentication, authorization,
+  and validation failures get their own types or variants — never collapsed
+  into generic network/protocol/clipboard/input/config errors — so
+  fail-closed paths and diagnostics can discriminate
+  ([SECURITY.md](SECURITY.md) invariant 1).
+- **Untrusted input produces values, not panics.** Every path reachable from
+  network input returns `Result`; `unwrap`/`expect`/`panic!` on such paths
+  is a defect (NFR-1).
+- **Errors are comparable values** (`PartialEq` where contents allow) so
+  state-machine tests assert exact rejection reasons.
+- **The app boundary is contextual.** `apps/crossover` attaches operational
+  context (anyhow-style), rendering concise user-facing messages while
+  structured logs retain detail (FR-7.3). The `anyhow` dependency arrives
+  when `main` first becomes fallible (CLI slice), not before.
