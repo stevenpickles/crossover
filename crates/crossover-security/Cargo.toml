@@ -25,6 +25,10 @@ rcgen = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+# Pairing ceremony (ADR 0002): SPAKE2 keyed by the one-time code, HMAC
+# confirmation over the transcript.
+hmac = { workspace = true }
+spake2 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 x509-parser = { workspace = true }
