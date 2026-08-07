@@ -51,6 +51,7 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0001](0001-wire-serialization-format.md) | Wire serialization format: postcard | Accepted |
 | [0002](0002-pairing-verification-mechanism.md) | Pairing verification: SPAKE2 with typed code | Accepted |
 | [0003](0003-device-identity-credential.md) | Device identity: Ed25519 pinned by SPKI in self-signed cert | Accepted |
+| [0004](0004-default-tcp-port.md) | Default TCP port: 27677 | Accepted |
 
 ## Known decisions awaiting an ADR
 
@@ -62,8 +63,6 @@ resolved by ADR before the phase that depends on it (see
    payloads with Offer/Accept reserved for large payloads, vs. uniform
    4-message flow. Required before Phase 2. See
    [docs/PROTOCOL.md](../PROTOCOL.md).
-5. **Windows input capture approach** — low-level hooks vs. Raw Input, and the
+2. **Windows input capture approach** — low-level hooks vs. Raw Input, and the
    injection strategy. Required before Phase 3. See risk notes in
    [docs/SPECIFICATION.md](../SPECIFICATION.md).
-6. **Default TCP port** — chosen and documented centrally. Required before
-   Phase 1.
