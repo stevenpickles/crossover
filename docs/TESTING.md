@@ -100,6 +100,14 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+The `dependencies` job enforces the dependency policy with `cargo-deny`
+(`deny.toml`): RustSec advisories, license compatibility against an
+explicit permissive allow-list, and crates.io-only provenance. Unlike
+coverage it **gates**, because a vulnerable or unmaintained dependency
+is a defect with a known fix. It also runs on a daily schedule, since a
+new advisory can land against unchanged code. Locally: `cargo deny
+check`.
+
 The `fuzz-smoke` job runs every fuzz target briefly on each change.
 
 The `coverage` job measures line/region/branch coverage with
@@ -117,8 +125,7 @@ written to move a number; the useful question is which paths a change
 leaves unexercised, which the report answers directly. Low branch
 coverage in error-handling code is a standing invitation to add
 fault-injection cases (docs/TESTING.md §1.5), not a build failure.
-Added as the project matures: `cargo audit` and `cargo deny` (dependency
-and license policy), documentation build, MSRV check, protocol
+Added as the project matures: documentation build, MSRV check, protocol
 compatibility tests across supported versions.
 
 ## 3. Phase-gate testing
