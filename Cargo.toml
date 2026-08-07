@@ -8,6 +8,9 @@ members = [
     "crates/crossover-security",
     "tools/test-peer",
 ]
+# cargo-fuzz convention: the fuzz crate lives outside the workspace (own
+# profiles, nightly-only sanitizer builds).
+exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
