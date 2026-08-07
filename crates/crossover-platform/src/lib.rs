@@ -5,10 +5,12 @@
 //! `crossover-platform-windows` implement these traits; nothing above the
 //! platform boundary names an OS API (docs/ARCHITECTURE.md §2, §4).
 
+pub mod clipboard;
 #[cfg(any(test, feature = "fakes"))]
 pub mod fakes;
 pub mod secure_storage;
 
+pub use clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
 pub use secure_storage::{SecureStorage, SecureStorageError};
 
 /// One-line statement of this crate's responsibility.
