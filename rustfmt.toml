@@ -1,0 +1,2 @@
+# Default rustfmt style is intentional; only the edition is pinned.
+edition = "2024"
