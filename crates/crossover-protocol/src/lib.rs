@@ -5,15 +5,39 @@
 //! testable (and fuzzable) without sockets. Wire-level invariants are
 //! specified in `docs/PROTOCOL.md`; layering rules in `docs/ARCHITECTURE.md`.
 
+pub mod clipboard;
 pub mod framing;
 pub mod hello;
 pub mod pairing;
 pub mod version;
 
+pub use clipboard::{
+    ApplyResult, ClipboardAccept, ClipboardApplied, ClipboardData, ClipboardDecline, ClipboardMeta,
+    ClipboardOffer, ContentType, DeclineReason,
+};
 pub use framing::{FrameDecoder, RawFrame, encode_frame};
 pub use hello::{FeatureFlags, Hello, MessageType, OsFamily};
 pub use pairing::{PairingConfirm, PairingStart};
 pub use version::{PROTOCOL_VERSION, VersionRange, negotiate};
+
+/// Decode a full postcard payload, rejecting trailing bytes — the strict
+/// contract every message decoder shares (docs/PROTOCOL.md §2: payload
+/// lengths are exact).
+pub(crate) fn decode_strict<'a, T: serde::Deserialize<'a>>(
+    payload: &'a [u8],
+    what: &str,
+) -> Result<T, ProtocolError> {
+    let (value, rest): (T, &[u8]) =
+        postcard::take_from_bytes(payload).map_err(|e| ProtocolError::Malformed {
+            reason: format!("undecodable {what} payload: {e}"),
+        })?;
+    if !rest.is_empty() {
+        return Err(ProtocolError::Malformed {
+            reason: format!("{} trailing bytes after {what} payload", rest.len()),
+        });
+    }
+    Ok(value)
+}
 
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =

@@ -45,5 +45,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "clipboard_data"
+path = "fuzz_targets/clipboard_data.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clipboard_control"
+path = "fuzz_targets/clipboard_control.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

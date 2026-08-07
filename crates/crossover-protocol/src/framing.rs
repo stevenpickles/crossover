@@ -27,11 +27,12 @@ pub const LENGTH_PREFIX_BYTES: usize = 4;
 /// Fixed body header: `message_type` (2) + `message_id` (8).
 pub const BODY_HEADER_BYTES: usize = 10;
 
-/// Maximum accepted frame body (header + payload). Placeholder ceiling
-/// until the clipboard-flow ADR fixes per-class payload maxima
-/// (docs/adr/README.md deferred decision 1); generous for CONTROL traffic,
-/// deliberately far below anything that could pressure memory.
-pub const MAX_FRAME_BODY_BYTES: usize = 1024 * 1024;
+/// Maximum accepted frame body (header + payload): one maximum clipboard
+/// item (4 MiB, ADR 0005) plus envelope headroom, so a full item always
+/// fits a single frame and no chunking/reassembly state exists. Safe
+/// against NFR-1 because the declared length is validated before
+/// allocation and the decode buffer is capped.
+pub const MAX_FRAME_BODY_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
 
 /// Maximum payload bytes a single frame can carry.
 pub const MAX_PAYLOAD_BYTES: usize = MAX_FRAME_BODY_BYTES - BODY_HEADER_BYTES;
