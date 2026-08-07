@@ -5,6 +5,12 @@
 //! `crossover-platform-windows` implement these traits; nothing above the
 //! platform boundary names an OS API (docs/ARCHITECTURE.md §2, §4).
 
+#[cfg(any(test, feature = "fakes"))]
+pub mod fakes;
+pub mod secure_storage;
+
+pub use secure_storage::{SecureStorage, SecureStorageError};
+
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =
     "platform trait definitions with no OS dependencies (docs/ARCHITECTURE.md §4)";
