@@ -112,9 +112,13 @@ impl ClipboardProvider for WindowsClipboard {
         let _open = OpenGuard::open()?;
         // SAFETY: the clipboard is open (guard); the returned handle is
         // owned by the clipboard, not by us.
+        // Contention-shaped, observed live: clipboard ownership can churn
+        // between our successful open and this call (another process
+        // taking the clipboard), surfacing as ERROR_CLIPBOARD_NOT_OPEN.
+        // Retryable, not fatal (R-5).
         let handle = unsafe { GetClipboardData(u32::from(CF_UNICODETEXT.0)) }.map_err(|e| {
-            ClipboardError::Unavailable {
-                reason: format!("GetClipboardData failed: {e}"),
+            ClipboardError::Busy {
+                reason: format!("GetClipboardData failed (ownership churn?): {e}"),
             }
         })?;
         if handle.is_invalid() {
@@ -126,7 +130,9 @@ impl ClipboardProvider for WindowsClipboard {
         // is open; GlobalLock pins it and yields the base pointer.
         let ptr = unsafe { GlobalLock(hglobal) }.cast::<u16>();
         if ptr.is_null() {
-            return Err(ClipboardError::Unavailable {
+            // Same churn window as above: the block can vanish with its
+            // owner. Retryable.
+            return Err(ClipboardError::Busy {
                 reason: "GlobalLock on clipboard data failed".to_owned(),
             });
         }
@@ -170,16 +176,16 @@ impl ClipboardProvider for WindowsClipboard {
         }
 
         // SAFETY: the clipboard is open (guard).
-        unsafe { EmptyClipboard() }.map_err(|e| ClipboardError::Unavailable {
-            reason: format!("EmptyClipboard failed: {e}"),
+        unsafe { EmptyClipboard() }.map_err(|e| ClipboardError::Busy {
+            reason: format!("EmptyClipboard failed (ownership churn?): {e}"),
         })?;
         // SAFETY: on success the system takes ownership of `hglobal`; we
         // must not free it. On failure ownership stays with us — the
         // block leaks rather than risking a double-free; failure here is
         // rare and the leak is bounded by the item size.
         unsafe { SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(hglobal.0))) }.map_err(
-            |e| ClipboardError::Unavailable {
-                reason: format!("SetClipboardData failed: {e}"),
+            |e| ClipboardError::Busy {
+                reason: format!("SetClipboardData failed (ownership churn?): {e}"),
             },
         )?;
         Ok(())

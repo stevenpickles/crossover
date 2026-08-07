@@ -16,7 +16,10 @@ use crossover_core::pairing::{PairingListener, pair_with};
 use crossover_core::supervision::{
     KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
 };
-use crossover_core::{LocalNode, SessionListener, SessionOptions};
+use crossover_core::{
+    ClipboardRetryPolicy, LocalNode, SessionListener, SessionOptions, SyncCommand, SyncEvent,
+    clipboard_sync,
+};
 use crossover_platform::SecureStorage;
 use crossover_protocol::DEFAULT_PORT;
 use crossover_security::pairing::{PairedPeer, PairingCode, PairingIdentity};
@@ -24,7 +27,7 @@ use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TrustStore, TrustedPeer,
 };
 
-use crate::storage::open_secure_storage;
+use crate::storage::{open_clipboard_provider, open_secure_storage};
 
 /// One ceremony's allowance, listener and connector alike. Generous
 /// enough to read a code off one screen and type it on another; bounded
@@ -228,6 +231,21 @@ pub async fn run(
         identity.spki_fingerprint()?
     );
 
+    // Clipboard sync: one driver for the peer relationship; sessions of
+    // either role feed it and carry its frames.
+    let provider = open_clipboard_provider()?;
+    let (sync_driver, sync_events, sync_commands) = clipboard_sync(
+        provider,
+        identity.device_id(),
+        ClipboardRetryPolicy::default(),
+    )
+    .context("starting clipboard sync")?;
+    tokio::spawn(sync_driver.run());
+
+    // The mux's view of the current inbound session: its outbound sender
+    // and its kill switch (for the driver's fail-closed verdicts).
+    let listener_slot: SessionSlotRef = Arc::new(std::sync::Mutex::new(None));
+
     // Outbound role: supervised session with automatic reconnect.
     let (handle, events) = match &connect {
         Some(addr) => {
@@ -239,10 +257,12 @@ pub async fn run(
                 Arc::new(RwLock::new(store.clone())),
                 SupervisorConfig::default(),
             );
-            (Some(handle), Some(events))
+            (Some(Arc::new(handle)), Some(events))
         }
         None => (None, None),
     };
+
+    spawn_command_mux(handle.clone(), Arc::clone(&listener_slot), sync_commands);
 
     // Inbound role: accept loop, one session at a time (two-machine scope).
     let listener = match &listen_bind {
@@ -265,19 +285,78 @@ pub async fn run(
                 handle.shutdown();
             }
         }
-        () = listener_loop(listener.as_ref(), &identity, &certified, &storage) => {}
-        () = outbound_event_loop(events, &storage) => {}
+        () = listener_loop(
+            listener.as_ref(),
+            &identity,
+            &certified,
+            &storage,
+            &sync_events,
+            &listener_slot,
+        ) => {}
+        () = outbound_event_loop(events, &storage, &sync_events) => {}
     }
     Ok(())
 }
 
 /// Accept trusted peers forever; each session runs the shared session
 /// loop (pings answered, frames logged) until it ends, then accept again.
+type SessionSlotRef =
+    Arc<std::sync::Mutex<Option<(mpsc::Sender<(u16, Vec<u8>)>, watch::Sender<bool>)>>>;
+
+/// Route driver commands to every active session; enforce fail-closed
+/// terminations on the inbound session. (The supervisor offers no
+/// per-session kill — an accepted limitation logged when it matters: a
+/// malformed payload from a trusted, authenticated peer.)
+fn spawn_command_mux(
+    handle: Option<Arc<crossover_core::supervision::SupervisorHandle>>,
+    listener_slot: SessionSlotRef,
+    mut sync_commands: mpsc::Receiver<SyncCommand>,
+) {
+    tokio::spawn(async move {
+        while let Some(command) = sync_commands.recv().await {
+            match command {
+                SyncCommand::SendFrame {
+                    message_type,
+                    payload,
+                } => {
+                    if let Some(handle) = &handle {
+                        let _ = handle.send(message_type, payload.clone()).await;
+                    }
+                    let maybe_tx = listener_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        .map(|(tx, _)| tx.clone());
+                    if let Some(tx) = maybe_tx {
+                        let _ = tx.send((message_type, payload)).await;
+                    }
+                }
+                SyncCommand::TerminateSession { reason } => {
+                    tracing::error!(
+                        error = %reason,
+                        "clipboard payload violation; terminating inbound session"
+                    );
+                    let maybe_kill = listener_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        .map(|(_, kill)| kill.clone());
+                    if let Some(kill) = maybe_kill {
+                        let _ = kill.send(true);
+                    }
+                }
+            }
+        }
+    });
+}
+
 async fn listener_loop(
     listener: Option<&SessionListener>,
     identity: &DeviceIdentity,
     certified: &CertifiedIdentity,
     storage: &Arc<dyn SecureStorage>,
+    sync_events: &mpsc::Sender<SyncEvent>,
+    session_slot: &SessionSlotRef,
 ) {
     let Some(listener) = listener else {
         return std::future::pending().await;
@@ -309,17 +388,20 @@ async fn listener_loop(
                 );
                 touch_last_connected(&**storage, info.peer_fingerprint);
 
-                let (events_tx, mut events_rx) = mpsc::channel(16);
-                let (_outbound_tx, mut outbound_rx) = mpsc::channel::<(u16, Vec<u8>)>(1);
-                let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+                let (events_tx, mut events_rx) = mpsc::channel(64);
+                let (outbound_tx, mut outbound_rx) = mpsc::channel::<(u16, Vec<u8>)>(64);
+                let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+                *session_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some((outbound_tx, shutdown_tx));
+                let _ = sync_events.send(SyncEvent::SessionEstablished).await;
+
+                let frame_sink = sync_events.clone();
                 let drain = tokio::spawn(async move {
                     while let Some(event) = events_rx.recv().await {
                         if let SessionEvent::Frame(frame) = event {
-                            tracing::debug!(
-                                message_type = frame.message_type,
-                                byte_count = frame.payload.len(),
-                                "application frame (no engine attached yet)"
-                            );
+                            let _ = frame_sink.send(SyncEvent::Frame(frame)).await;
                         }
                     }
                 });
@@ -333,6 +415,10 @@ async fn listener_loop(
                 .await;
                 drop(events_tx);
                 let _ = drain.await;
+                *session_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                let _ = sync_events.send(SyncEvent::SessionLost).await;
                 println!(
                     "Session with \"{}\" ended: {reason}.",
                     info.peer_device_name
@@ -352,6 +438,7 @@ async fn listener_loop(
 async fn outbound_event_loop(
     events: Option<mpsc::Receiver<SessionEvent>>,
     storage: &Arc<dyn SecureStorage>,
+    sync_events: &mpsc::Sender<SyncEvent>,
 ) {
     let Some(mut events) = events else {
         return std::future::pending().await;
@@ -364,16 +451,20 @@ async fn outbound_event_loop(
                     info.peer_device_name
                 );
                 touch_last_connected(&**storage, info.peer_fingerprint);
+                let _ = sync_events.send(SyncEvent::SessionEstablished).await;
             }
             SessionEvent::Disconnected {
                 reason, retry_in, ..
-            } => match retry_in {
-                Some(delay) => println!(
-                    "Outbound session ended ({reason}); retrying in {}s.",
-                    delay.as_secs_f32()
-                ),
-                None => println!("Outbound session ended ({reason})."),
-            },
+            } => {
+                match retry_in {
+                    Some(delay) => println!(
+                        "Outbound session ended ({reason}); retrying in {}s.",
+                        delay.as_secs_f32()
+                    ),
+                    None => println!("Outbound session ended ({reason})."),
+                }
+                let _ = sync_events.send(SyncEvent::SessionLost).await;
+            }
             SessionEvent::ConnectFailed { error, retry_in } => {
                 println!(
                     "Connect failed ({error}); retrying in {}s.",
@@ -381,13 +472,10 @@ async fn outbound_event_loop(
                 );
             }
             SessionEvent::Frame(frame) => {
-                tracing::debug!(
-                    message_type = frame.message_type,
-                    byte_count = frame.payload.len(),
-                    "application frame (no engine attached yet)"
-                );
+                let _ = sync_events.send(SyncEvent::Frame(frame)).await;
             }
         }
+        // A Disconnected event also voids sync state.
     }
 }
 
