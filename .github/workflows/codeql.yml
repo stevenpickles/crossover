@@ -1,0 +1,82 @@
+# CodeQL static analysis (docs/TESTING.md §2).
+#
+# Advanced setup rather than GitHub's default setup, because default
+# setup does not offer Rust — its API accepts only actions, c-cpp,
+# csharp, go, java-kotlin, javascript-typescript, python, ruby, and
+# swift. The codeql-action itself does support Rust, so a workflow gets
+# analysis that the point-and-click path cannot.
+#
+# Expected yield is honestly modest: Rust's type system already prevents
+# most of what CodeQL hunts for, and Crossover forbids `unsafe` outside
+# one crate. The value concentrates in three places worth the CI minutes:
+# the Win32 FFI in crossover-platform-windows, where our safety argument
+# rests on hand-written SAFETY comments; the workflows themselves, where
+# script injection is a real class of supply-chain bug; and the soak
+# report script.
+#
+# Kept in its own workflow so a preview-stage analyzer failing cannot
+# redden the build gate in ci.yml.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  schedule:
+    # New queries ship without our code changing.
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      # Required to upload results to the Security tab.
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rust is built, so it needs the platform whose code it
+          # analyses: the Windows crate is the reason this job exists.
+          - language: rust
+            runner: windows-latest
+          - language: actions
+            runner: ubuntu-latest
+          - language: python
+            runner: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Cache cargo registry and build artifacts
+        if: matrix.language == 'rust'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        with:
+          languages: ${{ matrix.language }}
+          # security-and-quality over the default suite: this codebase is
+          # small enough to read the extra findings, and Phase 6's
+          # security review will want them (docs/ROADMAP.md).
+          queries: security-and-quality
+
+      - name: Build
+        if: matrix.language == 'rust'
+        # Explicit rather than autobuild: the workspace builds with one
+        # command, and naming it keeps the analysed artifacts identical
+        # to what CI builds.
+        run: cargo build --workspace
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        with:
+          category: /language:${{ matrix.language }}
