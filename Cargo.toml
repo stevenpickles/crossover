@@ -34,9 +34,12 @@ crossover-security = { path = "crates/crossover-security" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-ed25519-dalek = { version = "2", features = ["pkcs8"] }
+# `alloc` is explicit: in 3.0 the pkcs8 feature no longer implies it, and
+# the DER *encode* traits (which produce the SPKI bytes our identity is
+# pinned to, ADR 0003) live behind it.
+ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
 getrandom = "0.3"
-hmac = "0.12"
+hmac = "0.13"
 # default-features = false drops postcard's heapless-cas default, which
 # pulls the unmaintained atomic-polyfill (RUSTSEC advisory) through
 # heapless 0.7. Crossover is a std application and never needed it.
@@ -47,7 +50,7 @@ proptest = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
+sha2 = "0.11"
 # RustCrypto PAKEs implementation (ADR 0002 dependency evaluation: active
 # org maintenance, MIT/Apache-2.0, pure Rust, transitive deps already in
 # tree via the dalek family). Stable 0.4 line, not the 0.5 pre-release.
