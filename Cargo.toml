@@ -63,6 +63,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 x509-parser = "0.18"
 windows = { version = "0.62", features = [
+    "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_System_DataExchange",
