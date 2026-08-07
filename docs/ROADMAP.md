@@ -1,7 +1,7 @@
 # Crossover Roadmap
 
-> **Current phase: 2 — Reliable Text Clipboard** (in progress — the
-> clipboard-flow ADR is recorded; implementation is next)
+> **Current phase: 3 — Remote Mouse** (not started; the Windows
+> input-capture ADR is the entry work)
 >
 > Update this marker when a phase's exit criteria are verified. Do not begin
 > a later phase because time remains — complete and validate exit criteria
@@ -82,7 +82,7 @@ Verified 2026-08-07:
   plaintext is the semantics-free SNI placeholder. TLS 1.3 keeps
   certificates (and thus fingerprints) encrypted as well.
 
-## Phase 2 — Reliable Text Clipboard
+## Phase 2 — Reliable Text Clipboard (completed 2026-08-07)
 
 **Goal:** extremely reliable bidirectional UTF-8 text clipboard sync —
 before any input forwarding.
@@ -103,6 +103,44 @@ Exit criteria:
 - Every ultimately-failed update produces an observable diagnostic
 - **Milestone: Secure Clipboard Prototype** — pair, trust persistence,
   encrypted transport, reliable bidirectional clipboard, auto-reconnect
+
+Verified 2026-08-07 — **milestone achieved**:
+
+- **Stress gate**: 10,000 bidirectional updates, `applied=10000`,
+  `corrupt=0`, `failed=0`, exactly 20,000 frames (no synchronization
+  loop). Hermetic, so it gates every merge
+  (`tools/test-peer/tests/stress.rs`).
+- **Two physical Windows machines** on one LAN (192.168.50.100 /
+  .101) ran the [SOAK.md](SOAK.md) runbook: one-directional sync,
+  simultaneous bidirectional copying, items above the offered-flow
+  threshold, Ethernet unplugged 30 s and replugged, and process
+  restart. Trust persisted; reconnection needed no re-pairing;
+  conflict resolution agreed on winners from both sides' logs; no
+  content mismatch in any run.
+- **Latency** (originating machine's own clock): p50 4–6 ms once a
+  transaction starts.
+- **Clipboard citizenship**: zero `read_busy` events and zero
+  `Set-Clipboard` failures in other applications during bidirectional
+  load — see below.
+
+The soak found two real defects that no hermetic test could, both fixed
+and re-verified rather than merely recorded:
+
+1. Crossover held the machine-global clipboard often enough to make
+   *other* applications' copy operations fail outright. Three rounds of
+   measurement narrowed it — critical-section length, then write
+   volume, then finally the reads, which took the same lock on every
+   change notification. Reported failures went from hundreds per run to
+   zero.
+2. Sustained read contention starved inbound work: an acknowledgement
+   waited 27 seconds behind a self-re-enqueueing retry loop sharing one
+   serial queue.
+
+That work produced [ADR 0006](adr/0006-clipboard-transmission-triggers.md):
+clipboard transmission is trigger-driven rather than change-driven.
+Control transfer becomes the primary trigger in Phase 5 (recorded in
+that phase's deliverables); a settled-change debounce carries Phase 2
+and remains the fallback.
 
 ## Phase 3 — Remote Mouse
 
