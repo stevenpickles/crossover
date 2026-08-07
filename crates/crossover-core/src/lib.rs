@@ -7,11 +7,13 @@
 //! (docs/ARCHITECTURE.md §2, §5).
 
 pub mod clipboard;
+pub mod clipboard_driver;
 pub mod net;
 pub mod pairing;
 pub mod supervision;
 
 pub use clipboard::{ClipboardEngine, RetryPolicy as ClipboardRetryPolicy};
+pub use clipboard_driver::{ClipboardSyncDriver, SyncCommand, SyncEvent, clipboard_sync};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
     connect,
