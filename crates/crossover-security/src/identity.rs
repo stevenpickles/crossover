@@ -260,6 +260,12 @@ impl DeviceIdentity {
         self.signing_key.verifying_key()
     }
 
+    /// Crate-internal access to the private key, for the TLS layer to
+    /// derive a PKCS#8 credential (`tls` module). Never exposed publicly.
+    pub(crate) fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
     /// The canonical identity: SHA-256 over the SPKI DER encoding of the
     /// public key (ADR 0003). Stable across certificate regeneration.
     ///
