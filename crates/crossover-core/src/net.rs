@@ -428,7 +428,7 @@ async fn establish(
 }
 
 /// Read one frame from the stream, growing the decoder as bytes arrive.
-async fn read_frame<S: AsyncRead + Unpin>(
+pub(crate) async fn read_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     decoder: &mut FrameDecoder,
 ) -> Result<RawFrame, SessionError> {
