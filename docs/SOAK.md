@@ -191,3 +191,45 @@ What warrants investigation:
 Record the outcome in the phase's exit-criteria notes
 (docs/ROADMAP.md), including the conditions: how long, how many items,
 what interference was staged.
+
+---
+
+## Phase 3 probe: input capture (single machine)
+
+Suppression cannot be proven by CI: the automated tests cover tag
+filtering, translation, state transitions, and a synthetic end-to-end
+event through the real hook and Raw Input pipeline, but only a human
+moving a real mouse can confirm that the *local cursor does not move*
+while capture holds it. That is what this probe is for. One machine, no
+peer needed.
+
+```
+cargo test -p crossover-platform-windows manual_probe_capture -- --ignored --nocapture
+```
+
+What happens, in order:
+
+1. The probe prints a warning, then captures for **ten seconds**. The
+   mouse goes dead — the cursor must not move, clicks must not land,
+   scrolling must do nothing. **That is suppression working.** Keep
+   moving, clicking, and scrolling anyway; the keyboard still works
+   (Ctrl+C aborts if something goes wrong).
+2. After ten seconds the probe releases capture and the mouse comes
+   back to life on its own.
+3. It prints how many motion, button, and scroll events were observed
+   while the mouse was dead, and whether capture stayed healthy.
+
+What good looks like:
+
+- The cursor did not move at all during the window — any movement while
+  "dead" means suppression failed, which is a defect.
+- Event counts reflect what you actually did (hundreds of motion events
+  from continuous movement; your clicks and scrolls present).
+- `capture healthy at end: true`, and the mouse is fully alive
+  afterwards — a mouse that stays dead after release is the
+  release-blocking defect class (FR-4.4).
+
+Honest limitation: the hook-loss watchdog (R-2) cannot be staged
+manually without deliberately wedging the pump thread, so this probe
+does not exercise it; its decision logic is unit-tested, and the
+loss path is exercised only if Windows actually removes the hook.
