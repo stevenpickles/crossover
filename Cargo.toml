@@ -25,6 +25,8 @@ crossover-security = { path = "crates/crossover-security" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # `unsafe_code = "forbid"` enforces NFR-6 (docs/SPECIFICATION.md). Platform
 # crates may later relax it locally with documented justification.

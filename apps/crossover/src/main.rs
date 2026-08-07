@@ -7,6 +7,8 @@
 //! return typed errors; this binary attaches operational context via
 //! `anyhow` and renders concise user-facing messages.
 
+mod logging;
+
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 
@@ -35,7 +37,16 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Parse first so `--help`/`--version` exit without emitting log lines.
     let cli = Cli::parse();
+    logging::init()?;
+    // Structured-field exemplar (docs/ARCHITECTURE.md §10): values as
+    // fields, snake_case canonical names, message as the human summary.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        command = ?cli.command,
+        "starting"
+    );
     match cli.command {
         Command::Run => not_yet("run", "Phase 2 (Reliable Text Clipboard)"),
         Command::Pair => not_yet("pair", "Phase 1 (Secure Peer Connection)"),
