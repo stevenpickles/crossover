@@ -6,6 +6,13 @@
 //! effects flow through the traits in `crossover-platform`
 //! (docs/ARCHITECTURE.md §2, §5).
 
+pub mod net;
+
+pub use net::{
+    EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
+    connect,
+};
+
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str = "state machines, clipboard and input engines, topology, \
      and connection supervision (docs/ARCHITECTURE.md §5)";
