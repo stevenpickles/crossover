@@ -91,104 +91,12 @@ async fn ten_thousand_bidirectional_updates_stay_correct() {
 
     for i in 0..updates {
         // Alternate the origin so the run is genuinely bidirectional.
-        let (source, sink) = if i % 2 == 0 {
+        let (source, sink) = if i.is_multiple_of(2) {
             (&mut a, &mut b)
         } else {
             (&mut b, &mut a)
         };
-        let text = format!("stress item {i} on {}", if i % 2 == 0 { "a" } else { "b" });
-        source.clipboard.set_text_locally(&text);
-
-        // Source emits Data; sink applies it and emits Applied; source
-        // closes. Anything else is a defect worth failing loudly on.
-        let data_frame = next_command(&mut source.commands).await;
-        let SyncCommand::SendFrame {
-            message_type,
-            payload,
-        } = data_frame
-        else {
-            panic!("update {i}: expected a frame, got a termination command");
-        };
-        frames_crossed.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(
-            message_type,
-            MessageType::ClipboardData.wire(),
-            "update {i}: unexpected outbound message type"
-        );
-
-        // Integrity: what left must be exactly what was copied.
-        let data = ClipboardData::decode_payload(&payload)
-            .unwrap_or_else(|e| panic!("update {i}: outbound data failed to decode: {e}"));
-        if data.content != text.as_bytes() {
-            tally.corrupt += 1;
-        }
-
-        sink.events
-            .send(SyncEvent::Frame(RawFrame {
-                message_type,
-                message_id: i as u64,
-                payload,
-            }))
-            .await
-            .unwrap();
-
-        let ack_frame = next_command(&mut sink.commands).await;
-        let SyncCommand::SendFrame {
-            message_type,
-            payload,
-        } = ack_frame
-        else {
-            panic!("update {i}: sink terminated the session");
-        };
-        frames_crossed.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(
-            message_type,
-            MessageType::ClipboardApplied.wire(),
-            "update {i}: sink did not acknowledge"
-        );
-        let applied = ClipboardApplied::decode_payload(&payload)
-            .unwrap_or_else(|e| panic!("update {i}: ack failed to decode: {e}"));
-        match applied.result {
-            ApplyResult::Applied => tally.applied += 1,
-            ApplyResult::Superseded => tally.superseded += 1,
-            // Every failure is *observable* — the criterion is no SILENT
-            // failure. With a healthy fake provider there should be none.
-            ApplyResult::ClipboardUnavailable | ApplyResult::ContentRejected => {
-                tally.failed += 1;
-            }
-        }
-
-        // Destination-updated is the definition of success (FR-3.2).
-        if applied.result == ApplyResult::Applied {
-            let landed = sink.clipboard.peek();
-            if landed.as_deref() != Some(text.as_str()) {
-                tally.corrupt += 1;
-            }
-        }
-
-        source
-            .events
-            .send(SyncEvent::Frame(RawFrame {
-                message_type,
-                message_id: i as u64,
-                payload,
-            }))
-            .await
-            .unwrap();
-
-        // Loop prevention (FR-3.3): applying the item fired the fake's
-        // own-write notification; an echo would appear as an extra frame.
-        // The global frame-count assertion below catches any echo across
-        // the whole run; this per-item probe localizes one to its
-        // iteration. Sampled, because each probe costs a full timer tick
-        // (~15 ms on Windows) — 10,000 of them would dominate the run.
-        if i % 100 == 0 {
-            let echo = timeout(Duration::from_millis(2), sink.commands.recv()).await;
-            assert!(
-                echo.is_err(),
-                "update {i}: synchronization loop — sink echoed an applied item: {echo:?}"
-            );
-        }
+        one_update(i, source, sink, &mut tally, &frames_crossed).await;
     }
 
     let elapsed = started.elapsed();
@@ -197,7 +105,7 @@ async fn ten_thousand_bidirectional_updates_stay_correct() {
         "stress: {updates} updates in {:.1}s ({:.0}/s), {crossed} frames, \
          applied={} superseded={} failed={} corrupt={}",
         elapsed.as_secs_f64(),
-        updates as f64 / elapsed.as_secs_f64(),
+        f64::from(u32::try_from(updates).unwrap_or(u32::MAX)) / elapsed.as_secs_f64(),
         tally.applied,
         tally.superseded,
         tally.failed,
@@ -235,7 +143,7 @@ async fn sustained_contention_still_delivers_every_item() {
     let mut applied = 0;
     for i in 0..updates {
         // Every third item meets a busy clipboard twice before landing.
-        if i % 3 == 0 {
+        if i.is_multiple_of(3) {
             b.clipboard
                 .fail_next(ClipboardOp::Write, ClipboardFailure::Busy, 2);
         }
@@ -281,6 +189,107 @@ async fn sustained_contention_still_delivers_every_item() {
     }
     assert_eq!(applied, updates);
     println!("contention stress: {applied} items delivered through injected contention");
+}
+
+/// One update: copy on `source`, deliver, apply on `sink`, acknowledge,
+/// close — verifying integrity, the destination-updated definition of
+/// success (FR-3.2), and (sampled) the absence of an echo.
+async fn one_update(
+    i: usize,
+    source: &mut Side,
+    sink: &mut Side,
+    tally: &mut Tally,
+    frames_crossed: &AtomicUsize,
+) {
+    let text = format!(
+        "stress item {i} on {}",
+        if i.is_multiple_of(2) { "a" } else { "b" }
+    );
+    source.clipboard.set_text_locally(&text);
+
+    let SyncCommand::SendFrame {
+        message_type,
+        payload,
+    } = next_command(&mut source.commands).await
+    else {
+        panic!("update {i}: expected a frame, got a termination command");
+    };
+    frames_crossed.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        message_type,
+        MessageType::ClipboardData.wire(),
+        "update {i}: unexpected outbound message type"
+    );
+
+    // Integrity: what left must be exactly what was copied.
+    let data = ClipboardData::decode_payload(&payload)
+        .unwrap_or_else(|e| panic!("update {i}: outbound data failed to decode: {e}"));
+    if data.content != text.as_bytes() {
+        tally.corrupt += 1;
+    }
+
+    sink.events
+        .send(SyncEvent::Frame(RawFrame {
+            message_type,
+            message_id: i as u64,
+            payload,
+        }))
+        .await
+        .unwrap();
+
+    let SyncCommand::SendFrame {
+        message_type,
+        payload,
+    } = next_command(&mut sink.commands).await
+    else {
+        panic!("update {i}: sink terminated the session");
+    };
+    frames_crossed.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        message_type,
+        MessageType::ClipboardApplied.wire(),
+        "update {i}: sink did not acknowledge"
+    );
+    let applied = ClipboardApplied::decode_payload(&payload)
+        .unwrap_or_else(|e| panic!("update {i}: ack failed to decode: {e}"));
+    match applied.result {
+        ApplyResult::Applied => tally.applied += 1,
+        ApplyResult::Superseded => tally.superseded += 1,
+        // Every failure is *observable* — the criterion is no SILENT
+        // failure. With a healthy fake provider there should be none.
+        ApplyResult::ClipboardUnavailable | ApplyResult::ContentRejected => {
+            tally.failed += 1;
+        }
+    }
+
+    // Destination-updated is the definition of success (FR-3.2).
+    if applied.result == ApplyResult::Applied && sink.clipboard.peek().as_deref() != Some(&text) {
+        tally.corrupt += 1;
+    }
+
+    source
+        .events
+        .send(SyncEvent::Frame(RawFrame {
+            message_type,
+            message_id: i as u64,
+            payload,
+        }))
+        .await
+        .unwrap();
+
+    // Loop prevention (FR-3.3): applying the item fired the fake's
+    // own-write notification; an echo would appear as an extra frame. The
+    // global frame-count assertion covers every iteration; this probe
+    // localizes a loop to its iteration. Sampled, because each probe
+    // costs a full timer tick (~15 ms on Windows) — 10,000 of them would
+    // dominate the run.
+    if i.is_multiple_of(100) {
+        let echo = timeout(Duration::from_millis(2), sink.commands.recv()).await;
+        assert!(
+            echo.is_err(),
+            "update {i}: synchronization loop — sink echoed an applied item: {echo:?}"
+        );
+    }
 }
 
 async fn next_command(commands: &mut mpsc::Receiver<SyncCommand>) -> SyncCommand {
