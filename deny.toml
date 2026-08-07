@@ -1,0 +1,59 @@
+# Dependency policy enforcement (docs/ARCHITECTURE.md §7, docs/TESTING.md §2).
+#
+# The policy already said dependencies are evaluated for security history
+# and license compatibility; this makes that check mechanical instead of
+# a promise. Run locally with `cargo deny check`.
+
+[advisories]
+# RustSec advisories. Unmaintained crates are treated as failures, not
+# warnings: an unmaintained dependency in a security-sensitive tree is a
+# supply-chain risk that will not fix itself, and the project is young
+# enough to still have cheap alternatives.
+version = 2
+yanked = "deny"
+ignore = [
+    # No exceptions currently. Each entry added here must carry the
+    # advisory id, why it cannot be fixed, and what would let us remove
+    # the exception — never a bare id.
+]
+
+[licenses]
+# Crossover is MIT. Every license below is permissive and compatible
+# with redistributing an MIT binary; copyleft is deliberately absent, so
+# a dependency that introduces it fails the build rather than quietly
+# changing the project's obligations.
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions of the same crate are a warning, not an error: they
+# are routine mid-ecosystem-migration (getrandom, syn, and windows-sys
+# all appear twice today) and blocking on them would punish us for other
+# people's release cadence. Worth watching, not worth failing.
+multiple-versions = "warn"
+# Wildcard version requirements are forbidden for published crates — a
+# dependency that accepts any version accepts a compromised one — but
+# the workspace's own path dependencies are wildcards by construction
+# and are not a supply-chain surface.
+wildcards = "deny"
+allow-wildcard-paths = true
+# Nothing is banned outright yet. Additions belong here with a comment
+# explaining the rejection, so the reasoning outlives the decision.
+deny = []
+
+[sources]
+# Everything must come from crates.io. An unexpected registry or git
+# dependency is exactly the shape of a supply-chain compromise, so it
+# fails rather than warns.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
