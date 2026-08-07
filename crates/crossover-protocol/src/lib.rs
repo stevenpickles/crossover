@@ -6,12 +6,21 @@
 //! specified in `docs/PROTOCOL.md`; layering rules in `docs/ARCHITECTURE.md`.
 
 pub mod framing;
+pub mod hello;
+pub mod version;
 
 pub use framing::{FrameDecoder, RawFrame, encode_frame};
+pub use hello::{FeatureFlags, Hello, MessageType, OsFamily};
+pub use version::{PROTOCOL_VERSION, VersionRange, negotiate};
 
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =
     "wire messages, framing, versioning, and validation (docs/PROTOCOL.md)";
+
+/// Default TCP port — "CROSS" on a phone keypad (ADR 0004). Defined once
+/// here; configuration, documentation, and diagnostics all reference this
+/// constant.
+pub const DEFAULT_PORT: u16 = 27677;
 
 /// Errors produced by protocol framing and message validation.
 ///
@@ -52,6 +61,12 @@ pub enum ProtocolError {
     /// malformation is fatal to the session (`docs/PROTOCOL.md` §7).
     #[error("malformed message: {reason}")]
     Malformed { reason: String },
+
+    /// Serializing an outbound message failed. A local fault, not a peer
+    /// fault — kept distinct from [`ProtocolError::Malformed`] so
+    /// diagnostics never blame a peer for our own encoding failure.
+    #[error("encoding outbound message failed: {reason}")]
+    Encode { reason: String },
 }
 
 #[cfg(test)]
