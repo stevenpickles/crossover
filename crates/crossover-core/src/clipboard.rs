@@ -85,6 +85,24 @@ impl OutboundMessage {
             Self::Applied(_) => MessageType::ClipboardApplied,
         }
     }
+
+    /// Encode into `(frame message type, payload)` for the session layer.
+    ///
+    /// # Errors
+    ///
+    /// [`crossover_protocol::ProtocolError`] if validation or
+    /// serialization fails (engine-built messages are always valid; this
+    /// is defensive).
+    pub fn encode(&self) -> Result<(u16, Vec<u8>), crossover_protocol::ProtocolError> {
+        let payload = match self {
+            Self::Offer(m) => m.encode_payload()?,
+            Self::Accept(m) => m.encode_payload()?,
+            Self::Decline(m) => m.encode_payload()?,
+            Self::Data(m) => m.encode_payload()?,
+            Self::Applied(m) => m.encode_payload()?,
+        };
+        Ok((self.message_type().wire(), payload))
+    }
 }
 
 /// What the driver must do next.
@@ -125,6 +143,40 @@ pub enum InboundMessage {
     Data(ClipboardData),
     /// Peer reports the verdict on our item.
     Applied(ClipboardApplied),
+}
+
+impl InboundMessage {
+    /// Decode a frame if it carries a clipboard message; `Ok(None)` for
+    /// non-clipboard traffic (the caller routes those elsewhere).
+    ///
+    /// # Errors
+    ///
+    /// [`crossover_protocol::ProtocolError`] for a clipboard-typed frame
+    /// whose payload does not validate — a peer nonconformance the
+    /// session must treat as fatal (docs/PROTOCOL.md §7).
+    pub fn decode(
+        message_type: u16,
+        payload: &[u8],
+    ) -> Result<Option<Self>, crossover_protocol::ProtocolError> {
+        Ok(match MessageType::from_wire(message_type) {
+            Some(MessageType::ClipboardOffer) => {
+                Some(Self::Offer(ClipboardOffer::decode_payload(payload)?))
+            }
+            Some(MessageType::ClipboardAccept) => {
+                Some(Self::Accept(ClipboardAccept::decode_payload(payload)?))
+            }
+            Some(MessageType::ClipboardDecline) => {
+                Some(Self::Decline(ClipboardDecline::decode_payload(payload)?))
+            }
+            Some(MessageType::ClipboardData) => {
+                Some(Self::Data(ClipboardData::decode_payload(payload)?))
+            }
+            Some(MessageType::ClipboardApplied) => {
+                Some(Self::Applied(ClipboardApplied::decode_payload(payload)?))
+            }
+            _ => None,
+        })
+    }
 }
 
 /// Outbound transaction state.
