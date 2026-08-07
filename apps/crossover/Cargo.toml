@@ -1,0 +1,17 @@
+[package]
+name = "crossover"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossover-core = { workspace = true }
+
+# Windows-only so non-Windows CI builds the app without the platform crate.
+[target.'cfg(windows)'.dependencies]
+crossover-platform-windows = { workspace = true }
+
+[lints]
+workspace = true

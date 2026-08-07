@@ -1,5 +1,12 @@
 [workspace]
-members = []
+members = [
+    "apps/crossover",
+    "crates/crossover-core",
+    "crates/crossover-platform",
+    "crates/crossover-platform-windows",
+    "crates/crossover-protocol",
+    "crates/crossover-security",
+]
 resolver = "3"
 
 [workspace.package]
@@ -7,6 +14,13 @@ edition = "2024"
 rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/stevenpickles/crossover"
+
+[workspace.dependencies]
+crossover-core = { path = "crates/crossover-core" }
+crossover-platform = { path = "crates/crossover-platform" }
+crossover-platform-windows = { path = "crates/crossover-platform-windows" }
+crossover-protocol = { path = "crates/crossover-protocol" }
+crossover-security = { path = "crates/crossover-security" }
 
 # `unsafe_code = "forbid"` enforces NFR-6 (docs/SPECIFICATION.md). Platform
 # crates may later relax it locally with documented justification.

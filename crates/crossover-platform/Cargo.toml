@@ -1,0 +1,13 @@
+[package]
+name = "crossover-platform"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately no dependencies: trait definitions only, no OS APIs
+# (docs/ARCHITECTURE.md §4).
+
+[lints]
+workspace = true
