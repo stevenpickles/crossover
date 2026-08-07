@@ -8,9 +8,14 @@
 pub mod clipboard;
 #[cfg(any(test, feature = "fakes"))]
 pub mod fakes;
+pub mod input;
 pub mod secure_storage;
 
 pub use clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
+pub use input::{
+    InputCapture, InputError, InputInjector, InputSink, PointerButton, PointerEvent,
+    SCROLL_UNITS_PER_DETENT,
+};
 pub use secure_storage::{SecureStorage, SecureStorageError};
 
 /// One-line statement of this crate's responsibility.
