@@ -86,9 +86,10 @@ addresses.
   `clipboard_receive`). Initial implementation may default paired peers to
   full capability, but the data model supports granular permissions so they
   can be enforced later without migration.
-- `crossover peers` / `peer show` / `peer remove` manage the store.
-  Removal revokes authorization immediately (FR-1.4): active sessions from
-  that identity are terminated and future connections rejected.
+- `crossover peers` lists the store; `crossover peers remove <device-id>`
+  revokes (a `show` subcommand can come later). Removal revokes
+  authorization immediately (FR-1.4): active sessions from that identity
+  are terminated and future connections rejected.
 - The store contains **no private keys** — only the local device's public
   metadata and peers' public credentials. Theft of the trust store without
   the private key must not enable impersonation.
