@@ -6,9 +6,13 @@
 //! invariants live in `docs/SECURITY.md`; layering in `docs/ARCHITECTURE.md`.
 
 pub mod identity;
+pub mod tls;
 pub mod trust;
 
 pub use identity::{DeviceIdentity, IdentityError, SpkiFingerprint};
+pub use tls::{
+    CertifiedIdentity, TlsError, certificate_spki_fingerprint, client_tls_config, server_tls_config,
+};
 pub use trust::{PeerPermissions, TrustStore, TrustStoreError, TrustedPeer};
 
 /// One-line statement of this crate's responsibility.
