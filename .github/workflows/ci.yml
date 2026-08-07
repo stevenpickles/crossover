@@ -56,6 +56,59 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # Coverage is reported, never gated: a percentage threshold rewards
+  # tests written to move a number. The HTML artifact makes "what is
+  # actually exercised" reviewable per change, which is the useful
+  # question (docs/TESTING.md §2). Windows because the platform crate's
+  # real-OS code only compiles and runs there — the leg with the most
+  # coverage to lose.
+  coverage:
+    name: coverage
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Install llvm-tools (instrumentation)
+        run: rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --workspace --html
+          cargo llvm-cov report --summary-only > coverage-summary.txt
+          type coverage-summary.txt
+
+      - name: Summarize in the job page
+        shell: bash
+        run: |
+          {
+            echo '### Coverage'
+            echo '```'
+            tail -n 25 coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the browsable report
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: coverage-html
+          path: |
+            target/llvm-cov/html
+            coverage-summary.txt
+          retention-days: 14
+
   # Short fuzz runs on every change (docs/TESTING.md §1.3): arbitrary
   # network bytes must never panic the parsers. Extended runs are a later,
   # scheduled concern; this catches regressions cheaply. One OS suffices —
