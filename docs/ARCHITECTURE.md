@@ -119,6 +119,12 @@ Guidelines:
   practical. Platform quirks (hook timeout budgets, clipboard retry,
   DPI mapping — see SPECIFICATION.md §6) are handled *inside*
   `crossover-platform-windows`, surfacing as normalized events/errors.
+- `InputCapture` on Windows is backed by two mechanisms rather than one
+  (ADR 0007): low-level hooks, because only they can suppress an event
+  locally, and Raw Input, because only it reports unaccelerated,
+  unclamped motion. `InputInjector` uses `SendInput`, tagging its events
+  so they are never captured back — the same mark-what-you-emit pattern
+  clipboard loop prevention uses.
 
 ## 5. Core state machines
 
