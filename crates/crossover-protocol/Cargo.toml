@@ -1,0 +1,13 @@
+[package]
+name = "crossover-protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately no dependencies: the protocol crate must stay independently
+# testable without sockets (docs/ARCHITECTURE.md §3.1).
+
+[lints]
+workspace = true
