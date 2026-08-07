@@ -6,9 +6,11 @@ larger workstation, without weakening the security boundary between them.
 
 **Move. Type. Copy. Paste.**
 
-> **Status: specification phase.** No code exists yet. The specification
-> suite below is authoritative; implementation begins with Phase 0 of the
-> [roadmap](docs/ROADMAP.md).
+> **Status: Phase 0 (Repository Foundation) complete.** The Cargo
+> workspace, tri-OS CI gate, and error/logging conventions are in place;
+> no user-facing functionality exists yet. Next up: Phase 1 — Secure Peer
+> Connection. The [roadmap](docs/ROADMAP.md) carries the authoritative
+> current-phase marker.
 
 ## What it will do
 
