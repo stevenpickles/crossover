@@ -213,6 +213,31 @@ impl TrustedPeer {
     pub fn remembered_addresses(&self) -> &[String] {
         &self.remembered_addresses
     }
+
+    /// Remember an address this peer was reached at (deduplicated; most
+    /// recent last). Bounded like everything else: adding beyond
+    /// [`MAX_REMEMBERED_ADDRESSES`] drops the oldest entry.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustStoreError::InvalidRecord`] for an empty or oversized
+    /// address string.
+    pub fn add_remembered_address(&mut self, address: &str) -> Result<(), TrustStoreError> {
+        if address.is_empty() || address.len() > MAX_ADDRESS_BYTES {
+            return Err(TrustStoreError::InvalidRecord {
+                reason: format!(
+                    "remembered address of {} bytes is out of 1..={MAX_ADDRESS_BYTES}",
+                    address.len()
+                ),
+            });
+        }
+        self.remembered_addresses.retain(|a| a != address);
+        if self.remembered_addresses.len() >= MAX_REMEMBERED_ADDRESSES {
+            self.remembered_addresses.remove(0);
+        }
+        self.remembered_addresses.push(address.to_owned());
+        Ok(())
+    }
 }
 
 /// At-rest layout, format version 1.
@@ -525,6 +550,38 @@ mod tests {
         assert!(matches!(
             TrustStore::load(&storage),
             Err(TrustStoreError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn remembered_addresses_dedupe_and_stay_bounded() {
+        let mut record = peer(0xAA, "machine");
+        record.add_remembered_address("192.168.1.25:27677").unwrap();
+        record.add_remembered_address("10.0.0.9:27677").unwrap();
+        // Re-adding moves it to most-recent, not duplicated.
+        record.add_remembered_address("192.168.1.25:27677").unwrap();
+        assert_eq!(
+            record.remembered_addresses(),
+            &["10.0.0.9:27677", "192.168.1.25:27677"]
+        );
+
+        for i in 0..super::MAX_REMEMBERED_ADDRESSES + 2 {
+            record
+                .add_remembered_address(&format!("10.0.0.{i}:1"))
+                .unwrap();
+        }
+        assert_eq!(
+            record.remembered_addresses().len(),
+            super::MAX_REMEMBERED_ADDRESSES
+        );
+
+        assert!(matches!(
+            record.add_remembered_address(""),
+            Err(TrustStoreError::InvalidRecord { .. })
+        ));
+        assert!(matches!(
+            record.add_remembered_address(&"x".repeat(300)),
+            Err(TrustStoreError::InvalidRecord { .. })
         ));
     }
 

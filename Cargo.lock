@@ -283,9 +283,14 @@ dependencies = [
  "anyhow",
  "clap",
  "crossover-core",
+ "crossover-platform",
  "crossover-platform-windows",
+ "crossover-protocol",
+ "crossover-security",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
