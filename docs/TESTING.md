@@ -108,6 +108,16 @@ is a defect with a known fix. It also runs on a daily schedule, since a
 new advisory can land against unchanged code. Locally: `cargo deny
 check`.
 
+CodeQL static analysis runs in its own workflow (`.github/workflows/
+codeql.yml`) over Rust, the workflow files, and the soak script. It uses
+advanced setup because GitHub's default setup does not offer Rust. Its
+expected yield is modest by design — safe Rust prevents most of what
+CodeQL hunts for — so it targets where the safety argument is weakest:
+the Win32 FFI, whose correctness rests on hand-written SAFETY comments,
+and the workflows, where script injection is a real supply-chain class.
+It is kept out of `ci.yml` so an analyzer problem cannot redden the
+merge gate.
+
 GitHub's own services cover what a build-time check cannot. Dependabot
 alerts and security updates watch the GitHub Advisory Database and open
 fix PRs when an advisory lands against unchanged code; `cargo-deny`
