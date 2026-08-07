@@ -81,6 +81,16 @@ impl SpkiFingerprint {
     }
 }
 
+impl From<[u8; 32]> for SpkiFingerprint {
+    /// Wrap raw bytes (e.g. a fingerprint received in a pairing
+    /// confirmation). Constructing a fingerprint asserts nothing — trust
+    /// exists only once the value is pinned in the trust store after
+    /// verification.
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 impl fmt::Display for SpkiFingerprint {
     /// Lowercase hex, 64 characters.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
