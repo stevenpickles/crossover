@@ -6,10 +6,12 @@
 //! effects flow through the traits in `crossover-platform`
 //! (docs/ARCHITECTURE.md §2, §5).
 
+pub mod clipboard;
 pub mod net;
 pub mod pairing;
 pub mod supervision;
 
+pub use clipboard::{ClipboardEngine, RetryPolicy as ClipboardRetryPolicy};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
     connect,
