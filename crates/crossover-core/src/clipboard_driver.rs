@@ -23,7 +23,7 @@ use crossover_protocol::RawFrame;
 use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
 use crossover_protocol::hello::MessageType;
 
-use crate::clipboard::{Action, ClipboardEngine, InboundMessage, RetryPolicy};
+use crate::clipboard::{Action, ClipboardConfig, ClipboardEngine, InboundMessage};
 
 /// How long after a `Busy` *read* before re-checking the clipboard. Reads
 /// have no transaction to retry inside the engine; the driver simply
@@ -61,6 +61,8 @@ pub enum SyncEvent {
     LocalChanged,
     /// A scheduled write retry came due.
     RetryDue(Uuid),
+    /// The transmit debounce elapsed (ADR 0006).
+    TransmitDue(u64),
 }
 
 /// What the driver asks the app to do.
@@ -91,6 +93,10 @@ pub struct ClipboardSyncDriver {
     commands_tx: mpsc::Sender<SyncCommand>,
     /// Consecutive `Busy` reads; reset by any successful read.
     busy_reads: u32,
+    /// Generation of the newest transmit timer; older ones are ignored
+    /// when they fire, which is how the debounce restarts cleanly
+    /// without cancelling tasks.
+    transmit_generation: u64,
 }
 
 /// Build a driver for `provider`, returning the handles the app uses:
@@ -104,7 +110,7 @@ pub struct ClipboardSyncDriver {
 pub fn clipboard_sync(
     provider: Arc<dyn ClipboardProvider>,
     origin: Uuid,
-    retry: RetryPolicy,
+    config: ClipboardConfig,
 ) -> Result<
     (
         ClipboardSyncDriver,
@@ -125,12 +131,13 @@ pub fn clipboard_sync(
     })))?;
 
     let driver = ClipboardSyncDriver {
-        engine: ClipboardEngine::new(origin, retry),
+        engine: ClipboardEngine::new(origin, config),
         provider,
         events_rx,
         events_tx: events_tx.clone(),
         commands_tx,
         busy_reads: 0,
+        transmit_generation: 0,
     };
     Ok((driver, events_tx, commands_rx))
 }
@@ -153,6 +160,13 @@ impl ClipboardSyncDriver {
                     SyncEvent::SessionLost => self.engine.on_session_lost(),
                     SyncEvent::LocalChanged => self.engine.on_local_change(),
                     SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
+                    SyncEvent::TransmitDue(generation) => {
+                        if generation == self.transmit_generation {
+                            self.engine.on_transmit_due()
+                        } else {
+                            Vec::new() // a newer local change restarted the timer
+                        }
+                    }
                     SyncEvent::Frame(frame) => {
                         match InboundMessage::decode(frame.message_type, &frame.payload) {
                             Ok(Some(message)) => self.engine.on_peer_message(message),
@@ -332,6 +346,18 @@ impl ClipboardSyncDriver {
                         let _ = notify.send(SyncEvent::RetryDue(id)).await;
                     });
                 }
+                Action::ScheduleTransmit { delay } => {
+                    // Bump the generation: any timer already in flight
+                    // becomes a no-op when it fires, so the debounce
+                    // restarts without cancellation bookkeeping.
+                    self.transmit_generation += 1;
+                    let generation = self.transmit_generation;
+                    let notify = self.events_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = notify.send(SyncEvent::TransmitDue(generation)).await;
+                    });
+                }
             }
         }
         true
@@ -355,7 +381,7 @@ mod tests {
     use crossover_protocol::hello::MessageType;
 
     use super::{SyncCommand, SyncEvent, clipboard_sync};
-    use crate::clipboard::RetryPolicy;
+    use crate::clipboard::{ClipboardConfig, RetryPolicy};
 
     struct Rig {
         clipboard: Arc<InMemoryClipboard>,
@@ -365,14 +391,18 @@ mod tests {
 
     fn rig() -> Rig {
         let clipboard = Arc::new(InMemoryClipboard::new());
-        let retry = RetryPolicy {
-            max_attempts: 3,
-            delay: Duration::from_millis(20),
+        let config = ClipboardConfig {
+            retry: RetryPolicy {
+                max_attempts: 3,
+                delay: Duration::from_millis(20),
+            },
+            // Tests drive the trigger's *behaviour*, not the wait.
+            transmit_debounce: Duration::from_millis(5),
         };
         let (driver, events, commands) = clipboard_sync(
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
             Uuid::from_bytes([0xAA; 16]),
-            retry,
+            config,
         )
         .unwrap();
         tokio::spawn(driver.run());

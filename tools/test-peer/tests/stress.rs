@@ -20,7 +20,9 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crossover_core::{ClipboardRetryPolicy, SyncCommand, SyncEvent, clipboard_sync};
+use crossover_core::{
+    ClipboardConfig, ClipboardRetryPolicy, SyncCommand, SyncEvent, clipboard_sync,
+};
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::InMemoryClipboard;
 use crossover_protocol::RawFrame;
@@ -50,9 +52,16 @@ fn side(origin: u8) -> Side {
     let (driver, events, commands) = clipboard_sync(
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
         Uuid::from_bytes([origin; 16]),
-        ClipboardRetryPolicy {
-            max_attempts: 5,
-            delay: Duration::from_millis(1),
+        ClipboardConfig {
+            retry: ClipboardRetryPolicy {
+                max_attempts: 5,
+                delay: Duration::from_millis(1),
+            },
+            // The gate measures transaction throughput, not the debounce
+            // (ADR 0006 has its own tests). Zero means transmit eagerly:
+            // any non-zero value would cost a scheduler tick per item —
+            // ~15 ms on Windows, which is 150 s across the run.
+            transmit_debounce: Duration::ZERO,
         },
     )
     .unwrap();

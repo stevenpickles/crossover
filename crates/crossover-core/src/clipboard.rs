@@ -38,6 +38,38 @@ use crossover_protocol::hello::MessageType;
 /// bound keeps memory fixed (NFR-1).
 const APPLIED_HASH_MEMORY: usize = 8;
 
+/// Clipboard engine tuning. Grouped because both knobs are timing
+/// policy, and tests need to shrink them without pretending the
+/// production defaults are different.
+#[derive(Debug, Clone, Default)]
+pub struct ClipboardConfig {
+    /// Bounded retry for `Busy` clipboard writes (FR-3.4).
+    pub retry: RetryPolicy,
+    /// Quiet period before staged content is transmitted (ADR 0006).
+    pub transmit_debounce: Duration,
+}
+
+impl ClipboardConfig {
+    /// Production defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            retry: RetryPolicy::default(),
+            transmit_debounce: TRANSMIT_DEBOUNCE,
+        }
+    }
+}
+
+/// How long the local clipboard must stay unchanged before its content
+/// is transmitted (ADR 0006).
+///
+/// Transmission is trigger-driven, not change-driven: a burst of copies
+/// produces one transmission instead of one per copy, so Crossover does
+/// not spend the machine-global clipboard lock on content nobody can
+/// paste. Control transfer becomes the primary trigger in Phase 5; this
+/// debounce carries Phase 2 and remains the fallback afterwards.
+pub const TRANSMIT_DEBOUNCE: Duration = Duration::from_millis(300);
+
 /// Retry policy for `Busy` clipboard writes (FR-3.4): centrally defined,
 /// bounded attempts, bounded total time (ADR 0005 requires exactly this
 /// shape).
@@ -126,6 +158,13 @@ pub enum Action {
         /// Transaction id to retry.
         id: Uuid,
         /// How long to wait.
+        delay: Duration,
+    },
+    /// Call [`ClipboardEngine::on_transmit_due`] after `delay` unless a
+    /// newer local change resets it (ADR 0006). Restarting an existing
+    /// timer is expected: the driver keeps only the latest.
+    ScheduleTransmit {
+        /// How long the clipboard must stay quiet.
         delay: Duration,
     },
 }
@@ -228,7 +267,7 @@ struct PendingWrite {
 pub struct ClipboardEngine {
     /// Our device id — the `origin` stamped on items we mint.
     origin: Uuid,
-    retry: RetryPolicy,
+    config: ClipboardConfig,
     /// Local observation counter (conflict ordering).
     next_sequence: u64,
     /// Hash of the last content this engine knows to be on the local
@@ -240,6 +279,9 @@ pub struct ClipboardEngine {
     /// At most one outbound transaction in flight; newer local copies
     /// supersede it.
     outbound: Option<Outbound>,
+    /// Locally observed content waiting for the transmit trigger
+    /// (ADR 0006). Replaced wholesale by any newer local change.
+    pending_transmit: Option<ClipboardData>,
     /// An accepted inbound offer whose Data we await.
     expecting_data: Option<ClipboardMeta>,
     /// The write (with retries) currently underway.
@@ -249,14 +291,15 @@ pub struct ClipboardEngine {
 impl ClipboardEngine {
     /// A fresh engine for `origin` (our device id).
     #[must_use]
-    pub fn new(origin: Uuid, retry: RetryPolicy) -> Self {
+    pub fn new(origin: Uuid, config: ClipboardConfig) -> Self {
         Self {
             origin,
-            retry,
+            config,
             next_sequence: 0,
             current_local_hash: None,
             applied_hashes: VecDeque::new(),
             outbound: None,
+            pending_transmit: None,
             expecting_data: None,
             pending_write: None,
         }
@@ -302,7 +345,30 @@ impl ClipboardEngine {
             ContentType::Utf8Text,
             text.into_bytes(),
         );
-        self.start_outbound(data)
+        // Stage rather than send (ADR 0006). A newer local change before
+        // the timer fires simply replaces this one, so a burst of copies
+        // costs one transmission.
+        //
+        // A zero debounce means transmit eagerly: no timer, no wait. That
+        // is the pre-ADR-0006 behaviour, kept addressable for callers who
+        // genuinely want it — and it keeps timing-independent tests from
+        // paying a scheduler tick per item.
+        if self.config.transmit_debounce.is_zero() {
+            return self.start_outbound(data);
+        }
+        self.pending_transmit = Some(data);
+        vec![Action::ScheduleTransmit {
+            delay: self.config.transmit_debounce,
+        }]
+    }
+
+    /// The transmit debounce elapsed: send whatever is staged.
+    pub fn on_transmit_due(&mut self) -> Vec<Action> {
+        match self.pending_transmit.take() {
+            Some(data) => self.start_outbound(data),
+            // Superseded, already sent, or the session dropped.
+            None => Vec::new(),
+        }
     }
 
     /// A decoded clipboard message arrived from the peer.
@@ -349,8 +415,8 @@ impl ClipboardEngine {
                 }))]
             }
             Err(retryable) => {
-                if retryable && pending.attempts_made < self.retry.max_attempts {
-                    let delay = self.retry.delay;
+                if retryable && pending.attempts_made < self.config.retry.max_attempts {
+                    let delay = self.config.retry.delay;
                     tracing::debug!(
                         clipboard_id = %id,
                         attempt_count = pending.attempts_made,
@@ -395,8 +461,10 @@ impl ClipboardEngine {
     pub fn on_session_established(&mut self) -> Vec<Action> {
         self.outbound = None;
         self.expecting_data = None;
+        self.pending_transmit = None;
         // Ask the driver to re-read: the clipboard may have changed while
-        // disconnected, and re-reading routes through the normal dedup.
+        // disconnected, and re-reading routes through the normal dedup
+        // (and then through the debounce, like any other observation).
         self.current_local_hash = None;
         vec![Action::ReadClipboard]
     }
@@ -411,6 +479,7 @@ impl ClipboardEngine {
             );
         }
         self.expecting_data = None;
+        self.pending_transmit = None;
         Vec::new()
     }
 
@@ -640,16 +709,33 @@ mod tests {
         ClipboardOffer, ContentType, DeclineReason, content_hash,
     };
 
-    use super::{Action, ClipboardEngine, InboundMessage, OutboundMessage, RetryPolicy};
+    use super::{
+        Action, ClipboardConfig, ClipboardEngine, InboundMessage, OutboundMessage, RetryPolicy,
+    };
 
     fn engine(origin_fill: u8) -> ClipboardEngine {
-        ClipboardEngine::new(Uuid::from_bytes([origin_fill; 16]), RetryPolicy::default())
+        ClipboardEngine::new(Uuid::from_bytes([origin_fill; 16]), ClipboardConfig::new())
     }
 
+    /// Copy locally and fire the transmit trigger, since these tests are
+    /// about what travels, not about debounce timing (which has its own
+    /// tests below).
     fn copy(engine: &mut ClipboardEngine, text: &str) -> Vec<Action> {
         let actions = engine.on_local_change();
         assert_eq!(actions, vec![Action::ReadClipboard]);
-        engine.on_local_read(Some(text.to_owned()))
+        let staged = engine.on_local_read(Some(text.to_owned()));
+        // Staging asks for the trigger; nothing travels yet (ADR 0006).
+        assert!(
+            staged.is_empty()
+                || staged
+                    .iter()
+                    .all(|a| matches!(a, Action::ScheduleTransmit { .. })),
+            "local read should stage, not send: {staged:?}"
+        );
+        if staged.is_empty() {
+            return staged; // deduped or loop-suppressed: nothing staged
+        }
+        engine.on_transmit_due()
     }
 
     fn sent(actions: &[Action]) -> Vec<&OutboundMessage> {
@@ -742,7 +828,13 @@ mod tests {
             max_attempts: 3,
             delay: std::time::Duration::from_millis(50),
         };
-        let mut e = ClipboardEngine::new(Uuid::from_bytes([0xBB; 16]), policy);
+        let mut e = ClipboardEngine::new(
+            Uuid::from_bytes([0xBB; 16]),
+            ClipboardConfig {
+                retry: policy,
+                ..ClipboardConfig::new()
+            },
+        );
         let item = ClipboardData::from_content(
             Uuid::new_v4(),
             Uuid::from_bytes([0xAA; 16]),
@@ -851,6 +943,10 @@ mod tests {
                         Action::WriteClipboard { id, text } => {
                             self.pending_write = Some((id, text));
                         }
+                        Action::ScheduleTransmit { .. } => {
+                            let sends = self.engine.on_transmit_due();
+                            self.drive(sends, outbox);
+                        }
                         Action::ReadClipboard | Action::ScheduleRetry { .. } => {}
                     }
                 }
@@ -954,9 +1050,59 @@ mod tests {
         let actions = e.on_session_established();
         assert_eq!(actions, vec![Action::ReadClipboard]);
         // The established reset cleared the dedup hash, so the same
-        // content ships again for post-gap convergence.
-        let actions = e.on_local_read(Some("persistent".to_owned()));
-        assert_eq!(sent(&actions).len(), 1);
+        // content stages again — then travels on the trigger, for
+        // post-gap convergence.
+        let staged = e.on_local_read(Some("persistent".to_owned()));
+        assert!(
+            staged
+                .iter()
+                .all(|a| matches!(a, Action::ScheduleTransmit { .. })),
+            "re-announcement should stage: {staged:?}"
+        );
+        assert_eq!(sent(&e.on_transmit_due()).len(), 1);
+    }
+
+    /// ADR 0006: a burst of copies transmits once, and the item that
+    /// travels is the newest — the storm the two-machine soak exposed
+    /// becomes structurally impossible.
+    #[test]
+    fn a_burst_of_copies_transmits_only_the_last() {
+        let mut e = engine(0xAA);
+
+        for i in 0..10 {
+            let actions = e.on_local_change();
+            assert_eq!(actions, vec![Action::ReadClipboard]);
+            let staged = e.on_local_read(Some(format!("burst {i}")));
+            assert!(
+                staged
+                    .iter()
+                    .all(|a| matches!(a, Action::ScheduleTransmit { .. })),
+                "copy {i} transmitted immediately instead of staging: {staged:?}"
+            );
+        }
+
+        // One trigger, one transmission, carrying the newest content.
+        let actions = e.on_transmit_due();
+        let msgs = sent(&actions);
+        assert_eq!(msgs.len(), 1, "burst produced more than one transmission");
+        let OutboundMessage::Data(data) = msgs[0] else {
+            panic!("expected inline data");
+        };
+        assert_eq!(data.content, b"burst 9");
+
+        // A second trigger with nothing staged is a no-op.
+        assert!(e.on_transmit_due().is_empty());
+    }
+
+    #[test]
+    fn session_loss_discards_staged_content() {
+        let mut e = engine(0xAA);
+        let staged = e.on_local_read(Some("staged then lost".to_owned()));
+        assert!(!staged.is_empty());
+        e.on_session_lost();
+        // The trigger finds nothing: the item belonged to a dead session,
+        // and reconnection re-reads from scratch.
+        assert!(e.on_transmit_due().is_empty());
     }
 
     #[test]

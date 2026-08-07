@@ -17,7 +17,7 @@ use crossover_core::supervision::{
     KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
 };
 use crossover_core::{
-    ClipboardRetryPolicy, LocalNode, SessionListener, SessionOptions, SyncCommand, SyncEvent,
+    ClipboardConfig, LocalNode, SessionListener, SessionOptions, SyncCommand, SyncEvent,
     clipboard_sync,
 };
 use crossover_platform::SecureStorage;
@@ -234,12 +234,9 @@ pub async fn run(
     // Clipboard sync: one driver for the peer relationship; sessions of
     // either role feed it and carry its frames.
     let provider = open_clipboard_provider()?;
-    let (sync_driver, sync_events, sync_commands) = clipboard_sync(
-        provider,
-        identity.device_id(),
-        ClipboardRetryPolicy::default(),
-    )
-    .context("starting clipboard sync")?;
+    let (sync_driver, sync_events, sync_commands) =
+        clipboard_sync(provider, identity.device_id(), ClipboardConfig::new())
+            .context("starting clipboard sync")?;
     tokio::spawn(sync_driver.run());
 
     // The mux's view of the current inbound session: its outbound sender
