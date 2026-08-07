@@ -18,10 +18,16 @@ getrandom = { workspace = true }
 # At-rest identity blob encoding. Storage format is versioned explicitly
 # (format_version field), independent of the wire protocol version.
 postcard = { workspace = true }
+# TLS layer (ADR 0003): rcgen wraps the identity key in a semantics-free
+# self-signed cert; rustls carries it with custom SPKI-pinning verifiers;
+# x509-parser extracts the peer's SPKI for fingerprinting.
+rcgen = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+x509-parser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
