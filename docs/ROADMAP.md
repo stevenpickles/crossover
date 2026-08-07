@@ -1,7 +1,7 @@
 # Crossover Roadmap
 
-> **Current phase: 1 — Secure Peer Connection** (in progress — the four
-> prerequisite ADRs are recorded; implementation is next)
+> **Current phase: 2 — Reliable Text Clipboard** (not started; the
+> clipboard-flow ADR is the entry work)
 >
 > Update this marker when a phase's exit criteria are verified. Do not begin
 > a later phase because time remains — complete and validate exit criteria
@@ -41,7 +41,7 @@ Exit criteria:
 Verified 2026-08-07: CI green on ubuntu/windows/macos for `dev` at the
 Phase 0 tip (runs 31185855135, 31186123879).
 
-## Phase 1 — Secure Peer Connection
+## Phase 1 — Secure Peer Connection (completed 2026-08-07)
 
 **Goal:** two Windows computers establish and retain a secure trusted
 relationship.
@@ -65,6 +65,22 @@ machine.
 Plus: packet capture reveals no plaintext application payload (automated
 where practical); every authentication failure mode produces an actionable
 diagnostic; fuzz targets exist for all Phase-1 parse paths.
+
+Verified 2026-08-07:
+
+- CI green on all three OSes plus the fuzz smoke at the Phase 1 tip of
+  `dev` (run 31197398890).
+- Exit criteria demonstrated live via two isolated-storage instances on
+  one Windows machine (accepted in lieu of two physical machines, by
+  explicit decision): explicit pairing with a typed code; encrypted
+  session establishment both roles; listener killed and restarted with
+  automatic reconnection and no re-pairing; a third machine paired
+  elsewhere refused by mutual authentication.
+- Plaintext check via a byte-capturing TCP relay around a live session:
+  canary device names absent from every wire byte, the capture parses as
+  contiguous TLS records (application data only inside TLS), and the only
+  plaintext is the semantics-free SNI placeholder. TLS 1.3 keeps
+  certificates (and thus fingerprints) encrypted as well.
 
 ## Phase 2 — Reliable Text Clipboard
 
