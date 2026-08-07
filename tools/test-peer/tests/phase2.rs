@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crossover_core::supervision::{KeepaliveConfig, SessionEvent, run_session};
 use crossover_core::{
-    ClipboardRetryPolicy, LocalNode, SessionListener, SessionOptions, SyncCommand, SyncEvent,
-    clipboard_sync,
+    ClipboardConfig, ClipboardRetryPolicy, LocalNode, SessionListener, SessionOptions, SyncCommand,
+    SyncEvent, clipboard_sync,
 };
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::{ClipboardFailure, ClipboardOp, InMemoryClipboard};
@@ -38,9 +38,12 @@ fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
     let (driver, sync_events, mut sync_commands) = clipboard_sync(
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
         node.identity.device_id(),
-        ClipboardRetryPolicy {
-            max_attempts: 3,
-            delay: Duration::from_millis(20),
+        ClipboardConfig {
+            retry: ClipboardRetryPolicy {
+                max_attempts: 3,
+                delay: Duration::from_millis(20),
+            },
+            transmit_debounce: Duration::from_millis(5),
         },
     )
     .unwrap();

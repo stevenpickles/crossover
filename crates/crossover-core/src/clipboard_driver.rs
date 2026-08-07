@@ -20,13 +20,32 @@ use uuid::Uuid;
 
 use crossover_platform::{ClipboardError, ClipboardProvider};
 use crossover_protocol::RawFrame;
+use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
+use crossover_protocol::hello::MessageType;
 
-use crate::clipboard::{Action, ClipboardEngine, InboundMessage, RetryPolicy};
+use crate::clipboard::{Action, ClipboardConfig, ClipboardEngine, InboundMessage};
 
 /// How long after a `Busy` *read* before re-checking the clipboard. Reads
 /// have no transaction to retry inside the engine; the driver simply
 /// looks again shortly (the next change notification would also do it).
 const READ_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Upper bound on events drained in one coalescing pass, so a flood
+/// cannot stall the loop (NFR-1).
+const MAX_COALESCE_BATCH: usize = 512;
+
+/// How many consecutive `Busy` reads before the driver stops re-nudging
+/// itself and waits for the next real change notification.
+///
+/// Found in the two-machine soak (docs/SOAK.md): with the local
+/// clipboard under sustained contention, an unbounded nudge cycle
+/// re-enqueues itself indefinitely, and because inbound frames share
+/// this one serial event queue, a peer's acknowledgement can sit
+/// unprocessed behind the churn — 27 seconds of it, in the run that
+/// exposed this. Bounding the cycle costs nothing real: the clipboard
+/// listener will notify us again for any change we miss, so giving up
+/// here loses no content, only a redundant look.
+const MAX_CONSECUTIVE_BUSY_READS: u32 = 5;
 
 /// Events the app (or the driver itself) feeds in.
 #[derive(Debug)]
@@ -42,6 +61,8 @@ pub enum SyncEvent {
     LocalChanged,
     /// A scheduled write retry came due.
     RetryDue(Uuid),
+    /// The settle window elapsed (ADR 0006): time to read.
+    SettleDue(u64),
 }
 
 /// What the driver asks the app to do.
@@ -70,6 +91,12 @@ pub struct ClipboardSyncDriver {
     events_rx: mpsc::Receiver<SyncEvent>,
     events_tx: mpsc::Sender<SyncEvent>,
     commands_tx: mpsc::Sender<SyncCommand>,
+    /// Consecutive `Busy` reads; reset by any successful read.
+    busy_reads: u32,
+    /// Generation of the newest settle timer; older ones are ignored
+    /// when they fire, which is how the debounce restarts cleanly
+    /// without cancelling tasks.
+    settle_generation: u64,
 }
 
 /// Build a driver for `provider`, returning the handles the app uses:
@@ -83,7 +110,7 @@ pub struct ClipboardSyncDriver {
 pub fn clipboard_sync(
     provider: Arc<dyn ClipboardProvider>,
     origin: Uuid,
-    retry: RetryPolicy,
+    config: ClipboardConfig,
 ) -> Result<
     (
         ClipboardSyncDriver,
@@ -104,11 +131,13 @@ pub fn clipboard_sync(
     })))?;
 
     let driver = ClipboardSyncDriver {
-        engine: ClipboardEngine::new(origin, retry),
+        engine: ClipboardEngine::new(origin, config),
         provider,
         events_rx,
         events_tx: events_tx.clone(),
         commands_tx,
+        busy_reads: 0,
+        settle_generation: 0,
     };
     Ok((driver, events_tx, commands_rx))
 }
@@ -117,33 +146,123 @@ impl ClipboardSyncDriver {
     /// Run until every event sender is dropped. Spawn this.
     pub async fn run(mut self) {
         while let Some(event) = self.events_rx.recv().await {
-            let actions = match event {
-                SyncEvent::SessionEstablished => self.engine.on_session_established(),
-                SyncEvent::SessionLost => self.engine.on_session_lost(),
-                SyncEvent::LocalChanged => self.engine.on_local_change(),
-                SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
-                SyncEvent::Frame(frame) => {
-                    match InboundMessage::decode(frame.message_type, &frame.payload) {
-                        Ok(Some(message)) => self.engine.on_peer_message(message),
-                        Ok(None) => Vec::new(), // not clipboard traffic
-                        Err(error) => {
-                            // Peer nonconformance: fail closed.
-                            let _ = self
-                                .commands_tx
-                                .send(SyncCommand::TerminateSession {
-                                    reason: error.to_string(),
-                                })
-                                .await;
-                            Vec::new()
+            // Coalesce before acting. The OS clipboard is a single-value
+            // register, not a queue: when several items are already
+            // waiting, applying the older ones writes content nobody can
+            // ever paste, and every wasted write takes the machine-global
+            // clipboard lock — which is how Crossover made other
+            // applications' clipboard calls fail in the two-machine soak
+            // (52 writes in one second while draining a backlog).
+            let batch = self.coalesce(event).await;
+            for event in batch {
+                let actions = match event {
+                    SyncEvent::SessionEstablished => self.engine.on_session_established(),
+                    SyncEvent::SessionLost => self.engine.on_session_lost(),
+                    SyncEvent::LocalChanged => self.engine.on_local_change(),
+                    SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
+                    SyncEvent::SettleDue(generation) => {
+                        if generation == self.settle_generation {
+                            self.engine.on_settle_due()
+                        } else {
+                            Vec::new() // a newer local change restarted the timer
                         }
                     }
+                    SyncEvent::Frame(frame) => {
+                        match InboundMessage::decode(frame.message_type, &frame.payload) {
+                            Ok(Some(message)) => self.engine.on_peer_message(message),
+                            Ok(None) => Vec::new(), // not clipboard traffic
+                            Err(error) => {
+                                // Peer nonconformance: fail closed.
+                                let _ = self
+                                    .commands_tx
+                                    .send(SyncCommand::TerminateSession {
+                                        reason: error.to_string(),
+                                    })
+                                    .await;
+                                Vec::new()
+                            }
+                        }
+                    }
+                };
+                if !self.execute(actions).await {
+                    return; // command receiver gone: the app is shutting down
                 }
-            };
-            if !self.execute(actions).await {
-                break; // command receiver gone: the app is shutting down
             }
         }
         tracing::debug!("clipboard sync driver stopped");
+    }
+
+    /// Drain what is immediately available and drop superseded clipboard
+    /// items, acknowledging each honestly rather than silently.
+    ///
+    /// Only *inbound items* coalesce. Everything else — acks, session
+    /// lifecycle, retries, local-change nudges — passes through in order,
+    /// because dropping any of those would lose state rather than lose a
+    /// value that was already stale.
+    async fn coalesce(&mut self, first: SyncEvent) -> Vec<SyncEvent> {
+        let mut batch = vec![first];
+        while batch.len() < MAX_COALESCE_BATCH {
+            match self.events_rx.try_recv() {
+                Ok(event) => batch.push(event),
+                Err(_) => break, // empty or closed; closed is handled by run()
+            }
+        }
+        if batch.len() == 1 {
+            return batch;
+        }
+
+        // Index of the last inbound clipboard item in the batch: every
+        // earlier one is stale before it is ever applied.
+        let last_data = batch.iter().rposition(|event| {
+            matches!(event, SyncEvent::Frame(frame)
+                if frame.message_type == MessageType::ClipboardData.wire())
+        });
+        let Some(last_data) = last_data else {
+            return batch;
+        };
+
+        let mut kept = Vec::with_capacity(batch.len());
+        let mut superseded = 0usize;
+        for (index, event) in batch.into_iter().enumerate() {
+            let is_stale_item = index < last_data
+                && matches!(&event, SyncEvent::Frame(frame)
+                    if frame.message_type == MessageType::ClipboardData.wire());
+            if !is_stale_item {
+                kept.push(event);
+                continue;
+            }
+            // Acknowledge the item we are deliberately not applying. The
+            // origin learns the truth — a newer item won — instead of
+            // waiting for a verdict that never comes.
+            let SyncEvent::Frame(frame) = event else {
+                continue;
+            };
+            if let Ok(Some(InboundMessage::Data(data))) =
+                InboundMessage::decode(frame.message_type, &frame.payload)
+            {
+                let applied = ClipboardApplied {
+                    id: data.meta.id,
+                    result: ApplyResult::Superseded,
+                };
+                if let Ok(payload) = applied.encode_payload() {
+                    let _ = self
+                        .commands_tx
+                        .send(SyncCommand::SendFrame {
+                            message_type: MessageType::ClipboardApplied.wire(),
+                            payload,
+                        })
+                        .await;
+                }
+                superseded += 1;
+            }
+        }
+        if superseded > 0 {
+            tracing::debug!(
+                superseded,
+                "coalesced stale inbound clipboard items; applying only the newest"
+            );
+        }
+        kept
     }
 
     /// Execute engine actions, feeding results back through the engine
@@ -153,14 +272,34 @@ impl ClipboardSyncDriver {
         while let Some(action) = queue.pop_front() {
             match action {
                 Action::ReadClipboard => match self.provider.read_text() {
-                    Ok(content) => queue.extend(self.engine.on_local_read(content)),
+                    Ok(content) => {
+                        self.busy_reads = 0;
+                        queue.extend(self.engine.on_local_read(content));
+                    }
                     Err(ClipboardError::Busy { reason }) => {
-                        tracing::debug!(error = %reason, "clipboard read busy; will look again");
-                        let notify = self.events_tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(READ_RETRY_DELAY).await;
-                            let _ = notify.try_send(SyncEvent::LocalChanged);
-                        });
+                        self.busy_reads += 1;
+                        if self.busy_reads > MAX_CONSECUTIVE_BUSY_READS {
+                            // Stop nudging: the change listener will wake
+                            // us for anything that actually changes, and
+                            // continuing would starve inbound frames on
+                            // this same queue.
+                            tracing::warn!(
+                                error = %reason,
+                                attempt_count = self.busy_reads,
+                                "clipboard read still busy; waiting for the next change                                  notification instead of re-checking"
+                            );
+                        } else {
+                            tracing::debug!(
+                                error = %reason,
+                                attempt_count = self.busy_reads,
+                                "clipboard read busy; will look again"
+                            );
+                            let notify = self.events_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(READ_RETRY_DELAY).await;
+                                let _ = notify.try_send(SyncEvent::LocalChanged);
+                            });
+                        }
                     }
                     Err(error) => {
                         tracing::error!(error = %error, "clipboard read failed");
@@ -207,6 +346,18 @@ impl ClipboardSyncDriver {
                         let _ = notify.send(SyncEvent::RetryDue(id)).await;
                     });
                 }
+                Action::ScheduleSettle { delay } => {
+                    // Bump the generation: any timer already in flight
+                    // becomes a no-op when it fires, so the debounce
+                    // restarts without cancellation bookkeeping.
+                    self.settle_generation += 1;
+                    let generation = self.settle_generation;
+                    let notify = self.events_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = notify.send(SyncEvent::SettleDue(generation)).await;
+                    });
+                }
             }
         }
         true
@@ -230,7 +381,7 @@ mod tests {
     use crossover_protocol::hello::MessageType;
 
     use super::{SyncCommand, SyncEvent, clipboard_sync};
-    use crate::clipboard::RetryPolicy;
+    use crate::clipboard::{ClipboardConfig, RetryPolicy};
 
     struct Rig {
         clipboard: Arc<InMemoryClipboard>,
@@ -240,14 +391,18 @@ mod tests {
 
     fn rig() -> Rig {
         let clipboard = Arc::new(InMemoryClipboard::new());
-        let retry = RetryPolicy {
-            max_attempts: 3,
-            delay: Duration::from_millis(20),
+        let config = ClipboardConfig {
+            retry: RetryPolicy {
+                max_attempts: 3,
+                delay: Duration::from_millis(20),
+            },
+            // Tests drive the trigger's *behaviour*, not the wait.
+            transmit_debounce: Duration::from_millis(5),
         };
         let (driver, events, commands) = clipboard_sync(
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
             Uuid::from_bytes([0xAA; 16]),
-            retry,
+            config,
         )
         .unwrap();
         tokio::spawn(driver.run());
@@ -401,6 +556,109 @@ mod tests {
             next_command(&mut rig).await,
             SyncCommand::TerminateSession { .. }
         ));
+    }
+
+    /// The soak defect, in a test: sustained read contention must not
+    /// starve an inbound frame. Before the bound, the nudge cycle
+    /// re-enqueued itself indefinitely and the peer's item waited behind
+    /// it (27 seconds, on real hardware).
+    #[tokio::test]
+    async fn sustained_read_contention_does_not_starve_inbound_items() {
+        let mut rig = rig();
+        // Far more busy reads than the bound allows.
+        rig.clipboard
+            .fail_next(ClipboardOp::Read, ClipboardFailure::Busy, 1000);
+        // Kick the read cycle, then deliver a peer item behind it.
+        rig.events.send(SyncEvent::LocalChanged).await.unwrap();
+
+        let item = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xBB; 16]),
+            0,
+            ContentType::Utf8Text,
+            b"must not wait for the read storm".to_vec(),
+        );
+        rig.events
+            .send(frame(
+                MessageType::ClipboardData,
+                item.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        // The ack must arrive promptly despite the ongoing read failures.
+        let SyncCommand::SendFrame {
+            message_type,
+            payload,
+        } = timeout(Duration::from_secs(3), rig.commands.recv())
+            .await
+            .expect("inbound item starved by read contention")
+            .expect("command channel closed")
+        else {
+            panic!("expected SendFrame");
+        };
+        assert_eq!(message_type, MessageType::ClipboardApplied.wire());
+        let applied = ClipboardApplied::decode_payload(&payload).unwrap();
+        assert_eq!(applied.result, ApplyResult::Applied);
+    }
+
+    /// The soak's real defect: a backlog of inbound items must not
+    /// become a burst of clipboard writes. Only the newest is applied;
+    /// the rest are acknowledged as superseded rather than written or
+    /// silently dropped.
+    #[tokio::test]
+    async fn a_backlog_of_items_applies_only_the_newest() {
+        let mut rig = rig();
+
+        let mut ids = Vec::new();
+        for i in 0..20 {
+            let item = ClipboardData::from_content(
+                Uuid::new_v4(),
+                Uuid::from_bytes([0xBB; 16]),
+                i,
+                ContentType::Utf8Text,
+                format!("backlog item {i}").into_bytes(),
+            );
+            ids.push(item.meta.id);
+            rig.events
+                .send(frame(
+                    MessageType::ClipboardData,
+                    item.encode_payload().unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Collect every ack the driver produces for the burst.
+        let mut results = Vec::new();
+        for _ in 0..ids.len() {
+            let SyncCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
+                panic!("expected SendFrame");
+            };
+            let applied = ClipboardApplied::decode_payload(&payload).unwrap();
+            results.push((applied.id, applied.result));
+        }
+
+        let applied_count = results
+            .iter()
+            .filter(|(_, r)| *r == ApplyResult::Applied)
+            .count();
+        let superseded_count = results
+            .iter()
+            .filter(|(_, r)| *r == ApplyResult::Superseded)
+            .count();
+
+        // Every item is answered — none silently dropped (NFR-3).
+        assert_eq!(results.len(), ids.len(), "some items were never answered");
+        // The clipboard was written far less than 20 times; in a single
+        // coalescing pass, exactly once.
+        assert!(
+            applied_count <= 2,
+            "applied {applied_count} items — the backlog was not coalesced"
+        );
+        assert!(superseded_count >= ids.len() - 2);
+        // The surviving content is the newest item.
+        assert_eq!(rig.clipboard.peek().as_deref(), Some("backlog item 19"));
     }
 
     #[tokio::test]

@@ -101,6 +101,22 @@ cargo test --workspace
 ```
 
 The `fuzz-smoke` job runs every fuzz target briefly on each change.
+
+The `coverage` job measures line/region/branch coverage with
+`cargo-llvm-cov` on Windows (the only leg where the real-OS platform code
+runs), publishes the browsable HTML as a build artifact, and prints the
+per-file summary to the job page. Locally:
+
+```
+cargo llvm-cov --workspace --html      # target/llvm-cov/html/index.html
+cargo llvm-cov report --summary-only   # per-file table
+```
+
+Coverage is **reported, not gated**. A percentage threshold rewards tests
+written to move a number; the useful question is which paths a change
+leaves unexercised, which the report answers directly. Low branch
+coverage in error-handling code is a standing invitation to add
+fault-injection cases (docs/TESTING.md §1.5), not a build failure.
 Added as the project matures: `cargo audit` and `cargo deny` (dependency
 and license policy), documentation build, MSRV check, protocol
 compatibility tests across supported versions.
@@ -112,6 +128,15 @@ stated — notably Phase 2's clipboard stress gate: **≥10,000 automated
 bidirectional clipboard updates with zero corruption, zero sync loops, zero
 silent failures, zero crashes**, and a diagnostic for every ultimately
 failed update.
+
+## 3.1 Two-machine soak
+
+The stress gate is hermetic by design. Real clipboards, a real network,
+and two independent machines are covered by the manual soak in
+[SOAK.md](SOAK.md), whose output is a report to interpret rather than a
+build verdict — a live desktop can always interfere, and a red build
+that says nothing about Crossover is worse than no build at all.
+`tools/soak-report.py` summarizes the structured logs from both sides.
 
 ## 4. Performance measurement
 
