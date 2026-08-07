@@ -61,8 +61,8 @@ pub enum SyncEvent {
     LocalChanged,
     /// A scheduled write retry came due.
     RetryDue(Uuid),
-    /// The transmit debounce elapsed (ADR 0006).
-    TransmitDue(u64),
+    /// The settle window elapsed (ADR 0006): time to read.
+    SettleDue(u64),
 }
 
 /// What the driver asks the app to do.
@@ -93,10 +93,10 @@ pub struct ClipboardSyncDriver {
     commands_tx: mpsc::Sender<SyncCommand>,
     /// Consecutive `Busy` reads; reset by any successful read.
     busy_reads: u32,
-    /// Generation of the newest transmit timer; older ones are ignored
+    /// Generation of the newest settle timer; older ones are ignored
     /// when they fire, which is how the debounce restarts cleanly
     /// without cancelling tasks.
-    transmit_generation: u64,
+    settle_generation: u64,
 }
 
 /// Build a driver for `provider`, returning the handles the app uses:
@@ -137,7 +137,7 @@ pub fn clipboard_sync(
         events_tx: events_tx.clone(),
         commands_tx,
         busy_reads: 0,
-        transmit_generation: 0,
+        settle_generation: 0,
     };
     Ok((driver, events_tx, commands_rx))
 }
@@ -160,9 +160,9 @@ impl ClipboardSyncDriver {
                     SyncEvent::SessionLost => self.engine.on_session_lost(),
                     SyncEvent::LocalChanged => self.engine.on_local_change(),
                     SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
-                    SyncEvent::TransmitDue(generation) => {
-                        if generation == self.transmit_generation {
-                            self.engine.on_transmit_due()
+                    SyncEvent::SettleDue(generation) => {
+                        if generation == self.settle_generation {
+                            self.engine.on_settle_due()
                         } else {
                             Vec::new() // a newer local change restarted the timer
                         }
@@ -346,16 +346,16 @@ impl ClipboardSyncDriver {
                         let _ = notify.send(SyncEvent::RetryDue(id)).await;
                     });
                 }
-                Action::ScheduleTransmit { delay } => {
+                Action::ScheduleSettle { delay } => {
                     // Bump the generation: any timer already in flight
                     // becomes a no-op when it fires, so the debounce
                     // restarts without cancellation bookkeeping.
-                    self.transmit_generation += 1;
-                    let generation = self.transmit_generation;
+                    self.settle_generation += 1;
+                    let generation = self.settle_generation;
                     let notify = self.events_tx.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
-                        let _ = notify.send(SyncEvent::TransmitDue(generation)).await;
+                        let _ = notify.send(SyncEvent::SettleDue(generation)).await;
                     });
                 }
             }

@@ -60,13 +60,18 @@ impl ClipboardConfig {
     }
 }
 
-/// How long the local clipboard must stay unchanged before its content
-/// is transmitted (ADR 0006).
+/// How long the local clipboard must stay unchanged before Crossover
+/// reads it and transmits (ADR 0006).
 ///
-/// Transmission is trigger-driven, not change-driven: a burst of copies
-/// produces one transmission instead of one per copy, so Crossover does
-/// not spend the machine-global clipboard lock on content nobody can
-/// paste. Control transfer becomes the primary trigger in Phase 5; this
+/// The window gates the **read**, not merely the send. Reading takes the
+/// machine-global clipboard lock exactly as writing does, so reacting to
+/// every change notification is itself the contention: the two-machine
+/// soak showed hundreds of failed opens per run while another
+/// application copied at 3 Hz, and a comparable number of that
+/// application's own copies failing in return. Waiting for the clipboard
+/// to settle collapses a burst into a single lock acquisition.
+///
+/// Control transfer becomes the primary trigger in Phase 5; this
 /// debounce carries Phase 2 and remains the fallback afterwards.
 pub const TRANSMIT_DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -160,10 +165,10 @@ pub enum Action {
         /// How long to wait.
         delay: Duration,
     },
-    /// Call [`ClipboardEngine::on_transmit_due`] after `delay` unless a
-    /// newer local change resets it (ADR 0006). Restarting an existing
-    /// timer is expected: the driver keeps only the latest.
-    ScheduleTransmit {
+    /// Call [`ClipboardEngine::on_settle_due`] after `delay` unless a
+    /// newer change resets it (ADR 0006). Restarting an existing timer is
+    /// expected: the driver keeps only the latest.
+    ScheduleSettle {
         /// How long the clipboard must stay quiet.
         delay: Duration,
     },
@@ -279,9 +284,6 @@ pub struct ClipboardEngine {
     /// At most one outbound transaction in flight; newer local copies
     /// supersede it.
     outbound: Option<Outbound>,
-    /// Locally observed content waiting for the transmit trigger
-    /// (ADR 0006). Replaced wholesale by any newer local change.
-    pending_transmit: Option<ClipboardData>,
     /// An accepted inbound offer whose Data we await.
     expecting_data: Option<ClipboardMeta>,
     /// The write (with retries) currently underway.
@@ -299,14 +301,28 @@ impl ClipboardEngine {
             current_local_hash: None,
             applied_hashes: VecDeque::new(),
             outbound: None,
-            pending_transmit: None,
             expecting_data: None,
             pending_write: None,
         }
     }
 
-    /// The provider signaled a change: read the current state.
+    /// The provider signaled a change.
+    ///
+    /// Deliberately does **not** read: reading takes the machine-global
+    /// clipboard lock, and a notification only means "something changed",
+    /// which during a burst is true many times per second. Wait for quiet
+    /// (ADR 0006), then read once.
     pub fn on_local_change(&mut self) -> Vec<Action> {
+        if self.config.transmit_debounce.is_zero() {
+            return vec![Action::ReadClipboard];
+        }
+        vec![Action::ScheduleSettle {
+            delay: self.config.transmit_debounce,
+        }]
+    }
+
+    /// The settle window elapsed: now read the clipboard, once.
+    pub fn on_settle_due(&mut self) -> Vec<Action> {
         vec![Action::ReadClipboard]
     }
 
@@ -345,30 +361,10 @@ impl ClipboardEngine {
             ContentType::Utf8Text,
             text.into_bytes(),
         );
-        // Stage rather than send (ADR 0006). A newer local change before
-        // the timer fires simply replaces this one, so a burst of copies
-        // costs one transmission.
-        //
-        // A zero debounce means transmit eagerly: no timer, no wait. That
-        // is the pre-ADR-0006 behaviour, kept addressable for callers who
-        // genuinely want it — and it keeps timing-independent tests from
-        // paying a scheduler tick per item.
-        if self.config.transmit_debounce.is_zero() {
-            return self.start_outbound(data);
-        }
-        self.pending_transmit = Some(data);
-        vec![Action::ScheduleTransmit {
-            delay: self.config.transmit_debounce,
-        }]
-    }
-
-    /// The transmit debounce elapsed: send whatever is staged.
-    pub fn on_transmit_due(&mut self) -> Vec<Action> {
-        match self.pending_transmit.take() {
-            Some(data) => self.start_outbound(data),
-            // Superseded, already sent, or the session dropped.
-            None => Vec::new(),
-        }
+        // The read only happens after the clipboard has settled, so
+        // whatever we just read is the content worth sending: transmit
+        // it directly.
+        self.start_outbound(data)
     }
 
     /// A decoded clipboard message arrived from the peer.
@@ -461,7 +457,6 @@ impl ClipboardEngine {
     pub fn on_session_established(&mut self) -> Vec<Action> {
         self.outbound = None;
         self.expecting_data = None;
-        self.pending_transmit = None;
         // Ask the driver to re-read: the clipboard may have changed while
         // disconnected, and re-reading routes through the normal dedup
         // (and then through the debounce, like any other observation).
@@ -479,7 +474,6 @@ impl ClipboardEngine {
             );
         }
         self.expecting_data = None;
-        self.pending_transmit = None;
         Vec::new()
     }
 
@@ -709,6 +703,8 @@ mod tests {
         ClipboardOffer, ContentType, DeclineReason, content_hash,
     };
 
+    use std::time::Duration;
+
     use super::{
         Action, ClipboardConfig, ClipboardEngine, InboundMessage, OutboundMessage, RetryPolicy,
     };
@@ -720,22 +716,16 @@ mod tests {
     /// Copy locally and fire the transmit trigger, since these tests are
     /// about what travels, not about debounce timing (which has its own
     /// tests below).
+    /// A change schedules the settle window; only then do we read
+    /// (ADR 0006). These tests care what travels, not about timing.
     fn copy(engine: &mut ClipboardEngine, text: &str) -> Vec<Action> {
-        let actions = engine.on_local_change();
-        assert_eq!(actions, vec![Action::ReadClipboard]);
-        let staged = engine.on_local_read(Some(text.to_owned()));
-        // Staging asks for the trigger; nothing travels yet (ADR 0006).
+        let scheduled = engine.on_local_change();
         assert!(
-            staged.is_empty()
-                || staged
-                    .iter()
-                    .all(|a| matches!(a, Action::ScheduleTransmit { .. })),
-            "local read should stage, not send: {staged:?}"
+            matches!(scheduled.as_slice(), [Action::ScheduleSettle { .. }]),
+            "a change should schedule a settle, not read now: {scheduled:?}"
         );
-        if staged.is_empty() {
-            return staged; // deduped or loop-suppressed: nothing staged
-        }
-        engine.on_transmit_due()
+        assert_eq!(engine.on_settle_due(), vec![Action::ReadClipboard]);
+        engine.on_local_read(Some(text.to_owned()))
     }
 
     fn sent(actions: &[Action]) -> Vec<&OutboundMessage> {
@@ -812,9 +802,14 @@ mod tests {
         ));
 
         // The provider now notifies for our own write (the contract
-        // term); the engine must stay silent.
+        // term); the engine must stay silent. The notification schedules
+        // a settle, the read happens after it, and the loop guard bites.
         let actions = receiver.on_local_change();
-        assert_eq!(actions, vec![Action::ReadClipboard]);
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::ScheduleSettle { .. }]
+        ));
+        assert_eq!(receiver.on_settle_due(), vec![Action::ReadClipboard]);
         let actions = receiver.on_local_read(Some("from peer".to_owned()));
         assert!(
             actions.is_empty(),
@@ -943,9 +938,9 @@ mod tests {
                         Action::WriteClipboard { id, text } => {
                             self.pending_write = Some((id, text));
                         }
-                        Action::ScheduleTransmit { .. } => {
-                            let sends = self.engine.on_transmit_due();
-                            self.drive(sends, outbox);
+                        Action::ScheduleSettle { .. } => {
+                            let read = self.engine.on_settle_due();
+                            self.drive(read, outbox);
                         }
                         Action::ReadClipboard | Action::ScheduleRetry { .. } => {}
                     }
@@ -1050,59 +1045,53 @@ mod tests {
         let actions = e.on_session_established();
         assert_eq!(actions, vec![Action::ReadClipboard]);
         // The established reset cleared the dedup hash, so the same
-        // content stages again — then travels on the trigger, for
-        // post-gap convergence.
-        let staged = e.on_local_read(Some("persistent".to_owned()));
-        assert!(
-            staged
-                .iter()
-                .all(|a| matches!(a, Action::ScheduleTransmit { .. })),
-            "re-announcement should stage: {staged:?}"
+        // content travels again for post-gap convergence.
+        assert_eq!(
+            sent(&e.on_local_read(Some("persistent".to_owned()))).len(),
+            1
         );
-        assert_eq!(sent(&e.on_transmit_due()).len(), 1);
     }
 
-    /// ADR 0006: a burst of copies transmits once, and the item that
-    /// travels is the newest — the storm the two-machine soak exposed
-    /// becomes structurally impossible.
+    /// ADR 0006: a burst of notifications costs one clipboard *read*,
+    /// not one per notification. Reading takes the machine-global lock,
+    /// so reacting to every notification is itself the contention the
+    /// two-machine soak exposed.
     #[test]
-    fn a_burst_of_copies_transmits_only_the_last() {
+    fn a_burst_of_changes_reads_the_clipboard_once() {
         let mut e = engine(0xAA);
 
         for i in 0..10 {
             let actions = e.on_local_change();
-            assert_eq!(actions, vec![Action::ReadClipboard]);
-            let staged = e.on_local_read(Some(format!("burst {i}")));
             assert!(
-                staged
-                    .iter()
-                    .all(|a| matches!(a, Action::ScheduleTransmit { .. })),
-                "copy {i} transmitted immediately instead of staging: {staged:?}"
+                matches!(actions.as_slice(), [Action::ScheduleSettle { .. }]),
+                "notification {i} read the clipboard immediately: {actions:?}"
             );
         }
 
-        // One trigger, one transmission, carrying the newest content.
-        let actions = e.on_transmit_due();
+        // The window elapses once: one read, then one send of whatever
+        // the clipboard settled on.
+        assert_eq!(e.on_settle_due(), vec![Action::ReadClipboard]);
+        let actions = e.on_local_read(Some("settled content".to_owned()));
         let msgs = sent(&actions);
-        assert_eq!(msgs.len(), 1, "burst produced more than one transmission");
+        assert_eq!(msgs.len(), 1);
         let OutboundMessage::Data(data) = msgs[0] else {
             panic!("expected inline data");
         };
-        assert_eq!(data.content, b"burst 9");
-
-        // A second trigger with nothing staged is a no-op.
-        assert!(e.on_transmit_due().is_empty());
+        assert_eq!(data.content, b"settled content");
     }
 
     #[test]
-    fn session_loss_discards_staged_content() {
-        let mut e = engine(0xAA);
-        let staged = e.on_local_read(Some("staged then lost".to_owned()));
-        assert!(!staged.is_empty());
-        e.on_session_lost();
-        // The trigger finds nothing: the item belonged to a dead session,
-        // and reconnection re-reads from scratch.
-        assert!(e.on_transmit_due().is_empty());
+    fn zero_debounce_reads_eagerly() {
+        let mut e = ClipboardEngine::new(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig {
+                transmit_debounce: Duration::ZERO,
+                ..ClipboardConfig::new()
+            },
+        );
+        // The escape hatch for callers who want no wait at all.
+        assert_eq!(e.on_local_change(), vec![Action::ReadClipboard]);
+        assert_eq!(sent(&e.on_local_read(Some("eager".to_owned()))).len(), 1);
     }
 
     #[test]
