@@ -10,7 +10,12 @@ repository.workspace = true
 # independently testable without sockets (docs/ARCHITECTURE.md §3). Pure
 # helper crates such as thiserror are acceptable.
 [dependencies]
+# Wire payload encoding per ADR 0001; serde stays an implementation detail
+# of this crate and does not leak across crate boundaries.
+postcard = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

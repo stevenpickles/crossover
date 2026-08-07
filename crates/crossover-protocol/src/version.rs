@@ -1,0 +1,98 @@
+//! Protocol version negotiation (docs/PROTOCOL.md §3).
+//!
+//! A session runs at the highest mutually supported version; disjoint
+//! ranges terminate the session — there is no silent downgrade below
+//! either side's minimum (docs/SECURITY.md invariant 4).
+
+use crate::ProtocolError;
+
+/// The highest protocol version this build speaks.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// The lowest protocol version this build accepts.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 1;
+
+/// An inclusive range of supported protocol versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionRange {
+    /// Lowest acceptable version.
+    pub min: u16,
+    /// Highest supported version.
+    pub max: u16,
+}
+
+impl VersionRange {
+    /// The range this build supports.
+    pub const CURRENT: Self = Self {
+        min: MIN_SUPPORTED_PROTOCOL_VERSION,
+        max: PROTOCOL_VERSION,
+    };
+}
+
+/// Pick the session version: the highest version inside both ranges.
+///
+/// # Errors
+///
+/// [`ProtocolError::NoCommonVersion`] when the ranges do not intersect
+/// (or either range is inverted — impossible states fail closed).
+pub fn negotiate(local: VersionRange, peer: VersionRange) -> Result<u16, ProtocolError> {
+    let highest = local.max.min(peer.max);
+    let lowest = local.min.max(peer.min);
+    if lowest <= highest {
+        Ok(highest)
+    } else {
+        Err(ProtocolError::NoCommonVersion {
+            local_min: local.min,
+            local_max: local.max,
+            peer_min: peer.min,
+            peer_max: peer.max,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PROTOCOL_VERSION, VersionRange, negotiate};
+    use crate::ProtocolError;
+
+    fn range(min: u16, max: u16) -> VersionRange {
+        VersionRange { min, max }
+    }
+
+    #[test]
+    fn identical_ranges_pick_that_version() {
+        assert_eq!(
+            negotiate(VersionRange::CURRENT, VersionRange::CURRENT).unwrap(),
+            PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn overlap_picks_highest_mutual_version() {
+        assert_eq!(negotiate(range(1, 3), range(2, 5)).unwrap(), 3);
+        assert_eq!(negotiate(range(2, 5), range(1, 3)).unwrap(), 3);
+        // A newer peer that still accepts our best: our best wins.
+        assert_eq!(negotiate(range(1, 2), range(2, 9)).unwrap(), 2);
+    }
+
+    #[test]
+    fn disjoint_ranges_fail_with_both_ranges_reported() {
+        let err = negotiate(range(1, 2), range(3, 4)).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::NoCommonVersion {
+                local_min: 1,
+                local_max: 2,
+                peer_min: 3,
+                peer_max: 4,
+            }
+        ));
+        // Symmetric case.
+        assert!(negotiate(range(3, 4), range(1, 2)).is_err());
+    }
+
+    #[test]
+    fn inverted_ranges_fail_closed() {
+        assert!(negotiate(range(5, 1), range(1, 5)).is_err());
+    }
+}
