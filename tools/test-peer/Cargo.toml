@@ -1,0 +1,29 @@
+[package]
+name = "crossover-test-peer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Deliberately NOT a dependency of/on crossover-core: the test peer is an
+# independent implementation of the wire contract (protocol + security
+# primitives only), so integration tests exercise core against a foreign
+# peer rather than against itself (docs/TESTING.md §1.4). crossover-core
+# appears only as a dev-dependency of this crate's integration tests.
+[dependencies]
+# anyhow at the surface: this is test harness, not shipped code — scenario
+# readability beats typed error taxonomies here.
+anyhow = { workspace = true }
+crossover-protocol = { workspace = true }
+crossover-security = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+
+[dev-dependencies]
+crossover-core = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
