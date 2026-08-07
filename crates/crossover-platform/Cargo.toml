@@ -6,8 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Deliberately no dependencies: trait definitions only, no OS APIs
-# (docs/ARCHITECTURE.md §4).
+# No OS or I/O dependencies: trait definitions only (docs/ARCHITECTURE.md
+# §4). Pure helper crates such as thiserror are acceptable.
+[dependencies]
+thiserror = { workspace = true }
+
+[features]
+# In-memory fakes of the platform traits for consuming crates' tests
+# (docs/ARCHITECTURE.md §4). Enable via dev-dependencies only.
+fakes = []
 
 [lints]
 workspace = true

@@ -143,6 +143,9 @@ dependencies = [
 [[package]]
 name = "crossover-platform"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "crossover-platform-windows"
