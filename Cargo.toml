@@ -22,6 +22,8 @@ crossover-platform-windows = { path = "crates/crossover-platform-windows" }
 crossover-protocol = { path = "crates/crossover-protocol" }
 crossover-security = { path = "crates/crossover-security" }
 
+thiserror = "2"
+
 # `unsafe_code = "forbid"` enforces NFR-6 (docs/SPECIFICATION.md). Platform
 # crates may later relax it locally with documented justification.
 [workspace.lints.rust]
