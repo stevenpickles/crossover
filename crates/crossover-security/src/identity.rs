@@ -126,6 +126,12 @@ impl Drop for StoredIdentityV1 {
 }
 
 /// This installation's persistent cryptographic identity.
+///
+/// `Clone` exists for the composition root, which hands one identity to
+/// concurrent roles (listener and supervisor); clones share nothing
+/// mutable, and the signing key clones as key material in process memory
+/// either way.
+#[derive(Clone)]
 pub struct DeviceIdentity {
     device_id: Uuid,
     device_name: String,

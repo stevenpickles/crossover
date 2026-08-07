@@ -56,6 +56,18 @@ pub struct CertifiedIdentity {
     fingerprint: SpkiFingerprint,
 }
 
+impl Clone for CertifiedIdentity {
+    /// Manual because `PrivateKeyDer` offers `clone_key()` rather than
+    /// `Clone`; semantics are identical (same credential, same key).
+    fn clone(&self) -> Self {
+        Self {
+            certificate: self.certificate.clone(),
+            private_key: self.private_key.clone_key(),
+            fingerprint: self.fingerprint,
+        }
+    }
+}
+
 impl std::fmt::Debug for CertifiedIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CertifiedIdentity")
