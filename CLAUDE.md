@@ -58,7 +58,8 @@ never let code and specification diverge silently.
 
 ## Conventions
 
-- Base branch for PRs: `main`
+- Branching model: feature branches merge into `dev` (the integration
+  branch); `main` is the stable branch. Branch new features from `dev`.
 - Feature branches: `feature/<n>/<short-description>`, where `<n>` increments
   sequentially per feature. One focused feature per branch, so the branch
   history alone tells the story of what has been developed.
