@@ -14,12 +14,21 @@
 //! holds the clipboard — and maps to [`ClipboardError::Busy`] for the
 //! engine's bounded retry. Real failures map to `Unavailable`.
 //!
+//! Contention runs both ways, and Crossover must be a good neighbour:
+//! the clipboard is a machine-global lock, so every other application's
+//! copy and paste blocks while we hold it. Both paths therefore keep the
+//! critical section to the clipboard calls alone — allocation, the byte
+//! copy, and UTF-16 conversion all happen outside it. The two-machine
+//! soak proved this matters: holding across that work made PowerShell's
+//! `Set-Clipboard` fail outright during bidirectional sync.
+//!
 //! Text is `CF_UNICODETEXT` (Windows synthesizes it from `CF_TEXT`
 //! automatically), converted UTF-16 ↔ UTF-8 at this boundary.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crossover_platform::{ClipboardError, ClipboardListener, ClipboardProvider};
+use windows::Win32::Foundation::GlobalFree;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
@@ -109,9 +118,11 @@ impl ClipboardProvider for WindowsClipboard {
             return Ok(None); // empty clipboard or no text representation
         }
 
-        let _open = OpenGuard::open()?;
+        let open = OpenGuard::open()?;
         // SAFETY: the clipboard is open (guard); the returned handle is
-        // owned by the clipboard, not by us.
+        // owned by the clipboard, not by us. Everything between here and
+        // the explicit drop below is the critical section — keep it to
+        // the bytes and nothing else.
         // Contention-shaped, observed live: clipboard ownership can churn
         // between our successful open and this call (another process
         // taking the clipboard), surfacing as ERROR_CLIPBOARD_NOT_OPEN.
@@ -137,25 +148,34 @@ impl ClipboardProvider for WindowsClipboard {
             });
         }
         // SAFETY: CF_UNICODETEXT is null-terminated UTF-16 by contract;
-        // scan for the terminator from the locked base pointer.
-        let text = unsafe {
+        // scan for the terminator, then copy the units out. Only the copy
+        // happens under the clipboard lock — the UTF-16 → String
+        // conversion (which allocates, and for a multi-megabyte item is
+        // not cheap) happens after releasing, so Crossover is not the
+        // reason another application's clipboard call fails.
+        let units: Vec<u16> = unsafe {
             let mut len = 0usize;
             while *ptr.add(len) != 0 {
                 len += 1;
             }
-            String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+            std::slice::from_raw_parts(ptr, len).to_vec()
         };
         // SAFETY: balances the successful GlobalLock above. GlobalUnlock
         // reports "no longer locked" as an error-shaped success; ignore.
         let _ = unsafe { GlobalUnlock(hglobal) };
-        Ok(Some(text))
+        drop(open);
+
+        Ok(Some(String::from_utf16_lossy(&units)))
     }
 
     fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
         let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let byte_len = utf16.len() * 2;
 
-        let _open = OpenGuard::open()?;
+        // Allocate and fill the block BEFORE taking the clipboard. None
+        // of this needs the lock, and for a multi-megabyte item the copy
+        // is long enough that holding it here made other applications'
+        // clipboard calls fail outright (found in the two-machine soak).
         // SAFETY: allocating a movable global block for the clipboard.
         let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) }.map_err(|e| {
             ClipboardError::Unavailable {
@@ -163,10 +183,12 @@ impl ClipboardProvider for WindowsClipboard {
             }
         })?;
         // SAFETY: `hglobal` is ours and unlocked; lock, copy the UTF-16
-        // (exactly `utf16.len()` units fit by construction), unlock.
+        // (exactly `utf16.len()` units fit by construction), unlock. On
+        // any failure before the system takes ownership we free it.
         unsafe {
             let ptr = GlobalLock(hglobal).cast::<u16>();
             if ptr.is_null() {
+                let _ = GlobalFree(Some(hglobal));
                 return Err(ClipboardError::Unavailable {
                     reason: "GlobalLock on fresh allocation failed".to_owned(),
                 });
@@ -175,19 +197,45 @@ impl ClipboardProvider for WindowsClipboard {
             let _ = GlobalUnlock(hglobal);
         }
 
+        // The critical section starts here and holds only two calls.
+        let _open = match OpenGuard::open() {
+            Ok(guard) => guard,
+            Err(error) => {
+                // SAFETY: the system never took ownership; the block is
+                // still ours to free.
+                unsafe {
+                    let _ = GlobalFree(Some(hglobal));
+                }
+                return Err(error);
+            }
+        };
+
         // SAFETY: the clipboard is open (guard).
-        unsafe { EmptyClipboard() }.map_err(|e| ClipboardError::Busy {
-            reason: format!("EmptyClipboard failed (ownership churn?): {e}"),
-        })?;
-        // SAFETY: on success the system takes ownership of `hglobal`; we
-        // must not free it. On failure ownership stays with us — the
-        // block leaks rather than risking a double-free; failure here is
-        // rare and the leak is bounded by the item size.
-        unsafe { SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(hglobal.0))) }.map_err(
-            |e| ClipboardError::Busy {
+        if let Err(e) = unsafe { EmptyClipboard() } {
+            // SAFETY: ownership never transferred; free our block.
+            unsafe {
+                let _ = GlobalFree(Some(hglobal));
+            }
+            return Err(ClipboardError::Busy {
+                reason: format!("EmptyClipboard failed (ownership churn?): {e}"),
+            });
+        }
+        // SAFETY: the clipboard is open (guard). On success the system
+        // takes ownership of `hglobal` and we must never free it; on
+        // failure ownership stays with us, which the error arm handles.
+        let stored =
+            unsafe { SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(hglobal.0))) };
+        if let Err(e) = stored {
+            // SAFETY: on failure the system did NOT take ownership, so
+            // freeing here is correct and avoids the leak the previous
+            // version accepted.
+            unsafe {
+                let _ = GlobalFree(Some(hglobal));
+            }
+            return Err(ClipboardError::Busy {
                 reason: format!("SetClipboardData failed (ownership churn?): {e}"),
-            },
-        )?;
+            });
+        }
         Ok(())
     }
 

@@ -28,6 +28,19 @@ use crate::clipboard::{Action, ClipboardEngine, InboundMessage, RetryPolicy};
 /// looks again shortly (the next change notification would also do it).
 const READ_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// How many consecutive `Busy` reads before the driver stops re-nudging
+/// itself and waits for the next real change notification.
+///
+/// Found in the two-machine soak (docs/SOAK.md): with the local
+/// clipboard under sustained contention, an unbounded nudge cycle
+/// re-enqueues itself indefinitely, and because inbound frames share
+/// this one serial event queue, a peer's acknowledgement can sit
+/// unprocessed behind the churn — 27 seconds of it, in the run that
+/// exposed this. Bounding the cycle costs nothing real: the clipboard
+/// listener will notify us again for any change we miss, so giving up
+/// here loses no content, only a redundant look.
+const MAX_CONSECUTIVE_BUSY_READS: u32 = 5;
+
 /// Events the app (or the driver itself) feeds in.
 #[derive(Debug)]
 pub enum SyncEvent {
@@ -70,6 +83,8 @@ pub struct ClipboardSyncDriver {
     events_rx: mpsc::Receiver<SyncEvent>,
     events_tx: mpsc::Sender<SyncEvent>,
     commands_tx: mpsc::Sender<SyncCommand>,
+    /// Consecutive `Busy` reads; reset by any successful read.
+    busy_reads: u32,
 }
 
 /// Build a driver for `provider`, returning the handles the app uses:
@@ -109,6 +124,7 @@ pub fn clipboard_sync(
         events_rx,
         events_tx: events_tx.clone(),
         commands_tx,
+        busy_reads: 0,
     };
     Ok((driver, events_tx, commands_rx))
 }
@@ -153,14 +169,34 @@ impl ClipboardSyncDriver {
         while let Some(action) = queue.pop_front() {
             match action {
                 Action::ReadClipboard => match self.provider.read_text() {
-                    Ok(content) => queue.extend(self.engine.on_local_read(content)),
+                    Ok(content) => {
+                        self.busy_reads = 0;
+                        queue.extend(self.engine.on_local_read(content));
+                    }
                     Err(ClipboardError::Busy { reason }) => {
-                        tracing::debug!(error = %reason, "clipboard read busy; will look again");
-                        let notify = self.events_tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(READ_RETRY_DELAY).await;
-                            let _ = notify.try_send(SyncEvent::LocalChanged);
-                        });
+                        self.busy_reads += 1;
+                        if self.busy_reads > MAX_CONSECUTIVE_BUSY_READS {
+                            // Stop nudging: the change listener will wake
+                            // us for anything that actually changes, and
+                            // continuing would starve inbound frames on
+                            // this same queue.
+                            tracing::warn!(
+                                error = %reason,
+                                attempt_count = self.busy_reads,
+                                "clipboard read still busy; waiting for the next change                                  notification instead of re-checking"
+                            );
+                        } else {
+                            tracing::debug!(
+                                error = %reason,
+                                attempt_count = self.busy_reads,
+                                "clipboard read busy; will look again"
+                            );
+                            let notify = self.events_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(READ_RETRY_DELAY).await;
+                                let _ = notify.try_send(SyncEvent::LocalChanged);
+                            });
+                        }
                     }
                     Err(error) => {
                         tracing::error!(error = %error, "clipboard read failed");
@@ -401,6 +437,50 @@ mod tests {
             next_command(&mut rig).await,
             SyncCommand::TerminateSession { .. }
         ));
+    }
+
+    /// The soak defect, in a test: sustained read contention must not
+    /// starve an inbound frame. Before the bound, the nudge cycle
+    /// re-enqueued itself indefinitely and the peer's item waited behind
+    /// it (27 seconds, on real hardware).
+    #[tokio::test]
+    async fn sustained_read_contention_does_not_starve_inbound_items() {
+        let mut rig = rig();
+        // Far more busy reads than the bound allows.
+        rig.clipboard
+            .fail_next(ClipboardOp::Read, ClipboardFailure::Busy, 1000);
+        // Kick the read cycle, then deliver a peer item behind it.
+        rig.events.send(SyncEvent::LocalChanged).await.unwrap();
+
+        let item = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xBB; 16]),
+            0,
+            ContentType::Utf8Text,
+            b"must not wait for the read storm".to_vec(),
+        );
+        rig.events
+            .send(frame(
+                MessageType::ClipboardData,
+                item.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        // The ack must arrive promptly despite the ongoing read failures.
+        let SyncCommand::SendFrame {
+            message_type,
+            payload,
+        } = timeout(Duration::from_secs(3), rig.commands.recv())
+            .await
+            .expect("inbound item starved by read contention")
+            .expect("command channel closed")
+        else {
+            panic!("expected SendFrame");
+        };
+        assert_eq!(message_type, MessageType::ClipboardApplied.wire());
+        let applied = ClipboardApplied::decode_payload(&payload).unwrap();
+        assert_eq!(applied.result, ApplyResult::Applied);
     }
 
     #[tokio::test]
