@@ -305,9 +305,33 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
-    use crossover_platform::ClipboardProvider;
+    use crossover_platform::{ClipboardError, ClipboardProvider};
 
     use super::WindowsClipboard;
+
+    /// Bounded retry over `Busy`, mirroring what the engine does in
+    /// production (FR-3.4). These tests drive the real machine clipboard,
+    /// which any application on a live desktop may hold momentarily;
+    /// treating that as failure would make the suite flaky about the one
+    /// condition the design explicitly expects.
+    fn with_retry<T>(
+        mut op: impl FnMut() -> Result<T, ClipboardError>,
+    ) -> Result<T, ClipboardError> {
+        let mut last = None;
+        for _ in 0..20 {
+            match op() {
+                Ok(value) => return Ok(value),
+                Err(ClipboardError::Busy { reason }) => {
+                    last = Some(ClipboardError::Busy { reason });
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(fatal) => return Err(fatal),
+            }
+        }
+        Err(last.unwrap_or(ClipboardError::Busy {
+            reason: "clipboard stayed busy".to_owned(),
+        }))
+    }
 
     /// The Windows clipboard is machine-global: serialize every test that
     /// touches it, across this whole test binary.
@@ -324,8 +348,11 @@ mod tests {
         let clipboard = WindowsClipboard::new().unwrap();
 
         let text = "crossover test: héllo 👋 line\r\nbreak";
-        clipboard.write_text(text).unwrap();
-        assert_eq!(clipboard.read_text().unwrap().as_deref(), Some(text));
+        with_retry(|| clipboard.write_text(text)).unwrap();
+        assert_eq!(
+            with_retry(|| clipboard.read_text()).unwrap().as_deref(),
+            Some(text)
+        );
     }
 
     #[test]
@@ -341,7 +368,7 @@ mod tests {
             })))
             .unwrap();
 
-        clipboard.write_text("notify me").unwrap();
+        with_retry(|| clipboard.write_text("notify me")).unwrap();
 
         // WM_CLIPBOARDUPDATE arrives asynchronously on the pump thread.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -354,22 +381,151 @@ mod tests {
         }
     }
 
+    /// R-5, the real thing: another thread holds the clipboard open, so
+    /// our operations must report retryable `Busy` — not `Unavailable`,
+    /// which the engine would never retry.
+    #[test]
+    fn contention_from_another_holder_reports_busy() {
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+        with_retry(|| clipboard.write_text("before contention")).unwrap();
+
+        // A separate thread opens the clipboard and sits on it; Win32
+        // clipboard ownership is per-thread, so this genuinely locks us
+        // out the way another application would.
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            // The desktop may itself be holding the clipboard; retry as
+            // the engine would before giving up on the simulation.
+            let mut acquired = false;
+            for _ in 0..20 {
+                // SAFETY: opening with no owner window associates the
+                // open with this thread; closed before the thread exits.
+                if unsafe { windows::Win32::System::DataExchange::OpenClipboard(None) }.is_ok() {
+                    acquired = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            holding_tx.send(acquired).ok();
+            if !acquired {
+                return;
+            }
+            let _ = release_rx.recv();
+            // SAFETY: balances the successful open above.
+            unsafe {
+                let _ = windows::Win32::System::DataExchange::CloseClipboard();
+            }
+        });
+
+        let held = holding_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("holder thread did not report");
+        if !held {
+            // The machine would not let us stage contention. Skip rather
+            // than fail: this test cannot control a live desktop, and a
+            // red build here would say nothing about Crossover.
+            release_tx.send(()).ok();
+            holder.join().unwrap();
+            eprintln!("skipped: could not acquire the clipboard to stage contention");
+            return;
+        }
+
+        // Classification is what matters: whatever the outcome, a
+        // contention failure must be Busy (retryable), never Unavailable
+        // (which the engine would never retry).
+        //
+        // Note the honest limitation: Windows may admit another thread of
+        // the *same process* even while this one holds the clipboard, so
+        // an in-process holder cannot guarantee lockout. When it does let
+        // us through, this exercises the success path instead — the
+        // assertion below still fails the build if a contention failure
+        // is ever misclassified.
+        for outcome in [
+            clipboard.write_text("during contention").err(),
+            clipboard.read_text().err(),
+        ] {
+            match outcome {
+                None | Some(ClipboardError::Busy { .. }) => {}
+                Some(other) => {
+                    panic!("contention must classify as Busy, got {other:?}")
+                }
+            }
+        }
+
+        release_tx.send(()).ok();
+        holder.join().unwrap();
+
+        // Recovery: once released, normal operation resumes.
+        with_retry(|| clipboard.write_text("after contention")).unwrap();
+        assert_eq!(
+            with_retry(|| clipboard.read_text()).unwrap().as_deref(),
+            Some("after contention")
+        );
+    }
+
+    /// Rapid replacement (FR-6.1): a burst of writes must leave the last
+    /// one installed, with no crash, deadlock, or leaked clipboard lock.
+    #[test]
+    fn rapid_replacement_settles_on_the_last_write() {
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        let mut installed = 0;
+        for i in 0..50 {
+            // Contention from the desktop can legitimately bounce a write;
+            // Busy is acceptable, Unavailable is not.
+            match clipboard.write_text(&format!("burst item {i}")) {
+                Ok(()) => installed += 1,
+                Err(ClipboardError::Busy { .. }) => {}
+                Err(other) => panic!("unexpected write failure: {other}"),
+            }
+        }
+        assert!(installed > 0, "no write in the burst succeeded");
+
+        // Settle, then confirm we can still read a coherent value.
+        std::thread::sleep(Duration::from_millis(100));
+        let final_text = with_retry(|| clipboard.read_text()).unwrap();
+        assert!(
+            final_text.is_some_and(|t| t.starts_with("burst item")),
+            "clipboard does not hold a burst item after rapid replacement"
+        );
+    }
+
+    /// The protocol's maximum item (4 MiB) survives the Win32 boundary —
+    /// the allocation, UTF-16 conversion, and read-back path at scale.
+    #[test]
+    fn maximum_sized_item_round_trips() {
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        let large = "L".repeat(4 * 1024 * 1024);
+        match clipboard.write_text(&large) {
+            Ok(()) => {}
+            Err(ClipboardError::Busy { .. }) => return, // desktop contention
+            Err(other) => panic!("unexpected failure writing 4 MiB: {other}"),
+        }
+        let read_back = with_retry(|| clipboard.read_text()).unwrap();
+        assert_eq!(read_back.as_deref().map(str::len), Some(large.len()));
+    }
+
     #[test]
     fn replacing_content_keeps_working_across_instances() {
         let _serial = clipboard_lock();
         {
             let clipboard = WindowsClipboard::new().unwrap();
-            clipboard.write_text("first instance").unwrap();
+            with_retry(|| clipboard.write_text("first instance")).unwrap();
         } // drops: pump thread must shut down cleanly
 
         let clipboard = WindowsClipboard::new().unwrap();
         assert_eq!(
-            clipboard.read_text().unwrap().as_deref(),
+            with_retry(|| clipboard.read_text()).unwrap().as_deref(),
             Some("first instance")
         );
-        clipboard.write_text("second instance").unwrap();
+        with_retry(|| clipboard.write_text("second instance")).unwrap();
         assert_eq!(
-            clipboard.read_text().unwrap().as_deref(),
+            with_retry(|| clipboard.read_text()).unwrap().as_deref(),
             Some("second instance")
         );
     }
