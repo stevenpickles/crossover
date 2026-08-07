@@ -7,8 +7,25 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Will consume the SecureStorage trait for private key material at rest.
+# Consumes the SecureStorage trait for private key material at rest.
 crossover-platform = { workspace = true }
+
+# Identity (ADR 0003): Ed25519 keypair, SPKI SHA-256 fingerprint. Chosen
+# over an rcgen/ring keypair here to stay pure-Rust with no native build
+# steps; the TLS slice converts to PKCS#8 for rustls/rcgen when needed.
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+# At-rest identity blob encoding. Storage format is versioned explicitly
+# (format_version field), independent of the wire protocol version.
+postcard = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+crossover-platform = { workspace = true, features = ["fakes"] }
 
 [lints]
 workspace = true
