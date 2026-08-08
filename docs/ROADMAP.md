@@ -1,8 +1,9 @@
 # Crossover Roadmap
 
 > **Current phase: 4 — Remote Keyboard** (in progress — the key-repre-
-> sentation decision is recorded as ADR 0008, Proposed; the input model,
-> wire messages, and Windows capture/injection follow once it is accepted)
+> sentation decision is recorded as ADR 0008 (Accepted): physical key by
+> USB HID usage, produced text carried alongside, inject by scan code.
+> The input model, wire messages, and Windows capture/injection follow.)
 >
 > Phase 3 (Remote Mouse) closed 2026-08-08: the two-machine remote-mouse
 > soak (docs/SOAK.md) ran on real hardware — clean takeover, smooth

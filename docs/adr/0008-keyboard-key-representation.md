@@ -1,6 +1,6 @@
 # 0008. Keyboard key representation: physical key by USB HID usage, produced text carried alongside, inject by scan code
 
-Status: Proposed
+Status: Accepted
 Date: 2026-08-08
 
 ## Context
@@ -129,10 +129,20 @@ permission is set ([SECURITY.md](../SECURITY.md) §permissions, T8).
   needs a mapping table to inject. HID usage is the numeric canonical
   source those strings derive from — chosen for compactness and to avoid
   string handling on a hot path.
-- **Windows scan codes as the wire identity.** Platform-specific, and
-  the scan-code sets (Set 1 vs. the extended-key `E0` prefixes) are
-  fiddly and Windows-flavoured. HID usage is the OS-neutral standard;
-  scan codes are derived from it only at the Windows injection boundary.
+- **Windows scan codes as the wire identity.** The strongest rejected
+  option, and worth the honest counterpoint: in a *Windows-only* world
+  scan codes would be the cleanest, because Windows capture already hands
+  you scan codes and injection takes them — no mapping table at all,
+  which HID usage does force on both capture and injection. But that
+  cleanliness holds only if you accept permanent Windows coupling, which
+  FR-4.1 ("must not permanently require Windows keycodes") and NFR-4
+  (tri-OS portability) rule out; the extended-key `E0`/`E1` prefixes
+  still have to be encoded either way; and macOS/Linux would convert
+  through HID usage regardless. So scan codes trade one bounded, testable
+  internal table for a permanent protocol-level Windows lock-in — the
+  wrong trade. HID usage is the OS-neutral standard; scan codes are
+  derived from it only at the Windows boundary, where platform specifics
+  belong.
 - **Virtual-key (VK) codes as identity.** Layout-dependent *and*
   Windows-specific — disqualified twice over by FR-4.1.
 - **Produced text only, no physical key.** Cannot express shortcuts
