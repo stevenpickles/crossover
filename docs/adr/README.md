@@ -55,14 +55,18 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0005](0005-clipboard-transaction-flow.md) | Clipboard transactions: 2-message inline, Offer/Accept above 64 KiB | Accepted |
 | [0006](0006-clipboard-transmission-triggers.md) | Clipboard transmission is trigger-driven, not change-driven | Accepted |
 | [0007](0007-windows-input-capture.md) | Windows input: hooks to suppress, Raw Input for motion, SendInput to inject | Accepted |
+| [0008](0008-keyboard-key-representation.md) | Keyboard key representation: physical key by USB HID usage, text carried, inject by scan code | Proposed |
 
 ## Known decisions awaiting an ADR
 
 None outstanding. Every decision the specification suite deliberately
 deferred has now been recorded — wire format (0001), pairing mechanism
 (0002), identity credential (0003), default port (0004), clipboard
-transaction flow (0005), and Windows input capture (0007); 0006 was
-raised by evidence rather than deferred.
+transaction flow (0005), Windows input capture (0007), and keyboard key
+representation (0008); 0006 was raised by evidence rather than deferred.
+
+ADR 0008 opens Phase 4 and is **Proposed** pending review before the
+keyboard input model is built against it.
 
 New entries belong here when a decision is identified but not yet made,
 so that the gap is visible rather than implicit.

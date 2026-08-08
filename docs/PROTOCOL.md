@@ -130,14 +130,22 @@ Invariants (enforced by the core clipboard engine, wire-visible here):
 
 ## 6. Input events
 
-Platform-neutral events (see FR-4.1 for the key-identity model):
+Platform-neutral events (see FR-4.1 and ADR 0008 for the key-identity
+model):
 
 ```
-KeyDown / KeyUp / KeyRepeat      { physical_key, os_key, text?, sequence }
+Key { key, pressed, repeat, text? }      // key = USB HID usage (u16); ADR 0008
 PointerMove                      { x, y, sequence }        // coalescable
 PointerButtonDown / Up           { button, sequence }
 PointerScroll                    { dx, dy, sequence }
 ```
+
+Key identity is the USB HID keyboard/keypad usage ID (Usage Page 0x07),
+which is neither a Windows keycode nor layout-dependent (FR-4.1). The
+source OS virtual-key is deliberately **not** carried — physical `key`
+and produced `text` are the two distinct slots, and the destination
+injects by scan code (derived from the HID usage), falling back to the
+Unicode `text` for mismatched layouts (ADR 0008).
 
 - Key transitions and button transitions are ordered and lossless; pointer
   motion is transient — under backpressure, intermediate positions are
