@@ -23,11 +23,23 @@
 //! button it would lose a click, but never create a stuck button: the
 //! engine's sent-state tracks only what was actually sent, so a dropped
 //! press is a press the peer never saw and never needs releasing.
+//!
+//! **Control is bound to one session (FR-5.1, FR-2.3).** The engine
+//! models a single control relationship, but the application fans every
+//! session's frames into this one driver. A grant is authority for the
+//! *authenticated session it was negotiated on* and no other, so the
+//! driver binds to the first session it sees established and drops
+//! control and input traffic from any other: a trusted-but-unbound peer
+//! must never reach the engine, or it could inject on a peer's grant it
+//! does not hold. Exactly one peer may drive this machine at a time —
+//! which is also the only shape the single local mouse and desktop can
+//! honour.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crossover_platform::{InputCapture, InputInjector};
 use crossover_protocol::RawFrame;
@@ -53,14 +65,30 @@ const MAX_DRAIN_BATCH: usize = 512;
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
 /// Events the application (or the platform sink) feeds in.
+///
+/// Session-scoped variants carry the locally generated `session` id, so
+/// the driver can bind control to one session and reject traffic from
+/// any other (see the module docs).
 #[derive(Debug)]
 pub enum InputControlEvent {
     /// A session to the peer reached `ESTABLISHED`.
-    SessionEstablished,
+    SessionEstablished {
+        /// Locally generated id of the session.
+        session: Uuid,
+    },
     /// The session ended (any reason).
-    SessionLost,
-    /// A frame arrived (any type; non-control frames are ignored here).
-    Frame(RawFrame),
+    SessionLost {
+        /// Locally generated id of the session.
+        session: Uuid,
+    },
+    /// A frame arrived on a session (any type; non-control frames are
+    /// ignored here).
+    Frame {
+        /// Locally generated id of the session it arrived on.
+        session: Uuid,
+        /// The frame.
+        frame: RawFrame,
+    },
     /// The user asked to take control of the peer.
     RequestControl,
     /// The user asked to end whichever control relationship exists.
@@ -84,6 +112,10 @@ pub struct InputControlDriver {
     events_tx: mpsc::Sender<InputControlEvent>,
     commands_tx: mpsc::Sender<SessionCommand>,
     notices_tx: mpsc::Sender<ControlNotice>,
+    /// The session that owns the control relationship. Set on the first
+    /// establishment, cleared on its loss; every other session's control
+    /// and input traffic is dropped (FR-5.1, FR-2.3).
+    bound_session: Option<Uuid>,
 }
 
 /// Build a driver, returning the handles the application uses: the
@@ -113,6 +145,7 @@ pub fn input_control(
         events_tx: events_tx.clone(),
         commands_tx,
         notices_tx,
+        bound_session: None,
     };
     (driver, events_tx, commands_rx, notices_rx)
 }
@@ -176,14 +209,52 @@ impl InputControlDriver {
                     captured_run.push(pointer_event);
                     continue;
                 }
-                InputControlEvent::SessionEstablished => ControlEvent::SessionEstablished,
-                InputControlEvent::SessionLost => ControlEvent::SessionLost,
+                InputControlEvent::SessionEstablished { session } => match self.bound_session {
+                    None => {
+                        self.bound_session = Some(session);
+                        ControlEvent::SessionEstablished
+                    }
+                    // Duplicate establishment for the bound session; ignore.
+                    Some(bound) if bound == session => continue,
+                    // A second concurrent session while one already owns
+                    // control. Exactly one peer may drive this machine
+                    // (FR-5.1); the incumbent keeps it, and the newcomer's
+                    // control/input frames are dropped below.
+                    Some(_) => {
+                        tracing::warn!(
+                            new_session = %session,
+                            "a second session established while control is bound to another; \
+                             ignoring it for control (FR-5.1)"
+                        );
+                        continue;
+                    }
+                },
+                InputControlEvent::SessionLost { session } => {
+                    if self.bound_session == Some(session) {
+                        // The controlling relationship ends; the engine
+                        // releases from its own belief (FR-4.4), then the
+                        // binding is free for the next session.
+                        self.bound_session = None;
+                        ControlEvent::SessionLost
+                    } else {
+                        continue; // an unbound session; nothing to release
+                    }
+                }
                 InputControlEvent::RequestControl => ControlEvent::UserRequestControl,
                 InputControlEvent::ReleaseControl => ControlEvent::UserRelease,
                 InputControlEvent::RequestTimeout { request_id } => {
                     ControlEvent::RequestTimeout { request_id }
                 }
-                InputControlEvent::Frame(frame) => {
+                InputControlEvent::Frame { session, frame } => {
+                    if self.bound_session != Some(session) {
+                        // Authorization boundary (FR-2.3, FR-5.1): control
+                        // and input frames are honoured only from the
+                        // session that owns the relationship. A trusted-
+                        // but-unbound peer must not reach the engine, or it
+                        // could inject on a grant it does not hold. Dropped
+                        // here, never injected.
+                        continue;
+                    }
                     match InboundControl::decode(frame.message_type, &frame.payload) {
                         Ok(Some(message)) => ControlEvent::Peer(message),
                         Ok(None) => continue, // not control traffic
@@ -333,6 +404,7 @@ mod tests {
 
     use tokio::sync::mpsc;
     use tokio::time::timeout;
+    use uuid::Uuid;
 
     use crossover_platform::fakes::{FakeInputCapture, FakeInputInjector};
     use crossover_platform::{InputCapture, InputInjector};
@@ -346,6 +418,11 @@ mod tests {
     use crate::clipboard_driver::SessionCommand;
     use crate::control::{ControlConfig, ControlNotice};
     use crate::input::{PointerButton, PointerEvent};
+
+    /// The session the single-session tests bind control to.
+    const SESSION: Uuid = Uuid::from_bytes([0xA1; 16]);
+    /// A distinct concurrent session, for the cross-session guard tests.
+    const OTHER_SESSION: Uuid = Uuid::from_bytes([0xB2; 16]);
 
     struct Rig {
         capture: Arc<FakeInputCapture>,
@@ -390,17 +467,24 @@ mod tests {
     }
 
     fn frame(message_type: MessageType, payload: Vec<u8>) -> InputControlEvent {
-        InputControlEvent::Frame(RawFrame {
-            message_type: message_type.wire(),
-            message_id: 1,
-            payload,
-        })
+        frame_on(SESSION, message_type, payload)
+    }
+
+    fn frame_on(session: Uuid, message_type: MessageType, payload: Vec<u8>) -> InputControlEvent {
+        InputControlEvent::Frame {
+            session,
+            frame: RawFrame {
+                message_type: message_type.wire(),
+                message_id: 1,
+                payload,
+            },
+        }
     }
 
     /// Bring a rig to the controlling state: request, grant, capture on.
     async fn make_controlling(rig: &mut Rig) {
         rig.events
-            .send(InputControlEvent::SessionEstablished)
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
             .unwrap();
         rig.events
@@ -493,7 +577,7 @@ mod tests {
     async fn granted_peer_input_is_injected_and_released_on_disconnect() {
         let mut rig = rig();
         rig.events
-            .send(InputControlEvent::SessionEstablished)
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
             .unwrap();
 
@@ -531,7 +615,7 @@ mod tests {
             .await
             .unwrap();
         rig.events
-            .send(InputControlEvent::SessionLost)
+            .send(InputControlEvent::SessionLost { session: SESSION })
             .await
             .unwrap();
         assert_eq!(
@@ -562,7 +646,7 @@ mod tests {
     async fn malformed_control_payload_terminates_the_session() {
         let mut rig = rig();
         rig.events
-            .send(InputControlEvent::SessionEstablished)
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
             .unwrap();
         rig.events
@@ -604,7 +688,7 @@ mod tests {
     async fn failed_capture_start_releases_the_grant() {
         let mut rig = rig();
         rig.events
-            .send(InputControlEvent::SessionEstablished)
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
             .unwrap();
         rig.capture.fail_next_start("no hook for you");
@@ -650,7 +734,7 @@ mod tests {
     async fn request_timeout_reverts_and_notifies() {
         let mut rig = rig();
         rig.events
-            .send(InputControlEvent::SessionEstablished)
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
             .unwrap();
         rig.events
@@ -669,7 +753,7 @@ mod tests {
     async fn peer_release_after_hand_back_finds_nothing_held() {
         let mut rig = rig();
         rig.events
-            .send(InputControlEvent::SessionEstablished)
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
             .unwrap();
 
@@ -732,5 +816,162 @@ mod tests {
             })
             .count();
         assert_eq!(releases, 1, "exactly one release for one press");
+    }
+
+    /// The authorization fix (FR-2.3, FR-5.1): once control is bound to
+    /// one session, an input batch arriving on a *different* trusted
+    /// session must never be injected — even though the machine is being
+    /// legitimately controlled by the bound peer. This is the exact
+    /// scenario the security review flagged: a second trusted peer
+    /// riding another peer's grant.
+    #[tokio::test]
+    async fn input_from_an_unbound_session_is_never_injected() {
+        let mut rig = rig();
+        // SESSION establishes first and becomes the controller: it grants
+        // itself control of this machine, so the machine IS being driven.
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest { request_id: 1 }.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+
+        // A second trusted peer connects and, without any grant of its
+        // own, sends input carrying a button press.
+        rig.events
+            .send(InputControlEvent::SessionEstablished {
+                session: OTHER_SESSION,
+            })
+            .await
+            .unwrap();
+        let intruder = InputBatch {
+            sequence: 1,
+            events: vec![WireInputEvent::Button {
+                button: WireButton::Left,
+                pressed: true,
+            }],
+        };
+        rig.events
+            .send(frame_on(
+                OTHER_SESSION,
+                MessageType::InputBatch,
+                intruder.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        // The bound session then sends its own legitimate input; observing
+        // it proves the driver processed past the intruder's frame.
+        let legit = InputBatch {
+            sequence: 1,
+            events: vec![WireInputEvent::Button {
+                button: WireButton::Right,
+                pressed: true,
+            }],
+        };
+        rig.events
+            .send(frame(
+                MessageType::InputBatch,
+                legit.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        // Poll until the legitimate press is injected, then assert the
+        // intruder's press never was. FIFO through one driver loop means
+        // the intruder frame was handled first — and dropped.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let injected = rig.injector.injected();
+            if injected.contains(&PointerEvent::Button {
+                button: PointerButton::Right,
+                pressed: true,
+            }) {
+                assert!(
+                    !injected.contains(&PointerEvent::Button {
+                        button: PointerButton::Left,
+                        pressed: true,
+                    }),
+                    "input from an unbound session was injected — grant bypass"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the bound session's input never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A second session cannot negotiate its own control while another
+    /// session owns the relationship: its `ControlRequest` is dropped, so
+    /// no grant response is ever sent to it (FR-5.1).
+    #[tokio::test]
+    async fn an_unbound_session_cannot_take_control() {
+        let mut rig = rig();
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        // The bound peer takes control legitimately.
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest { request_id: 1 }.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected the grant to the bound session");
+        };
+        assert_eq!(message_type, MessageType::ControlResponse.wire());
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+
+        // A second peer establishes and requests control.
+        rig.events
+            .send(InputControlEvent::SessionEstablished {
+                session: OTHER_SESSION,
+            })
+            .await
+            .unwrap();
+        rig.events
+            .send(frame_on(
+                OTHER_SESSION,
+                MessageType::ControlRequest,
+                ControlRequest { request_id: 1 }.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        // Drive a round-trip on the bound session and observe its output;
+        // by the time it arrives, the intruder's request has been handled
+        // (and dropped) — no response was produced for it.
+        rig.events
+            .send(InputControlEvent::ReleaseControl)
+            .await
+            .unwrap();
+        // ReleaseControl on the controlled machine revokes: it injects any
+        // held releases (none here), sends a ControlRelease, and notifies.
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected the revoke release to the bound session");
+        };
+        assert_eq!(message_type, MessageType::ControlRelease.wire());
+        // The very next command would be a grant to OTHER_SESSION if its
+        // request had been honoured; instead it is the revoke notice path,
+        // and no further command is pending.
+        assert!(
+            timeout(Duration::from_millis(200), rig.commands.recv())
+                .await
+                .is_err(),
+            "an unbound session's control request was answered — it must be dropped"
+        );
     }
 }

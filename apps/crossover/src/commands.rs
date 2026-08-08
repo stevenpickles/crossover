@@ -325,6 +325,10 @@ pub async fn run(
 /// Session lifecycle and inbound frames fanned out to both the clipboard
 /// and input-control drivers. Each driver ignores what is not its
 /// traffic, so broadcasting is simpler and cheaper than routing by type.
+/// The session id travels with every event: clipboard sync is
+/// session-agnostic (FR-5.4), but the control driver binds to one
+/// session and drops the rest (FR-5.1), so it must know which session
+/// each frame arrived on.
 #[derive(Clone)]
 struct SessionFanout {
     sync: mpsc::Sender<SyncEvent>,
@@ -332,22 +336,28 @@ struct SessionFanout {
 }
 
 impl SessionFanout {
-    async fn established(&self) {
+    async fn established(&self, session: Uuid) {
         let _ = self.sync.send(SyncEvent::SessionEstablished).await;
         let _ = self
             .control
-            .send(InputControlEvent::SessionEstablished)
+            .send(InputControlEvent::SessionEstablished { session })
             .await;
     }
 
-    async fn lost(&self) {
+    async fn lost(&self, session: Uuid) {
         let _ = self.sync.send(SyncEvent::SessionLost).await;
-        let _ = self.control.send(InputControlEvent::SessionLost).await;
+        let _ = self
+            .control
+            .send(InputControlEvent::SessionLost { session })
+            .await;
     }
 
-    async fn frame(&self, frame: crossover_protocol::RawFrame) {
+    async fn frame(&self, session: Uuid, frame: crossover_protocol::RawFrame) {
         let _ = self.sync.send(SyncEvent::Frame(frame.clone())).await;
-        let _ = self.control.send(InputControlEvent::Frame(frame)).await;
+        let _ = self
+            .control
+            .send(InputControlEvent::Frame { session, frame })
+            .await;
     }
 }
 
@@ -562,17 +572,18 @@ async fn listener_loop(
                 let (events_tx, mut events_rx) = mpsc::channel(64);
                 let (outbound_tx, mut outbound_rx) = mpsc::channel::<(u16, Vec<u8>)>(64);
                 let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+                let session_id = info.session_id;
                 *session_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some((outbound_tx, shutdown_tx));
-                fanout.established().await;
+                fanout.established(session_id).await;
 
                 let frame_sink = fanout.clone();
                 let drain = tokio::spawn(async move {
                     while let Some(event) = events_rx.recv().await {
                         if let SessionEvent::Frame(frame) = event {
-                            frame_sink.frame(frame).await;
+                            frame_sink.frame(session_id, frame).await;
                         }
                     }
                 });
@@ -589,7 +600,7 @@ async fn listener_loop(
                 *session_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                fanout.lost().await;
+                fanout.lost(session_id).await;
                 println!(
                     "Session with \"{}\" ended: {reason}.",
                     info.peer_device_name
@@ -614,6 +625,10 @@ async fn outbound_event_loop(
     let Some(mut events) = events else {
         return std::future::pending().await;
     };
+    // The supervisor runs one session at a time, so every Frame between an
+    // Established and its Disconnected belongs to this id — which the
+    // control driver needs to scope the grant to the right session.
+    let mut current_session: Option<uuid::Uuid> = None;
     while let Some(event) = events.recv().await {
         match event {
             SessionEvent::Established(info) => {
@@ -622,10 +637,13 @@ async fn outbound_event_loop(
                     info.peer_device_name
                 );
                 touch_last_connected(&**storage, info.peer_fingerprint);
-                fanout.established().await;
+                current_session = Some(info.session_id);
+                fanout.established(info.session_id).await;
             }
             SessionEvent::Disconnected {
-                reason, retry_in, ..
+                session_id,
+                reason,
+                retry_in,
             } => {
                 match retry_in {
                     Some(delay) => println!(
@@ -634,7 +652,8 @@ async fn outbound_event_loop(
                     ),
                     None => println!("Outbound session ended ({reason})."),
                 }
-                fanout.lost().await;
+                current_session = None;
+                fanout.lost(session_id).await;
             }
             SessionEvent::ConnectFailed { error, retry_in } => {
                 println!(
@@ -643,7 +662,9 @@ async fn outbound_event_loop(
                 );
             }
             SessionEvent::Frame(frame) => {
-                fanout.frame(frame).await;
+                if let Some(session) = current_session {
+                    fanout.frame(session, frame).await;
+                }
             }
         }
         // A Disconnected event also voids sync state.
