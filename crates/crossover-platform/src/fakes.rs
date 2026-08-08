@@ -219,6 +219,9 @@ pub struct FakeInputCapture {
     /// to expose.
     silently_lost: Mutex<bool>,
     fail_next_start: Mutex<Option<String>>,
+    /// Simulates the user pressing the release escape gesture (both
+    /// Control keys on Windows); read-and-cleared by `escape_requested`.
+    escape: Mutex<bool>,
 }
 
 impl FakeInputCapture {
@@ -265,6 +268,12 @@ impl FakeInputCapture {
     pub fn fail_next_start(&self, reason: &str) {
         *lock(&self.fail_next_start) = Some(reason.to_owned());
     }
+
+    /// Simulate the user's release escape gesture; the next
+    /// `escape_requested` returns true (once).
+    pub fn request_escape(&self) {
+        *lock(&self.escape) = true;
+    }
 }
 
 impl InputCapture for FakeInputCapture {
@@ -287,6 +296,11 @@ impl InputCapture for FakeInputCapture {
 
     fn is_capturing(&self) -> bool {
         *lock(&self.capturing) && !*lock(&self.silently_lost)
+    }
+
+    fn escape_requested(&self) -> bool {
+        let mut escape = lock(&self.escape);
+        std::mem::replace(&mut escape, false)
     }
 }
 

@@ -251,6 +251,17 @@ pub trait InputCapture: Send + Sync {
     /// so a caller polling this can fail closed rather than believe it
     /// still holds input it stopped receiving.
     fn is_capturing(&self) -> bool;
+
+    /// Whether the user asked to release control via the platform escape
+    /// gesture since the last poll — both Control keys, on Windows
+    /// (ADR 0008). Read-and-clear: a caller polling this true releases
+    /// control. It exists because, once the keyboard is captured, every
+    /// ordinary key goes to the peer, so the usual console command cannot
+    /// reach the user; the escape is caught in the hook and never
+    /// forwarded. Platforms with no capture escape keep the default.
+    fn escape_requested(&self) -> bool {
+        false
+    }
 }
 
 /// Injects pointer and keyboard input on this machine.

@@ -314,3 +314,10 @@ Honest limitation: the hook-loss watchdog (R-2) cannot be staged
 manually without deliberately wedging the pump thread, so this probe
 does not exercise it; its decision logic is unit-tested, and the
 loss path is exercised only if Windows actually removes the hook.
+
+From Phase 4 on, the probe freezes the **keyboard** too — both hooks
+install together. You cannot Ctrl-C out during the ten seconds; it
+auto-releases. The report also counts key events. In a live session
+(not the probe), the way out while the keyboard is captured is the
+escape gesture: **press both Control keys at once**, which is caught in
+the hook, never sent to the peer, and hands control straight back.
