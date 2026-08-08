@@ -559,6 +559,7 @@ mod tests {
             },
             session: SessionOptions {
                 establish_timeout: Duration::from_secs(5),
+                metrics: None,
             },
         }
     }

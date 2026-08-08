@@ -21,6 +21,7 @@ use crossover_test_peer::{TestConnection, TestNode};
 fn options() -> SessionOptions {
     SessionOptions {
         establish_timeout: Duration::from_secs(5),
+        metrics: None,
     }
 }
 

@@ -13,6 +13,7 @@
 //! module owns exactly the lifecycle prefix
 //! `CONNECTING → AUTHENTICATING → NEGOTIATING → ESTABLISHED`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -21,10 +22,12 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use uuid::Uuid;
 
-use crossover_protocol::framing::MAX_FRAME_BODY_BYTES;
+use crossover_protocol::framing::{BODY_HEADER_BYTES, LENGTH_PREFIX_BYTES, MAX_FRAME_BODY_BYTES};
 use crossover_protocol::hello::{FeatureFlags, Hello, MessageType, OsFamily};
 use crossover_protocol::version::{MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionRange};
 use crossover_protocol::{FrameDecoder, ProtocolError, RawFrame, encode_frame, negotiate};
+
+use crate::metrics::Metrics;
 use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TlsError, TrustStore,
     certificate_spki_fingerprint, client_tls_config, server_tls_config,
@@ -49,12 +52,18 @@ pub struct SessionOptions {
     /// side, TLS + Hello on both): a peer that connects and stalls must
     /// not hold resources forever (NFR-1).
     pub establish_timeout: Duration,
+    /// Optional shared metrics registry. When present, every session
+    /// built with these options counts its frames and bytes into it
+    /// (FR-7.3); when `None`, sessions are uninstrumented, which is what
+    /// most tests want.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             establish_timeout: Duration::from_secs(10),
+            metrics: None,
         }
     }
 }
@@ -124,6 +133,15 @@ pub struct EstablishedSession {
     decoder: FrameDecoder,
     next_message_id: u64,
     info: SessionInfo,
+    metrics: Option<Arc<Metrics>>,
+}
+
+/// On-wire byte length of a frame carrying `payload_len` payload bytes:
+/// the length prefix and body header plus the payload (docs/PROTOCOL.md
+/// §2). Used to count received frames, where the encoded frame is not in
+/// hand the way it is on send.
+fn wire_len(payload_len: usize) -> usize {
+    LENGTH_PREFIX_BYTES + BODY_HEADER_BYTES + payload_len
 }
 
 impl EstablishedSession {
@@ -145,6 +163,9 @@ impl EstablishedSession {
         self.stream.write_all(&frame).await?;
         self.stream.flush().await?;
         self.next_message_id += 1;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_sent(message_type, frame.len());
+        }
         Ok(message_id)
     }
 
@@ -156,7 +177,11 @@ impl EstablishedSession {
     /// framing violations (fail closed — callers terminate the session);
     /// [`SessionError::Io`] on transport failure.
     pub async fn recv(&mut self) -> Result<RawFrame, SessionError> {
-        read_frame(&mut self.stream, &mut self.decoder).await
+        let frame = read_frame(&mut self.stream, &mut self.decoder).await?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_received(frame.message_type, wire_len(frame.payload.len()));
+        }
+        Ok(frame)
     }
 
     /// Gracefully close the session.
@@ -181,11 +206,13 @@ impl EstablishedSession {
                 read,
                 decoder: self.decoder,
                 info: self.info.clone(),
+                metrics: self.metrics.clone(),
             },
             SessionWriter {
                 write,
                 next_message_id: self.next_message_id,
                 info: self.info,
+                metrics: self.metrics,
             },
         )
     }
@@ -196,6 +223,7 @@ pub struct SessionReader {
     read: tokio::io::ReadHalf<TlsStream<TcpStream>>,
     decoder: FrameDecoder,
     info: SessionInfo,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl SessionReader {
@@ -211,7 +239,11 @@ impl SessionReader {
     ///
     /// As [`EstablishedSession::recv`].
     pub async fn recv(&mut self) -> Result<RawFrame, SessionError> {
-        read_frame(&mut self.read, &mut self.decoder).await
+        let frame = read_frame(&mut self.read, &mut self.decoder).await?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_received(frame.message_type, wire_len(frame.payload.len()));
+        }
+        Ok(frame)
     }
 }
 
@@ -220,6 +252,7 @@ pub struct SessionWriter {
     write: tokio::io::WriteHalf<TlsStream<TcpStream>>,
     next_message_id: u64,
     info: SessionInfo,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl SessionWriter {
@@ -240,6 +273,9 @@ impl SessionWriter {
         self.write.write_all(&frame).await?;
         self.write.flush().await?;
         self.next_message_id += 1;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_sent(message_type, frame.len());
+        }
         Ok(message_id)
     }
 
@@ -307,7 +343,14 @@ impl SessionListener {
             })?;
             let peer_fingerprint =
                 peer_fingerprint_from_certs(tls.get_ref().1.peer_certificates())?;
-            establish(TlsStream::Server(tls), peer_fingerprint, local, session_id).await
+            establish(
+                TlsStream::Server(tls),
+                peer_fingerprint,
+                local,
+                session_id,
+                options.metrics.clone(),
+            )
+            .await
         })
         .await
         .map_err(|_| SessionError::Timeout)?;
@@ -347,7 +390,14 @@ pub async fn connect(
                 reason: e.to_string(),
             })?;
         let peer_fingerprint = peer_fingerprint_from_certs(tls.get_ref().1.peer_certificates())?;
-        establish(TlsStream::Client(tls), peer_fingerprint, local, session_id).await
+        establish(
+            TlsStream::Client(tls),
+            peer_fingerprint,
+            local,
+            session_id,
+            options.metrics.clone(),
+        )
+        .await
     })
     .await
     .map_err(|_| SessionError::Timeout)?;
@@ -373,6 +423,7 @@ async fn establish(
     peer_fingerprint: SpkiFingerprint,
     local: &LocalNode<'_>,
     session_id: Uuid,
+    metrics: Option<Arc<Metrics>>,
 ) -> Result<EstablishedSession, SessionError> {
     // Send our Hello (message id 1).
     let hello = Hello {
@@ -387,11 +438,19 @@ async fn establish(
     let frame = encode_frame(MessageType::Hello.wire(), 1, &payload)?;
     stream.write_all(&frame).await?;
     stream.flush().await?;
+    // The Hello exchange is real network traffic (Setup class); count it,
+    // even though it predates the session the counters usually hang off.
+    if let Some(metrics) = &metrics {
+        metrics.record_sent(MessageType::Hello.wire(), frame.len());
+    }
 
     // The peer's first frame must be a Hello — anything else is a
     // protocol violation, fatal before the session exists.
     let mut decoder = FrameDecoder::new();
     let first = read_frame(&mut stream, &mut decoder).await?;
+    if let Some(metrics) = &metrics {
+        metrics.record_received(first.message_type, wire_len(first.payload.len()));
+    }
     if MessageType::from_wire(first.message_type) != Some(MessageType::Hello) {
         return Err(ProtocolError::Malformed {
             reason: format!(
@@ -424,6 +483,7 @@ async fn establish(
             peer_os: peer_hello.operating_system,
             protocol_version,
         },
+        metrics,
     })
 }
 
@@ -540,6 +600,7 @@ mod tests {
     fn options() -> SessionOptions {
         SessionOptions {
             establish_timeout: Duration::from_secs(5),
+            metrics: None,
         }
     }
 
@@ -593,6 +654,55 @@ mod tests {
             server_session.recv().await,
             Err(SessionError::PeerClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn frames_and_bytes_are_counted_into_the_metrics_registry() {
+        use std::sync::Arc;
+
+        use crate::metrics::Metrics;
+
+        let mut a = Node::new("machine-a");
+        let mut b = Node::new("machine-b");
+        a.trust_peer(&b);
+        b.trust_peer(&a);
+
+        let metrics = Arc::new(Metrics::new());
+        let opts = SessionOptions {
+            establish_timeout: Duration::from_secs(5),
+            metrics: Some(Arc::clone(&metrics)),
+        };
+
+        let listener = SessionListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (a_local, b_local) = (a.local(), b.local());
+        let (inbound, outbound) = tokio::join!(
+            listener.accept(&b_local, &opts),
+            connect(addr, &a_local, &opts),
+        );
+        let mut server = inbound.unwrap();
+        let mut client = outbound.unwrap();
+
+        // Both sessions share the one registry: the Hello exchange alone
+        // is one Hello sent and one received per side.
+        let after_hello = metrics.snapshot();
+        assert_eq!(after_hello.frames_sent, 2, "two Hellos sent");
+        assert_eq!(after_hello.frames_received, 2, "two Hellos received");
+        assert!(after_hello.bytes_sent > 0);
+
+        // One application frame each way is counted with framing overhead.
+        client.send(0x0042, b"ping").await.unwrap();
+        let received = server.recv().await.unwrap();
+        server.send(0x0043, b"pong").await.unwrap();
+        let _ = client.recv().await.unwrap();
+
+        assert_eq!(received.payload, b"ping");
+        let report = metrics.snapshot();
+        assert_eq!(report.frames_sent, 4); // 2 Hello + 2 application
+        assert_eq!(report.frames_received, 4);
+        // Counted bytes include the framing overhead (length prefix + body
+        // header), so they exceed the bare payloads on every frame.
+        assert!(report.bytes_received > report.frames_received * 4);
     }
 
     #[tokio::test]
@@ -658,6 +768,7 @@ mod tests {
 
         let short = SessionOptions {
             establish_timeout: Duration::from_millis(200),
+            metrics: None,
         };
         let server_local = server.local();
         let (inbound, ()) = tokio::join!(listener.accept(&server_local, &short), async {
