@@ -237,7 +237,7 @@ pub async fn run(
     // either role feed it and carry its frames.
     let provider = open_clipboard_provider()?;
     let (sync_driver, sync_events, sync_commands) =
-        clipboard_sync(provider, identity.device_id(), ClipboardConfig::new())
+        clipboard_sync(provider, identity.device_id(), ClipboardConfig::new(), None)
             .context("starting clipboard sync")?;
     tokio::spawn(sync_driver.run());
 

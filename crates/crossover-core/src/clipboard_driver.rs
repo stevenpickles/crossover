@@ -24,6 +24,7 @@ use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
 use crossover_protocol::hello::MessageType;
 
 use crate::clipboard::{Action, ClipboardConfig, ClipboardEngine, InboundMessage};
+use crate::metrics::Metrics;
 
 /// How long after a `Busy` *read* before re-checking the clipboard. Reads
 /// have no transaction to retry inside the engine; the driver simply
@@ -114,6 +115,11 @@ pub struct ClipboardSyncDriver {
     /// when they fire, which is how the debounce restarts cleanly
     /// without cancelling tasks.
     settle_generation: u64,
+    /// Optional metrics sink for the physical I/O outcomes only the driver
+    /// sees — `Busy` contention and write retries. The semantic outcomes
+    /// (sent, applied, superseded, latency) are recorded inside the engine
+    /// itself, which owns those decisions.
+    metrics: Option<Arc<Metrics>>,
 }
 
 /// Build a driver for `provider`, returning the handles the app uses:
@@ -128,6 +134,7 @@ pub fn clipboard_sync(
     provider: Arc<dyn ClipboardProvider>,
     origin: Uuid,
     config: ClipboardConfig,
+    metrics: Option<Arc<Metrics>>,
 ) -> Result<
     (
         ClipboardSyncDriver,
@@ -148,18 +155,26 @@ pub fn clipboard_sync(
     })))?;
 
     let driver = ClipboardSyncDriver {
-        engine: ClipboardEngine::new(origin, config),
+        engine: ClipboardEngine::with_metrics(origin, config, metrics.clone()),
         provider,
         events_rx,
         events_tx: events_tx.clone(),
         commands_tx,
         busy_reads: 0,
         settle_generation: 0,
+        metrics,
     };
     Ok((driver, events_tx, commands_rx))
 }
 
 impl ClipboardSyncDriver {
+    /// Record into the metrics sink if one is attached; a no-op otherwise.
+    fn record(&self, f: impl FnOnce(&Metrics)) {
+        if let Some(metrics) = &self.metrics {
+            f(metrics);
+        }
+    }
+
     /// Run until every event sender is dropped. Spawn this.
     pub async fn run(mut self) {
         while let Some(event) = self.events_rx.recv().await {
@@ -277,6 +292,7 @@ impl ClipboardSyncDriver {
                         .await;
                 }
                 superseded += 1;
+                self.record(Metrics::record_clipboard_superseded);
             }
         }
         if superseded > 0 {
@@ -301,6 +317,7 @@ impl ClipboardSyncDriver {
                     }
                     Err(ClipboardError::Busy { reason }) => {
                         self.busy_reads += 1;
+                        self.record(Metrics::record_clipboard_contention);
                         if self.busy_reads > MAX_CONSECUTIVE_BUSY_READS {
                             // Stop nudging: the change listener will wake
                             // us for anything that actually changes, and
@@ -333,6 +350,7 @@ impl ClipboardSyncDriver {
                         Ok(()) => Ok(()),
                         Err(ClipboardError::Busy { reason }) => {
                             tracing::debug!(clipboard_id = %id, error = %reason, "write busy");
+                            self.record(Metrics::record_clipboard_contention);
                             Err(true)
                         }
                         Err(error) => {
@@ -364,6 +382,7 @@ impl ClipboardSyncDriver {
                     }
                 },
                 Action::ScheduleRetry { id, delay } => {
+                    self.record(Metrics::record_clipboard_retry);
                     let notify = self.events_tx.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
@@ -406,11 +425,13 @@ mod tests {
 
     use super::{SessionCommand, SyncEvent, clipboard_sync};
     use crate::clipboard::{ClipboardConfig, RetryPolicy};
+    use crate::metrics::Metrics;
 
     struct Rig {
         clipboard: Arc<InMemoryClipboard>,
         events: mpsc::Sender<SyncEvent>,
         commands: mpsc::Receiver<SessionCommand>,
+        metrics: Arc<Metrics>,
     }
 
     fn rig() -> Rig {
@@ -423,10 +444,12 @@ mod tests {
             // Tests drive the trigger's *behaviour*, not the wait.
             transmit_debounce: Duration::from_millis(5),
         };
+        let metrics = Arc::new(Metrics::new());
         let (driver, events, commands) = clipboard_sync(
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
             Uuid::from_bytes([0xAA; 16]),
             config,
+            Some(Arc::clone(&metrics)),
         )
         .unwrap();
         tokio::spawn(driver.run());
@@ -434,6 +457,7 @@ mod tests {
             clipboard,
             events,
             commands,
+            metrics,
         }
     }
 
@@ -540,6 +564,13 @@ mod tests {
         let applied = ClipboardApplied::decode_payload(&payload).unwrap();
         assert_eq!(applied.result, ApplyResult::Applied);
         assert_eq!(rig.clipboard.peek().as_deref(), Some("contended"));
+
+        // Two Busy writes were two contention events and two retries; the
+        // third write applied the item once.
+        let report = rig.metrics.snapshot();
+        assert_eq!(report.clipboard_contention, 2);
+        assert_eq!(report.clipboard_retries, 2);
+        assert_eq!(report.clipboard_applied, 1);
     }
 
     #[tokio::test]
