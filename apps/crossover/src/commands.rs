@@ -17,8 +17,8 @@ use crossover_core::supervision::{
     KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
 };
 use crossover_core::{
-    ClipboardConfig, LocalNode, SessionListener, SessionOptions, SessionCommand, SyncEvent,
-    clipboard_sync,
+    ClipboardConfig, ControlConfig, ControlNotice, InputControlEvent, LocalNode, SessionCommand,
+    SessionListener, SessionOptions, SyncEvent, clipboard_sync, input_control,
 };
 use crossover_platform::SecureStorage;
 use crossover_protocol::DEFAULT_PORT;
@@ -27,7 +27,8 @@ use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TrustStore, TrustedPeer,
 };
 
-use crate::storage::{open_clipboard_provider, open_secure_storage};
+use crate::console::{self, ConsoleCommand};
+use crate::storage::{open_clipboard_provider, open_input, open_secure_storage};
 
 /// One ceremony's allowance, listener and connector alike. Generous
 /// enough to read a code off one screen and type it on another; bounded
@@ -198,10 +199,11 @@ pub fn status(device_name: &str) -> anyhow::Result<()> {
 
 /// `crossover run [--listen [--bind <addr>]] [--connect <addr>]`
 ///
-/// Foreground session maintenance (docs/ROADMAP.md Phase 1): accept
-/// trusted peers, keep an outbound session alive with reconnect, log
-/// every establishment and loss, and stop on Ctrl-C. Clipboard and input
-/// engines attach to these sessions in later phases.
+/// Foreground session maintenance: accept trusted peers, keep an
+/// outbound session alive with reconnect, and run the clipboard and
+/// input-control engines over whichever session is live. Console
+/// commands (`c` take control, `r` release) drive explicit control
+/// transfer (Phase 3, FR-5.1); Ctrl-C or `q` stops.
 pub async fn run(
     device_name: &str,
     listen_bind: Option<String>,
@@ -239,9 +241,28 @@ pub async fn run(
             .context("starting clipboard sync")?;
     tokio::spawn(sync_driver.run());
 
+    // Input control: capture/inject behind the platform traits, driving
+    // the control-transfer engine. Capture installs no hook until the
+    // first grant.
+    let (capture, injector) = open_input()?;
+    let (control_driver, control_events, control_commands, control_notices) =
+        input_control(capture, injector, ControlConfig::default());
+    tokio::spawn(control_driver.run());
+    tokio::spawn(print_control_notices(control_notices));
+
+    // Session lifecycle and frames fan out to both drivers.
+    let fanout = SessionFanout {
+        sync: sync_events,
+        control: control_events.clone(),
+    };
+
     // The mux's view of the current inbound session: its outbound sender
-    // and its kill switch (for the driver's fail-closed verdicts).
+    // and its kill switch (for the drivers' fail-closed verdicts).
     let listener_slot: SessionSlotRef = Arc::new(std::sync::Mutex::new(None));
+
+    // Both drivers emit the same SessionCommands; merge them into one
+    // stream for the mux.
+    let commands = merge_command_streams(sync_commands, control_commands);
 
     // Outbound role: supervised session with automatic reconnect.
     let (handle, events) = match &connect {
@@ -259,7 +280,7 @@ pub async fn run(
         None => (None, None),
     };
 
-    spawn_command_mux(handle.clone(), Arc::clone(&listener_slot), sync_commands);
+    spawn_command_mux(handle.clone(), Arc::clone(&listener_slot), commands);
 
     // Inbound role: accept loop, one session at a time (two-machine scope).
     let listener = match &listen_bind {
@@ -273,26 +294,179 @@ pub async fn run(
         None => None,
     };
 
+    println!();
+    println!("{}", console::HELP);
     println!("Press Ctrl-C to stop.");
     tokio::select! {
         result = tokio::signal::ctrl_c() => {
             result.context("waiting for Ctrl-C")?;
             println!("Shutting down.");
-            if let Some(handle) = &handle {
-                handle.shutdown();
-            }
+        }
+        () = console_loop(&control_events) => {
+            // The user typed a quit command (or stdin closed with one).
+            println!("Shutting down.");
         }
         () = listener_loop(
             listener.as_ref(),
             &identity,
             &certified,
             &storage,
-            &sync_events,
+            &fanout,
             &listener_slot,
         ) => {}
-        () = outbound_event_loop(events, &storage, &sync_events) => {}
+        () = outbound_event_loop(events, &storage, &fanout) => {}
+    }
+    if let Some(handle) = &handle {
+        handle.shutdown();
     }
     Ok(())
+}
+
+/// Session lifecycle and inbound frames fanned out to both the clipboard
+/// and input-control drivers. Each driver ignores what is not its
+/// traffic, so broadcasting is simpler and cheaper than routing by type.
+#[derive(Clone)]
+struct SessionFanout {
+    sync: mpsc::Sender<SyncEvent>,
+    control: mpsc::Sender<InputControlEvent>,
+}
+
+impl SessionFanout {
+    async fn established(&self) {
+        let _ = self.sync.send(SyncEvent::SessionEstablished).await;
+        let _ = self
+            .control
+            .send(InputControlEvent::SessionEstablished)
+            .await;
+    }
+
+    async fn lost(&self) {
+        let _ = self.sync.send(SyncEvent::SessionLost).await;
+        let _ = self.control.send(InputControlEvent::SessionLost).await;
+    }
+
+    async fn frame(&self, frame: crossover_protocol::RawFrame) {
+        let _ = self.sync.send(SyncEvent::Frame(frame.clone())).await;
+        let _ = self.control.send(InputControlEvent::Frame(frame)).await;
+    }
+}
+
+/// Forward two `SessionCommand` streams into one, so the mux has a single
+/// receiver. The forwarders end when their drivers drop the senders.
+fn merge_command_streams(
+    mut a: mpsc::Receiver<SessionCommand>,
+    mut b: mpsc::Receiver<SessionCommand>,
+) -> mpsc::Receiver<SessionCommand> {
+    let (merged_tx, merged_rx) = mpsc::channel(64);
+    let tx_a = merged_tx.clone();
+    tokio::spawn(async move {
+        while let Some(command) = a.recv().await {
+            if tx_a.send(command).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(command) = b.recv().await {
+            if merged_tx.send(command).await.is_err() {
+                break;
+            }
+        }
+    });
+    merged_rx
+}
+
+/// Print control-transfer state changes as they happen. Every failed or
+/// ended transfer is user-visible here (NFR-3); detail is in the logs.
+async fn print_control_notices(mut notices: mpsc::Receiver<ControlNotice>) {
+    while let Some(notice) = notices.recv().await {
+        println!("{}", describe_notice(notice));
+    }
+}
+
+/// One-line human phrasing for a control notice.
+fn describe_notice(notice: ControlNotice) -> String {
+    use crossover_core::control::{ControlEndReason, RequestBlocked};
+
+    match notice {
+        ControlNotice::RequestSent => "Requesting control of the peer…".to_owned(),
+        ControlNotice::RequestBlocked(RequestBlocked::NoSession) => {
+            "Cannot take control: no session with the peer yet.".to_owned()
+        }
+        ControlNotice::RequestBlocked(RequestBlocked::PeerHoldsControl) => {
+            "Cannot take control: the peer is controlling this machine (release first).".to_owned()
+        }
+        ControlNotice::RequestBlocked(RequestBlocked::AlreadyControlling) => {
+            "Already controlling the peer.".to_owned()
+        }
+        ControlNotice::RequestBlocked(RequestBlocked::RequestPending) => {
+            "A control request is already pending.".to_owned()
+        }
+        ControlNotice::RequestDenied(reason) => {
+            format!("The peer denied control ({reason:?}).")
+        }
+        ControlNotice::RequestTimedOut => "Control request timed out; still local.".to_owned(),
+        ControlNotice::ControlGained => {
+            "You now control the peer. Move the mouse; press 'r' to hand back.".to_owned()
+        }
+        ControlNotice::ControlEnded(ControlEndReason::HandedBack) => {
+            "Control handed back to the peer.".to_owned()
+        }
+        ControlNotice::ControlEnded(ControlEndReason::Cancelled) => {
+            "Control request cancelled.".to_owned()
+        }
+        ControlNotice::ControlEnded(ControlEndReason::Revoked) => {
+            "The peer revoked your control.".to_owned()
+        }
+        ControlNotice::ControlEnded(ControlEndReason::Disconnected) => {
+            "Control ended: session lost.".to_owned()
+        }
+        ControlNotice::ControlEnded(ControlEndReason::CaptureLost) => {
+            "Control ended: local input capture was lost (failing closed).".to_owned()
+        }
+        ControlNotice::PeerTookControl => {
+            "The peer is now controlling this machine. Press 'r' to revoke.".to_owned()
+        }
+        ControlNotice::PeerReleasedControl => "The peer released control.".to_owned(),
+        ControlNotice::PeerControlRevoked => {
+            "Revoked the peer's control of this machine.".to_owned()
+        }
+        ControlNotice::PeerControlLostOnDisconnect => {
+            "The peer's control ended with the session; input released.".to_owned()
+        }
+    }
+}
+
+/// Read console commands until the user quits. On EOF (no interactive
+/// terminal — e.g. `crossover run > log`) it pends forever, so the
+/// non-interactive soak usage still relies on Ctrl-C rather than exiting
+/// the moment stdin closes.
+async fn console_loop(control: &mpsc::Sender<InputControlEvent>) {
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => match console::parse(&line) {
+                Some(ConsoleCommand::TakeControl) => {
+                    let _ = control.send(InputControlEvent::RequestControl).await;
+                }
+                Some(ConsoleCommand::Release) => {
+                    let _ = control.send(InputControlEvent::ReleaseControl).await;
+                }
+                Some(ConsoleCommand::Help) => println!("{}", console::HELP),
+                Some(ConsoleCommand::Quit) => return,
+                None => {
+                    if !line.trim().is_empty() {
+                        println!("{}", console::HELP);
+                    }
+                }
+            },
+            // EOF or a read error: stop reading, but do not trigger
+            // shutdown — leave that to Ctrl-C so piped runs are unaffected.
+            Ok(None) | Err(_) => std::future::pending().await,
+        }
+    }
 }
 
 /// Accept trusted peers forever; each session runs the shared session
@@ -331,7 +505,7 @@ fn spawn_command_mux(
                 SessionCommand::TerminateSession { reason } => {
                     tracing::error!(
                         error = %reason,
-                        "clipboard payload violation; terminating inbound session"
+                        "peer payload violation; terminating inbound session"
                     );
                     let maybe_kill = listener_slot
                         .lock()
@@ -352,7 +526,7 @@ async fn listener_loop(
     identity: &DeviceIdentity,
     certified: &CertifiedIdentity,
     storage: &Arc<dyn SecureStorage>,
-    sync_events: &mpsc::Sender<SyncEvent>,
+    fanout: &SessionFanout,
     session_slot: &SessionSlotRef,
 ) {
     let Some(listener) = listener else {
@@ -392,13 +566,13 @@ async fn listener_loop(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some((outbound_tx, shutdown_tx));
-                let _ = sync_events.send(SyncEvent::SessionEstablished).await;
+                fanout.established().await;
 
-                let frame_sink = sync_events.clone();
+                let frame_sink = fanout.clone();
                 let drain = tokio::spawn(async move {
                     while let Some(event) = events_rx.recv().await {
                         if let SessionEvent::Frame(frame) = event {
-                            let _ = frame_sink.send(SyncEvent::Frame(frame)).await;
+                            frame_sink.frame(frame).await;
                         }
                     }
                 });
@@ -415,7 +589,7 @@ async fn listener_loop(
                 *session_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                let _ = sync_events.send(SyncEvent::SessionLost).await;
+                fanout.lost().await;
                 println!(
                     "Session with \"{}\" ended: {reason}.",
                     info.peer_device_name
@@ -435,7 +609,7 @@ async fn listener_loop(
 async fn outbound_event_loop(
     events: Option<mpsc::Receiver<SessionEvent>>,
     storage: &Arc<dyn SecureStorage>,
-    sync_events: &mpsc::Sender<SyncEvent>,
+    fanout: &SessionFanout,
 ) {
     let Some(mut events) = events else {
         return std::future::pending().await;
@@ -448,7 +622,7 @@ async fn outbound_event_loop(
                     info.peer_device_name
                 );
                 touch_last_connected(&**storage, info.peer_fingerprint);
-                let _ = sync_events.send(SyncEvent::SessionEstablished).await;
+                fanout.established().await;
             }
             SessionEvent::Disconnected {
                 reason, retry_in, ..
@@ -460,7 +634,7 @@ async fn outbound_event_loop(
                     ),
                     None => println!("Outbound session ended ({reason})."),
                 }
-                let _ = sync_events.send(SyncEvent::SessionLost).await;
+                fanout.lost().await;
             }
             SessionEvent::ConnectFailed { error, retry_in } => {
                 println!(
@@ -469,7 +643,7 @@ async fn outbound_event_loop(
                 );
             }
             SessionEvent::Frame(frame) => {
-                let _ = sync_events.send(SyncEvent::Frame(frame)).await;
+                fanout.frame(frame).await;
             }
         }
         // A Disconnected event also voids sync state.
