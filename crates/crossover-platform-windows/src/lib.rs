@@ -16,6 +16,8 @@ pub mod clipboard;
 #[cfg(windows)]
 pub mod input;
 #[cfg(windows)]
+pub mod keymap;
+#[cfg(windows)]
 pub mod secure_storage;
 
 #[cfg(windows)]
