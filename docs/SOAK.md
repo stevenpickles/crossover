@@ -194,6 +194,25 @@ what interference was staged.
 
 ---
 
+## Troubleshooting: every clipboard operation fails with "Access is denied"
+
+Seen twice on a development machine (2026-08-07): `OpenClipboard` returns
+error 5 for **every** process — the platform tests fail in a block, and
+even PowerShell's `Set-Clipboard` fails — while `GetOpenClipboardWindow`
+reports no holder (a process that opened the clipboard with a NULL window
+handle is invisible to it). Thirteen consecutive test-suite runs could
+not reproduce it, so it is environmental, not a Crossover defect: the
+signature of a wedged per-session Clipboard User Service. The fix, from
+an elevated prompt:
+
+```
+Restart-Service cbdhsvc*
+```
+
+If clipboard tests fail this way, check `Set-Clipboard` in PowerShell
+first — if that also fails, the machine is wedged and the test results
+mean nothing until the service is restarted.
+
 ## Phase 3 probe: input capture (single machine)
 
 Suppression cannot be proven by CI: the automated tests cover tag
