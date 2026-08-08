@@ -28,6 +28,7 @@ pub use control_driver::{InputControlDriver, InputControlEvent, input_control};
 pub use input::{
     InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce, coalesce_input, hid,
 };
+pub use metrics::{FrameClass, Metrics, Report};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
     connect,
