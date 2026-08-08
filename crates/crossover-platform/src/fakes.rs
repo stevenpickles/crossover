@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use crate::clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
-use crate::input::{InputCapture, InputError, InputEvent, InputInjector, InputSink, PointerEvent};
+use crate::input::{
+    InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerEvent,
+};
 use crate::secure_storage::{SecureStorage, SecureStorageError};
 
 /// In-memory [`SecureStorage`] with scriptable fault injection.
@@ -226,11 +228,20 @@ impl FakeInputCapture {
         Self::default()
     }
 
-    /// Deliver an event as though the user had produced it.
+    /// Deliver a pointer event as though the user had produced it.
     ///
     /// Events raised while not capturing are dropped, exactly as the
     /// real implementation would never see them.
     pub fn raise(&self, event: PointerEvent) {
+        self.deliver(InputEvent::Pointer(event));
+    }
+
+    /// Deliver a keyboard event as though the user had produced it.
+    pub fn raise_key(&self, event: KeyEvent) {
+        self.deliver(InputEvent::Key(event));
+    }
+
+    fn deliver(&self, event: InputEvent) {
         if !*lock(&self.capturing) || *lock(&self.silently_lost) {
             return;
         }
@@ -350,7 +361,7 @@ mod input_tests {
         hid,
     };
 
-    fn collecting_sink() -> (Arc<StdMutex<Vec<PointerEvent>>>, crate::input::InputSink) {
+    fn collecting_sink() -> (Arc<StdMutex<Vec<InputEvent>>>, crate::input::InputSink) {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let sink_seen = Arc::clone(&seen);
         (
@@ -386,6 +397,33 @@ mod input_tests {
         assert!(!capture.is_capturing());
         capture.raise(PointerEvent::Motion { dx: 9, dy: 9 });
         assert_eq!(seen.lock().unwrap().len(), 2, "delivered after stopping");
+    }
+
+    #[test]
+    fn pointer_and_key_events_share_the_sink_stream() {
+        let capture = FakeInputCapture::new();
+        let (seen, sink) = collecting_sink();
+        capture.start_capture(sink).unwrap();
+
+        capture.raise(PointerEvent::Motion { dx: 1, dy: 0 });
+        capture.raise_key(KeyEvent::press(hid::LEFT_SHIFT));
+        capture.raise(PointerEvent::Button {
+            button: PointerButton::Left,
+            pressed: true,
+        });
+
+        // Both kinds arrive, interleaved, in the one ordered stream.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                InputEvent::Pointer(PointerEvent::Motion { dx: 1, dy: 0 }),
+                InputEvent::Key(KeyEvent::press(hid::LEFT_SHIFT)),
+                InputEvent::Pointer(PointerEvent::Button {
+                    button: PointerButton::Left,
+                    pressed: true,
+                }),
+            ]
+        );
     }
 
     /// The R-2 scenario: Windows removes an overrunning hook silently.

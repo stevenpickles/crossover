@@ -208,11 +208,11 @@ pub enum InputError {
     InjectionFailed { reason: String },
 }
 
-/// Receives captured events. Invoked on the platform's input thread, so
-/// it must return promptly and never block — on Windows it descends from
-/// a low-level hook callback whose overrun causes Windows to silently
-/// remove the hook (R-2).
-pub type InputSink = Box<dyn Fn(PointerEvent) + Send + Sync>;
+/// Receives captured events, pointer and keyboard in one stream. Invoked
+/// on the platform's input thread, so it must return promptly and never
+/// block — on Windows it descends from a low-level hook callback whose
+/// overrun causes Windows to silently remove the hook (R-2).
+pub type InputSink = Box<dyn Fn(InputEvent) + Send + Sync>;
 
 /// Captures local pointer input and suppresses its local effect.
 ///

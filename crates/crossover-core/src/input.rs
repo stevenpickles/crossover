@@ -188,6 +188,35 @@ pub fn coalesce(events: &[PointerEvent]) -> Vec<PointerEvent> {
     out
 }
 
+/// Coalesce a mixed pointer/keyboard stream (ADR 0008): adjacent pointer
+/// motion and scroll merge exactly as in [`coalesce`], while every key
+/// transition is a barrier — keys are ordered and lossless (FR-4.2), and
+/// merging motion across one would move a keystroke the way merging
+/// across a button would move a click.
+#[must_use]
+pub fn coalesce_input(events: &[InputEvent]) -> Vec<InputEvent> {
+    let mut out: Vec<InputEvent> = Vec::with_capacity(events.len());
+    for event in events {
+        let merged = match (out.last_mut(), event) {
+            (Some(InputEvent::Pointer(last)), InputEvent::Pointer(next)) => merge_into(last, *next),
+            _ => false,
+        };
+        if !merged {
+            out.push(event.clone());
+        }
+    }
+    // A pointer run that cancels out carries nothing on the wire.
+    out.retain(|event| {
+        !matches!(
+            event,
+            InputEvent::Pointer(
+                PointerEvent::Motion { dx: 0, dy: 0 } | PointerEvent::Scroll { dx: 0, dy: 0 }
+            )
+        )
+    });
+    out
+}
+
 /// Accumulate `next` into `target` when both are the same coalescable
 /// kind; `false` means they must stay separate events.
 fn merge_into(target: &mut PointerEvent, next: PointerEvent) -> bool {

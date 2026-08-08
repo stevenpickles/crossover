@@ -49,7 +49,7 @@ use crate::clipboard_driver::{FrameTarget, SessionCommand};
 use crate::control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
 };
-use crate::input::PointerEvent;
+use crate::input::InputEvent;
 
 /// How often capture health is checked while controlling. One period
 /// bounds how long a silently lost capture can go unnoticed here after
@@ -94,8 +94,8 @@ pub enum InputControlEvent {
     RequestControl,
     /// The user asked to end whichever control relationship exists.
     ReleaseControl,
-    /// One captured pointer event (platform sink bridge).
-    Captured(PointerEvent),
+    /// One captured input event, pointer or key (platform sink bridge).
+    Captured(InputEvent),
     /// A scheduled request timeout came due.
     RequestTimeout {
         /// The session the request went to.
@@ -195,7 +195,7 @@ impl InputControlDriver {
             }
         }
 
-        let mut captured_run: Vec<PointerEvent> = Vec::new();
+        let mut captured_run: Vec<InputEvent> = Vec::new();
         for event in batch {
             // A non-capture event is a barrier: the run before it must
             // reach the engine first so ordering is preserved.
@@ -208,8 +208,8 @@ impl InputControlDriver {
                 }
             }
             let engine_event = match event {
-                InputControlEvent::Captured(pointer_event) => {
-                    captured_run.push(pointer_event);
+                InputControlEvent::Captured(input_event) => {
+                    captured_run.push(input_event);
                     continue;
                 }
                 InputControlEvent::SessionEstablished { session } => {
@@ -384,7 +384,7 @@ impl InputControlDriver {
         let capture = Arc::clone(&self.capture);
         let bridge = self.events_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let sink = Box::new(move |event: PointerEvent| {
+            let sink = Box::new(move |event: InputEvent| {
                 // try_send IS the backpressure policy — see module docs.
                 let _ = bridge.try_send(InputControlEvent::Captured(event));
             });

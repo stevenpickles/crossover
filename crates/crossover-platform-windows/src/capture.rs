@@ -55,7 +55,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use crossover_platform::{InputCapture, InputError, InputSink, PointerButton, PointerEvent};
+use crossover_platform::{
+    InputCapture, InputError, InputEvent, InputSink, PointerButton, PointerEvent,
+};
 use windows::Win32::Devices::HumanInterfaceDevice::{
     HID_USAGE_GENERIC_MOUSE, HID_USAGE_PAGE_GENERIC,
 };
@@ -657,8 +659,9 @@ impl Pump {
             for event in &self.events {
                 // Contract (InputSink): quick and non-blocking — this
                 // runs on the thread whose stall would overrun the hook
-                // timeout (R-2).
-                sink(*event);
+                // timeout (R-2). Raw Input on this path is mouse only, so
+                // every event is a pointer event.
+                sink(InputEvent::Pointer(*event));
             }
         }
     }
@@ -783,7 +786,9 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
-    use crossover_platform::{InputCapture, InputError, InputSink, PointerButton, PointerEvent};
+    use crossover_platform::{
+        InputCapture, InputError, InputEvent, InputSink, PointerButton, PointerEvent,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
     };
@@ -1027,7 +1032,7 @@ mod tests {
     // well under a second. A live desktop can also feed real events into
     // the sink, so assertions use distinctive markers, never counts.
 
-    fn collecting_sink() -> (InputSink, Arc<Mutex<Vec<PointerEvent>>>) {
+    fn collecting_sink() -> (InputSink, Arc<Mutex<Vec<InputEvent>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink_seen = Arc::clone(&seen);
         let sink: InputSink = Box::new(move |event| {
@@ -1063,11 +1068,13 @@ mod tests {
         assert_eq!(accepted, 1, "test SendInput was blocked");
     }
 
-    fn saw_marker(seen: &Mutex<Vec<PointerEvent>>) -> bool {
+    fn saw_marker(seen: &Mutex<Vec<InputEvent>>) -> bool {
         seen.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .any(|e| matches!(e, PointerEvent::Scroll { dy, .. } if dy.abs() == MARKER_WHEEL))
+            .any(|e| {
+                matches!(e, InputEvent::Pointer(PointerEvent::Scroll { dy, .. }) if dy.abs() == MARKER_WHEEL)
+            })
     }
 
     #[test]
@@ -1179,15 +1186,15 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let motions = events
             .iter()
-            .filter(|e| matches!(e, PointerEvent::Motion { .. }))
+            .filter(|e| matches!(e, InputEvent::Pointer(PointerEvent::Motion { .. })))
             .count();
         let buttons = events
             .iter()
-            .filter(|e| matches!(e, PointerEvent::Button { .. }))
+            .filter(|e| matches!(e, InputEvent::Pointer(PointerEvent::Button { .. })))
             .count();
         let scrolls = events
             .iter()
-            .filter(|e| matches!(e, PointerEvent::Scroll { .. }))
+            .filter(|e| matches!(e, InputEvent::Pointer(PointerEvent::Scroll { .. })))
             .count();
         eprintln!();
         eprintln!("released: the mouse should be alive again.");

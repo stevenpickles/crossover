@@ -44,7 +44,7 @@ use crossover_protocol::{
 };
 use uuid::Uuid;
 
-use crate::input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce};
+use crate::input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce_input};
 
 /// Tuning for the negotiation.
 #[derive(Debug, Clone)]
@@ -121,9 +121,10 @@ pub enum ControlEvent {
         /// The session.
         session: Uuid,
     },
-    /// Locally captured pointer events (already suppressed locally),
-    /// destined for whichever peer this machine controls.
-    Captured(Vec<PointerEvent>),
+    /// Locally captured input events (already suppressed locally),
+    /// pointer or keyboard, destined for whichever peer this machine
+    /// controls.
+    Captured(Vec<InputEvent>),
     /// Capture reported unhealthy (`is_capturing` false while `REMOTE`) —
     /// the Windows watchdog detected silent hook loss (R-2).
     CaptureLost,
@@ -523,26 +524,26 @@ impl ControlEngine {
         actions
     }
 
-    fn on_captured(&mut self, events: &[PointerEvent]) -> Vec<ControlAction> {
+    fn on_captured(&mut self, events: &[InputEvent]) -> Vec<ControlAction> {
         // Anything captured outside REMOTE is a stray tail between the
         // stop decision and the platform actually stopping: drop it, or
         // it would act on a peer that no longer expects input.
         let Outbound::Remote { session } = self.outbound else {
             return Vec::new();
         };
-        let merged = coalesce(events);
+        let merged = coalesce_input(events);
         if merged.is_empty() {
             return Vec::new();
         }
         let mut actions = Vec::new();
         for chunk in merged.chunks(MAX_INPUT_BATCH_EVENTS) {
             self.send_sequence += 1;
-            self.sent_state.apply_all(chunk);
+            self.sent_state.apply_inputs(chunk);
             actions.push(ControlAction::Send {
                 session,
                 message: OutboundControl::Batch(InputBatch {
                     sequence: self.send_sequence,
-                    events: chunk.iter().copied().map(to_wire).collect(),
+                    events: chunk.iter().map(to_wire).collect(),
                 }),
             });
         }
@@ -785,15 +786,26 @@ fn drain_releases(state: &mut InputState) -> Vec<InputEvent> {
     releases
 }
 
-/// Platform event → wire event. Total: every capturable event travels.
-fn to_wire(event: PointerEvent) -> WireInputEvent {
+/// Platform event → wire event (ADR 0008). Total: every capturable
+/// event travels, pointer or key.
+fn to_wire(event: &InputEvent) -> WireInputEvent {
     match event {
-        PointerEvent::Motion { dx, dy } => WireInputEvent::Motion { dx, dy },
-        PointerEvent::Button { button, pressed } => WireInputEvent::Button {
-            button: button_to_wire(button),
-            pressed,
+        InputEvent::Pointer(PointerEvent::Motion { dx, dy }) => {
+            WireInputEvent::Motion { dx: *dx, dy: *dy }
+        }
+        InputEvent::Pointer(PointerEvent::Button { button, pressed }) => WireInputEvent::Button {
+            button: button_to_wire(*button),
+            pressed: *pressed,
         },
-        PointerEvent::Scroll { dx, dy } => WireInputEvent::Scroll { dx, dy },
+        InputEvent::Pointer(PointerEvent::Scroll { dx, dy }) => {
+            WireInputEvent::Scroll { dx: *dx, dy: *dy }
+        }
+        InputEvent::Key(key) => WireInputEvent::Key {
+            key: key.key,
+            pressed: key.pressed,
+            repeat: key.repeat,
+            text: key.text.clone(),
+        },
     }
 }
 
@@ -960,6 +972,12 @@ mod tests {
         ControlAction::Inject(events.into_iter().map(InputEvent::Pointer).collect())
     }
 
+    /// A `Captured` of pointer events — same convenience for the capture
+    /// side, which the engine now takes as the unified type.
+    fn captured(events: Vec<PointerEvent>) -> ControlEvent {
+        ControlEvent::Captured(events.into_iter().map(InputEvent::Pointer).collect())
+    }
+
     // ---- negotiation (FR-5.3) ----
 
     #[test]
@@ -1104,10 +1122,41 @@ mod tests {
 
     // ---- controller: capture, batching, hand-back ----
 
+    /// Captured keyboard travels the same path as pointer input (ADR
+    /// 0008): motion coalesces around a key, the key is a barrier and is
+    /// never merged, and the batch carries both, in order, to the
+    /// controlled session.
+    #[test]
+    fn captured_keys_coalesce_around_but_never_into_pointer_motion() {
+        let mut engine = controlling_engine();
+        let actions = engine.handle(ControlEvent::Captured(vec![
+            InputEvent::Pointer(PointerEvent::Motion { dx: 2, dy: 0 }),
+            InputEvent::Pointer(PointerEvent::Motion { dx: 3, dy: 0 }),
+            InputEvent::Key(KeyEvent::press(hid::LEFT_SHIFT)),
+            InputEvent::Pointer(PointerEvent::Motion { dx: 4, dy: 0 }),
+        ]));
+        assert_eq!(
+            actions,
+            vec![send(OutboundControl::Batch(InputBatch {
+                sequence: 1,
+                events: vec![
+                    WireInputEvent::Motion { dx: 5, dy: 0 }, // the two merged
+                    WireInputEvent::Key {
+                        key: hid::LEFT_SHIFT,
+                        pressed: true,
+                        repeat: false,
+                        text: None,
+                    },
+                    WireInputEvent::Motion { dx: 4, dy: 0 }, // not merged across the key
+                ],
+            }))]
+        );
+    }
+
     #[test]
     fn captured_events_are_coalesced_sequenced_and_tracked() {
         let mut engine = controlling_engine();
-        let actions = engine.handle(ControlEvent::Captured(vec![
+        let actions = engine.handle(captured(vec![
             PointerEvent::Motion { dx: 3, dy: 0 },
             PointerEvent::Motion { dx: 4, dy: 1 },
             press(PointerButton::Left),
@@ -1127,10 +1176,7 @@ mod tests {
         );
 
         // Sequence advances per batch.
-        let actions = engine.handle(ControlEvent::Captured(vec![PointerEvent::Motion {
-            dx: 1,
-            dy: 1,
-        }]));
+        let actions = engine.handle(captured(vec![PointerEvent::Motion { dx: 1, dy: 1 }]));
         assert!(matches!(
             &actions[0],
             ControlAction::Send { message: OutboundControl::Batch(batch), .. } if batch.sequence == 2
@@ -1142,7 +1188,7 @@ mod tests {
         let mut engine = established_engine();
         assert!(
             engine
-                .handle(ControlEvent::Captured(vec![press(PointerButton::Left)]))
+                .handle(captured(vec![press(PointerButton::Left)]))
                 .is_empty()
         );
     }
@@ -1158,7 +1204,7 @@ mod tests {
                 pressed: i % 2 == 0,
             })
             .collect();
-        let actions = engine.handle(ControlEvent::Captured(events));
+        let actions = engine.handle(captured(events));
         assert_eq!(actions.len(), 2, "burst must split into two batches");
         for action in &actions {
             let ControlAction::Send {
@@ -1175,7 +1221,7 @@ mod tests {
     #[test]
     fn hand_back_stops_capture_then_releases_then_ends() {
         let mut engine = controlling_engine();
-        let _ = engine.handle(ControlEvent::Captured(vec![press(PointerButton::Left)]));
+        let _ = engine.handle(captured(vec![press(PointerButton::Left)]));
 
         let actions = engine.handle(ControlEvent::UserRelease);
         assert_eq!(
@@ -1195,7 +1241,7 @@ mod tests {
     #[test]
     fn capture_loss_fails_closed_and_tells_both_sides() {
         let mut engine = controlling_engine();
-        let _ = engine.handle(ControlEvent::Captured(vec![press(PointerButton::Right)]));
+        let _ = engine.handle(captured(vec![press(PointerButton::Right)]));
 
         let actions = engine.handle(ControlEvent::CaptureLost);
         assert!(actions.contains(&ControlAction::StopCapture));
@@ -1603,7 +1649,7 @@ mod tests {
                 message: InboundControl::ReleaseAll(ReleaseAllInput { after_sequence: 0 }),
             }),
             (0usize..5, any::<bool>()).prop_map(|(button, pressed)| {
-                ControlEvent::Captured(vec![PointerEvent::Button {
+                captured(vec![PointerEvent::Button {
                     button: PointerButton::ALL[button],
                     pressed,
                 }])
