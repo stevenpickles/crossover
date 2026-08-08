@@ -1,8 +1,10 @@
 # Crossover Roadmap
 
-> **Current phase: 3 — Remote Mouse** (in progress — Windows pointer
-> injection and capture are implemented; explicit control switching and
-> the phase exit criteria are next)
+> **Current phase: 3 — Remote Mouse** (implementation complete — pointer
+> injection and capture, the negotiated control-transfer state machine,
+> and explicit console-driven switching are all in; the remaining gate
+> is the two-machine remote-mouse soak in docs/SOAK.md, which verifies
+> the exit criteria on real hardware)
 >
 > Update this marker when a phase's exit criteria are verified. Do not begin
 > a later phase because time remains — complete and validate exit criteria

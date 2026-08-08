@@ -213,6 +213,68 @@ If clipboard tests fail this way, check `Set-Clipboard` in PowerShell
 first — if that also fails, the machine is wedged and the test results
 mean nothing until the service is restarted.
 
+## Phase 3 soak: remote mouse (two machines)
+
+This is the Phase 3 exit criterion that no single machine can show:
+driving machine B's pointer with machine A's mouse, and proving that
+repeated control cycles and mid-control faults never leave a stuck
+button or a dead mouse (FR-4.4, FR-5.1). The hermetic property tests in
+`crossover-core` prove the state machine; this proves the two real
+machines.
+
+Pair and connect exactly as for the clipboard soak above (same binary,
+same firewall rule, same pairing ceremony). Then, with both sides
+running `crossover run` (A `--listen`, B `--connect <A>:27677`), both
+consoles accept commands:
+
+```
+c   take control of the peer
+r   release / hand back
+q   quit
+```
+
+### The procedure
+
+1. **Take control.** On machine A, type `c`. A prints "You now control
+   the peer"; B prints "The peer is now controlling this machine." Move
+   A's mouse — **B's cursor moves**, and A's does not (A's local pointer
+   is suppressed; that is capture working). Click and scroll; they land
+   on B.
+2. **Hand back.** On A, type `r`. A's mouse comes back to life; B's
+   cursor is left wherever it was, with **no button held** — verify by
+   clicking on B that nothing was already down (no stuck drag).
+3. **Repeat rapidly.** Alternate `c` and `r` a few dozen times, moving
+   and clicking each time you hold control. Not once should a button be
+   left down on B, and A's mouse must be alive after every `r`.
+4. **The fault that matters — disconnect mid-drag.** On A, take control
+   (`c`), press and *hold* A's left button while moving (a drag on B),
+   and while still holding, pull B's network (disable its adapter) or
+   `q` on B. On A the control ends ("session lost"); on B, when it comes
+   back, **the button must not be stuck** — B synthesized the release
+   from its own record the moment the session dropped. This is the
+   release-blocking scenario; a stuck button here fails Phase 3.
+5. **Revoke from the controlled side.** Take control from A again, then
+   on **B** type `r`. A stops controlling immediately ("the peer revoked
+   your control"); A's mouse returns. The local user's escape hatch
+   works even while being driven.
+
+### What good looks like
+
+- While A holds control, A's cursor is frozen and B's tracks A's mouse
+  one-to-one; motion feels immediate on a LAN (NFR-5).
+- After every hand-back, revocation, or disconnect, **B holds no button
+  and no key** and B's mouse is fully alive. A stuck button or dead
+  pointer is release-blocking — record it and stop.
+- Every transition is narrated on both consoles (NFR-3): no silent
+  changes of who is in control.
+- Injection into an elevated window on B may silently do nothing (UIPI,
+  R-1) — expected and documented; A's log notes when injection is
+  likely to have been swallowed.
+
+Record the outcome in the Phase 3 exit-criteria notes
+(docs/ROADMAP.md): how many control cycles, whether any button ever
+stuck, and the subjective pointer feel.
+
 ## Phase 3 probe: input capture (single machine)
 
 Suppression cannot be proven by CI: the automated tests cover tag
