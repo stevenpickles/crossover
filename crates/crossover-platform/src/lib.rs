@@ -13,8 +13,8 @@ pub mod secure_storage;
 
 pub use clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
 pub use input::{
-    InputCapture, InputError, InputInjector, InputSink, PointerButton, PointerEvent,
-    SCROLL_UNITS_PER_DETENT,
+    InputCapture, InputError, InputInjector, InputSink, KeyEvent, PointerButton, PointerEvent,
+    SCROLL_UNITS_PER_DETENT, hid,
 };
 pub use secure_storage::{SecureStorage, SecureStorageError};
 

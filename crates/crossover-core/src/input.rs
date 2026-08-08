@@ -1,23 +1,31 @@
 //! Platform-neutral input model (FR-4.x, docs/SPECIFICATION.md §4.4).
 //!
-//! Phase 3 covers the pointer; the keyboard joins in Phase 4. The
-//! structure anticipates it: [`InputState`] tracks *what this machine
-//! believes is held down on the destination*, and
-//! [`InputState::release_all`] synthesizes the releases for all of it —
-//! the mechanism FR-4.4 requires and the one that keeps a disconnect
-//! from leaving a stuck button.
+//! [`InputState`] tracks *what this machine believes is held down on the
+//! destination* — pointer buttons and, from Phase 4, keyboard keys — and
+//! synthesizes the releases for all of it: [`InputState::release_all`]
+//! for buttons, [`InputState::release_all_keys`] for keys. This is the
+//! mechanism FR-4.4 requires, and the one that keeps a disconnect from
+//! leaving a stuck button *or a stuck key/modifier* (ADR 0008).
+//!
+//! Buttons are a fixed set of five, so they live in an array; keys are a
+//! sparse slice of the USB HID usage namespace, so held keys live in a
+//! `BTreeSet` — sorted, which keeps release order deterministic (NFR-2).
 //!
 //! Motion is **relative** (ADR 0007: Raw Input reports unaccelerated,
 //! unclamped deltas), which makes coalescing exact rather than lossy:
 //! merging two movements is addition, where merging absolute positions
-//! would mean discarding one.
+//! would mean discarding one. Key transitions are never coalesced
+//! (FR-4.2).
 //!
-//! The event *vocabulary* ([`PointerEvent`], [`PointerButton`]) lives in
-//! `crossover-platform`, because the HAL traits must speak it and cannot
-//! depend on this crate (docs/ARCHITECTURE.md §2). What lives here is
-//! *policy*: what is believed held, and what may be merged.
+//! The event *vocabulary* ([`PointerEvent`], [`PointerButton`],
+//! [`KeyEvent`]) lives in `crossover-platform`, because the HAL traits
+//! must speak it and cannot depend on this crate (docs/ARCHITECTURE.md
+//! §2). What lives here is *policy*: what is believed held, and what may
+//! be merged.
 
-pub use crossover_platform::{PointerButton, PointerEvent, SCROLL_UNITS_PER_DETENT};
+use std::collections::BTreeSet;
+
+pub use crossover_platform::{KeyEvent, PointerButton, PointerEvent, SCROLL_UNITS_PER_DETENT, hid};
 
 /// What this machine believes is currently held down on the destination.
 ///
@@ -27,6 +35,11 @@ pub use crossover_platform::{PointerButton, PointerEvent, SCROLL_UNITS_PER_DETEN
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputState {
     buttons: [bool; 5],
+    /// Held keys, by USB HID usage. A set, not per-event: only the usage
+    /// determines what must be released, so a repeat is idempotent and a
+    /// release simply removes. Sorted iteration gives deterministic
+    /// release order (NFR-2).
+    keys: BTreeSet<u16>,
 }
 
 impl InputState {
@@ -63,20 +76,50 @@ impl InputState {
             .filter(|button| self.buttons[button.index()])
     }
 
-    /// Nothing is held — the state a session may safely end in.
-    #[must_use]
-    pub fn is_clear(&self) -> bool {
-        !self.buttons.iter().any(|down| *down)
+    /// Update from a key event being sent to the destination. A press (or
+    /// its auto-repeat) marks the key held; a release clears it. Only the
+    /// usage matters, so `text` and `repeat` do not affect the belief.
+    pub fn apply_key(&mut self, event: &KeyEvent) {
+        if event.pressed {
+            self.keys.insert(event.key);
+        } else {
+            self.keys.remove(&event.key);
+        }
     }
 
-    /// `ReleaseAllInput` (FR-4.4): the release events needed to leave the
-    /// destination holding nothing, and clear the belief.
+    /// Update from a whole sequence of key events.
+    pub fn apply_keys(&mut self, events: &[KeyEvent]) {
+        for event in events {
+            self.apply_key(event);
+        }
+    }
+
+    /// Is the key with USB HID usage `key` believed held?
+    #[must_use]
+    pub fn is_key_held(&self, key: u16) -> bool {
+        self.keys.contains(&key)
+    }
+
+    /// Keys believed held, by usage, in ascending (deterministic) order.
+    pub fn keys_held(&self) -> impl Iterator<Item = u16> + '_ {
+        self.keys.iter().copied()
+    }
+
+    /// Nothing is held — no button and no key. The state a session may
+    /// safely end in.
+    #[must_use]
+    pub fn is_clear(&self) -> bool {
+        !self.buttons.iter().any(|down| *down) && self.keys.is_empty()
+    }
+
+    /// `ReleaseAllInput` for buttons (FR-4.4): the release events needed
+    /// to leave the destination holding no button, and clear that belief.
     ///
     /// Called on disconnect, session termination, fatal protocol failure,
     /// and control reset. A stuck button after any of those is a
     /// release-blocking defect, so this is deliberately total: it emits a
-    /// release for everything believed held, and afterwards
-    /// [`InputState::is_clear`] is unconditionally true.
+    /// release for every button believed held, and afterwards no button
+    /// is held.
     pub fn release_all(&mut self) -> Vec<PointerEvent> {
         let releases: Vec<PointerEvent> = self
             .pressed()
@@ -86,6 +129,17 @@ impl InputState {
             })
             .collect();
         self.buttons = [false; 5];
+        releases
+    }
+
+    /// `ReleaseAllInput` for keys (FR-4.4): a release for every key
+    /// believed held, in deterministic usage order (NFR-2), clearing the
+    /// belief. A stuck key or modifier after a disconnect is the same
+    /// release-blocking defect class as a stuck button (ADR 0008), so
+    /// this is equally total: afterwards no key is held.
+    pub fn release_all_keys(&mut self) -> Vec<KeyEvent> {
+        let releases: Vec<KeyEvent> = self.keys_held().map(KeyEvent::release).collect();
+        self.keys.clear();
         releases
     }
 }
@@ -135,7 +189,7 @@ fn merge_into(target: &mut PointerEvent, next: PointerEvent) -> bool {
 mod tests {
     use proptest::prelude::*;
 
-    use super::{InputState, PointerButton, PointerEvent, coalesce};
+    use super::{InputState, KeyEvent, PointerButton, PointerEvent, coalesce, hid};
 
     fn motion(dx: i32, dy: i32) -> PointerEvent {
         PointerEvent::Motion { dx, dy }
@@ -331,6 +385,173 @@ mod tests {
             let mut merged = InputState::new();
             merged.apply_all(&coalesce(&events));
             prop_assert_eq!(direct, merged);
+        }
+    }
+
+    // ---- keyboard key-state (FR-4.3, FR-4.4; ADR 0008) ----
+
+    #[test]
+    fn state_tracks_key_presses_and_releases() {
+        let mut state = InputState::new();
+        assert!(state.is_clear());
+
+        state.apply_key(&KeyEvent::press(hid::A));
+        state.apply_key(&KeyEvent::press(hid::LEFT_CONTROL));
+        assert!(state.is_key_held(hid::A));
+        assert!(state.is_key_held(hid::LEFT_CONTROL));
+        assert!(!state.is_key_held(hid::ENTER));
+        assert!(!state.is_clear());
+
+        state.apply_key(&KeyEvent::release(hid::A));
+        assert!(!state.is_key_held(hid::A));
+        assert!(!state.is_clear()); // Control still held
+
+        state.apply_key(&KeyEvent::release(hid::LEFT_CONTROL));
+        assert!(state.is_clear());
+    }
+
+    #[test]
+    fn auto_repeat_does_not_double_track_a_held_key() {
+        let mut state = InputState::new();
+        state.apply_key(&KeyEvent::press(hid::A));
+        // Several OS auto-repeats of the same held key.
+        for _ in 0..5 {
+            state.apply_key(&KeyEvent {
+                key: hid::A,
+                pressed: true,
+                repeat: true,
+                text: Some("a".to_owned()),
+            });
+        }
+        // One release still fully clears it — a repeat is not a new press.
+        let releases = state.release_all_keys();
+        assert_eq!(releases, vec![KeyEvent::release(hid::A)]);
+        assert!(state.is_clear());
+    }
+
+    #[test]
+    fn text_and_repeat_do_not_affect_the_belief() {
+        // Only the usage determines what is held; a press carrying text is
+        // the same held key as one without.
+        let mut with_text = InputState::new();
+        with_text.apply_key(&KeyEvent {
+            key: hid::A,
+            pressed: true,
+            repeat: false,
+            text: Some("á".to_owned()),
+        });
+        let mut without = InputState::new();
+        without.apply_key(&KeyEvent::press(hid::A));
+        assert_eq!(with_text, without);
+    }
+
+    #[test]
+    fn release_all_keys_is_ordered_by_usage_and_idempotent() {
+        let mut state = InputState::new();
+        // Press out of usage order; releases must still come out sorted.
+        for key in [hid::LEFT_GUI, hid::A, hid::ENTER, hid::LEFT_SHIFT] {
+            state.apply_key(&KeyEvent::press(key));
+        }
+        let releases = state.release_all_keys();
+        assert_eq!(
+            releases,
+            vec![
+                KeyEvent::release(hid::A),          // 0x04
+                KeyEvent::release(hid::ENTER),      // 0x28
+                KeyEvent::release(hid::LEFT_SHIFT), // 0xE1
+                KeyEvent::release(hid::LEFT_GUI),   // 0xE3
+            ],
+            "releases must follow ascending usage order (NFR-2)"
+        );
+        // Nothing left; calling again is harmless.
+        assert!(state.release_all_keys().is_empty());
+        assert!(state.is_clear());
+    }
+
+    #[test]
+    fn key_and_button_state_are_independent_and_both_gate_is_clear() {
+        let mut state = InputState::new();
+        state.apply(press(PointerButton::Left));
+        state.apply_key(&KeyEvent::press(hid::LEFT_ALT));
+        assert!(!state.is_clear());
+
+        // Releasing only buttons leaves the key held (and vice versa).
+        let _ = state.release_all();
+        assert!(!state.is_pressed(PointerButton::Left));
+        assert!(state.is_key_held(hid::LEFT_ALT));
+        assert!(
+            !state.is_clear(),
+            "a held key must keep the state non-clear"
+        );
+
+        let _ = state.release_all_keys();
+        assert!(state.is_clear());
+    }
+
+    fn any_key_event() -> impl Strategy<Value = KeyEvent> {
+        // A small pool of usages (so presses and releases actually
+        // collide), an arbitrary press/release, repeat, and optional text.
+        (
+            prop::sample::select(vec![
+                hid::A,
+                hid::ENTER,
+                hid::ESCAPE,
+                hid::LEFT_CONTROL,
+                hid::LEFT_SHIFT,
+                hid::RIGHT_ALT,
+            ]),
+            any::<bool>(),
+            any::<bool>(),
+            prop::option::of(prop::string::string_regex("[a-z]").unwrap()),
+        )
+            .prop_map(|(key, pressed, repeat, text)| KeyEvent {
+                key,
+                pressed,
+                repeat,
+                text,
+            })
+    }
+
+    proptest! {
+        /// FR-4.4 for the keyboard: whatever sequence of key transitions
+        /// occurred, releasing leaves nothing held — no stuck key or
+        /// modifier can survive a disconnect.
+        #[test]
+        fn release_all_keys_always_clears(
+            events in proptest::collection::vec(any_key_event(), 0..40),
+        ) {
+            let mut state = InputState::new();
+            state.apply_keys(&events);
+            let releases = state.release_all_keys();
+            prop_assert!(state.is_clear());
+            prop_assert_eq!(state.keys_held().count(), 0);
+            // Every release is a release (never a press), and unique.
+            prop_assert!(releases.iter().all(|e| !e.pressed && e.text.is_none()));
+            let mut usages: Vec<u16> = releases.iter().map(|e| e.key).collect();
+            let len = usages.len();
+            usages.dedup();
+            prop_assert_eq!(usages.len(), len, "a key was released more than once");
+        }
+
+        /// Release output is exactly the set of keys whose last transition
+        /// was a press — the belief matches the transitions applied.
+        #[test]
+        fn held_keys_are_those_last_pressed(
+            events in proptest::collection::vec(any_key_event(), 0..40),
+        ) {
+            use std::collections::BTreeSet;
+            let mut expected: BTreeSet<u16> = BTreeSet::new();
+            for event in &events {
+                if event.pressed {
+                    expected.insert(event.key);
+                } else {
+                    expected.remove(&event.key);
+                }
+            }
+            let mut state = InputState::new();
+            state.apply_keys(&events);
+            let held: BTreeSet<u16> = state.keys_held().collect();
+            prop_assert_eq!(held, expected);
         }
     }
 }
