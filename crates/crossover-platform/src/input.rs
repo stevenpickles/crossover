@@ -77,6 +77,89 @@ pub enum PointerEvent {
     },
 }
 
+/// A platform-neutral keyboard event (FR-4.1, ADR 0008).
+///
+/// Unlike [`PointerEvent`] this is not `Copy`: it may carry produced
+/// text. Key transitions are ordered and lossless — never coalesced
+/// (FR-4.2), because dropping or reordering a press/release is exactly
+/// how a key gets stuck.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KeyEvent {
+    /// Physical key identity as a USB HID keyboard/keypad usage ID
+    /// (Usage Page 0x07) — layout- and OS-independent, the standard every
+    /// OS derives its own codes from (ADR 0008). See [`hid`] for named
+    /// examples.
+    pub key: u16,
+    /// True for press, false for release.
+    pub pressed: bool,
+    /// True when this is an OS-generated auto-repeat of an already-held
+    /// key, so key-state accounting is not fooled into double-counting.
+    pub repeat: bool,
+    /// The Unicode text the source produced, carried so mismatched
+    /// layouts can be reproduced without a wire change (ADR 0008). `None`
+    /// for keys that produce no text — modifiers, arrows, function keys —
+    /// and always `None` for a release.
+    pub text: Option<String>,
+}
+
+impl KeyEvent {
+    /// A press of `key` that produces no text.
+    #[must_use]
+    pub fn press(key: u16) -> Self {
+        Self {
+            key,
+            pressed: true,
+            repeat: false,
+            text: None,
+        }
+    }
+
+    /// A release of `key`. Releases never carry text or a repeat flag.
+    #[must_use]
+    pub fn release(key: u16) -> Self {
+        Self {
+            key,
+            pressed: false,
+            repeat: false,
+            text: None,
+        }
+    }
+}
+
+/// A few well-known USB HID keyboard/keypad usage IDs (Usage Page 0x07),
+/// named for readability in code and tests. This is deliberately *not*
+/// the full table — the exhaustive HID ↔ platform-scancode mapping lives
+/// at the Windows boundary (`crossover-platform-windows`), where platform
+/// specifics belong, not in this neutral vocabulary (ADR 0008).
+pub mod hid {
+    /// Keyboard `a` / `A` — the canonical example usage.
+    pub const A: u16 = 0x04;
+    /// Keyboard Return (Enter).
+    pub const ENTER: u16 = 0x28;
+    /// Keyboard Escape.
+    pub const ESCAPE: u16 = 0x29;
+    /// Keyboard Tab.
+    pub const TAB: u16 = 0x2B;
+    /// Keyboard Spacebar.
+    pub const SPACE: u16 = 0x2C;
+    /// Left Control.
+    pub const LEFT_CONTROL: u16 = 0xE0;
+    /// Left Shift.
+    pub const LEFT_SHIFT: u16 = 0xE1;
+    /// Left Alt.
+    pub const LEFT_ALT: u16 = 0xE2;
+    /// Left GUI (Windows / Command / Super).
+    pub const LEFT_GUI: u16 = 0xE3;
+    /// Right Control.
+    pub const RIGHT_CONTROL: u16 = 0xE4;
+    /// Right Shift.
+    pub const RIGHT_SHIFT: u16 = 0xE5;
+    /// Right Alt.
+    pub const RIGHT_ALT: u16 = 0xE6;
+    /// Right GUI.
+    pub const RIGHT_GUI: u16 = 0xE7;
+}
+
 /// Failures from input capture or injection.
 #[non_exhaustive]
 #[derive(Debug, Error)]

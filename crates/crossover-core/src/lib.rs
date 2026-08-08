@@ -24,7 +24,7 @@ pub use control::{
     OutboundControl,
 };
 pub use control_driver::{InputControlDriver, InputControlEvent, input_control};
-pub use input::{InputState, PointerButton, PointerEvent, coalesce};
+pub use input::{InputState, KeyEvent, PointerButton, PointerEvent, coalesce, hid};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
     connect,
