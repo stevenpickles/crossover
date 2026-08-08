@@ -1,6 +1,8 @@
-//! Win32 input injection (ADR 0007; risks R-1, R-3).
+//! Win32 input injection (ADR 0007, ADR 0008; risks R-1, R-3).
 //!
-//! `SendInput` is the injection path. Two details do real work here:
+//! `SendInput` is the injection path for both pointer and keyboard, in
+//! one ordered stream so a chord keeps its ordering. Three details do
+//! real work here:
 //!
 //! - **Every injected event is tagged** with [`CROSSOVER_INJECTION_TAG`]
 //!   in `dwExtraInfo`, which surfaces in low-level hook callbacks. That
@@ -13,23 +15,34 @@
 //!   ballistics to our unaccelerated deltas, which is what makes the
 //!   remote pointer feel like the local one rather than doubly
 //!   accelerated (ADR 0007).
+//! - **Keys inject by scan code.** `KEYEVENTF_SCANCODE` (with
+//!   `KEYEVENTF_EXTENDEDKEY` for the `E0` keys) means the destination's
+//!   own layout resolves the character, so matching-layout typing and
+//!   positional shortcuts land right (ADR 0008). The HID→scancode table
+//!   lives in [`crate::keymap`]; an unmapped key produces no `INPUT` and
+//!   is skipped rather than sent to the wrong place.
 //!
 //! Honest limitation (R-1): `SendInput` returns success for events that
 //! UIPI then discards, so a higher-integrity foreground window swallows
 //! injection silently. `Ok(())` here means Windows accepted the events,
 //! not that anything acted on them.
 
-use crossover_platform::{InputError, InputInjector, PointerButton, PointerEvent};
+use crossover_platform::{
+    InputError, InputEvent, InputInjector, KeyEvent, PointerButton, PointerEvent,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    SendInput,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 // The XBUTTON constants live under WindowsAndMessaging as u16 (those in
 // KeyboardAndMouse are virtual-key codes, a different thing) while
 // mouseData is u32, so widen once here rather than at each use.
 use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
+
+use crate::keymap;
 
 /// Marks input this process injected, so our own capture ignores it.
 ///
@@ -50,14 +63,17 @@ impl WindowsInputInjector {
 }
 
 impl InputInjector for WindowsInputInjector {
-    fn inject(&self, events: &[PointerEvent]) -> Result<(), InputError> {
-        if events.is_empty() {
-            return Ok(());
-        }
+    fn inject(&self, events: &[InputEvent]) -> Result<(), InputError> {
         // One SendInput call for the whole batch: Windows guarantees the
         // events are not interleaved with other input, which keeps a
-        // press and its motion from being split by an unrelated event.
-        let inputs: Vec<INPUT> = events.iter().map(|event| build_input(*event)).collect();
+        // press and its motion — or a modifier and the key it guards —
+        // from being split by an unrelated event. A key with no scan-code
+        // mapping (ADR 0008) produces no INPUT and is skipped, so the
+        // built count, not the event count, is what SendInput must accept.
+        let inputs: Vec<INPUT> = events.iter().filter_map(build_input).collect();
+        if inputs.is_empty() {
+            return Ok(());
+        }
 
         let size = i32::try_from(size_of::<INPUT>()).map_err(|_| InputError::InjectionFailed {
             reason: "INPUT size does not fit in i32".to_owned(),
@@ -83,8 +99,47 @@ impl InputInjector for WindowsInputInjector {
     }
 }
 
-/// Translate one platform-neutral event into a Win32 `INPUT`.
-fn build_input(event: PointerEvent) -> INPUT {
+/// Translate one platform-neutral event into a Win32 `INPUT`, or `None`
+/// for a keyboard event whose HID usage has no scan-code mapping.
+fn build_input(event: &InputEvent) -> Option<INPUT> {
+    match event {
+        InputEvent::Pointer(pointer) => Some(build_mouse_input(*pointer)),
+        InputEvent::Key(key) => build_key_input(key),
+    }
+}
+
+/// Translate a keyboard event into a scan-code `INPUT` (ADR 0008), or
+/// `None` if the HID usage has no Set-1 scan code — the injector skips it
+/// rather than send a wrong key. Text is not consulted: Phase 4 injects
+/// by physical key, and the Unicode-`text` path is a documented follow-on.
+fn build_key_input(event: &KeyEvent) -> Option<INPUT> {
+    let (scancode, extended) = keymap::hid_to_scancode(event.key)?;
+    let mut flags = KEYEVENTF_SCANCODE;
+    if extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if !event.pressed {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    Some(INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                // Ignored under KEYEVENTF_SCANCODE — Windows resolves the
+                // key from the scan code, applying the destination's own
+                // layout, which is the point (ADR 0008).
+                wVk: VIRTUAL_KEY(0),
+                wScan: scancode,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: CROSSOVER_INJECTION_TAG,
+            },
+        },
+    })
+}
+
+/// Translate one pointer event into a Win32 mouse `INPUT`.
+fn build_mouse_input(event: PointerEvent) -> INPUT {
     let mouse = match event {
         PointerEvent::Motion { dx, dy } => MOUSEINPUT {
             dx,
@@ -163,13 +218,18 @@ fn button_flags(
 
 #[cfg(test)]
 mod tests {
-    use crossover_platform::{InputInjector, PointerButton, PointerEvent};
+    use crossover_platform::{
+        InputEvent, InputInjector, KeyEvent, PointerButton, PointerEvent, hid,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
     };
     use windows::Win32::UI::WindowsAndMessaging::XBUTTON2;
 
-    use super::{CROSSOVER_INJECTION_TAG, WindowsInputInjector, build_input};
+    use super::{
+        CROSSOVER_INJECTION_TAG, WindowsInputInjector, build_key_input, build_mouse_input,
+    };
 
     /// Every injected event must carry the tag, or capture will treat
     /// our own injections as user input — the input-layer equivalent of
@@ -185,16 +245,21 @@ mod tests {
             PointerEvent::Scroll { dx: 0, dy: 120 },
         ];
         for event in events {
-            let input = build_input(event);
-            // SAFETY: `build_input` always constructs the `mi` variant.
+            let input = build_mouse_input(event);
+            // SAFETY: `build_mouse_input` always constructs the `mi` variant.
             let extra = unsafe { input.Anonymous.mi.dwExtraInfo };
             assert_eq!(extra, CROSSOVER_INJECTION_TAG, "untagged: {event:?}");
         }
+        // Keyboard injections carry the tag too, in the `ki` variant.
+        let input = build_key_input(&KeyEvent::press(hid::A)).unwrap();
+        // SAFETY: `build_key_input` always constructs the `ki` variant.
+        let extra = unsafe { input.Anonymous.ki.dwExtraInfo };
+        assert_eq!(extra, CROSSOVER_INJECTION_TAG);
     }
 
     #[test]
     fn motion_is_relative_not_absolute() {
-        let input = build_input(PointerEvent::Motion { dx: 7, dy: -3 });
+        let input = build_mouse_input(PointerEvent::Motion { dx: 7, dy: -3 });
         // SAFETY: as above.
         let mouse = unsafe { input.Anonymous.mi };
         assert_eq!(mouse.dwFlags, MOUSEEVENTF_MOVE);
@@ -203,7 +268,7 @@ mod tests {
 
     #[test]
     fn extended_buttons_are_distinguished_by_mouse_data() {
-        let input = build_input(PointerEvent::Button {
+        let input = build_mouse_input(PointerEvent::Button {
             button: PointerButton::X2,
             pressed: true,
         });
@@ -217,7 +282,7 @@ mod tests {
     fn negative_scroll_survives_the_u32_reinterpretation() {
         // mouseData is u32 but carries a signed wheel delta; a scroll
         // toward the user must not become a huge positive value.
-        let input = build_input(PointerEvent::Scroll { dx: 0, dy: -120 });
+        let input = build_mouse_input(PointerEvent::Scroll { dx: 0, dy: -120 });
         // SAFETY: as above.
         let mouse = unsafe { input.Anonymous.mi };
         assert_eq!(mouse.dwFlags, MOUSEEVENTF_WHEEL);
@@ -226,18 +291,63 @@ mod tests {
 
     #[test]
     fn button_flags_are_not_confused_with_each_other() {
-        let down = build_input(PointerEvent::Button {
+        let down = build_mouse_input(PointerEvent::Button {
             button: PointerButton::Left,
             pressed: true,
         });
         // SAFETY: as above.
         assert_eq!(unsafe { down.Anonymous.mi.dwFlags }, MOUSEEVENTF_LEFTDOWN);
-        let up = build_input(PointerEvent::Button {
+        let up = build_mouse_input(PointerEvent::Button {
             button: PointerButton::Left,
             pressed: false,
         });
         // SAFETY: as above.
         assert_ne!(unsafe { up.Anonymous.mi.dwFlags }, MOUSEEVENTF_LEFTDOWN);
+    }
+
+    /// A key press injects by scan code (ADR 0008), so the destination's
+    /// own layout resolves the character — no virtual key, no source
+    /// layout imported.
+    #[test]
+    fn key_press_injects_by_scancode() {
+        let input = build_key_input(&KeyEvent::press(hid::A)).unwrap();
+        // SAFETY: the `ki` variant is always what `build_key_input` builds.
+        let key = unsafe { input.Anonymous.ki };
+        assert_eq!(key.wScan, 0x1E); // HID 'a' → Set-1 scancode
+        assert!(key.dwFlags.contains(KEYEVENTF_SCANCODE));
+        assert!(!key.dwFlags.contains(KEYEVENTF_KEYUP));
+        assert!(!key.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+    }
+
+    #[test]
+    fn key_release_sets_keyup() {
+        let input = build_key_input(&KeyEvent::release(hid::A)).unwrap();
+        // SAFETY: as above.
+        assert!(unsafe { input.Anonymous.ki.dwFlags }.contains(KEYEVENTF_KEYUP));
+    }
+
+    /// An extended key (right-hand modifiers, arrows, nav cluster) carries
+    /// `KEYEVENTF_EXTENDEDKEY` so it lands on the right physical key.
+    #[test]
+    fn extended_key_carries_the_extended_flag() {
+        let input = build_key_input(&KeyEvent::press(hid::RIGHT_CONTROL)).unwrap();
+        // SAFETY: as above.
+        let key = unsafe { input.Anonymous.ki };
+        assert_eq!(key.wScan, 0x1D); // same scancode as Left Control…
+        assert!(key.dwFlags.contains(KEYEVENTF_EXTENDEDKEY)); // …distinguished by E0
+    }
+
+    #[test]
+    fn a_key_with_no_scancode_mapping_is_skipped() {
+        // HID Pause (0x48) has no single Set-1 code; it produces no INPUT.
+        assert!(build_key_input(&KeyEvent::press(0x48)).is_none());
+        // And a batch of only-unmapped keys reaches SendInput with nothing,
+        // which is a no-op rather than an error.
+        assert!(
+            WindowsInputInjector::new()
+                .inject(&[InputEvent::Key(KeyEvent::press(0x48))])
+                .is_ok()
+        );
     }
 
     #[test]

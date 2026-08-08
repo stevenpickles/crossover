@@ -419,7 +419,7 @@ mod tests {
     use super::{InputControlEvent, input_control};
     use crate::clipboard_driver::{FrameTarget, SessionCommand};
     use crate::control::{ControlConfig, ControlNotice};
-    use crate::input::{PointerButton, PointerEvent};
+    use crate::input::{InputEvent, KeyEvent, PointerButton, PointerEvent, hid};
 
     /// The session the single-session tests operate on.
     const SESSION: Uuid = Uuid::from_bytes([0xA1; 16]);
@@ -628,7 +628,7 @@ mod tests {
 
         // FR-4.4 through the whole driver: the injected stream ends with
         // the synthesized release, so nothing is left held.
-        let injected = rig.injector.injected();
+        let injected = rig.injector.injected_pointers();
         assert_eq!(
             injected,
             vec![
@@ -805,7 +805,7 @@ mod tests {
 
         // The press was released exactly once (by ReleaseAllInput); the
         // following ControlRelease found a clear state.
-        let injected = rig.injector.injected();
+        let injected = rig.injector.injected_pointers();
         let releases = injected
             .iter()
             .filter(|event| {
@@ -899,7 +899,7 @@ mod tests {
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let injected = rig.injector.injected();
+            let injected = rig.injector.injected_pointers();
             if injected.contains(&PointerEvent::Button {
                 button: PointerButton::Right,
                 pressed: true,
@@ -977,5 +977,81 @@ mod tests {
             ControlVerdict::Denied(DenyReason::AlreadyControlled),
             "a second peer must be denied, never granted a shared desktop"
         );
+    }
+
+    /// End to end through the driver: a granted peer's key batch reaches
+    /// the injector as key events (ADR 0008), interleaved in order with a
+    /// pointer event.
+    #[tokio::test]
+    async fn granted_keyboard_input_reaches_the_injector() {
+        let mut rig = rig();
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest { request_id: 1 }.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+
+        // Shift held, click, 'A': a chord whose ordering must survive.
+        let batch = InputBatch {
+            sequence: 1,
+            events: vec![
+                WireInputEvent::Key {
+                    key: hid::LEFT_SHIFT,
+                    pressed: true,
+                    repeat: false,
+                    text: None,
+                },
+                WireInputEvent::Button {
+                    button: WireButton::Left,
+                    pressed: true,
+                },
+                WireInputEvent::Key {
+                    key: hid::A,
+                    pressed: true,
+                    repeat: false,
+                    text: Some("A".to_owned()),
+                },
+            ],
+        };
+        rig.events
+            .send(frame(
+                MessageType::InputBatch,
+                batch.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let want = vec![
+            InputEvent::Key(KeyEvent::press(hid::LEFT_SHIFT)),
+            InputEvent::Pointer(PointerEvent::Button {
+                button: PointerButton::Left,
+                pressed: true,
+            }),
+            InputEvent::Key(KeyEvent {
+                key: hid::A,
+                pressed: true,
+                repeat: false,
+                text: Some("A".to_owned()),
+            }),
+        ];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if rig.injector.injected() == want {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the key chord never reached the injector"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

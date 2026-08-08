@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use crate::clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
-use crate::input::{InputCapture, InputError, InputInjector, InputSink, PointerEvent};
+use crate::input::{InputCapture, InputError, InputEvent, InputInjector, InputSink, PointerEvent};
 use crate::secure_storage::{SecureStorage, SecureStorageError};
 
 /// In-memory [`SecureStorage`] with scriptable fault injection.
@@ -282,7 +282,7 @@ impl InputCapture for FakeInputCapture {
 /// In-memory [`InputInjector`] that records what it was asked to replay.
 #[derive(Default)]
 pub struct FakeInputInjector {
-    injected: Mutex<Vec<PointerEvent>>,
+    injected: Mutex<Vec<InputEvent>>,
     fail_next: Mutex<Option<String>>,
 }
 
@@ -295,8 +295,21 @@ impl FakeInputInjector {
 
     /// Everything injected so far, in order.
     #[must_use]
-    pub fn injected(&self) -> Vec<PointerEvent> {
+    pub fn injected(&self) -> Vec<InputEvent> {
         lock(&self.injected).clone()
+    }
+
+    /// Only the pointer events injected, in order — a convenience for the
+    /// many tests that predate the keyboard and reason in pointer terms.
+    #[must_use]
+    pub fn injected_pointers(&self) -> Vec<PointerEvent> {
+        lock(&self.injected)
+            .iter()
+            .filter_map(|event| match event {
+                InputEvent::Pointer(pointer) => Some(*pointer),
+                InputEvent::Key(_) => None,
+            })
+            .collect()
     }
 
     /// Forget the record.
@@ -311,7 +324,7 @@ impl FakeInputInjector {
 }
 
 impl InputInjector for FakeInputInjector {
-    fn inject(&self, events: &[PointerEvent]) -> Result<(), InputError> {
+    fn inject(&self, events: &[InputEvent]) -> Result<(), InputError> {
         if let Some(reason) = lock(&self.fail_next).take() {
             return Err(InputError::InjectionFailed { reason });
         }
@@ -332,7 +345,10 @@ mod input_tests {
     use std::sync::Mutex as StdMutex;
 
     use super::{FakeInputCapture, FakeInputInjector};
-    use crate::input::{InputCapture, InputError, InputInjector, PointerButton, PointerEvent};
+    use crate::input::{
+        InputCapture, InputError, InputEvent, InputInjector, KeyEvent, PointerButton, PointerEvent,
+        hid,
+    };
 
     fn collecting_sink() -> (Arc<StdMutex<Vec<PointerEvent>>>, crate::input::InputSink) {
         let seen = Arc::new(StdMutex::new(Vec::new()));
@@ -409,14 +425,26 @@ mod input_tests {
     fn injector_records_order_and_reports_failure() {
         let injector = FakeInputInjector::new();
         let events = [
-            PointerEvent::Motion { dx: 5, dy: 0 },
-            PointerEvent::Button {
+            InputEvent::Pointer(PointerEvent::Motion { dx: 5, dy: 0 }),
+            InputEvent::Key(KeyEvent::press(hid::LEFT_SHIFT)),
+            InputEvent::Pointer(PointerEvent::Button {
                 button: PointerButton::Right,
                 pressed: true,
-            },
+            }),
         ];
         injector.inject(&events).unwrap();
+        // Order is preserved across the pointer/key interleave.
         assert_eq!(injector.injected(), events.to_vec());
+        assert_eq!(
+            injector.injected_pointers(),
+            vec![
+                PointerEvent::Motion { dx: 5, dy: 0 },
+                PointerEvent::Button {
+                    button: PointerButton::Right,
+                    pressed: true,
+                },
+            ]
+        );
 
         injector.fail_next("UIPI");
         assert!(matches!(
@@ -424,7 +452,7 @@ mod input_tests {
             Err(InputError::InjectionFailed { .. })
         ));
         // The failed call recorded nothing.
-        assert_eq!(injector.injected().len(), 2);
+        assert_eq!(injector.injected().len(), 3);
     }
 }
 
