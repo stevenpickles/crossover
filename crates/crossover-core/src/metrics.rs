@@ -1,0 +1,777 @@
+//! Local execution metrics, dumped on shutdown (FR-7.3, FR-7.5).
+//!
+//! One shared [`Metrics`] registry of atomic counters that the whole
+//! process increments at the source — the session layer counts frames
+//! and bytes, the clipboard engine records latency, the application
+//! counts sessions and control transfers — and the application renders on
+//! the way out. Everything here is **local**: nothing leaves the machine
+//! (FR-7.5), and nothing records clipboard *content* or key material,
+//! only counts and byte totals (FR-7.4).
+//!
+//! Counters are `Relaxed` atomics: each is an independent tally with no
+//! ordering relationship to any other, and an approximate count under a
+//! torn read at shutdown is worth far more than the cost of stronger
+//! ordering on the hot send path. Latency samples need a `Mutex` (a
+//! percentile needs the distribution, not a running sum); it is taken
+//! only on the low-frequency clipboard-transaction path, never on the
+//! input hot path.
+
+use std::fmt;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use crossover_protocol::hello::MessageType;
+
+use crate::supervision::DisconnectReason;
+
+/// Upper bound on retained latency samples (NFR-1). Clipboard
+/// transactions are human-paced, so a run realistically produces
+/// thousands at most; beyond this the oldest are dropped and the report
+/// notes the truncation, so percentiles never cost unbounded memory.
+const MAX_LATENCY_SAMPLES: usize = 100_000;
+
+/// Traffic grouped for a readable breakdown. The raw message type is a
+/// `u16` with fifteen values; a summary wants classes, not a histogram
+/// of every discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameClass {
+    /// `Ping` / `Pong` keepalive.
+    Keepalive,
+    /// `Hello` and the pairing ceremony.
+    Setup,
+    /// Clipboard transaction messages.
+    Clipboard,
+    /// Input batches and `ReleaseAllInput`.
+    Input,
+    /// Control-transfer negotiation.
+    Control,
+    /// An unrecognized message type (a newer or misbehaving peer).
+    Other,
+}
+
+impl FrameClass {
+    /// Every class, in report order.
+    const ALL: [Self; 6] = [
+        Self::Keepalive,
+        Self::Setup,
+        Self::Clipboard,
+        Self::Input,
+        Self::Control,
+        Self::Other,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Keepalive => 0,
+            Self::Setup => 1,
+            Self::Clipboard => 2,
+            Self::Input => 3,
+            Self::Control => 4,
+            Self::Other => 5,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keepalive => "keepalive",
+            Self::Setup => "setup",
+            Self::Clipboard => "clipboard",
+            Self::Input => "input",
+            Self::Control => "control",
+            Self::Other => "other",
+        }
+    }
+
+    /// Classify a wire message type. Unknown values are `Other`, never a
+    /// panic — a peer we do not fully understand still counts.
+    #[must_use]
+    pub fn of(message_type: u16) -> Self {
+        match MessageType::from_wire(message_type) {
+            Some(MessageType::Ping | MessageType::Pong) => Self::Keepalive,
+            Some(MessageType::Hello | MessageType::PairingStart | MessageType::PairingConfirm) => {
+                Self::Setup
+            }
+            Some(
+                MessageType::ClipboardOffer
+                | MessageType::ClipboardAccept
+                | MessageType::ClipboardDecline
+                | MessageType::ClipboardData
+                | MessageType::ClipboardApplied,
+            ) => Self::Clipboard,
+            Some(MessageType::InputBatch | MessageType::ReleaseAllInput) => Self::Input,
+            Some(
+                MessageType::ControlRequest
+                | MessageType::ControlResponse
+                | MessageType::ControlRelease,
+            ) => Self::Control,
+            None => Self::Other,
+        }
+    }
+}
+
+/// Which disconnect reasons the report breaks out, mirroring
+/// [`DisconnectReason`] but flattened for counting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisconnectKind {
+    PeerClosed,
+    KeepaliveTimeout,
+    ProtocolViolation,
+    Transport,
+    ShutdownRequested,
+}
+
+impl DisconnectKind {
+    const ALL: [Self; 5] = [
+        Self::PeerClosed,
+        Self::KeepaliveTimeout,
+        Self::ProtocolViolation,
+        Self::Transport,
+        Self::ShutdownRequested,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::PeerClosed => 0,
+            Self::KeepaliveTimeout => 1,
+            Self::ProtocolViolation => 2,
+            Self::Transport => 3,
+            Self::ShutdownRequested => 4,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PeerClosed => "peer_closed",
+            Self::KeepaliveTimeout => "keepalive_timeout",
+            Self::ProtocolViolation => "protocol_violation",
+            Self::Transport => "transport",
+            Self::ShutdownRequested => "shutdown_requested",
+        }
+    }
+
+    fn of(reason: &DisconnectReason) -> Self {
+        // Exhaustive within this crate (DisconnectReason is only
+        // `#[non_exhaustive]` for downstream crates): a new reason breaks
+        // the build here, so the report can never silently drop one.
+        match reason {
+            DisconnectReason::PeerClosed => Self::PeerClosed,
+            DisconnectReason::KeepaliveTimeout => Self::KeepaliveTimeout,
+            DisconnectReason::ProtocolViolation { .. } => Self::ProtocolViolation,
+            DisconnectReason::Transport { .. } => Self::Transport,
+            DisconnectReason::ShutdownRequested => Self::ShutdownRequested,
+        }
+    }
+}
+
+/// The process-wide metrics registry. Cheap to clone as `Arc<Metrics>`
+/// and share; every field is an independent tally.
+#[derive(Debug, Default)]
+pub struct Metrics {
+    // ---- network ----
+    frames_sent: AtomicU64,
+    frames_received: AtomicU64,
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+    sent_by_class: [AtomicU64; 6],
+    received_by_class: [AtomicU64; 6],
+
+    // ---- sessions ----
+    sessions_inbound: AtomicU64,
+    sessions_outbound: AtomicU64,
+    reconnect_attempts: AtomicU64,
+    disconnects: [AtomicU64; 5],
+    total_connected_ms: AtomicU64,
+    longest_session_ms: AtomicU64,
+
+    // ---- clipboard ----
+    clipboard_sent: AtomicU64,
+    clipboard_applied: AtomicU64,
+    clipboard_superseded: AtomicU64,
+    clipboard_retries: AtomicU64,
+    clipboard_contention: AtomicU64,
+    clipboard_loop_suppressed: AtomicU64,
+    clipboard_conflicts: AtomicU64,
+    clipboard_latency_ms: Mutex<Vec<u32>>,
+    clipboard_latency_dropped: AtomicU64,
+
+    // ---- control & input ----
+    control_gained: AtomicU64,
+    control_given: AtomicU64,
+    control_denied: AtomicU64,
+    control_requests: AtomicU64,
+    control_timeouts: AtomicU64,
+    control_handbacks: AtomicU64,
+    control_revocations: AtomicU64,
+    capture_losses: AtomicU64,
+    input_events_sent: AtomicU64,
+    input_events_received: AtomicU64,
+    key_events_sent: AtomicU64,
+    key_events_received: AtomicU64,
+}
+
+impl Metrics {
+    /// A registry with everything at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // ---- network ----
+
+    /// Record a frame sent: its on-wire byte length and message type.
+    pub fn record_sent(&self, message_type: u16, wire_bytes: usize) {
+        self.frames_sent.fetch_add(1, Ordering::Relaxed);
+        self.bytes_sent
+            .fetch_add(wire_bytes as u64, Ordering::Relaxed);
+        self.sent_by_class[FrameClass::of(message_type).index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a frame received: its on-wire byte length and message type.
+    pub fn record_received(&self, message_type: u16, wire_bytes: usize) {
+        self.frames_received.fetch_add(1, Ordering::Relaxed);
+        self.bytes_received
+            .fetch_add(wire_bytes as u64, Ordering::Relaxed);
+        self.received_by_class[FrameClass::of(message_type).index()]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ---- sessions ----
+
+    /// Record a session reaching `ESTABLISHED`, by role.
+    pub fn record_session_established(&self, inbound: bool) {
+        if inbound {
+            &self.sessions_inbound
+        } else {
+            &self.sessions_outbound
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a session's end: its reason and how long it was up.
+    pub fn record_session_ended(&self, reason: &DisconnectReason, duration: Duration) {
+        self.disconnects[DisconnectKind::of(reason).index()].fetch_add(1, Ordering::Relaxed);
+        let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        self.total_connected_ms.fetch_add(ms, Ordering::Relaxed);
+        self.longest_session_ms.fetch_max(ms, Ordering::Relaxed);
+    }
+
+    /// Record a reconnection attempt (an establish that failed and will
+    /// be retried) — the app-level stand-in for "retransmitted", since
+    /// TCP's own retransmits are invisible above the socket.
+    pub fn record_reconnect_attempt(&self) {
+        self.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ---- clipboard ----
+
+    /// A clipboard item was sent to the peer.
+    pub fn record_clipboard_sent(&self) {
+        self.clipboard_sent.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A remote item was applied to the local clipboard.
+    pub fn record_clipboard_applied(&self) {
+        self.clipboard_applied.fetch_add(1, Ordering::Relaxed);
+    }
+    /// An item was superseded by a newer one before it took effect.
+    pub fn record_clipboard_superseded(&self) {
+        self.clipboard_superseded.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A clipboard write was retried after `Busy` contention.
+    pub fn record_clipboard_retry(&self) {
+        self.clipboard_retries.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A clipboard read/write hit `Busy` contention (R-5).
+    pub fn record_clipboard_contention(&self) {
+        self.clipboard_contention.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Our own applied item was recognized on read-back and not resent
+    /// (loop prevention, FR-3.3).
+    pub fn record_clipboard_loop_suppressed(&self) {
+        self.clipboard_loop_suppressed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// A near-simultaneous clipboard change was resolved by the
+    /// latest-wins policy (FR-3.5).
+    pub fn record_clipboard_conflict(&self) {
+        self.clipboard_conflicts.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A completed clipboard round-trip latency, on the originating
+    /// clock (the number docs/TESTING.md §4 defines).
+    pub fn record_clipboard_latency(&self, ms: u32) {
+        let mut samples = self
+            .clipboard_latency_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if samples.len() < MAX_LATENCY_SAMPLES {
+            samples.push(ms);
+        } else {
+            self.clipboard_latency_dropped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // ---- control & input ----
+
+    /// This machine gained control of a peer.
+    pub fn record_control_gained(&self) {
+        self.control_gained.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A peer took control of this machine.
+    pub fn record_control_given(&self) {
+        self.control_given.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A control request (either direction) was denied.
+    pub fn record_control_denied(&self) {
+        self.control_denied.fetch_add(1, Ordering::Relaxed);
+    }
+    /// This machine asked a peer for control.
+    pub fn record_control_request(&self) {
+        self.control_requests.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A control request timed out with no answer.
+    pub fn record_control_timeout(&self) {
+        self.control_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A control relationship ended by hand-back (includes the escape
+    /// gesture, which hands back the same way).
+    pub fn record_control_handback(&self) {
+        self.control_handbacks.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A control grant was revoked by the controlled side.
+    pub fn record_control_revocation(&self) {
+        self.control_revocations.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Local input capture was lost while controlling (R-2 fail-closed).
+    pub fn record_capture_loss(&self) {
+        self.capture_losses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record input events forwarded to a peer: total, and how many were
+    /// key events.
+    pub fn record_input_sent(&self, total: u64, keys: u64) {
+        self.input_events_sent.fetch_add(total, Ordering::Relaxed);
+        self.key_events_sent.fetch_add(keys, Ordering::Relaxed);
+    }
+
+    /// Record input events injected from a peer: total, and how many were
+    /// key events.
+    pub fn record_input_received(&self, total: u64, keys: u64) {
+        self.input_events_received
+            .fetch_add(total, Ordering::Relaxed);
+        self.key_events_received.fetch_add(keys, Ordering::Relaxed);
+    }
+
+    /// Read every counter into a plain, orderless snapshot for rendering.
+    #[must_use]
+    pub fn snapshot(&self) -> Report {
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let sorted_latency = {
+            let samples = self
+                .clipboard_latency_ms
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut v = samples.clone();
+            v.sort_unstable();
+            v
+        };
+        Report {
+            frames_sent: load(&self.frames_sent),
+            frames_received: load(&self.frames_received),
+            bytes_sent: load(&self.bytes_sent),
+            bytes_received: load(&self.bytes_received),
+            sent_by_class: FrameClass::ALL.map(|c| load(&self.sent_by_class[c.index()])),
+            received_by_class: FrameClass::ALL.map(|c| load(&self.received_by_class[c.index()])),
+            sessions_inbound: load(&self.sessions_inbound),
+            sessions_outbound: load(&self.sessions_outbound),
+            reconnect_attempts: load(&self.reconnect_attempts),
+            disconnects: DisconnectKind::ALL.map(|k| load(&self.disconnects[k.index()])),
+            total_connected_ms: load(&self.total_connected_ms),
+            longest_session_ms: load(&self.longest_session_ms),
+            clipboard_sent: load(&self.clipboard_sent),
+            clipboard_applied: load(&self.clipboard_applied),
+            clipboard_superseded: load(&self.clipboard_superseded),
+            clipboard_retries: load(&self.clipboard_retries),
+            clipboard_contention: load(&self.clipboard_contention),
+            clipboard_loop_suppressed: load(&self.clipboard_loop_suppressed),
+            clipboard_conflicts: load(&self.clipboard_conflicts),
+            clipboard_latency_dropped: load(&self.clipboard_latency_dropped),
+            latency_p50: percentile(&sorted_latency, 50),
+            latency_p95: percentile(&sorted_latency, 95),
+            latency_max: sorted_latency.last().copied(),
+            latency_samples: sorted_latency.len() as u64,
+            control_gained: load(&self.control_gained),
+            control_given: load(&self.control_given),
+            control_denied: load(&self.control_denied),
+            control_requests: load(&self.control_requests),
+            control_timeouts: load(&self.control_timeouts),
+            control_handbacks: load(&self.control_handbacks),
+            control_revocations: load(&self.control_revocations),
+            capture_losses: load(&self.capture_losses),
+            input_events_sent: load(&self.input_events_sent),
+            input_events_received: load(&self.input_events_received),
+            key_events_sent: load(&self.key_events_sent),
+            key_events_received: load(&self.key_events_received),
+        }
+    }
+}
+
+/// The nearest-rank percentile of a pre-sorted slice, or `None` if empty.
+fn percentile(sorted: &[u32], p: u8) -> Option<u32> {
+    if sorted.is_empty() {
+        return None;
+    }
+    // Nearest-rank: ceil(p/100 * n), 1-indexed, clamped into range. The
+    // sample count is bounded by MAX_LATENCY_SAMPLES, so this cannot
+    // overflow usize.
+    let rank = (usize::from(p) * sorted.len()).div_ceil(100).max(1);
+    sorted.get(rank - 1).copied()
+}
+
+/// An orderless snapshot of every counter, for rendering. Plain values,
+/// so the human block and the structured record read the same numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// Total frames sent.
+    pub frames_sent: u64,
+    /// Total frames received.
+    pub frames_received: u64,
+    /// Total on-wire bytes sent.
+    pub bytes_sent: u64,
+    /// Total on-wire bytes received.
+    pub bytes_received: u64,
+    /// Frames sent, per [`FrameClass`] in `FrameClass::ALL` order.
+    pub sent_by_class: [u64; 6],
+    /// Frames received, per class in `FrameClass::ALL` order.
+    pub received_by_class: [u64; 6],
+    /// Inbound sessions established.
+    pub sessions_inbound: u64,
+    /// Outbound sessions established.
+    pub sessions_outbound: u64,
+    /// Reconnection attempts.
+    pub reconnect_attempts: u64,
+    /// Disconnects, per reason in `DisconnectKind::ALL` order.
+    pub disconnects: [u64; 5],
+    /// Total connected time across all sessions, milliseconds.
+    pub total_connected_ms: u64,
+    /// Longest single session, milliseconds.
+    pub longest_session_ms: u64,
+    /// Clipboard items sent.
+    pub clipboard_sent: u64,
+    /// Clipboard items applied locally.
+    pub clipboard_applied: u64,
+    /// Clipboard items superseded before taking effect.
+    pub clipboard_superseded: u64,
+    /// Clipboard write retries (`Busy`).
+    pub clipboard_retries: u64,
+    /// Clipboard contention events (`Busy`).
+    pub clipboard_contention: u64,
+    /// Own-write loop suppressions.
+    pub clipboard_loop_suppressed: u64,
+    /// Clipboard conflicts resolved.
+    pub clipboard_conflicts: u64,
+    /// Latency samples dropped past the retention cap.
+    pub clipboard_latency_dropped: u64,
+    /// Clipboard round-trip latency p50 (ms), if any samples.
+    pub latency_p50: Option<u32>,
+    /// Clipboard round-trip latency p95 (ms).
+    pub latency_p95: Option<u32>,
+    /// Clipboard round-trip latency max (ms).
+    pub latency_max: Option<u32>,
+    /// Latency samples counted.
+    pub latency_samples: u64,
+    /// Times this machine gained control of a peer.
+    pub control_gained: u64,
+    /// Times a peer took control of this machine.
+    pub control_given: u64,
+    /// Control requests denied.
+    pub control_denied: u64,
+    /// Control requests made by this machine.
+    pub control_requests: u64,
+    /// Control requests that timed out.
+    pub control_timeouts: u64,
+    /// Control relationships ended by hand-back (incl. escape).
+    pub control_handbacks: u64,
+    /// Control grants revoked by the controlled side.
+    pub control_revocations: u64,
+    /// Capture losses (R-2).
+    pub capture_losses: u64,
+    /// Input events forwarded to peers.
+    pub input_events_sent: u64,
+    /// Input events injected from peers.
+    pub input_events_received: u64,
+    /// Of the sent input events, how many were key events.
+    pub key_events_sent: u64,
+    /// Of the received input events, how many were key events.
+    pub key_events_received: u64,
+}
+
+impl Report {
+    /// Emit the snapshot as one structured `tracing` record (`snake_case`
+    /// fields), for log post-processing alongside the human block.
+    pub fn log(&self) {
+        tracing::info!(
+            frames_sent = self.frames_sent,
+            frames_received = self.frames_received,
+            bytes_sent = self.bytes_sent,
+            bytes_received = self.bytes_received,
+            reconnect_attempts = self.reconnect_attempts,
+            sessions_inbound = self.sessions_inbound,
+            sessions_outbound = self.sessions_outbound,
+            total_connected_ms = self.total_connected_ms,
+            longest_session_ms = self.longest_session_ms,
+            clipboard_sent = self.clipboard_sent,
+            clipboard_applied = self.clipboard_applied,
+            clipboard_retries = self.clipboard_retries,
+            clipboard_contention = self.clipboard_contention,
+            clipboard_conflicts = self.clipboard_conflicts,
+            latency_p50_ms = self.latency_p50,
+            latency_p95_ms = self.latency_p95,
+            latency_max_ms = self.latency_max,
+            control_gained = self.control_gained,
+            control_given = self.control_given,
+            control_denied = self.control_denied,
+            capture_losses = self.capture_losses,
+            input_events_sent = self.input_events_sent,
+            input_events_received = self.input_events_received,
+            "execution metrics"
+        );
+    }
+
+    fn total_disconnects(&self) -> u64 {
+        self.disconnects.iter().sum()
+    }
+}
+
+/// Human-readable shutdown block. Grouped, aligned, and only printing
+/// the sub-lines that carry a signal, so a quiet run stays short.
+impl fmt::Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Session statistics")?;
+
+        writeln!(
+            f,
+            "  network:    {} frames / {} sent,  {} frames / {} received",
+            self.frames_sent,
+            human_bytes(self.bytes_sent),
+            self.frames_received,
+            human_bytes(self.bytes_received),
+        )?;
+        for (i, class) in FrameClass::ALL.iter().enumerate() {
+            let sent = self.sent_by_class[i];
+            let recv = self.received_by_class[i];
+            if sent + recv > 0 {
+                writeln!(
+                    f,
+                    "                {:<10} {sent} sent, {recv} received",
+                    class.label()
+                )?;
+            }
+        }
+
+        writeln!(
+            f,
+            "  sessions:   {} inbound, {} outbound established; {} reconnect attempt(s)",
+            self.sessions_inbound, self.sessions_outbound, self.reconnect_attempts,
+        )?;
+        if self.total_disconnects() > 0 {
+            for (i, kind) in DisconnectKind::ALL.iter().enumerate() {
+                if self.disconnects[i] > 0 {
+                    writeln!(
+                        f,
+                        "                {:<18} {}",
+                        kind.label(),
+                        self.disconnects[i]
+                    )?;
+                }
+            }
+        }
+        writeln!(
+            f,
+            "                connected {}, longest session {}",
+            human_ms(self.total_connected_ms),
+            human_ms(self.longest_session_ms),
+        )?;
+
+        writeln!(
+            f,
+            "  clipboard:  {} sent, {} applied, {} superseded; {} retries, {} contention, {} conflicts",
+            self.clipboard_sent,
+            self.clipboard_applied,
+            self.clipboard_superseded,
+            self.clipboard_retries,
+            self.clipboard_contention,
+            self.clipboard_conflicts,
+        )?;
+        if let (Some(p50), Some(p95), Some(max)) =
+            (self.latency_p50, self.latency_p95, self.latency_max)
+        {
+            writeln!(
+                f,
+                "                latency p50 {p50}ms, p95 {p95}ms, max {max}ms (over {} samples)",
+                self.latency_samples,
+            )?;
+        }
+
+        writeln!(
+            f,
+            "  control:    gained {}, given {}, denied {}, timed out {}, handed back {}, revoked {}",
+            self.control_gained,
+            self.control_given,
+            self.control_denied,
+            self.control_timeouts,
+            self.control_handbacks,
+            self.control_revocations,
+        )?;
+        if self.capture_losses > 0 {
+            writeln!(
+                f,
+                "                capture lost {} time(s)",
+                self.capture_losses
+            )?;
+        }
+        write!(
+            f,
+            "  input:      {} events sent ({} keys), {} events received ({} keys)",
+            self.input_events_sent,
+            self.key_events_sent,
+            self.input_events_received,
+            self.key_events_received,
+        )
+    }
+}
+
+/// Bytes with a binary-unit suffix, for the human block.
+#[allow(clippy::cast_precision_loss)] // display only; a fractional GiB is fine
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Milliseconds as a compact human duration.
+fn human_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{FrameClass, Metrics, percentile};
+    use crate::supervision::DisconnectReason;
+
+    #[test]
+    fn frame_classes_cover_the_message_types() {
+        assert_eq!(FrameClass::of(2), FrameClass::Keepalive); // Ping
+        assert_eq!(FrameClass::of(9), FrameClass::Clipboard); // ClipboardData
+        assert_eq!(FrameClass::of(11), FrameClass::Input); // InputBatch
+        assert_eq!(FrameClass::of(13), FrameClass::Control); // ControlRequest
+        assert_eq!(FrameClass::of(1), FrameClass::Setup); // Hello
+        assert_eq!(FrameClass::of(9999), FrameClass::Other); // unknown
+    }
+
+    #[test]
+    fn network_counters_total_and_classify() {
+        let m = Metrics::new();
+        m.record_sent(11, 40); // InputBatch, 40 bytes
+        m.record_sent(2, 14); // Ping
+        m.record_received(9, 4096); // ClipboardData
+
+        let r = m.snapshot();
+        assert_eq!(r.frames_sent, 2);
+        assert_eq!(r.bytes_sent, 54);
+        assert_eq!(r.frames_received, 1);
+        assert_eq!(r.bytes_received, 4096);
+        // Input class (index 3) has one sent; keepalive (0) one sent.
+        assert_eq!(r.sent_by_class[FrameClass::Input.index()], 1);
+        assert_eq!(r.sent_by_class[FrameClass::Keepalive.index()], 1);
+        assert_eq!(r.received_by_class[FrameClass::Clipboard.index()], 1);
+    }
+
+    #[test]
+    fn sessions_track_reasons_and_longest() {
+        let m = Metrics::new();
+        m.record_session_established(true);
+        m.record_session_established(false);
+        m.record_session_ended(&DisconnectReason::PeerClosed, Duration::from_secs(3));
+        m.record_session_ended(&DisconnectReason::KeepaliveTimeout, Duration::from_secs(10));
+        m.record_reconnect_attempt();
+
+        let r = m.snapshot();
+        assert_eq!(r.sessions_inbound, 1);
+        assert_eq!(r.sessions_outbound, 1);
+        assert_eq!(r.reconnect_attempts, 1);
+        assert_eq!(r.total_connected_ms, 13_000);
+        assert_eq!(r.longest_session_ms, 10_000);
+        assert_eq!(r.total_disconnects(), 2);
+    }
+
+    #[test]
+    fn latency_percentiles_are_nearest_rank() {
+        let m = Metrics::new();
+        for ms in 1..=100 {
+            m.record_clipboard_latency(ms);
+        }
+        let r = m.snapshot();
+        assert_eq!(r.latency_samples, 100);
+        assert_eq!(r.latency_p50, Some(50));
+        assert_eq!(r.latency_p95, Some(95));
+        assert_eq!(r.latency_max, Some(100));
+    }
+
+    #[test]
+    fn percentile_of_empty_is_none_and_single_is_itself() {
+        assert_eq!(percentile(&[], 50), None);
+        assert_eq!(percentile(&[42], 50), Some(42));
+        assert_eq!(percentile(&[42], 95), Some(42));
+    }
+
+    #[test]
+    fn a_quiet_run_renders_without_optional_lines() {
+        // Nothing recorded: the block must still render, with no
+        // disconnect breakdown, no latency line, no capture-loss line.
+        let text = Metrics::new().snapshot().to_string();
+        assert!(text.starts_with("Session statistics"));
+        assert!(!text.contains("latency"));
+        assert!(!text.contains("capture lost"));
+        assert!(text.contains("input:"));
+    }
+
+    #[test]
+    fn a_busy_run_renders_every_group() {
+        let m = Metrics::new();
+        m.record_sent(11, 40);
+        m.record_received(9, 4096);
+        m.record_session_established(false);
+        m.record_session_ended(&DisconnectReason::PeerClosed, Duration::from_secs(5));
+        m.record_clipboard_sent();
+        m.record_clipboard_latency(6);
+        m.record_control_gained();
+        m.record_capture_loss();
+        m.record_input_sent(120, 5);
+
+        let text = m.snapshot().to_string();
+        assert!(text.contains("network:"));
+        assert!(text.contains("peer_closed"));
+        assert!(text.contains("latency p50 6ms"));
+        assert!(text.contains("capture lost 1"));
+        assert!(text.contains("120 events sent (5 keys)"));
+    }
+}

@@ -45,6 +45,7 @@ fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
             },
             transmit_debounce: Duration::from_millis(5),
         },
+        None,
     )
     .unwrap();
     tokio::spawn(driver.run());

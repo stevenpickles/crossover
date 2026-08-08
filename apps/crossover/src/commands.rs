@@ -6,7 +6,7 @@
 
 use std::io::Write as _;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use tokio::sync::{mpsc, watch};
@@ -18,10 +18,13 @@ use crossover_core::supervision::{
 };
 use crossover_core::{
     ClipboardConfig, ControlConfig, ControlNotice, FrameTarget, InputControlEvent, LocalNode,
-    SessionCommand, SessionListener, SessionOptions, SyncEvent, clipboard_sync, input_control,
+    Metrics, SessionCommand, SessionListener, SessionOptions, SyncEvent, clipboard_sync,
+    input_control,
 };
 use crossover_platform::SecureStorage;
 use crossover_protocol::DEFAULT_PORT;
+use crossover_protocol::hello::MessageType;
+use crossover_protocol::input::{InputBatch, WireInputEvent};
 use crossover_security::pairing::{PairedPeer, PairingCode, PairingIdentity};
 use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TrustStore, TrustedPeer,
@@ -233,12 +236,21 @@ pub async fn run(
         identity.spki_fingerprint()?
     );
 
+    // One metrics registry for the whole run, shared by every layer that
+    // knows something worth counting and dumped on the way out (FR-7.3,
+    // FR-7.5). Local only: nothing here leaves the machine.
+    let metrics = Arc::new(Metrics::new());
+
     // Clipboard sync: one driver for the peer relationship; sessions of
     // either role feed it and carry its frames.
     let provider = open_clipboard_provider()?;
-    let (sync_driver, sync_events, sync_commands) =
-        clipboard_sync(provider, identity.device_id(), ClipboardConfig::new())
-            .context("starting clipboard sync")?;
+    let (sync_driver, sync_events, sync_commands) = clipboard_sync(
+        provider,
+        identity.device_id(),
+        ClipboardConfig::new(),
+        Some(Arc::clone(&metrics)),
+    )
+    .context("starting clipboard sync")?;
     tokio::spawn(sync_driver.run());
 
     // Input control: capture/inject behind the platform traits, driving
@@ -248,12 +260,13 @@ pub async fn run(
     let (control_driver, control_events, control_commands, control_notices) =
         input_control(capture, injector, ControlConfig::default());
     tokio::spawn(control_driver.run());
-    tokio::spawn(print_control_notices(control_notices));
+    tokio::spawn(print_control_notices(control_notices, Arc::clone(&metrics)));
 
     // Session lifecycle and frames fan out to both drivers.
     let fanout = SessionFanout {
         sync: sync_events,
         control: control_events.clone(),
+        metrics: Some(Arc::clone(&metrics)),
     };
 
     // Every live session, keyed by id, so the mux can route control and
@@ -267,22 +280,10 @@ pub async fn run(
     let commands = merge_command_streams(sync_commands, control_commands);
 
     // Outbound role: supervised session with automatic reconnect.
-    let (handle, events) = match &connect {
-        Some(addr) => {
-            println!("Maintaining an outbound session to {addr}.");
-            let (handle, events) = supervise_outbound(
-                addr.clone(),
-                identity.clone(),
-                certified.clone(),
-                Arc::new(RwLock::new(store.clone())),
-                SupervisorConfig::default(),
-            );
-            (Some(Arc::new(handle)), Some(events))
-        }
-        None => (None, None),
-    };
+    let (handle, events) =
+        start_outbound(connect.as_ref(), &identity, &certified, &store, &metrics);
 
-    spawn_command_mux(Arc::clone(&registry), commands);
+    spawn_command_mux(Arc::clone(&registry), commands, Some(Arc::clone(&metrics)));
 
     // Inbound role: accept loop, one session at a time (two-machine scope).
     let listener = match &listen_bind {
@@ -315,13 +316,63 @@ pub async fn run(
             &storage,
             &fanout,
             &registry,
+            &metrics,
         ) => {}
-        () = outbound_event_loop(events, handle.clone(), &storage, &fanout, &registry) => {}
+        () = outbound_event_loop(
+            events,
+            handle.clone(),
+            &storage,
+            &fanout,
+            &registry,
+            &metrics,
+        ) => {}
     }
     if let Some(handle) = &handle {
         handle.shutdown();
     }
+    print_execution_metrics(&metrics);
     Ok(())
+}
+
+/// Dump the run's statistics on shutdown (FR-7.3): the human-readable
+/// block to stdout, then the same numbers as one structured record for
+/// log post-processing. Always on shutdown, by design — no flag to
+/// forget. Everything here is local (FR-7.5).
+fn print_execution_metrics(metrics: &Metrics) {
+    let report = metrics.snapshot();
+    println!();
+    println!("{report}");
+    report.log();
+}
+
+/// Start the outbound role if an address was given: a supervised session
+/// with automatic reconnect, its `SessionOptions` carrying the metrics
+/// registry so its traffic is counted like the inbound side's. Returns
+/// `(None, None)` for a listen-only run.
+fn start_outbound(
+    connect: Option<&String>,
+    identity: &DeviceIdentity,
+    certified: &CertifiedIdentity,
+    store: &TrustStore,
+    metrics: &Arc<Metrics>,
+) -> (
+    Option<Arc<crossover_core::supervision::SupervisorHandle>>,
+    Option<mpsc::Receiver<SessionEvent>>,
+) {
+    let Some(addr) = connect else {
+        return (None, None);
+    };
+    println!("Maintaining an outbound session to {addr}.");
+    let mut supervisor_config = SupervisorConfig::default();
+    supervisor_config.session.metrics = Some(Arc::clone(metrics));
+    let (handle, events) = supervise_outbound(
+        addr.clone(),
+        identity.clone(),
+        certified.clone(),
+        Arc::new(RwLock::new(store.clone())),
+        supervisor_config,
+    );
+    (Some(Arc::new(handle)), Some(events))
 }
 
 /// Session lifecycle and inbound frames fanned out to both the clipboard
@@ -335,6 +386,7 @@ pub async fn run(
 struct SessionFanout {
     sync: mpsc::Sender<SyncEvent>,
     control: mpsc::Sender<InputControlEvent>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl SessionFanout {
@@ -355,12 +407,36 @@ impl SessionFanout {
     }
 
     async fn frame(&self, session: Uuid, frame: crossover_protocol::RawFrame) {
+        // Count input events injected from the peer at the point they
+        // arrive; the network layer already counts the frames, this adds
+        // the events inside them (total and how many were keys).
+        if frame.message_type == MessageType::InputBatch.wire()
+            && let Some(metrics) = &self.metrics
+            && let Some((total, keys)) = input_counts(&frame.payload)
+        {
+            metrics.record_input_received(total, keys);
+        }
         let _ = self.sync.send(SyncEvent::Frame(frame.clone())).await;
         let _ = self
             .control
             .send(InputControlEvent::Frame { session, frame })
             .await;
     }
+}
+
+/// Count the events in an encoded input batch: total, and how many are
+/// key events. `None` if the payload does not decode — the network layer
+/// still counts the frame, so a malformed batch is not lost here, only
+/// its per-event detail.
+fn input_counts(payload: &[u8]) -> Option<(u64, u64)> {
+    let batch = InputBatch::decode_payload(payload).ok()?;
+    let total = batch.events.len() as u64;
+    let keys = batch
+        .events
+        .iter()
+        .filter(|event| matches!(event, WireInputEvent::Key { .. }))
+        .count() as u64;
+    Some((total, keys))
 }
 
 /// Forward two `SessionCommand` streams into one, so the mux has a single
@@ -390,9 +466,33 @@ fn merge_command_streams(
 
 /// Print control-transfer state changes as they happen. Every failed or
 /// ended transfer is user-visible here (NFR-3); detail is in the logs.
-async fn print_control_notices(mut notices: mpsc::Receiver<ControlNotice>) {
+async fn print_control_notices(mut notices: mpsc::Receiver<ControlNotice>, metrics: Arc<Metrics>) {
     while let Some(notice) = notices.recv().await {
+        count_control_notice(&metrics, notice);
         println!("{}", describe_notice(notice));
+    }
+}
+
+/// Tally a control-transfer notice into the metrics registry. The notice
+/// stream is the app's window onto the control engine's decisions, so the
+/// control counters are sourced here rather than reaching into the engine.
+fn count_control_notice(metrics: &Metrics, notice: ControlNotice) {
+    use crossover_core::control::ControlEndReason;
+
+    match notice {
+        ControlNotice::RequestSent => metrics.record_control_request(),
+        ControlNotice::RequestDenied(_) => metrics.record_control_denied(),
+        ControlNotice::RequestTimedOut => metrics.record_control_timeout(),
+        ControlNotice::ControlGained => metrics.record_control_gained(),
+        ControlNotice::PeerTookControl => metrics.record_control_given(),
+        ControlNotice::ControlEnded(ControlEndReason::HandedBack) => {
+            metrics.record_control_handback();
+        }
+        ControlNotice::ControlEnded(ControlEndReason::CaptureLost) => metrics.record_capture_loss(),
+        ControlNotice::PeerControlRevoked => metrics.record_control_revocation(),
+        // The remaining notices (blocked requests, cancellations,
+        // disconnect-driven ends, peer releases) have no dedicated counter.
+        _ => {}
     }
 }
 
@@ -532,7 +632,11 @@ fn registry_lock(
 /// frames broadcast (FR-5.4). Fail-closed terminations kill the named
 /// session where it can be killed — the supervised outbound session has
 /// no per-session kill, an accepted limitation logged when it bites.
-fn spawn_command_mux(registry: SessionRegistry, mut commands: mpsc::Receiver<SessionCommand>) {
+fn spawn_command_mux(
+    registry: SessionRegistry,
+    mut commands: mpsc::Receiver<SessionCommand>,
+    metrics: Option<Arc<Metrics>>,
+) {
     tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
             match command {
@@ -541,6 +645,14 @@ fn spawn_command_mux(registry: SessionRegistry, mut commands: mpsc::Receiver<Ses
                     message_type,
                     payload,
                 } => {
+                    // Count input events forwarded to the peer as they pass
+                    // through the one place every outbound frame does.
+                    if message_type == MessageType::InputBatch.wire()
+                        && let Some(metrics) = &metrics
+                        && let Some((total, keys)) = input_counts(&payload)
+                    {
+                        metrics.record_input_sent(total, keys);
+                    }
                     // Collect matching sinks under the lock, then send
                     // after releasing it (never hold a std Mutex over an
                     // await).
@@ -605,11 +717,15 @@ async fn listener_loop(
     storage: &Arc<dyn SecureStorage>,
     fanout: &SessionFanout,
     registry: &SessionRegistry,
+    metrics: &Arc<Metrics>,
 ) {
     let Some(listener) = listener else {
         return std::future::pending().await;
     };
-    let options = SessionOptions::default();
+    let options = SessionOptions {
+        metrics: Some(Arc::clone(metrics)),
+        ..SessionOptions::default()
+    };
     let keepalive = KeepaliveConfig::default();
     loop {
         // Fresh trust per accept: pairings and revocations made by other
@@ -635,6 +751,8 @@ async fn listener_loop(
                     info.peer_device_name
                 );
                 touch_last_connected(&**storage, info.peer_fingerprint);
+                metrics.record_session_established(true);
+                let established_at = Instant::now();
 
                 let (events_tx, mut events_rx) = mpsc::channel(64);
                 let (outbound_tx, mut outbound_rx) = mpsc::channel::<(u16, Vec<u8>)>(64);
@@ -667,6 +785,7 @@ async fn listener_loop(
                 .await;
                 drop(events_tx);
                 let _ = drain.await;
+                metrics.record_session_ended(&reason, established_at.elapsed());
                 registry_lock(registry).remove(&session_id);
                 fanout.lost(session_id).await;
                 println!(
@@ -691,6 +810,7 @@ async fn outbound_event_loop(
     storage: &Arc<dyn SecureStorage>,
     fanout: &SessionFanout,
     registry: &SessionRegistry,
+    metrics: &Arc<Metrics>,
 ) {
     let Some(mut events) = events else {
         return std::future::pending().await;
@@ -699,6 +819,8 @@ async fn outbound_event_loop(
     // Established and its Disconnected belongs to this id — which the
     // control driver needs to scope the grant to the right session.
     let mut current_session: Option<uuid::Uuid> = None;
+    // When the live session was established, for its connected duration.
+    let mut established_at: Option<Instant> = None;
     while let Some(event) = events.recv().await {
         match event {
             SessionEvent::Established(info) => {
@@ -707,6 +829,8 @@ async fn outbound_event_loop(
                     info.peer_device_name
                 );
                 touch_last_connected(&**storage, info.peer_fingerprint);
+                metrics.record_session_established(false);
+                established_at = Some(Instant::now());
                 current_session = Some(info.session_id);
                 // Register the outbound session so control frames route to
                 // it by id. No kill switch: the supervisor has no
@@ -727,6 +851,9 @@ async fn outbound_event_loop(
                 reason,
                 retry_in,
             } => {
+                if let Some(since) = established_at.take() {
+                    metrics.record_session_ended(&reason, since.elapsed());
+                }
                 match retry_in {
                     Some(delay) => println!(
                         "Outbound session ended ({reason}); retrying in {}s.",
@@ -739,6 +866,9 @@ async fn outbound_event_loop(
                 fanout.lost(session_id).await;
             }
             SessionEvent::ConnectFailed { error, retry_in } => {
+                // A failed establish that will be retried — the app-level
+                // stand-in for "retransmitted" (TCP hides its own).
+                metrics.record_reconnect_attempt();
                 println!(
                     "Connect failed ({error}); retrying in {}s.",
                     retry_in.as_secs_f32()

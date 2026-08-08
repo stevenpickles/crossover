@@ -11,6 +11,7 @@ pub mod clipboard_driver;
 pub mod control;
 pub mod control_driver;
 pub mod input;
+pub mod metrics;
 pub mod net;
 pub mod pairing;
 pub mod supervision;

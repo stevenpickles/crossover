@@ -22,6 +22,7 @@
 //!   up, which only matters during genuinely simultaneous copies.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -32,6 +33,8 @@ use crossover_protocol::clipboard::{
     MAX_CLIPBOARD_TEXT_BYTES, content_hash,
 };
 use crossover_protocol::hello::MessageType;
+
+use crate::metrics::Metrics;
 
 /// How many recently-applied content hashes are remembered for loop
 /// prevention. Notifications coalesce, so a small window suffices; the
@@ -288,12 +291,29 @@ pub struct ClipboardEngine {
     expecting_data: Option<ClipboardMeta>,
     /// The write (with retries) currently underway.
     pending_write: Option<PendingWrite>,
+    /// Optional metrics sink. Recorded alongside the `tracing` side
+    /// effects the engine already emits at each decision point, so the
+    /// semantic outcomes only this engine can see — sent, applied,
+    /// superseded, conflicts, loop suppressions, latency — are counted at
+    /// their source. `None` in unit tests and when the app runs without a
+    /// registry.
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl ClipboardEngine {
     /// A fresh engine for `origin` (our device id).
     #[must_use]
     pub fn new(origin: Uuid, config: ClipboardConfig) -> Self {
+        Self::with_metrics(origin, config, None)
+    }
+
+    /// A fresh engine that records its outcomes into `metrics`.
+    #[must_use]
+    pub fn with_metrics(
+        origin: Uuid,
+        config: ClipboardConfig,
+        metrics: Option<Arc<Metrics>>,
+    ) -> Self {
         Self {
             origin,
             config,
@@ -303,6 +323,14 @@ impl ClipboardEngine {
             outbound: None,
             expecting_data: None,
             pending_write: None,
+            metrics,
+        }
+    }
+
+    /// Record into the metrics sink if one is attached; a no-op otherwise.
+    fn record(&self, f: impl FnOnce(&Metrics)) {
+        if let Some(metrics) = &self.metrics {
+            f(metrics);
         }
     }
 
@@ -344,6 +372,7 @@ impl ClipboardEngine {
         // Loop prevention: this is content we ourselves applied.
         if self.applied_hashes.contains(&hash) {
             self.current_local_hash = Some(hash);
+            self.record(Metrics::record_clipboard_loop_suppressed);
             return Vec::new();
         }
         // Dedup: unchanged content never re-sends.
@@ -397,6 +426,7 @@ impl ClipboardEngine {
             Ok(()) => {
                 self.remember_applied(pending.meta.content_hash);
                 self.current_local_hash = Some(pending.meta.content_hash);
+                self.record(Metrics::record_clipboard_applied);
                 tracing::info!(
                     clipboard_id = %pending.meta.id,
                     origin_peer = %pending.meta.origin,
@@ -486,6 +516,7 @@ impl ClipboardEngine {
                 "outbound clipboard transaction superseded by newer local copy"
             );
         }
+        self.record(Metrics::record_clipboard_sent);
         let meta = data.meta;
         let started = Instant::now();
         if meta.content_length <= CLIPBOARD_INLINE_MAX_BYTES as u64 {
@@ -539,6 +570,7 @@ impl ClipboardEngine {
         match self.outbound.take() {
             Some(Outbound::AwaitingAccept { data, started }) if data.meta.id == decline.id => {
                 let latency_ms = elapsed_ms(started);
+                self.record(|m| m.record_clipboard_latency(clamp_ms(latency_ms)));
                 let outcome = match decline.reason {
                     // Success-shaped: the peer already has the content, or
                     // a newer item won the race.
@@ -581,6 +613,7 @@ impl ClipboardEngine {
 
         if let Some(reason) = self.conflict_verdict(data.meta) {
             debug_assert_eq!(reason, DeclineReason::Superseded);
+            self.record(Metrics::record_clipboard_superseded);
             return vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
                 id: data.meta.id,
                 result: ApplyResult::Superseded,
@@ -632,11 +665,13 @@ impl ClipboardEngine {
                 // Round trip measured on this machine's clock alone:
                 // local observation through the destination's verdict
                 // (docs/TESTING.md §4 — the number Phase 6 will want).
+                let latency_ms = elapsed_ms(started);
+                self.record(|m| m.record_clipboard_latency(clamp_ms(latency_ms)));
                 tracing::info!(
                     clipboard_id = %applied.id,
                     result = outcome,
                     byte_count = meta.content_length,
-                    latency_ms = elapsed_ms(started),
+                    latency_ms,
                     "clipboard transaction closed"
                 );
                 Vec::new()
@@ -656,6 +691,9 @@ impl ClipboardEngine {
     /// closes locally as superseded).
     fn conflict_verdict(&mut self, inbound: ClipboardMeta) -> Option<DeclineReason> {
         let ours = self.outbound.as_ref()?.meta();
+        // Reaching here means an inbound item arrived while our own was in
+        // flight: a genuine near-simultaneous race (FR-3.5).
+        self.record(Metrics::record_clipboard_conflict);
         let inbound_wins =
             (inbound.sequence, inbound.origin.as_bytes()) > (ours.sequence, ours.origin.as_bytes());
         if inbound_wins {
@@ -692,6 +730,13 @@ impl ClipboardEngine {
 /// Milliseconds since `started`, saturating into `u64` for logging.
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Narrow a millisecond duration to the `u32` the latency histogram
+/// keeps, saturating rather than wrapping (a clipboard round trip past 49
+/// days is a broken clock, not a real sample).
+fn clamp_ms(ms: u64) -> u32 {
+    u32::try_from(ms).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -1092,6 +1137,86 @@ mod tests {
         // The escape hatch for callers who want no wait at all.
         assert_eq!(e.on_local_change(), vec![Action::ReadClipboard]);
         assert_eq!(sent(&e.on_local_read(Some("eager".to_owned()))).len(), 1);
+    }
+
+    #[test]
+    fn metrics_record_the_semantic_clipboard_outcomes() {
+        use std::sync::Arc;
+
+        use crate::metrics::Metrics;
+
+        let metrics = Arc::new(Metrics::new());
+        let mut e = ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig::new(),
+            Some(Arc::clone(&metrics)),
+        );
+
+        // A local copy is one item sent.
+        let actions = copy(&mut e, "hello");
+        let OutboundMessage::Data(data) = sent(&actions)[0] else {
+            panic!("expected inline data");
+        };
+        let sent_id = data.meta.id;
+        assert_eq!(metrics.snapshot().clipboard_sent, 1);
+
+        // The peer's verdict closes the round trip: one latency sample, on
+        // this machine's clock.
+        e.on_peer_message(InboundMessage::Applied(ClipboardApplied {
+            id: sent_id,
+            result: ApplyResult::Applied,
+        }));
+        assert_eq!(metrics.snapshot().latency_samples, 1);
+
+        // Receiving and writing a peer item counts one applied.
+        let item = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xBB; 16]),
+            0,
+            ContentType::Utf8Text,
+            b"from peer".to_vec(),
+        );
+        let write_id = item.meta.id;
+        e.on_peer_message(InboundMessage::Data(item));
+        e.on_write_result(write_id, Ok(()));
+        assert_eq!(metrics.snapshot().clipboard_applied, 1);
+
+        // The provider's own-write notification is suppressed, not resent.
+        e.on_local_change();
+        e.on_settle_due();
+        e.on_local_read(Some("from peer".to_owned()));
+        let snap = metrics.snapshot();
+        assert_eq!(snap.clipboard_loop_suppressed, 1);
+        // No race occurred in this sequence.
+        assert_eq!(snap.clipboard_conflicts, 0);
+    }
+
+    #[test]
+    fn metrics_record_a_conflict_when_an_inbound_item_races_ours() {
+        use std::sync::Arc;
+
+        use crate::metrics::Metrics;
+
+        let metrics = Arc::new(Metrics::new());
+        let mut e = ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig::new(),
+            Some(Arc::clone(&metrics)),
+        );
+
+        // Our item is in flight when a higher-origin inbound item arrives:
+        // the deterministic order makes theirs win, and it counts as one
+        // conflict resolved.
+        copy(&mut e, "ours");
+        let inbound = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xBB; 16]),
+            0,
+            ContentType::Utf8Text,
+            b"theirs".to_vec(),
+        );
+        e.on_peer_message(InboundMessage::Data(inbound));
+        assert_eq!(metrics.snapshot().clipboard_conflicts, 1);
     }
 
     #[test]

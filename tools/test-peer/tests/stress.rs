@@ -63,6 +63,7 @@ fn side(origin: u8) -> Side {
             // ~15 ms on Windows, which is 150 s across the run.
             transmit_debounce: Duration::ZERO,
         },
+        None,
     )
     .unwrap();
     tokio::spawn(driver.run());
