@@ -9,6 +9,7 @@
 pub mod clipboard;
 pub mod clipboard_driver;
 pub mod control;
+pub mod control_driver;
 pub mod input;
 pub mod net;
 pub mod pairing;
@@ -20,6 +21,7 @@ pub use control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
     OutboundControl,
 };
+pub use control_driver::{InputControlDriver, InputControlEvent, input_control};
 pub use input::{InputState, PointerButton, PointerEvent, coalesce};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
