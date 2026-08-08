@@ -1,22 +1,26 @@
-//! Input wire messages (docs/PROTOCOL.md §6, FR-4.1/4.2).
+//! Input wire messages (docs/PROTOCOL.md §6, FR-4.1/4.2; ADR 0008).
 //!
-//! Phase 3 carries the pointer; the keyboard joins in Phase 4. Two
-//! delivery classes share one message type, because the difference is
-//! semantic rather than structural:
+//! Pointer and keyboard events share one ordered stream — they must
+//! interleave, or a chord like Shift+click loses its ordering. Two
+//! delivery classes coexist in it, because the difference is semantic
+//! rather than structural:
 //!
 //! - **Pointer motion and scroll may be coalesced.** Newer movement
 //!   supersedes older, so under backpressure intermediate positions are
 //!   dropped rather than queued (docs/SPECIFICATION.md §6.7: latency
 //!   matters more than motion durability).
-//! - **Button transitions are ordered and lossless.** A press that
-//!   arrives after its release, or not at all, leaves the destination
-//!   holding a button nobody is pressing — the defect class
-//!   `ReleaseAllInput` exists to clean up and which must not be created
-//!   casually.
+//! - **Button and key transitions are ordered and lossless.** A press
+//!   that arrives after its release, or not at all, leaves the
+//!   destination holding a button or key nobody is pressing — the defect
+//!   class `ReleaseAllInput` exists to clean up and which must not be
+//!   created casually.
 //!
 //! A batch therefore travels as an ordered sequence within one frame:
 //! the sender coalesces before sending, and the receiver replays in
-//! order, so ordering is preserved without a message per event.
+//! order, so ordering is preserved without a message per event. Key
+//! identity is a USB HID usage id; produced text rides alongside, bounded
+//! by [`MAX_KEY_TEXT_BYTES`] because it is network-influenced (ADR 0008,
+//! NFR-1).
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +36,15 @@ pub const MAX_INPUT_BATCH_EVENTS: usize = 256;
 
 /// Scroll units per traditional detent, mirroring the core model.
 pub const SCROLL_UNITS_PER_DETENT: i32 = 120;
+
+/// Maximum bytes of produced text a single [`WireInputEvent::Key`] may
+/// carry.
+///
+/// A keystroke normally produces one grapheme; this bounds even a
+/// combining sequence, and — being network-influenced — is validated
+/// before it is trusted (NFR-1). Dead-key composition and IME, which
+/// could produce more, are out of Phase 4 scope (ADR 0008).
+pub const MAX_KEY_TEXT_BYTES: usize = 32;
 
 /// Pointer buttons as they travel. Wire values are explicit and never
 /// reused; unknown values are rejected rather than guessed at.
@@ -50,7 +63,10 @@ pub enum WireButton {
 }
 
 /// One input event on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Copy`: a [`WireInputEvent::Key`] may carry produced text. Both
+/// button and key transitions are ordered and never coalesced (FR-4.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireInputEvent {
     /// Relative pointer movement in device units (ADR 0007: Raw Input
     /// deltas, unaccelerated and unclamped).
@@ -73,6 +89,23 @@ pub enum WireInputEvent {
         dx: i32,
         /// Vertical (positive: away from the user).
         dy: i32,
+    },
+    /// A keyboard transition (ADR 0008). Ordered and never coalesced —
+    /// interleaved with pointer events in one stream so a chord like
+    /// Shift+click keeps its ordering.
+    Key {
+        /// Physical key identity as a USB HID keyboard/keypad usage ID
+        /// (Usage Page 0x07) — layout- and OS-independent.
+        key: u16,
+        /// True for press, false for release.
+        pressed: bool,
+        /// True for an OS-generated auto-repeat of a held key.
+        repeat: bool,
+        /// The Unicode text the source produced, if any — carried so
+        /// mismatched layouts can be reproduced (ADR 0008). Bounded by
+        /// [`MAX_KEY_TEXT_BYTES`]; `None` for keys that produce no text
+        /// and for releases.
+        text: Option<String>,
     },
 }
 
@@ -111,6 +144,20 @@ impl InputBatch {
                     self.events.len()
                 ),
             });
+        }
+        for event in &self.events {
+            if let WireInputEvent::Key {
+                text: Some(text), ..
+            } = event
+                && text.len() > MAX_KEY_TEXT_BYTES
+            {
+                return Err(ProtocolError::Malformed {
+                    reason: format!(
+                        "key event text of {} bytes exceeds maximum {MAX_KEY_TEXT_BYTES}",
+                        text.len()
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -179,8 +226,20 @@ impl ReleaseAllInput {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputBatch, MAX_INPUT_BATCH_EVENTS, ReleaseAllInput, WireButton, WireInputEvent};
+    use super::{
+        InputBatch, MAX_INPUT_BATCH_EVENTS, MAX_KEY_TEXT_BYTES, ReleaseAllInput, WireButton,
+        WireInputEvent,
+    };
     use crate::ProtocolError;
+
+    fn key(key: u16, pressed: bool, repeat: bool, text: Option<&str>) -> WireInputEvent {
+        WireInputEvent::Key {
+            key,
+            pressed,
+            repeat,
+            text: text.map(str::to_owned),
+        }
+    }
 
     fn batch(events: Vec<WireInputEvent>) -> InputBatch {
         InputBatch {
@@ -299,6 +358,89 @@ mod tests {
             vec![0x03],
             "v1 ReleaseAllInput wire layout changed: bump the protocol version"
         );
+
+        // The Key variant (ADR 0008) is wire variant 3. The Motion/Button
+        // snapshot above is unchanged, proving the addition is backward
+        // compatible; this pins Key's own layout.
+        let key_batch = InputBatch {
+            sequence: 1,
+            events: vec![key(0x04, true, false, Some("a"))],
+        };
+        let expected_key: Vec<u8> = vec![
+            0x01, // sequence varint
+            0x01, // event count
+            0x03, // variant 3: Key
+            0x04, // key = 0x04 (HID usage for 'a')
+            0x01, // pressed = true
+            0x00, // repeat = false
+            0x01, // text = Some
+            0x01, // string length 1
+            0x61, // 'a'
+        ];
+        assert_eq!(
+            key_batch.encode_payload().unwrap(),
+            expected_key,
+            "v1 Key wire layout changed: bump the protocol version"
+        );
+    }
+
+    #[test]
+    fn key_events_round_trip_and_keep_order_among_pointer_events() {
+        let original = batch(vec![
+            key(0x04, true, false, Some("a")), // press with text
+            key(0x04, true, true, Some("a")),  // auto-repeat
+            key(0x04, false, false, None),     // release, no text
+            WireInputEvent::Button {
+                button: WireButton::Left,
+                pressed: true,
+            },
+            key(0xE1, true, false, None), // Left Shift: usage 0xE1 needs a 2-byte varint
+        ]);
+        let decoded = InputBatch::decode_payload(&original.encode_payload().unwrap()).unwrap();
+        assert_eq!(decoded, original);
+        // Order is the contract — a chord must replay exactly.
+        assert_eq!(decoded.events, original.events);
+    }
+
+    #[test]
+    fn unicode_key_text_survives_the_wire() {
+        let original = batch(vec![
+            key(0x04, true, false, Some("é")),
+            key(0x1D, true, false, Some("🎹")),
+        ]);
+        let decoded = InputBatch::decode_payload(&original.encode_payload().unwrap()).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn oversized_key_text_is_rejected_on_encode_and_decode() {
+        let big = "x".repeat(MAX_KEY_TEXT_BYTES + 1);
+        let bad = batch(vec![key(0x04, true, false, Some(&big))]);
+        assert!(matches!(
+            bad.encode_payload(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // Built past the encoder's guard to prove the decoder enforces the
+        // bound independently — a hostile peer will not use our encoder.
+        let hostile = InputBatch {
+            sequence: 1,
+            events: vec![key(0x04, true, false, Some(&big))],
+        };
+        let bytes = postcard::to_stdvec(&hostile).unwrap();
+        assert!(matches!(
+            InputBatch::decode_payload(&bytes),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // The boundary length itself is fine.
+        let at_limit = batch(vec![key(
+            0x04,
+            true,
+            false,
+            Some(&"x".repeat(MAX_KEY_TEXT_BYTES)),
+        )]);
+        assert!(at_limit.encode_payload().is_ok());
     }
 
     #[test]
