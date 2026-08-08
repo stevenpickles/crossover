@@ -149,6 +149,40 @@ PointerScroll                    { dx, dy, sequence }
 - Sockets carrying INPUT/CONTROL traffic set `TCP_NODELAY`; latency is then
   managed by coalescing, not by Nagle buffering.
 
+### 6.1 Control transfer (CONTROL class)
+
+Ownership is explicit, negotiated state (FR-5.1) — request → acknowledge →
+switch (FR-5.3). Phase 3 triggers requests explicitly (CLI command); Phase 5
+will trigger them from edge crossings without changing these messages.
+
+```
+A -> B   ControlRequest   { request_id }             // A asks to control B
+B -> A   ControlResponse  { request_id, verdict }    // Granted | Denied(reason)
+A        on Granted: starts capture, sends InputBatch frames
+...
+A -> B   ReleaseAllInput  { after_sequence }         // hand-back begins
+A -> B   ControlRelease   { }                        // relationship ends
+```
+
+Rules, all fail-closed:
+
+- Exactly one control relationship may exist (FR-5.1). A peer that is
+  controlling, requesting, or already controlled answers `Denied` with the
+  reason — so simultaneous requests from both sides deterministically
+  resolve to two denials, and either user simply retries.
+- `InputBatch` is valid only while the sender holds a grant; otherwise it
+  is a protocol violation and the session terminates (§7).
+- `request_id` is requester-monotonic; a response whose id matches no
+  in-flight request (timeout, supersession) is ignored — late answers are
+  the condition the negotiation exists to survive, not an error.
+- A request left unanswered past the requester's timeout reverts the
+  requester to local control; nothing was captured in the interim.
+- `ControlRelease` from the *controlled* side revokes an active grant (the
+  local user's escape hatch). The ex-controller stops capturing on receipt.
+- Disconnect in any state releases everything: the controlled side executes
+  `ReleaseAllInput` locally (FR-4.4), the controller stops capture, and
+  both sides are local until a new negotiation.
+
 ## 7. Error handling
 
 - Malformed frame or framing-level violation → terminate session (fail
