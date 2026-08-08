@@ -53,6 +53,47 @@ pub fn open_clipboard_provider()
     }
 }
 
+/// Open the platform pointer-input capture and injector.
+///
+/// Returned together because control transfer needs both, and both are
+/// Windows-only until Phase 7 (docs/ROADMAP.md). The capture provider
+/// owns a pump thread from construction; it installs no hook until the
+/// control engine first grants control.
+///
+/// # Errors
+///
+/// On Windows, if the capture pump thread or its window cannot be
+/// created. On other platforms, always — injection and capture arrive
+/// with those platforms in later phases.
+#[cfg(windows)]
+pub fn open_input() -> anyhow::Result<(
+    std::sync::Arc<dyn crossover_platform::InputCapture>,
+    std::sync::Arc<dyn crossover_platform::InputInjector>,
+)> {
+    use anyhow::Context;
+    let capture =
+        crossover_platform_windows::WindowsInputCapture::new().context("starting input capture")?;
+    let injector = crossover_platform_windows::WindowsInputInjector::new();
+    Ok((std::sync::Arc::new(capture), std::sync::Arc::new(injector)))
+}
+
+/// Open the platform pointer-input capture and injector.
+///
+/// # Errors
+///
+/// Always, on non-Windows platforms: input forwarding is Windows-first
+/// (macOS/Linux arrive in later phases — docs/ROADMAP.md).
+#[cfg(not(windows))]
+pub fn open_input() -> anyhow::Result<(
+    std::sync::Arc<dyn crossover_platform::InputCapture>,
+    std::sync::Arc<dyn crossover_platform::InputInjector>,
+)> {
+    anyhow::bail!(
+        "input forwarding is not implemented for this platform yet \
+         (Windows first; macOS/Linux arrive in later phases — docs/ROADMAP.md)"
+    )
+}
+
 /// Resolve the local device name: `--name` flag, else the machine's
 /// hostname-ish environment, else a fixed fallback — truncated on a char
 /// boundary to the identity bound.

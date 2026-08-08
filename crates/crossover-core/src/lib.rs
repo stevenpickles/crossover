@@ -8,13 +8,22 @@
 
 pub mod clipboard;
 pub mod clipboard_driver;
+pub mod control;
+pub mod control_driver;
 pub mod input;
 pub mod net;
 pub mod pairing;
 pub mod supervision;
 
 pub use clipboard::{ClipboardConfig, ClipboardEngine, RetryPolicy as ClipboardRetryPolicy};
-pub use clipboard_driver::{ClipboardSyncDriver, SyncCommand, SyncEvent, clipboard_sync};
+pub use clipboard_driver::{
+    ClipboardSyncDriver, FrameTarget, SessionCommand, SyncEvent, clipboard_sync,
+};
+pub use control::{
+    ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
+    OutboundControl,
+};
+pub use control_driver::{InputControlDriver, InputControlEvent, input_control};
 pub use input::{InputState, PointerButton, PointerEvent, coalesce};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,

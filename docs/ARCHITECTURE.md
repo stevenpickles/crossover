@@ -148,6 +148,16 @@ Exactly one active input destination at all times (FR-5.1).
   triggers `ReleaseAllInput` on the remote side (FR-4.4).
 - While `REMOTE`: local input is captured and forwarded, local effects are
   suppressed, pointer position maps through the topology model.
+- **Authorization is scoped to the session that holds the grant.** The
+  engine is session-aware on both axes: the outbound state remembers which
+  session it controls (batches and releases route only there), and the
+  inbound grant records which session controls this machine. Every
+  injection is checked against that grant-holder's identity, so a
+  peer authenticated by TLS but holding no grant — or holding a grant on a
+  *different* session — cannot inject; its input terminates its own session
+  (FR-2.3). This is complete mediation on the principal, not an assumption
+  that only one peer is ever connected: it holds for any number of trusted
+  peers. Authentication is not authorization.
 
 ### 5.2 Clipboard transaction engine
 

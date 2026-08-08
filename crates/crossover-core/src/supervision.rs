@@ -420,8 +420,8 @@ async fn dispatch_frame(
         Some(MessageType::PairingStart | MessageType::PairingConfirm) => {
             violation("pairing message on an established session")
         }
-        // Clipboard traffic belongs to the engine, which consumes it as
-        // Frame events (attached in the wiring slice).
+        // Clipboard, input, and control-transfer traffic belongs to the
+        // engines, which consume it as Frame events.
         Some(
             MessageType::ClipboardOffer
             | MessageType::ClipboardAccept
@@ -429,7 +429,10 @@ async fn dispatch_frame(
             | MessageType::ClipboardData
             | MessageType::ClipboardApplied
             | MessageType::InputBatch
-            | MessageType::ReleaseAllInput,
+            | MessageType::ReleaseAllInput
+            | MessageType::ControlRequest
+            | MessageType::ControlResponse
+            | MessageType::ControlRelease,
         )
         // Not a control message: the application owns dispatch (and
         // validity) of everything else.

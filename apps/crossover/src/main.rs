@@ -8,6 +8,7 @@
 //! `anyhow` and renders concise user-facing messages.
 
 mod commands;
+mod console;
 mod logging;
 mod storage;
 

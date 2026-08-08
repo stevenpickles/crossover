@@ -6,6 +6,7 @@
 //! specified in `docs/PROTOCOL.md`; layering rules in `docs/ARCHITECTURE.md`.
 
 pub mod clipboard;
+pub mod control;
 pub mod framing;
 pub mod hello;
 pub mod input;
@@ -16,6 +17,7 @@ pub use clipboard::{
     ApplyResult, ClipboardAccept, ClipboardApplied, ClipboardData, ClipboardDecline, ClipboardMeta,
     ClipboardOffer, ContentType, DeclineReason,
 };
+pub use control::{ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason};
 pub use framing::{FrameDecoder, RawFrame, encode_frame};
 pub use hello::{FeatureFlags, Hello, MessageType, OsFamily};
 pub use input::{InputBatch, ReleaseAllInput, WireButton, WireInputEvent};

@@ -49,6 +49,12 @@ pub enum MessageType {
     /// Input: release everything the destination believes is held
     /// (FR-4.4).
     ReleaseAllInput = 12,
+    /// Control: ask the peer for control (FR-5.3).
+    ControlRequest = 13,
+    /// Control: grant or deny a request.
+    ControlResponse = 14,
+    /// Control: end the control relationship (hand-back or revocation).
+    ControlRelease = 15,
 }
 
 impl MessageType {
@@ -70,6 +76,9 @@ impl MessageType {
             10 => Some(Self::ClipboardApplied),
             11 => Some(Self::InputBatch),
             12 => Some(Self::ReleaseAllInput),
+            13 => Some(Self::ControlRequest),
+            14 => Some(Self::ControlResponse),
+            15 => Some(Self::ControlRelease),
             _ => None,
         }
     }

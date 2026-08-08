@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crossover_core::{
-    ClipboardConfig, ClipboardRetryPolicy, SyncCommand, SyncEvent, clipboard_sync,
+    ClipboardConfig, ClipboardRetryPolicy, SessionCommand, SyncEvent, clipboard_sync,
 };
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::InMemoryClipboard;
@@ -44,7 +44,7 @@ fn update_count() -> usize {
 struct Side {
     clipboard: Arc<InMemoryClipboard>,
     events: mpsc::Sender<SyncEvent>,
-    commands: mpsc::Receiver<SyncCommand>,
+    commands: mpsc::Receiver<SessionCommand>,
 }
 
 fn side(origin: u8) -> Side {
@@ -159,9 +159,10 @@ async fn sustained_contention_still_delivers_every_item() {
         let text = format!("contended item {i}");
         a.clipboard.set_text_locally(&text);
 
-        let SyncCommand::SendFrame {
+        let SessionCommand::SendFrame {
             message_type,
             payload,
+            ..
         } = next_command(&mut a.commands).await
         else {
             panic!("item {i}: unexpected termination");
@@ -175,7 +176,7 @@ async fn sustained_contention_still_delivers_every_item() {
             .await
             .unwrap();
 
-        let SyncCommand::SendFrame { payload, .. } = next_command(&mut b.commands).await else {
+        let SessionCommand::SendFrame { payload, .. } = next_command(&mut b.commands).await else {
             panic!("item {i}: unexpected termination");
         };
         let ack = ClipboardApplied::decode_payload(&payload).unwrap();
@@ -216,9 +217,10 @@ async fn one_update(
     );
     source.clipboard.set_text_locally(&text);
 
-    let SyncCommand::SendFrame {
+    let SessionCommand::SendFrame {
         message_type,
         payload,
+        ..
     } = next_command(&mut source.commands).await
     else {
         panic!("update {i}: expected a frame, got a termination command");
@@ -246,9 +248,10 @@ async fn one_update(
         .await
         .unwrap();
 
-    let SyncCommand::SendFrame {
+    let SessionCommand::SendFrame {
         message_type,
         payload,
+        ..
     } = next_command(&mut sink.commands).await
     else {
         panic!("update {i}: sink terminated the session");
@@ -301,7 +304,7 @@ async fn one_update(
     }
 }
 
-async fn next_command(commands: &mut mpsc::Receiver<SyncCommand>) -> SyncCommand {
+async fn next_command(commands: &mut mpsc::Receiver<SessionCommand>) -> SessionCommand {
     timeout(Duration::from_secs(10), commands.recv())
         .await
         .expect("timed out waiting for a sync command")
