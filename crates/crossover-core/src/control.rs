@@ -44,7 +44,7 @@ use crossover_protocol::{
 };
 use uuid::Uuid;
 
-use crate::input::{InputState, PointerButton, PointerEvent, coalesce};
+use crate::input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce};
 
 /// Tuning for the negotiation.
 #[derive(Debug, Clone)]
@@ -295,8 +295,8 @@ pub enum ControlAction {
     StartCapture,
     /// Stop capturing; local input acts locally again.
     StopCapture,
-    /// Inject these events into this machine.
-    Inject(Vec<PointerEvent>),
+    /// Inject these events into this machine, pointer and key interleaved.
+    Inject(Vec<InputEvent>),
     /// Arrange a [`ControlEvent::RequestTimeout`] after `delay`.
     ScheduleRequestTimeout {
         /// The session the request went to.
@@ -459,7 +459,7 @@ impl ControlEngine {
                 // Revoke a peer's grant: the local user's escape hatch.
                 if let Some(controlled) = self.controlled.take() {
                     let mut controlled = controlled;
-                    let releases = controlled.applied_state.release_all();
+                    let releases = drain_releases(&mut controlled.applied_state);
                     let mut actions = Vec::new();
                     if !releases.is_empty() {
                         actions.push(ControlAction::Inject(releases));
@@ -512,7 +512,7 @@ impl ControlEngine {
             // destination synthesizes releases for everything it
             // believes is pressed, from its own records.
             let mut controlled = self.controlled.take().expect("checked just above");
-            let releases = controlled.applied_state.release_all();
+            let releases = drain_releases(&mut controlled.applied_state);
             if !releases.is_empty() {
                 actions.push(ControlAction::Inject(releases));
             }
@@ -695,7 +695,7 @@ impl ControlEngine {
             // the authority and releasing twice is harmless where a
             // stuck button is not (FR-4.4).
             let mut controlled = self.controlled.take().expect("checked just above");
-            let releases = controlled.applied_state.release_all();
+            let releases = drain_releases(&mut controlled.applied_state);
             let mut actions = Vec::new();
             if !releases.is_empty() {
                 actions.push(ControlAction::Inject(releases));
@@ -743,16 +743,12 @@ impl ControlEngine {
             }];
         }
         controlled.applied_sequence = batch.sequence;
-        // Keyboard events cross the wire from this slice on (ADR 0008) but
-        // are not yet actuated — `from_wire` drops them. No keyboard
-        // capture exists to produce one until the Windows keyboard slice,
-        // so a key-only batch simply advances the sequence and injects
-        // nothing.
-        let events: Vec<PointerEvent> = batch.events.iter().filter_map(from_wire).collect();
-        if events.is_empty() {
-            return Vec::new();
-        }
-        controlled.applied_state.apply_all(&events);
+        // Pointer and keyboard events replay in one ordered stream so a
+        // chord keeps its ordering (ADR 0008). The applied-state belief
+        // tracks both, so `ReleaseAllInput` can synthesize releases for a
+        // held key or modifier just as it does for a button (FR-4.4).
+        let events: Vec<InputEvent> = batch.events.iter().map(from_wire).collect();
+        controlled.applied_state.apply_inputs(&events);
         vec![ControlAction::Inject(events)]
     }
 
@@ -762,7 +758,7 @@ impl ControlEngine {
         // meaningless — ignore rather than inject or terminate, since it
         // can hold nothing to release.
         if let Some(controlled) = self.controlled.as_mut().filter(|c| c.session == session) {
-            let releases = controlled.applied_state.release_all();
+            let releases = drain_releases(&mut controlled.applied_state);
             if releases.is_empty() {
                 Vec::new()
             } else {
@@ -772,6 +768,21 @@ impl ControlEngine {
             Vec::new()
         }
     }
+}
+
+/// Every held button and key drained as release events to inject — the
+/// local half of `ReleaseAllInput` (FR-4.4). Buttons first, then keys,
+/// each in its own deterministic order (NFR-2); afterwards the state
+/// holds nothing, so a stuck modifier cannot survive a disconnect any
+/// more than a stuck button can (ADR 0008).
+fn drain_releases(state: &mut InputState) -> Vec<InputEvent> {
+    let mut releases: Vec<InputEvent> = state
+        .release_all()
+        .into_iter()
+        .map(InputEvent::Pointer)
+        .collect();
+    releases.extend(state.release_all_keys().into_iter().map(InputEvent::Key));
+    releases
 }
 
 /// Platform event → wire event. Total: every capturable event travels.
@@ -786,22 +797,31 @@ fn to_wire(event: PointerEvent) -> WireInputEvent {
     }
 }
 
-/// Wire event → platform pointer event, or `None` for a keyboard event.
-///
-/// The wire carries keyboard events from the Phase 4 wire slice on
-/// (ADR 0008), but the control engine does not yet actuate them —
-/// keyboard injection and key-state tracking land with the Windows
-/// keyboard slice. Dropping a key here is inert until then: no keyboard
-/// capture exists to produce one.
-fn from_wire(event: &WireInputEvent) -> Option<PointerEvent> {
+/// Wire event → platform input event (ADR 0008). Total: every valid wire
+/// event injects, pointer or key.
+fn from_wire(event: &WireInputEvent) -> InputEvent {
     match event {
-        WireInputEvent::Motion { dx, dy } => Some(PointerEvent::Motion { dx: *dx, dy: *dy }),
-        WireInputEvent::Button { button, pressed } => Some(PointerEvent::Button {
+        WireInputEvent::Motion { dx, dy } => {
+            InputEvent::Pointer(PointerEvent::Motion { dx: *dx, dy: *dy })
+        }
+        WireInputEvent::Button { button, pressed } => InputEvent::Pointer(PointerEvent::Button {
             button: button_from_wire(*button),
             pressed: *pressed,
         }),
-        WireInputEvent::Scroll { dx, dy } => Some(PointerEvent::Scroll { dx: *dx, dy: *dy }),
-        WireInputEvent::Key { .. } => None,
+        WireInputEvent::Scroll { dx, dy } => {
+            InputEvent::Pointer(PointerEvent::Scroll { dx: *dx, dy: *dy })
+        }
+        WireInputEvent::Key {
+            key,
+            pressed,
+            repeat,
+            text,
+        } => InputEvent::Key(KeyEvent {
+            key: *key,
+            pressed: *pressed,
+            repeat: *repeat,
+            text: text.clone(),
+        }),
     }
 }
 
@@ -839,7 +859,7 @@ mod tests {
         ControlAction, ControlConfig, ControlEndReason, ControlEngine, ControlEvent, ControlNotice,
         InboundControl, OutboundControl, RequestBlocked,
     };
-    use crate::input::{InputState, PointerButton, PointerEvent};
+    use crate::input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, hid};
 
     /// The session the single-session tests operate on.
     const SESSION: Uuid = Uuid::from_bytes([0xA1; 16]);
@@ -932,6 +952,12 @@ mod tests {
             button,
             pressed: true,
         }
+    }
+
+    /// An `Inject` of pointer events — most tests predate the keyboard and
+    /// reason in pointer terms; the engine now injects the unified type.
+    fn inject(events: Vec<PointerEvent>) -> ControlAction {
+        ControlAction::Inject(events.into_iter().map(InputEvent::Pointer).collect())
     }
 
     // ---- negotiation (FR-5.3) ----
@@ -1223,7 +1249,7 @@ mod tests {
         })));
         assert_eq!(
             actions,
-            vec![ControlAction::Inject(vec![
+            vec![inject(vec![
                 PointerEvent::Motion { dx: 5, dy: 5 },
                 press(PointerButton::Left),
             ])]
@@ -1281,7 +1307,7 @@ mod tests {
         })));
         assert_eq!(
             actions,
-            vec![ControlAction::Inject(vec![
+            vec![inject(vec![
                 PointerEvent::Button {
                     button: PointerButton::Left,
                     pressed: false,
@@ -1317,12 +1343,10 @@ mod tests {
         })));
 
         let actions = engine.handle(ControlEvent::SessionLost { session: SESSION });
-        assert!(
-            actions.contains(&ControlAction::Inject(vec![PointerEvent::Button {
-                button: PointerButton::Left,
-                pressed: false,
-            }]))
-        );
+        assert!(actions.contains(&inject(vec![PointerEvent::Button {
+            button: PointerButton::Left,
+            pressed: false,
+        }])));
         assert!(!engine.is_controlled());
     }
 
@@ -1341,7 +1365,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                ControlAction::Inject(vec![PointerEvent::Button {
+                inject(vec![PointerEvent::Button {
                     button: PointerButton::Middle,
                     pressed: false,
                 }]),
@@ -1349,6 +1373,54 @@ mod tests {
                 ControlAction::Notify(ControlNotice::PeerControlRevoked),
             ]
         );
+        assert!(!engine.is_controlled());
+    }
+
+    /// Keyboard through the engine (ADR 0008): a granted key batch injects
+    /// as key events, and a disconnect mid-hold synthesizes their releases
+    /// from the engine's own belief — a stuck modifier is the same
+    /// release-blocking defect class as a stuck button (FR-4.4).
+    #[test]
+    fn granted_keys_are_injected_and_released_on_disconnect() {
+        let mut engine = controlled_engine();
+        // The peer presses Left Control and holds it, then 'a' with text.
+        let actions = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 1,
+            events: vec![
+                WireInputEvent::Key {
+                    key: hid::LEFT_CONTROL,
+                    pressed: true,
+                    repeat: false,
+                    text: None,
+                },
+                WireInputEvent::Key {
+                    key: hid::A,
+                    pressed: true,
+                    repeat: false,
+                    text: Some("a".to_owned()),
+                },
+            ],
+        })));
+        assert_eq!(
+            actions,
+            vec![ControlAction::Inject(vec![
+                InputEvent::Key(KeyEvent::press(hid::LEFT_CONTROL)),
+                InputEvent::Key(KeyEvent {
+                    key: hid::A,
+                    pressed: true,
+                    repeat: false,
+                    text: Some("a".to_owned()),
+                }),
+            ])]
+        );
+
+        // The session drops with both keys still held. The engine releases
+        // them from its own record, in ascending usage order (NFR-2).
+        let actions = engine.handle(ControlEvent::SessionLost { session: SESSION });
+        assert!(actions.contains(&ControlAction::Inject(vec![
+            InputEvent::Key(KeyEvent::release(hid::A)), // 0x04
+            InputEvent::Key(KeyEvent::release(hid::LEFT_CONTROL)), // 0xE0
+        ])));
         assert!(!engine.is_controlled());
     }
 
@@ -1392,10 +1464,7 @@ mod tests {
                 pressed: true,
             }],
         })));
-        assert_eq!(
-            actions,
-            vec![ControlAction::Inject(vec![press(PointerButton::Right)])]
-        );
+        assert_eq!(actions, vec![inject(vec![press(PointerButton::Right)])]);
     }
 
     /// A grant arriving from a session other than the one we requested is
@@ -1463,7 +1532,7 @@ mod tests {
                 match action {
                     ControlAction::StartCapture => self.capture_active = true,
                     ControlAction::StopCapture => self.capture_active = false,
-                    ControlAction::Inject(events) => self.injected.apply_all(events),
+                    ControlAction::Inject(events) => self.injected.apply_inputs(events),
                     _ => {}
                 }
             }

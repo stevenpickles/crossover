@@ -25,7 +25,9 @@
 
 use std::collections::BTreeSet;
 
-pub use crossover_platform::{KeyEvent, PointerButton, PointerEvent, SCROLL_UNITS_PER_DETENT, hid};
+pub use crossover_platform::{
+    InputEvent, KeyEvent, PointerButton, PointerEvent, SCROLL_UNITS_PER_DETENT, hid,
+};
 
 /// What this machine believes is currently held down on the destination.
 ///
@@ -91,6 +93,21 @@ impl InputState {
     pub fn apply_keys(&mut self, events: &[KeyEvent]) {
         for event in events {
             self.apply_key(event);
+        }
+    }
+
+    /// Update from one event of either kind.
+    pub fn apply_input(&mut self, event: &InputEvent) {
+        match event {
+            InputEvent::Pointer(pointer) => self.apply(*pointer),
+            InputEvent::Key(key) => self.apply_key(key),
+        }
+    }
+
+    /// Update from a whole sequence of mixed events.
+    pub fn apply_inputs(&mut self, events: &[InputEvent]) {
+        for event in events {
+            self.apply_input(event);
         }
     }
 

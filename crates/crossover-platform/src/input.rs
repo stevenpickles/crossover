@@ -160,6 +160,32 @@ pub mod hid {
     pub const RIGHT_GUI: u16 = 0xE7;
 }
 
+/// One input event of either kind, in a single ordered stream.
+///
+/// Pointer and keyboard events must interleave — a chord like Shift+click
+/// depends on the key press landing between the pointer events around it —
+/// so injection replays them from one `InputEvent` sequence rather than
+/// two, which would lose the ordering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputEvent {
+    /// A pointer event.
+    Pointer(PointerEvent),
+    /// A keyboard event.
+    Key(KeyEvent),
+}
+
+impl From<PointerEvent> for InputEvent {
+    fn from(event: PointerEvent) -> Self {
+        Self::Pointer(event)
+    }
+}
+
+impl From<KeyEvent> for InputEvent {
+    fn from(event: KeyEvent) -> Self {
+        Self::Key(event)
+    }
+}
+
 /// Failures from input capture or injection.
 #[non_exhaustive]
 #[derive(Debug, Error)]
@@ -227,9 +253,9 @@ pub trait InputCapture: Send + Sync {
     fn is_capturing(&self) -> bool;
 }
 
-/// Injects pointer input on this machine.
+/// Injects pointer and keyboard input on this machine.
 pub trait InputInjector: Send + Sync {
-    /// Replay `events` in order.
+    /// Replay `events` in order, pointer and keyboard interleaved.
     ///
     /// Implementations must mark their own injections so that a
     /// concurrently active [`InputCapture`] does not capture them back
@@ -241,5 +267,5 @@ pub trait InputInjector: Send + Sync {
     /// [`InputError::InjectionFailed`] if the platform rejects the
     /// events. Success does **not** guarantee the destination window
     /// received them (UIPI, R-1).
-    fn inject(&self, events: &[PointerEvent]) -> Result<(), InputError>;
+    fn inject(&self, events: &[InputEvent]) -> Result<(), InputError>;
 }
