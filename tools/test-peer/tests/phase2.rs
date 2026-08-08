@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crossover_core::supervision::{KeepaliveConfig, SessionEvent, run_session};
 use crossover_core::{
-    ClipboardConfig, ClipboardRetryPolicy, LocalNode, SessionListener, SessionOptions, SessionCommand,
-    SyncEvent, clipboard_sync,
+    ClipboardConfig, ClipboardRetryPolicy, LocalNode, SessionCommand, SessionListener,
+    SessionOptions, SyncEvent, clipboard_sync,
 };
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::{ClipboardFailure, ClipboardOp, InMemoryClipboard};
