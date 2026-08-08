@@ -8,7 +8,7 @@
 //! the engine; everything here is mechanical and replaceable.
 //!
 //! Fail-closed lever: a clipboard-typed frame whose payload fails
-//! validation produces [`SyncCommand::TerminateSession`] — the app kills
+//! validation produces [`SessionCommand::TerminateSession`] — the app kills
 //! that session (docs/PROTOCOL.md §7) and supervision reconnects.
 
 use std::collections::VecDeque;
@@ -67,7 +67,7 @@ pub enum SyncEvent {
 
 /// What the driver asks the app to do.
 #[derive(Debug)]
-pub enum SyncCommand {
+pub enum SessionCommand {
     /// Send this frame to the peer over the active session.
     SendFrame {
         /// Frame message type.
@@ -90,7 +90,7 @@ pub struct ClipboardSyncDriver {
     provider: Arc<dyn ClipboardProvider>,
     events_rx: mpsc::Receiver<SyncEvent>,
     events_tx: mpsc::Sender<SyncEvent>,
-    commands_tx: mpsc::Sender<SyncCommand>,
+    commands_tx: mpsc::Sender<SessionCommand>,
     /// Consecutive `Busy` reads; reset by any successful read.
     busy_reads: u32,
     /// Generation of the newest settle timer; older ones are ignored
@@ -115,7 +115,7 @@ pub fn clipboard_sync(
     (
         ClipboardSyncDriver,
         mpsc::Sender<SyncEvent>,
-        mpsc::Receiver<SyncCommand>,
+        mpsc::Receiver<SessionCommand>,
     ),
     ClipboardError,
 > {
@@ -175,7 +175,7 @@ impl ClipboardSyncDriver {
                                 // Peer nonconformance: fail closed.
                                 let _ = self
                                     .commands_tx
-                                    .send(SyncCommand::TerminateSession {
+                                    .send(SessionCommand::TerminateSession {
                                         reason: error.to_string(),
                                     })
                                     .await;
@@ -247,7 +247,7 @@ impl ClipboardSyncDriver {
                 if let Ok(payload) = applied.encode_payload() {
                     let _ = self
                         .commands_tx
-                        .send(SyncCommand::SendFrame {
+                        .send(SessionCommand::SendFrame {
                             message_type: MessageType::ClipboardApplied.wire(),
                             payload,
                         })
@@ -323,7 +323,7 @@ impl ClipboardSyncDriver {
                     Ok((message_type, payload)) => {
                         if self
                             .commands_tx
-                            .send(SyncCommand::SendFrame {
+                            .send(SessionCommand::SendFrame {
                                 message_type,
                                 payload,
                             })
@@ -380,13 +380,13 @@ mod tests {
     };
     use crossover_protocol::hello::MessageType;
 
-    use super::{SyncCommand, SyncEvent, clipboard_sync};
+    use super::{SessionCommand, SyncEvent, clipboard_sync};
     use crate::clipboard::{ClipboardConfig, RetryPolicy};
 
     struct Rig {
         clipboard: Arc<InMemoryClipboard>,
         events: mpsc::Sender<SyncEvent>,
-        commands: mpsc::Receiver<SyncCommand>,
+        commands: mpsc::Receiver<SessionCommand>,
     }
 
     fn rig() -> Rig {
@@ -413,7 +413,7 @@ mod tests {
         }
     }
 
-    async fn next_command(rig: &mut Rig) -> SyncCommand {
+    async fn next_command(rig: &mut Rig) -> SessionCommand {
         timeout(Duration::from_secs(5), rig.commands.recv())
             .await
             .expect("timed out waiting for a sync command")
@@ -435,7 +435,7 @@ mod tests {
         // whole pipeline, no manual events.
         rig.clipboard.set_text_locally("copied text");
 
-        let SyncCommand::SendFrame {
+        let SessionCommand::SendFrame {
             message_type,
             payload,
         } = next_command(&mut rig).await
@@ -466,7 +466,7 @@ mod tests {
             .await
             .unwrap();
 
-        let SyncCommand::SendFrame {
+        let SessionCommand::SendFrame {
             message_type,
             payload,
         } = next_command(&mut rig).await
@@ -508,7 +508,7 @@ mod tests {
 
         // Two Busy failures burn through real ScheduleRetry timers before
         // the third attempt lands.
-        let SyncCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
+        let SessionCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
             panic!("expected SendFrame");
         };
         let applied = ClipboardApplied::decode_payload(&payload).unwrap();
@@ -537,7 +537,7 @@ mod tests {
             .await
             .unwrap();
 
-        let SyncCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
+        let SessionCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
             panic!("expected SendFrame");
         };
         let applied = ClipboardApplied::decode_payload(&payload).unwrap();
@@ -554,7 +554,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             next_command(&mut rig).await,
-            SyncCommand::TerminateSession { .. }
+            SessionCommand::TerminateSession { .. }
         ));
     }
 
@@ -587,7 +587,7 @@ mod tests {
             .unwrap();
 
         // The ack must arrive promptly despite the ongoing read failures.
-        let SyncCommand::SendFrame {
+        let SessionCommand::SendFrame {
             message_type,
             payload,
         } = timeout(Duration::from_secs(3), rig.commands.recv())
@@ -632,7 +632,7 @@ mod tests {
         // Collect every ack the driver produces for the burst.
         let mut results = Vec::new();
         for _ in 0..ids.len() {
-            let SyncCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
+            let SessionCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
                 panic!("expected SendFrame");
             };
             let applied = ClipboardApplied::decode_payload(&payload).unwrap();
@@ -689,7 +689,7 @@ mod tests {
             .await
             .unwrap();
 
-        let SyncCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
+        let SessionCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
             panic!("expected SendFrame");
         };
         let data = ClipboardData::decode_payload(&payload).unwrap();

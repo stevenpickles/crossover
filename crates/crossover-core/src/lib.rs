@@ -15,7 +15,7 @@ pub mod pairing;
 pub mod supervision;
 
 pub use clipboard::{ClipboardConfig, ClipboardEngine, RetryPolicy as ClipboardRetryPolicy};
-pub use clipboard_driver::{ClipboardSyncDriver, SyncCommand, SyncEvent, clipboard_sync};
+pub use clipboard_driver::{ClipboardSyncDriver, SessionCommand, SyncEvent, clipboard_sync};
 pub use control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
     OutboundControl,

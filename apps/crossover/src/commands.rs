@@ -17,7 +17,7 @@ use crossover_core::supervision::{
     KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
 };
 use crossover_core::{
-    ClipboardConfig, LocalNode, SessionListener, SessionOptions, SyncCommand, SyncEvent,
+    ClipboardConfig, LocalNode, SessionListener, SessionOptions, SessionCommand, SyncEvent,
     clipboard_sync,
 };
 use crossover_platform::SecureStorage;
@@ -307,12 +307,12 @@ type SessionSlotRef =
 fn spawn_command_mux(
     handle: Option<Arc<crossover_core::supervision::SupervisorHandle>>,
     listener_slot: SessionSlotRef,
-    mut sync_commands: mpsc::Receiver<SyncCommand>,
+    mut sync_commands: mpsc::Receiver<SessionCommand>,
 ) {
     tokio::spawn(async move {
         while let Some(command) = sync_commands.recv().await {
             match command {
-                SyncCommand::SendFrame {
+                SessionCommand::SendFrame {
                     message_type,
                     payload,
                 } => {
@@ -328,7 +328,7 @@ fn spawn_command_mux(
                         let _ = tx.send((message_type, payload)).await;
                     }
                 }
-                SyncCommand::TerminateSession { reason } => {
+                SessionCommand::TerminateSession { reason } => {
                     tracing::error!(
                         error = %reason,
                         "clipboard payload violation; terminating inbound session"

@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crossover_core::supervision::{KeepaliveConfig, SessionEvent, run_session};
 use crossover_core::{
-    ClipboardConfig, ClipboardRetryPolicy, LocalNode, SessionListener, SessionOptions, SyncCommand,
+    ClipboardConfig, ClipboardRetryPolicy, LocalNode, SessionListener, SessionOptions, SessionCommand,
     SyncEvent, clipboard_sync,
 };
 use crossover_platform::ClipboardProvider;
@@ -95,10 +95,10 @@ fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
                     None => break,
                 },
                 maybe = sync_commands.recv() => match maybe {
-                    Some(SyncCommand::SendFrame { message_type, payload }) => {
+                    Some(SessionCommand::SendFrame { message_type, payload }) => {
                         let _ = outbound_for_glue.send((message_type, payload)).await;
                     }
-                    Some(SyncCommand::TerminateSession { reason }) => {
+                    Some(SessionCommand::TerminateSession { reason }) => {
                         panic!("unexpected session termination: {reason}");
                     }
                     None => break,
