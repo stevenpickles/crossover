@@ -11,81 +11,13 @@
 //! unclamped deltas), which makes coalescing exact rather than lossy:
 //! merging two movements is addition, where merging absolute positions
 //! would mean discarding one.
+//!
+//! The event *vocabulary* ([`PointerEvent`], [`PointerButton`]) lives in
+//! `crossover-platform`, because the HAL traits must speak it and cannot
+//! depend on this crate (docs/ARCHITECTURE.md §2). What lives here is
+//! *policy*: what is believed held, and what may be merged.
 
-/// A pointer button, named by role rather than by any OS's numbering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PointerButton {
-    /// Primary button (left-handed users have already swapped it at the
-    /// OS level; Crossover sees the logical button).
-    Left,
-    /// Secondary button.
-    Right,
-    /// Wheel button.
-    Middle,
-    /// First extended button (typically "back").
-    X1,
-    /// Second extended button (typically "forward").
-    X2,
-}
-
-impl PointerButton {
-    /// Every button, in a stable order — the order releases are emitted
-    /// in, so `ReleaseAllInput` is deterministic (NFR-2).
-    pub const ALL: [Self; 5] = [Self::Left, Self::Right, Self::Middle, Self::X1, Self::X2];
-
-    fn index(self) -> usize {
-        match self {
-            Self::Left => 0,
-            Self::Right => 1,
-            Self::Middle => 2,
-            Self::X1 => 3,
-            Self::X2 => 4,
-        }
-    }
-}
-
-/// One unit of scroll: 120 per traditional detent.
-///
-/// Windows' `WHEEL_DELTA` convention, adopted because high-resolution
-/// wheels report fractions of a detent and a coarser unit would discard
-/// them. Platforms whose native unit differs scale at their HAL
-/// boundary, not here.
-pub const SCROLL_UNITS_PER_DETENT: i32 = 120;
-
-/// A platform-neutral pointer event (docs/PROTOCOL.md §6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PointerEvent {
-    /// Relative movement in device units.
-    Motion {
-        /// Rightward delta.
-        dx: i32,
-        /// Downward delta.
-        dy: i32,
-    },
-    /// A button transition. Ordering matters and is never coalesced.
-    Button {
-        /// Which button.
-        button: PointerButton,
-        /// True for press, false for release.
-        pressed: bool,
-    },
-    /// Wheel movement in [`SCROLL_UNITS_PER_DETENT`] units.
-    Scroll {
-        /// Horizontal (positive: right).
-        dx: i32,
-        /// Vertical (positive: away from the user).
-        dy: i32,
-    },
-}
-
-impl PointerEvent {
-    /// Whether this event may merge with an adjacent one of its kind.
-    /// Motion and scroll accumulate; button transitions never do.
-    #[must_use]
-    pub fn is_coalescable(&self) -> bool {
-        matches!(self, Self::Motion { .. } | Self::Scroll { .. })
-    }
-}
+pub use crossover_platform::{PointerButton, PointerEvent, SCROLL_UNITS_PER_DETENT};
 
 /// What this machine believes is currently held down on the destination.
 ///

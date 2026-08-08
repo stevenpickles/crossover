@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use crate::clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
+use crate::input::{InputCapture, InputError, InputInjector, InputSink, PointerEvent};
 use crate::secure_storage::{SecureStorage, SecureStorageError};
 
 /// In-memory [`SecureStorage`] with scriptable fault injection.
@@ -201,10 +202,230 @@ impl ClipboardProvider for InMemoryClipboard {
     }
 }
 
+/// In-memory [`InputCapture`], driven by the test rather than a mouse.
+///
+/// The real implementation suppresses local input as a side effect of
+/// capturing; there is nothing to suppress here, so what this fake
+/// models is the *contract*: what the sink receives, when capture is
+/// considered healthy, and how loss is reported.
+#[derive(Default)]
+pub struct FakeInputCapture {
+    sink: Mutex<Option<InputSink>>,
+    capturing: Mutex<bool>,
+    /// Simulates the platform losing capture without telling us — the
+    /// Windows hook-timeout behaviour (R-2) that `is_capturing` exists
+    /// to expose.
+    silently_lost: Mutex<bool>,
+    fail_next_start: Mutex<Option<String>>,
+}
+
+impl FakeInputCapture {
+    /// Not capturing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Deliver an event as though the user had produced it.
+    ///
+    /// Events raised while not capturing are dropped, exactly as the
+    /// real implementation would never see them.
+    pub fn raise(&self, event: PointerEvent) {
+        if !*lock(&self.capturing) || *lock(&self.silently_lost) {
+            return;
+        }
+        let sink = lock(&self.sink).take();
+        if let Some(sink) = sink {
+            sink(event);
+            let mut slot = lock(&self.sink);
+            if slot.is_none() {
+                *slot = Some(sink);
+            }
+        }
+    }
+
+    /// Simulate the platform dropping capture without notice: events
+    /// stop arriving and `is_capturing` reports the truth.
+    pub fn lose_capture_silently(&self) {
+        *lock(&self.silently_lost) = true;
+    }
+
+    /// Make the next `start_capture` fail.
+    pub fn fail_next_start(&self, reason: &str) {
+        *lock(&self.fail_next_start) = Some(reason.to_owned());
+    }
+}
+
+impl InputCapture for FakeInputCapture {
+    fn start_capture(&self, sink: InputSink) -> Result<(), InputError> {
+        if let Some(reason) = lock(&self.fail_next_start).take() {
+            return Err(InputError::CaptureUnavailable { reason });
+        }
+        *lock(&self.sink) = Some(sink);
+        *lock(&self.capturing) = true;
+        *lock(&self.silently_lost) = false;
+        Ok(())
+    }
+
+    fn stop_capture(&self) -> Result<(), InputError> {
+        *lock(&self.capturing) = false;
+        *lock(&self.sink) = None;
+        *lock(&self.silently_lost) = false;
+        Ok(())
+    }
+
+    fn is_capturing(&self) -> bool {
+        *lock(&self.capturing) && !*lock(&self.silently_lost)
+    }
+}
+
+/// In-memory [`InputInjector`] that records what it was asked to replay.
+#[derive(Default)]
+pub struct FakeInputInjector {
+    injected: Mutex<Vec<PointerEvent>>,
+    fail_next: Mutex<Option<String>>,
+}
+
+impl FakeInputInjector {
+    /// Nothing injected yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything injected so far, in order.
+    #[must_use]
+    pub fn injected(&self) -> Vec<PointerEvent> {
+        lock(&self.injected).clone()
+    }
+
+    /// Forget the record.
+    pub fn clear(&self) {
+        lock(&self.injected).clear();
+    }
+
+    /// Make the next `inject` fail.
+    pub fn fail_next(&self, reason: &str) {
+        *lock(&self.fail_next) = Some(reason.to_owned());
+    }
+}
+
+impl InputInjector for FakeInputInjector {
+    fn inject(&self, events: &[PointerEvent]) -> Result<(), InputError> {
+        if let Some(reason) = lock(&self.fail_next).take() {
+            return Err(InputError::InjectionFailed { reason });
+        }
+        lock(&self.injected).extend_from_slice(events);
+        Ok(())
+    }
+}
+
 /// Locks a mutex, recovering from poisoning: a panicked test thread must
 /// not cascade opaque failures into unrelated tests.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod input_tests {
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    use super::{FakeInputCapture, FakeInputInjector};
+    use crate::input::{InputCapture, InputError, InputInjector, PointerButton, PointerEvent};
+
+    fn collecting_sink() -> (Arc<StdMutex<Vec<PointerEvent>>>, crate::input::InputSink) {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        (
+            seen,
+            Box::new(move |event| {
+                sink_seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event);
+            }),
+        )
+    }
+
+    #[test]
+    fn events_reach_the_sink_only_while_capturing() {
+        let capture = FakeInputCapture::new();
+        let (seen, sink) = collecting_sink();
+
+        // Before starting: nothing is delivered.
+        capture.raise(PointerEvent::Motion { dx: 1, dy: 1 });
+        assert!(seen.lock().unwrap().is_empty());
+
+        capture.start_capture(sink).unwrap();
+        assert!(capture.is_capturing());
+        capture.raise(PointerEvent::Motion { dx: 3, dy: 4 });
+        capture.raise(PointerEvent::Button {
+            button: PointerButton::Left,
+            pressed: true,
+        });
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        capture.stop_capture().unwrap();
+        assert!(!capture.is_capturing());
+        capture.raise(PointerEvent::Motion { dx: 9, dy: 9 });
+        assert_eq!(seen.lock().unwrap().len(), 2, "delivered after stopping");
+    }
+
+    /// The R-2 scenario: Windows removes an overrunning hook silently.
+    /// `is_capturing` must report the truth so callers can fail closed.
+    #[test]
+    fn silent_capture_loss_is_visible_and_stops_delivery() {
+        let capture = FakeInputCapture::new();
+        let (seen, sink) = collecting_sink();
+        capture.start_capture(sink).unwrap();
+
+        capture.lose_capture_silently();
+        assert!(
+            !capture.is_capturing(),
+            "loss must not be reported as healthy"
+        );
+        capture.raise(PointerEvent::Motion { dx: 1, dy: 1 });
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_capture_is_idempotent_and_start_failure_surfaces() {
+        let capture = FakeInputCapture::new();
+        // Safe on the error paths callers reach for it from.
+        capture.stop_capture().unwrap();
+        capture.stop_capture().unwrap();
+
+        capture.fail_next_start("hook rejected");
+        let (_seen, sink) = collecting_sink();
+        assert!(matches!(
+            capture.start_capture(sink),
+            Err(InputError::CaptureUnavailable { .. })
+        ));
+        assert!(!capture.is_capturing());
+    }
+
+    #[test]
+    fn injector_records_order_and_reports_failure() {
+        let injector = FakeInputInjector::new();
+        let events = [
+            PointerEvent::Motion { dx: 5, dy: 0 },
+            PointerEvent::Button {
+                button: PointerButton::Right,
+                pressed: true,
+            },
+        ];
+        injector.inject(&events).unwrap();
+        assert_eq!(injector.injected(), events.to_vec());
+
+        injector.fail_next("UIPI");
+        assert!(matches!(
+            injector.inject(&events),
+            Err(InputError::InjectionFailed { .. })
+        ));
+        // The failed call recorded nothing.
+        assert_eq!(injector.injected().len(), 2);
+    }
 }
 
 #[cfg(test)]

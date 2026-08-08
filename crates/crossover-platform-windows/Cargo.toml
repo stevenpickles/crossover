@@ -13,6 +13,10 @@ crossover-platform = { workspace = true }
 # Win32 bindings only when actually building for Windows; on other targets
 # this crate compiles as an empty shell so tri-OS CI builds the workspace.
 [target.'cfg(windows)'.dependencies]
+# tracing: hook loss is an asynchronous event with no error path to
+# surface through, and NFR-3 forbids a silent failure of an important
+# state transition — the watchdog logs it at the moment of detection.
+tracing = { workspace = true }
 windows = { workspace = true }
 
 # The workspace forbids unsafe_code (NFR-6). This crate is the designated

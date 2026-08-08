@@ -39,9 +39,18 @@ Consequences that are not optional:
   captured. The callback timestamps, decides suppress-or-pass, pushes to
   a bounded queue, and returns. No allocation beyond the queue, no
   locks held across the decision, no logging.
-- **Hook loss must be detected and recovered**, not assumed away. A
-  watchdog re-installs the hook if events stop arriving while control is
-  held remotely, and the loss is logged (NFR-3).
+- **Hook loss must be detected and surfaced**, not assumed away. A
+  watchdog compares the hook's event count against Raw Input's — the two
+  observe the same stream, so raw events flowing while the hook counts
+  nothing means Windows removed the hook. The response is to **fail
+  closed**: tear capture down (local input acts locally again
+  immediately), report `is_capturing() == false`, and log the loss
+  (NFR-3). Deliberately *not* done: re-installing the hook in place —
+  that would resume suppressing input while the caller is already
+  abandoning the control transfer, and a suppressed mouse nobody is
+  consuming is a dead mouse, the release-blocking defect class.
+  Recovery is the caller's fresh `start_capture` on the next control
+  transfer.
 - Hooks live on a dedicated thread owning a message pump — the same
   shape as the clipboard listener in `crossover-platform-windows`.
 
