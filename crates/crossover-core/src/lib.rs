@@ -11,6 +11,7 @@ pub mod clipboard_driver;
 pub mod control;
 pub mod control_driver;
 pub mod input;
+pub mod metrics;
 pub mod net;
 pub mod pairing;
 pub mod supervision;
@@ -25,6 +26,7 @@ pub use control::{
 };
 pub use control_driver::{InputControlDriver, InputControlEvent, input_control};
 pub use input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce, hid};
+pub use metrics::{FrameClass, Metrics, Report};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
     connect,
