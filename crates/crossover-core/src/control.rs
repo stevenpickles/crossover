@@ -743,7 +743,15 @@ impl ControlEngine {
             }];
         }
         controlled.applied_sequence = batch.sequence;
-        let events: Vec<PointerEvent> = batch.events.iter().copied().map(from_wire).collect();
+        // Keyboard events cross the wire from this slice on (ADR 0008) but
+        // are not yet actuated — `from_wire` drops them. No keyboard
+        // capture exists to produce one until the Windows keyboard slice,
+        // so a key-only batch simply advances the sequence and injects
+        // nothing.
+        let events: Vec<PointerEvent> = batch.events.iter().filter_map(from_wire).collect();
+        if events.is_empty() {
+            return Vec::new();
+        }
         controlled.applied_state.apply_all(&events);
         vec![ControlAction::Inject(events)]
     }
@@ -778,15 +786,22 @@ fn to_wire(event: PointerEvent) -> WireInputEvent {
     }
 }
 
-/// Wire event → platform event. Total: every valid wire event injects.
-fn from_wire(event: WireInputEvent) -> PointerEvent {
+/// Wire event → platform pointer event, or `None` for a keyboard event.
+///
+/// The wire carries keyboard events from the Phase 4 wire slice on
+/// (ADR 0008), but the control engine does not yet actuate them —
+/// keyboard injection and key-state tracking land with the Windows
+/// keyboard slice. Dropping a key here is inert until then: no keyboard
+/// capture exists to produce one.
+fn from_wire(event: &WireInputEvent) -> Option<PointerEvent> {
     match event {
-        WireInputEvent::Motion { dx, dy } => PointerEvent::Motion { dx, dy },
-        WireInputEvent::Button { button, pressed } => PointerEvent::Button {
-            button: button_from_wire(button),
-            pressed,
-        },
-        WireInputEvent::Scroll { dx, dy } => PointerEvent::Scroll { dx, dy },
+        WireInputEvent::Motion { dx, dy } => Some(PointerEvent::Motion { dx: *dx, dy: *dy }),
+        WireInputEvent::Button { button, pressed } => Some(PointerEvent::Button {
+            button: button_from_wire(*button),
+            pressed: *pressed,
+        }),
+        WireInputEvent::Scroll { dx, dy } => Some(PointerEvent::Scroll { dx: *dx, dy: *dy }),
+        WireInputEvent::Key { .. } => None,
     }
 }
 
