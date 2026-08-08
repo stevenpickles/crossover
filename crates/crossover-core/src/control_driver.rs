@@ -49,12 +49,14 @@ use crate::clipboard_driver::{FrameTarget, SessionCommand};
 use crate::control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
 };
-use crate::input::PointerEvent;
+use crate::input::InputEvent;
 
-/// How often capture health is checked while controlling. One period
-/// bounds how long a silently lost capture can go unnoticed here after
-/// the platform watchdog reports it.
-const CAPTURE_HEALTH_PERIOD: Duration = Duration::from_millis(500);
+/// How often, while controlling, the driver polls the platform for a
+/// lost capture (R-2) and for the release escape gesture (ADR 0008). One
+/// period bounds how long a silently lost capture goes unnoticed here,
+/// and how long the escape takes to release — short enough that the way
+/// out feels immediate.
+const CAPTURE_HEALTH_PERIOD: Duration = Duration::from_millis(200);
 
 /// Upper bound on events drained in one pass, so a flood cannot stall
 /// the loop (NFR-1).
@@ -94,8 +96,8 @@ pub enum InputControlEvent {
     RequestControl,
     /// The user asked to end whichever control relationship exists.
     ReleaseControl,
-    /// One captured pointer event (platform sink bridge).
-    Captured(PointerEvent),
+    /// One captured input event, pointer or key (platform sink bridge).
+    Captured(InputEvent),
     /// A scheduled request timeout came due.
     RequestTimeout {
         /// The session the request went to.
@@ -167,13 +169,24 @@ impl InputControlDriver {
                     }
                 }
                 _ = health.tick() => {
-                    // The platform watchdog reports loss through
-                    // is_capturing (R-2); this poll turns it into the
-                    // engine's fail-closed transition.
-                    if self.engine.is_controlling() && !self.capture.is_capturing() {
-                        let actions = self.engine.handle(ControlEvent::CaptureLost);
-                        if !self.execute(actions).await {
-                            return;
+                    if self.engine.is_controlling() {
+                        // The platform watchdog reports loss through
+                        // is_capturing (R-2); this poll turns it into the
+                        // engine's fail-closed transition.
+                        if !self.capture.is_capturing() {
+                            let actions = self.engine.handle(ControlEvent::CaptureLost);
+                            if !self.execute(actions).await {
+                                return;
+                            }
+                        } else if self.capture.escape_requested() {
+                            // The user pressed the release escape gesture
+                            // (both Control keys); hand control back — the
+                            // only way out while the keyboard is captured
+                            // and the console is unreachable (ADR 0008).
+                            let actions = self.engine.handle(ControlEvent::UserRelease);
+                            if !self.execute(actions).await {
+                                return;
+                            }
                         }
                     }
                 }
@@ -195,7 +208,7 @@ impl InputControlDriver {
             }
         }
 
-        let mut captured_run: Vec<PointerEvent> = Vec::new();
+        let mut captured_run: Vec<InputEvent> = Vec::new();
         for event in batch {
             // A non-capture event is a barrier: the run before it must
             // reach the engine first so ordering is preserved.
@@ -208,8 +221,8 @@ impl InputControlDriver {
                 }
             }
             let engine_event = match event {
-                InputControlEvent::Captured(pointer_event) => {
-                    captured_run.push(pointer_event);
+                InputControlEvent::Captured(input_event) => {
+                    captured_run.push(input_event);
                     continue;
                 }
                 InputControlEvent::SessionEstablished { session } => {
@@ -384,7 +397,7 @@ impl InputControlDriver {
         let capture = Arc::clone(&self.capture);
         let bridge = self.events_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let sink = Box::new(move |event: PointerEvent| {
+            let sink = Box::new(move |event: InputEvent| {
                 // try_send IS the backpressure policy — see module docs.
                 let _ = bridge.try_send(InputControlEvent::Captured(event));
             });
@@ -1053,5 +1066,35 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// The keyboard escape (both Control keys, ADR 0008): while
+    /// controlling, the platform sets the escape flag; the driver polls
+    /// it and hands control back — the only way out once every key is
+    /// being captured and the console is unreachable.
+    #[tokio::test]
+    async fn escape_gesture_hands_control_back() {
+        let mut rig = rig();
+        make_controlling(&mut rig).await;
+        assert!(rig.capture.is_capturing());
+
+        // The user presses the release chord.
+        rig.capture.request_escape();
+
+        // The driver polls the escape and hands back: ReleaseAllInput,
+        // then ControlRelease, and capture stops.
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected ReleaseAllInput after the escape gesture");
+        };
+        assert_eq!(message_type, MessageType::ReleaseAllInput.wire());
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected ControlRelease after the escape gesture");
+        };
+        assert_eq!(message_type, MessageType::ControlRelease.wire());
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::ControlEnded(crate::control::ControlEndReason::HandedBack)
+        );
+        assert!(!rig.capture.is_capturing(), "escape must stop capture");
     }
 }

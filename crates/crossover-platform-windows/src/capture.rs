@@ -46,20 +46,41 @@
 //! makes capture per-process-exclusive, which `start_capture` enforces
 //! explicitly rather than leaves to whichever instance's flags win.
 //!
+//! **Keyboard capture (ADR 0008)** adds a `WH_KEYBOARD_LL` hook on this
+//! same pump. Unlike the mouse, the keyboard hook *is* the data source:
+//! there is no Raw Input equivalent worth using, so the callback — still
+//! near-zero work (R-2) — records the raw scan code to a bounded queue,
+//! wakes the pump, and returns; the pump translates (scan code → HID
+//! usage) and delivers, off the hot path. The two hooks share the
+//! `SUPPRESSING` flag. The keyboard hook does not feed the watchdog: its
+//! Raw-Input-free path has no independent signal to compare against, so a
+//! pump stall (which removes both hooks) is still caught via the mouse
+//! comparison, but a keyboard-only silent removal is a documented gap.
+//!
+//! **The escape (both Control keys)** is caught in the keyboard hook and
+//! never forwarded: once the keyboard is captured, every ordinary key
+//! goes to the peer, so the console command that releases the mouse is
+//! unreachable. Pressing both Control keys sets a flag the driver polls
+//! to hand control back — the local user's guaranteed way out.
+//!
 //! Known limitation (R-6): applications taking exclusive raw input
 //! (games, some remote-desktop clients) may not honour suppression.
-//! Out of scope for Phase 3.
+//! Out of scope for this phase.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use crossover_platform::{InputCapture, InputError, InputSink, PointerButton, PointerEvent};
+use crossover_platform::{
+    InputCapture, InputError, InputEvent, InputSink, KeyEvent, PointerButton, PointerEvent,
+};
 use windows::Win32::Devices::HumanInterfaceDevice::{
     HID_USAGE_GENERIC_MOUSE, HID_USAGE_PAGE_GENERIC,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_RCONTROL};
 use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE,
@@ -67,17 +88,19 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetSystemMetrics, HHOOK, KillTimer, MSG, MSLLHOOKSTRUCT, PostMessageW, RI_MOUSE_BUTTON_4_DOWN,
-    RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, RI_MOUSE_HWHEEL,
-    RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN,
-    RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP,
-    RI_MOUSE_WHEEL, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SetTimer,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_MOUSE_LL, WINDOW_EX_STYLE,
+    GetSystemMetrics, HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_UP, MSG,
+    MSLLHOOKSTRUCT, PostMessageW, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP,
+    RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, RI_MOUSE_HWHEEL, RI_MOUSE_LEFT_BUTTON_DOWN,
+    RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP,
+    RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, RI_MOUSE_WHEEL, SM_CXSCREEN,
+    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SetTimer, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_APP, WM_INPUT, WM_TIMER,
 };
 use windows::core::w;
 
 use crate::input::CROSSOVER_INJECTION_TAG;
+use crate::keymap;
 
 /// Private message asking the pump thread to shut down.
 const WM_APP_SHUTDOWN: u32 = WM_APP + 1;
@@ -85,6 +108,8 @@ const WM_APP_SHUTDOWN: u32 = WM_APP + 1;
 const WM_APP_START_CAPTURE: u32 = WM_APP + 2;
 /// Private message asking the pump thread to tear capture down.
 const WM_APP_STOP_CAPTURE: u32 = WM_APP + 3;
+/// Posted by the keyboard callback to wake the pump to drain `KEY_QUEUE`.
+const WM_APP_KEY_READY: u32 = WM_APP + 4;
 
 /// Watchdog timer identity and period. One period bounds how long a
 /// silently removed hook can leak input locally before detection.
@@ -108,10 +133,138 @@ const WATCHDOG_MIN_RAW_EVENTS: usize = 5;
 
 /// Whether the hook should swallow untagged events right now.
 static SUPPRESSING: AtomicBool = AtomicBool::new(false);
-/// Untagged mouse events the hook has seen (watchdog evidence).
+/// Untagged mouse events the hook has seen (watchdog evidence). Only the
+/// mouse hook touches this, so the watchdog's mouse-hook-vs-Raw-Input
+/// comparison stays clean; the keyboard hook has no independent signal to
+/// compare against (a documented gap: a pump stall removes both hooks and
+/// is caught here, but a keyboard-only silent removal is not).
 static HOOK_EVENTS: AtomicUsize = AtomicUsize::new(0);
 /// Process-wide exclusivity: exactly one capture may be installed.
 static CAPTURE_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+// Keyboard state the WH_KEYBOARD_LL callback reaches. Static for the same
+// reason as the mouse flags — a C callback cannot capture — and
+// per-process-exclusive by the same guard.
+
+/// Left/right Control currently held, tracked for the escape chord.
+static LEFT_CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+static RIGHT_CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+/// Set when the escape chord (both Control keys) is detected. The driver
+/// polls and clears it to release control — the local user's way out
+/// while every other key is being captured and sent to the peer.
+static ESCAPE_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// The pump window, as a raw handle the keyboard callback posts to so the
+/// pump wakes and drains [`KEY_QUEUE`]. Zero when no capture is installed.
+static PUMP_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Raw key events the callback enqueues for the pump to translate and
+/// deliver — the near-zero-work callback (R-2) does no lookup or sink
+/// call itself. Bounded (NFR-1); a flood past the bound is dropped.
+static KEY_QUEUE: Mutex<VecDeque<RawKey>> = Mutex::new(VecDeque::new());
+
+/// Cap on [`KEY_QUEUE`]. A quarter-second of the fastest human typing is
+/// far below this; reaching it means something is wrong, and dropping
+/// beats unbounded growth.
+const MAX_KEY_QUEUE: usize = 256;
+
+/// One captured key, as the callback records it — raw scan code and
+/// flags, translated to a [`KeyEvent`] later on the pump.
+#[derive(Debug, Clone, Copy)]
+struct RawKey {
+    scancode: u16,
+    extended: bool,
+    pressed: bool,
+}
+
+/// Enqueue a raw key for the pump, bounded (NFR-1). Same-thread with the
+/// drain (both on the pump thread), so the lock never contends.
+fn enqueue_key(raw: RawKey) {
+    let mut queue = KEY_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+    if queue.len() < MAX_KEY_QUEUE {
+        queue.push_back(raw);
+    }
+}
+
+/// Translate a captured key to a [`KeyEvent`] (ADR 0008). `None` for a
+/// scan code Crossover does not carry — skipped rather than forwarded as
+/// the wrong key. Produced text is left empty: Phase 4 injects by scan
+/// code, so text is unused, and producing it correctly under suppression
+/// (which hides held modifiers from the OS) belongs with the later
+/// text-injection fallback.
+fn translate_key(raw: RawKey) -> Option<KeyEvent> {
+    let key = keymap::scancode_to_hid(raw.scancode, raw.extended)?;
+    Some(KeyEvent {
+        key,
+        pressed: raw.pressed,
+        repeat: false,
+        text: None,
+    })
+}
+
+/// The `WH_KEYBOARD_LL` callback. Near-zero work (R-2): read fields, track
+/// the Control modifiers for the escape chord, enqueue, wake the pump,
+/// return. No scan-code lookup or sink call here — those happen on the
+/// pump after this returns.
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        // SAFETY: for code >= 0 the WH_KEYBOARD_LL contract says lparam
+        // points to a valid KBDLLHOOKSTRUCT for the duration of the call.
+        let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        if info.dwExtraInfo == CROSSOVER_INJECTION_TAG {
+            // Our own injection: never capture it back (ADR 0007).
+            // SAFETY: forwarding exactly the arguments we received.
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
+
+        let pressed = info.flags.0 & LLKHF_UP.0 == 0;
+        let vk = info.vkCode;
+        // Track Control state and note whether the *other* Control was
+        // already held — that is what makes a Control press the escape.
+        let other_ctrl_held = if vk == u32::from(VK_LCONTROL.0) {
+            let other = RIGHT_CTRL_DOWN.load(Ordering::Relaxed);
+            LEFT_CTRL_DOWN.store(pressed, Ordering::Relaxed);
+            other
+        } else if vk == u32::from(VK_RCONTROL.0) {
+            let other = LEFT_CTRL_DOWN.load(Ordering::Relaxed);
+            RIGHT_CTRL_DOWN.store(pressed, Ordering::Relaxed);
+            other
+        } else {
+            false
+        };
+
+        if SUPPRESSING.load(Ordering::Relaxed) {
+            // The escape chord: a Control press while the other Control is
+            // already down. Never forwarded — the peer must not receive
+            // the gesture that ends its own control.
+            if pressed && other_ctrl_held {
+                ESCAPE_REQUESTED.store(true, Ordering::Relaxed);
+                return LRESULT(1);
+            }
+            enqueue_key(RawKey {
+                scancode: u16::try_from(info.scanCode).unwrap_or(0),
+                extended: info.flags.0 & LLKHF_EXTENDED.0 != 0,
+                pressed,
+            });
+            let hwnd = PUMP_HWND.load(Ordering::Relaxed);
+            if hwnd != 0 {
+                // SAFETY: PostMessageW is thread-safe by API contract; a
+                // stale handle at worst fails harmlessly. It wakes the
+                // pump to drain the queue after this callback returns.
+                let _ = unsafe {
+                    PostMessageW(
+                        Some(HWND(hwnd as *mut core::ffi::c_void)),
+                        WM_APP_KEY_READY,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                };
+            }
+            return LRESULT(1); // suppress locally (the point of capture)
+        }
+    }
+    // SAFETY: forwarding exactly the arguments we received, as the hook
+    // contract requires for events we do not consume.
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
 
 /// What the hook does with one event. Factored out of the callback so
 /// the decision — the security-relevant part — is testable without
@@ -293,6 +446,12 @@ impl InputCapture for WindowsInputCapture {
     fn is_capturing(&self) -> bool {
         self.shared.active.load(Ordering::Relaxed)
     }
+
+    fn escape_requested(&self) -> bool {
+        // Read-and-clear: the keyboard hook set it (both Control keys),
+        // and the caller acting on it releases control (ADR 0008).
+        ESCAPE_REQUESTED.swap(false, Ordering::Relaxed)
+    }
 }
 
 impl Drop for WindowsInputCapture {
@@ -444,6 +603,8 @@ struct Pump {
     shared: Arc<Shared>,
     hwnd: HWND,
     hook: Option<HHOOK>,
+    /// The `WH_KEYBOARD_LL` hook, installed alongside the mouse hook.
+    keyboard_hook: Option<HHOOK>,
     /// Whether this pump holds the process-wide capture (guards the
     /// statics: a second, idle instance must never touch them).
     owns_capture: bool,
@@ -497,6 +658,23 @@ impl Pump {
         let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
             .map_err(|e| format!("SetWindowsHookExW(WH_MOUSE_LL) failed: {e}"))?;
         self.hook = Some(hook);
+
+        // The keyboard callback posts to this window; publish it before the
+        // hook can fire (ADR 0008).
+        PUMP_HWND.store(self.hwnd.0 as isize, Ordering::Relaxed);
+        LEFT_CTRL_DOWN.store(false, Ordering::Relaxed);
+        RIGHT_CTRL_DOWN.store(false, Ordering::Relaxed);
+        ESCAPE_REQUESTED.store(false, Ordering::Relaxed);
+        KEY_QUEUE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        // SAFETY: as for the mouse hook — the callback lives in this
+        // module, null module handle is correct for a low-level hook.
+        let keyboard_hook =
+            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) }
+                .map_err(|e| format!("SetWindowsHookExW(WH_KEYBOARD_LL) failed: {e}"))?;
+        self.keyboard_hook = Some(keyboard_hook);
 
         let size = u32::try_from(size_of::<RAWINPUTDEVICE>())
             .map_err(|_| "RAWINPUTDEVICE size does not fit in u32".to_owned())?;
@@ -572,6 +750,22 @@ impl Pump {
                 let _ = UnhookWindowsHookEx(hook);
             }
         }
+        if let Some(keyboard_hook) = self.keyboard_hook.take() {
+            // SAFETY: unhooking the keyboard hook this thread installed;
+            // an already-removed hook fails harmlessly.
+            unsafe {
+                let _ = UnhookWindowsHookEx(keyboard_hook);
+            }
+        }
+        // The keyboard callback must not reach a torn-down pump.
+        PUMP_HWND.store(0, Ordering::Relaxed);
+        LEFT_CTRL_DOWN.store(false, Ordering::Relaxed);
+        RIGHT_CTRL_DOWN.store(false, Ordering::Relaxed);
+        ESCAPE_REQUESTED.store(false, Ordering::Relaxed);
+        KEY_QUEUE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         *self
             .shared
             .sink
@@ -657,8 +851,43 @@ impl Pump {
             for event in &self.events {
                 // Contract (InputSink): quick and non-blocking — this
                 // runs on the thread whose stall would overrun the hook
-                // timeout (R-2).
-                sink(*event);
+                // timeout (R-2). Raw Input on this path is mouse only, so
+                // every event is a pointer event.
+                sink(InputEvent::Pointer(*event));
+            }
+        }
+    }
+
+    /// Drain the keyboard queue the callback filled, translate each key,
+    /// and deliver it. Runs on the pump after the callback returns, so
+    /// the scan-code lookup and the sink call are off the hot hook path
+    /// (R-2).
+    fn on_key_ready(&mut self) {
+        if !self.owns_capture {
+            return; // stray wake queued around teardown
+        }
+        let drained: Vec<RawKey> = {
+            let mut queue = KEY_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+            queue.drain(..).collect()
+        };
+        let events: Vec<InputEvent> = drained
+            .into_iter()
+            .filter_map(translate_key)
+            .map(InputEvent::Key)
+            .collect();
+        if events.is_empty() {
+            return;
+        }
+        if let Some(sink) = self
+            .shared
+            .sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            for event in events {
+                // Contract (InputSink): quick and non-blocking.
+                sink(event);
             }
         }
     }
@@ -732,6 +961,7 @@ fn pump_thread(shared: &Arc<Shared>, init: &mpsc::Sender<Result<isize, String>>)
         shared: Arc::clone(shared),
         hwnd,
         hook: None,
+        keyboard_hook: None,
         owns_capture: false,
         tracker: AbsoluteTracker::default(),
         events: Vec::new(),
@@ -759,6 +989,7 @@ fn pump_thread(shared: &Arc<Shared>, init: &mpsc::Sender<Result<isize, String>>)
                     DispatchMessageW(&raw const msg);
                 }
             }
+            WM_APP_KEY_READY => pump.on_key_ready(),
             WM_TIMER if msg.wParam.0 == WATCHDOG_TIMER_ID => pump.on_watchdog_tick(),
             WM_APP_START_CAPTURE => pump.on_start(),
             WM_APP_STOP_CAPTURE => pump.on_stop(),
@@ -783,7 +1014,9 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
-    use crossover_platform::{InputCapture, InputError, InputSink, PointerButton, PointerEvent};
+    use crossover_platform::{
+        InputCapture, InputError, InputEvent, InputSink, KeyEvent, PointerButton, PointerEvent,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
     };
@@ -794,10 +1027,42 @@ mod tests {
     };
 
     use super::{
-        AbsoluteTracker, HookVerdict, RawMouseReport, ScreenExtents, WindowsInputCapture,
-        hook_lost, hook_verdict, is_our_injection, translate_raw_mouse,
+        AbsoluteTracker, HookVerdict, RawKey, RawMouseReport, ScreenExtents, WindowsInputCapture,
+        hook_lost, hook_verdict, is_our_injection, translate_key, translate_raw_mouse,
     };
     use crate::input::CROSSOVER_INJECTION_TAG;
+
+    #[test]
+    fn keyboard_translation_maps_scancode_to_hid_by_the_table() {
+        // 'a': scancode 0x1E, not extended → HID 0x04, a press.
+        assert_eq!(
+            translate_key(RawKey {
+                scancode: 0x1E,
+                extended: false,
+                pressed: true,
+            }),
+            Some(KeyEvent::press(0x04))
+        );
+        // Right Control: scancode 0x1D *extended* → HID 0xE4, a release —
+        // the extended flag keeps it distinct from Left Control.
+        assert_eq!(
+            translate_key(RawKey {
+                scancode: 0x1D,
+                extended: true,
+                pressed: false,
+            }),
+            Some(KeyEvent::release(0xE4))
+        );
+        // A scan code Crossover does not carry is skipped, not guessed.
+        assert!(
+            translate_key(RawKey {
+                scancode: 0x00,
+                extended: false,
+                pressed: true,
+            })
+            .is_none()
+        );
+    }
 
     /// Input capture is process-exclusive by design; serialize every
     /// test that installs the real hook.
@@ -1027,7 +1292,7 @@ mod tests {
     // well under a second. A live desktop can also feed real events into
     // the sink, so assertions use distinctive markers, never counts.
 
-    fn collecting_sink() -> (InputSink, Arc<Mutex<Vec<PointerEvent>>>) {
+    fn collecting_sink() -> (InputSink, Arc<Mutex<Vec<InputEvent>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink_seen = Arc::clone(&seen);
         let sink: InputSink = Box::new(move |event| {
@@ -1063,11 +1328,13 @@ mod tests {
         assert_eq!(accepted, 1, "test SendInput was blocked");
     }
 
-    fn saw_marker(seen: &Mutex<Vec<PointerEvent>>) -> bool {
+    fn saw_marker(seen: &Mutex<Vec<InputEvent>>) -> bool {
         seen.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .any(|e| matches!(e, PointerEvent::Scroll { dy, .. } if dy.abs() == MARKER_WHEEL))
+            .any(|e| {
+                matches!(e, InputEvent::Pointer(PointerEvent::Scroll { dy, .. }) if dy.abs() == MARKER_WHEEL)
+            })
     }
 
     #[test]
@@ -1152,23 +1419,29 @@ mod tests {
     }
 
     /// Manual probe (docs/SOAK.md): run alone, on purpose, with a real
-    /// mouse. Captures for ten seconds — the local pointer goes dead,
-    /// which IS suppression working — then releases and reports what
-    /// was observed. Move, click, and scroll during the window.
+    /// mouse and keyboard. Captures for ten seconds — the local pointer
+    /// *and keyboard* go dead, which IS suppression working — then
+    /// releases and reports what was observed. Move, click, scroll, and
+    /// type during the window.
+    ///
+    /// The keyboard is frozen too, so you cannot Ctrl-C out; it
+    /// auto-releases after ten seconds. Do not type anything you would
+    /// not want swallowed.
     ///
     /// ```text
     /// cargo test -p crossover-platform-windows manual_probe_capture -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore = "manual probe: freezes the local mouse for 10 seconds (docs/SOAK.md)"]
+    #[ignore = "manual probe: freezes the local mouse AND keyboard for 10 seconds (docs/SOAK.md)"]
     fn manual_probe_capture() {
         let _serial = capture_lock();
         let capture = WindowsInputCapture::new().unwrap();
         let (sink, seen) = collecting_sink();
 
         eprintln!();
-        eprintln!("capturing for 10 seconds: the mouse should go DEAD locally;");
-        eprintln!("move it, click, and scroll anyway — events are being counted.");
+        eprintln!("capturing for 10 seconds: the mouse AND keyboard should go DEAD locally;");
+        eprintln!("move, click, scroll, and type anyway — events are being counted.");
+        eprintln!("(you cannot Ctrl-C during this; it releases itself after 10s.)");
         capture.start_capture(sink).unwrap();
         std::thread::sleep(Duration::from_secs(10));
         let healthy = capture.is_capturing();
@@ -1179,23 +1452,27 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let motions = events
             .iter()
-            .filter(|e| matches!(e, PointerEvent::Motion { .. }))
+            .filter(|e| matches!(e, InputEvent::Pointer(PointerEvent::Motion { .. })))
             .count();
         let buttons = events
             .iter()
-            .filter(|e| matches!(e, PointerEvent::Button { .. }))
+            .filter(|e| matches!(e, InputEvent::Pointer(PointerEvent::Button { .. })))
             .count();
         let scrolls = events
             .iter()
-            .filter(|e| matches!(e, PointerEvent::Scroll { .. }))
+            .filter(|e| matches!(e, InputEvent::Pointer(PointerEvent::Scroll { .. })))
+            .count();
+        let keys = events
+            .iter()
+            .filter(|e| matches!(e, InputEvent::Key(_)))
             .count();
         eprintln!();
-        eprintln!("released: the mouse should be alive again.");
+        eprintln!("released: the mouse and keyboard should be alive again.");
         eprintln!(
-            "observed while capturing: {motions} motion, {buttons} button, {scrolls} scroll \
-             events; capture healthy at end: {healthy}"
+            "observed while capturing: {motions} motion, {buttons} button, {scrolls} scroll, \
+             {keys} key events; capture healthy at end: {healthy}"
         );
-        eprintln!("if the cursor moved while \"dead\", suppression failed — that is a bug.");
+        eprintln!("if the cursor moved or a keystroke landed while \"dead\", suppression failed.");
         assert!(healthy, "capture reported unhealthy during the probe");
     }
 }

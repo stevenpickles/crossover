@@ -208,11 +208,11 @@ pub enum InputError {
     InjectionFailed { reason: String },
 }
 
-/// Receives captured events. Invoked on the platform's input thread, so
-/// it must return promptly and never block — on Windows it descends from
-/// a low-level hook callback whose overrun causes Windows to silently
-/// remove the hook (R-2).
-pub type InputSink = Box<dyn Fn(PointerEvent) + Send + Sync>;
+/// Receives captured events, pointer and keyboard in one stream. Invoked
+/// on the platform's input thread, so it must return promptly and never
+/// block — on Windows it descends from a low-level hook callback whose
+/// overrun causes Windows to silently remove the hook (R-2).
+pub type InputSink = Box<dyn Fn(InputEvent) + Send + Sync>;
 
 /// Captures local pointer input and suppresses its local effect.
 ///
@@ -251,6 +251,17 @@ pub trait InputCapture: Send + Sync {
     /// so a caller polling this can fail closed rather than believe it
     /// still holds input it stopped receiving.
     fn is_capturing(&self) -> bool;
+
+    /// Whether the user asked to release control via the platform escape
+    /// gesture since the last poll — both Control keys, on Windows
+    /// (ADR 0008). Read-and-clear: a caller polling this true releases
+    /// control. It exists because, once the keyboard is captured, every
+    /// ordinary key goes to the peer, so the usual console command cannot
+    /// reach the user; the escape is caught in the hook and never
+    /// forwarded. Platforms with no capture escape keep the default.
+    fn escape_requested(&self) -> bool {
+        false
+    }
 }
 
 /// Injects pointer and keyboard input on this machine.

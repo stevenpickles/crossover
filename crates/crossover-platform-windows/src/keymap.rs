@@ -106,11 +106,24 @@ pub fn hid_to_scancode(hid: u16) -> Option<(u16, bool)> {
         .map(|entry| (entry.scancode, entry.extended))
 }
 
+/// The HID usage for a Windows Set-1 scan code and its extended flag, the
+/// reverse of [`hid_to_scancode`] used by keyboard capture. `None` for a
+/// scan code Crossover does not carry — the capture skips it rather than
+/// forward a key it cannot name. The `(scancode, extended)` pair is
+/// unique (a table invariant tested here), so the reverse is unambiguous.
+#[must_use]
+pub fn scancode_to_hid(scancode: u16, extended: bool) -> Option<u16> {
+    KEY_MAP
+        .iter()
+        .find(|entry| entry.scancode == scancode && entry.extended == extended)
+        .map(|entry| entry.hid)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{KEY_MAP, hid_to_scancode};
+    use super::{KEY_MAP, hid_to_scancode, scancode_to_hid};
 
     #[test]
     fn representative_keys_map_correctly() {
@@ -158,6 +171,31 @@ mod tests {
         assert_eq!(hid_to_scancode(0x00), None); // reserved
         assert_eq!(hid_to_scancode(0x48), None); // Pause — deliberate gap
         assert_eq!(hid_to_scancode(0xFFFF), None); // nonsense
+    }
+
+    #[test]
+    fn scancode_reverse_round_trips_every_entry() {
+        // Capture (scancode → HID) must invert injection (HID → scancode)
+        // for every key, extended flag included — a right-hand modifier
+        // must not come back as its left-hand twin.
+        for entry in KEY_MAP {
+            let (scancode, extended) = hid_to_scancode(entry.hid).unwrap();
+            assert_eq!(
+                scancode_to_hid(scancode, extended),
+                Some(entry.hid),
+                "HID {:#04x} did not round-trip through the scan code",
+                entry.hid
+            );
+        }
+    }
+
+    #[test]
+    fn scancode_reverse_respects_the_extended_flag() {
+        // Left and Right Control share scancode 0x1D; only the flag tells
+        // them apart, in both directions.
+        assert_eq!(scancode_to_hid(0x1D, false), Some(0xE0)); // Left Control
+        assert_eq!(scancode_to_hid(0x1D, true), Some(0xE4)); // Right Control
+        assert_eq!(scancode_to_hid(0x00, false), None); // unmapped
     }
 
     #[test]
