@@ -6,22 +6,34 @@
 //! which is what makes the stuck-button invariant *provable* here rather
 //! than hoped-for in integration (docs/TESTING.md §1).
 //!
-//! One engine instance serves both roles at once:
+//! One engine instance serves both roles at once, and — this is the
+//! point of the design — it is **session-aware**. Authentication is not
+//! authorization: a peer authenticated by TLS is entitled to inject only
+//! while it holds a *grant*, and a grant is authority for the one
+//! session it was negotiated on and no other (FR-2.3, FR-5.1). So every
+//! event carries the session it belongs to, and every authorization
+//! decision is checked against the identity of the session that holds
+//! the grant — complete mediation on the principal. A second trusted
+//! peer cannot ride the first peer's grant.
 //!
-//! - **Controller** (this machine drives the peer): negotiates the grant
+//! - **Controller** (this machine drives a peer): negotiates the grant
 //!   (request → acknowledge → switch, FR-5.3), captures only *after* the
-//!   peer says yes, coalesces and sequences outbound batches, and tracks
-//!   what it believes is held down on the peer (FR-4.3).
-//! - **Controlled** (the peer drives this machine): grants or denies
-//!   requests deterministically, injects granted input, tracks what it
-//!   has applied, and releases all of it on hand-back, revocation, or
-//!   disconnect (FR-4.4) — the destination executes its *own* belief,
-//!   never a list the departed peer might have gotten wrong.
+//!   peer says yes, coalesces and sequences outbound batches to that
+//!   session, and tracks what it believes is held down on the peer
+//!   (FR-4.3). At most one peer is controlled at a time — the single
+//!   local mouse can drive only one destination.
+//! - **Controlled** (a peer drives this machine): grants or denies
+//!   requests deterministically, injects granted input from the *one*
+//!   session that holds the grant, tracks what it has applied, and
+//!   releases all of it on hand-back, revocation, or disconnect (FR-4.4)
+//!   — the destination executes its *own* belief, never a list the
+//!   departed peer might have gotten wrong. At most one peer controls
+//!   this machine at a time — the single local desktop.
 //!
-//! Fail-closed rules (FR-2.3): an `InputBatch` without a grant, or with
-//! a non-increasing sequence, terminates the session. Authenticated does
-//! not mean entitled to inject.
+//! Fail-closed rules (FR-2.3): an `InputBatch` from a session that holds
+//! no grant, or with a non-increasing sequence, terminates that session.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crossover_protocol::hello::MessageType;
@@ -30,6 +42,7 @@ use crossover_protocol::{
     ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, InputBatch,
     ProtocolError, ReleaseAllInput, WireButton, WireInputEvent,
 };
+use uuid::Uuid;
 
 use crate::input::{InputState, PointerButton, PointerEvent, coalesce};
 
@@ -49,48 +62,88 @@ impl Default for ControlConfig {
     }
 }
 
-/// This machine's control of the *peer* — the outbound axis.
+/// This machine's control of a peer — the outbound axis. A singleton
+/// (the local mouse drives one destination), but it remembers *which*
+/// session it targets so responses, batches, and releases go to the
+/// right peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outbound {
     /// Input acts locally.
     Local,
-    /// A request is in flight; nothing is captured yet.
+    /// A request is in flight to `session`; nothing is captured yet.
     Requesting {
+        /// The session the request went to.
+        session: Uuid,
         /// The id awaiting its response.
         request_id: u64,
     },
-    /// The peer granted control: local input is captured and forwarded.
-    Remote,
+    /// `session` granted control: local input is captured and forwarded
+    /// to it.
+    Remote {
+        /// The session being controlled.
+        session: Uuid,
+    },
 }
 
-/// Everything that can happen to the engine.
+/// A peer's control of this machine — the inbound axis. Present only
+/// while a grant is held, and it names the one session that holds it, so
+/// input from any other session is unauthorized.
+#[derive(Debug)]
+struct Controlled {
+    /// The session that holds the grant.
+    session: Uuid,
+    /// Last sequence applied from that session (rejects regressions).
+    applied_sequence: u64,
+    /// What this machine has applied for that peer (FR-4.3, FR-4.4).
+    applied_state: InputState,
+}
+
+/// Everything that can happen to the engine. Session-scoped variants
+/// carry the session they belong to.
 #[derive(Debug, Clone)]
 pub enum ControlEvent {
-    /// The user asked to take control of the peer.
-    UserRequestControl,
+    /// The user asked to take control of a specific peer.
+    UserRequestControl {
+        /// The session to request control of.
+        session: Uuid,
+    },
     /// The user asked to end whichever control relationship exists:
     /// hand back control they hold, cancel a pending request, or revoke
-    /// the peer's grant over this machine (the escape hatch).
+    /// a peer's grant over this machine (the escape hatch).
     UserRelease,
-    /// A session to the peer reached `ESTABLISHED`.
-    SessionEstablished,
-    /// The session ended, for any reason.
-    SessionLost,
-    /// Locally captured pointer events (already suppressed locally).
+    /// A session reached `ESTABLISHED`.
+    SessionEstablished {
+        /// The session.
+        session: Uuid,
+    },
+    /// A session ended, for any reason.
+    SessionLost {
+        /// The session.
+        session: Uuid,
+    },
+    /// Locally captured pointer events (already suppressed locally),
+    /// destined for whichever peer this machine controls.
     Captured(Vec<PointerEvent>),
     /// Capture reported unhealthy (`is_capturing` false while `REMOTE`) —
     /// the Windows watchdog detected silent hook loss (R-2).
     CaptureLost,
-    /// The request timeout scheduled for `request_id` came due.
+    /// The request timeout scheduled for a session's request came due.
     RequestTimeout {
+        /// The session the request went to.
+        session: Uuid,
         /// Which request the timer belonged to.
         request_id: u64,
     },
-    /// A decoded control or input message from the peer.
-    Peer(InboundControl),
+    /// A decoded control or input message from a specific session.
+    Peer {
+        /// The session it arrived on.
+        session: Uuid,
+        /// The message.
+        message: InboundControl,
+    },
 }
 
-/// Control and input messages from the peer, decoded and validated.
+/// Control and input messages from a peer, decoded and validated.
 #[derive(Debug, Clone)]
 pub enum InboundControl {
     /// Peer asks to control this machine.
@@ -172,7 +225,7 @@ impl OutboundControl {
     }
 }
 
-/// Why this machine's control of the peer ended.
+/// Why this machine's control of a peer ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlEndReason {
     /// The user handed control back.
@@ -190,9 +243,9 @@ pub enum ControlEndReason {
 /// Why a request never went out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestBlocked {
-    /// No session exists.
+    /// The named session is not established.
     NoSession,
-    /// The peer currently controls this machine; release first.
+    /// A peer currently controls this machine; release first.
     PeerHoldsControl,
     /// Control is already held.
     AlreadyControlling,
@@ -204,7 +257,7 @@ pub enum RequestBlocked {
 /// Every failed or ended transfer surfaces here (NFR-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlNotice {
-    /// A request went to the peer.
+    /// A request went to a peer.
     RequestSent,
     /// A request could not be made.
     RequestBlocked(RequestBlocked),
@@ -212,17 +265,17 @@ pub enum ControlNotice {
     RequestDenied(DenyReason),
     /// The peer never answered inside the timeout.
     RequestTimedOut,
-    /// This machine now controls the peer.
+    /// This machine now controls a peer.
     ControlGained,
-    /// This machine's control of the peer ended.
+    /// This machine's control of a peer ended.
     ControlEnded(ControlEndReason),
-    /// The peer now controls this machine.
+    /// A peer now controls this machine.
     PeerTookControl,
-    /// The peer handed control of this machine back.
+    /// The controlling peer handed control of this machine back.
     PeerReleasedControl,
-    /// The user revoked the peer's control of this machine.
+    /// The user revoked a peer's control of this machine.
     PeerControlRevoked,
-    /// The peer's control of this machine ended with the session; its
+    /// A peer's control of this machine ended with the session; its
     /// input was released locally (FR-4.4).
     PeerControlLostOnDisconnect,
 }
@@ -231,8 +284,13 @@ pub enum ControlNotice {
 /// `Vec` is the required execution order.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ControlAction {
-    /// Send this message to the peer.
-    Send(OutboundControl),
+    /// Send this message to a specific session.
+    Send {
+        /// The session to send it to.
+        session: Uuid,
+        /// The message.
+        message: OutboundControl,
+    },
     /// Begin capturing (and suppressing) local pointer input.
     StartCapture,
     /// Stop capturing; local input acts locally again.
@@ -241,13 +299,17 @@ pub enum ControlAction {
     Inject(Vec<PointerEvent>),
     /// Arrange a [`ControlEvent::RequestTimeout`] after `delay`.
     ScheduleRequestTimeout {
+        /// The session the request went to.
+        session: Uuid,
         /// Which request the timer guards.
         request_id: u64,
         /// The configured wait.
         delay: Duration,
     },
-    /// The peer violated the protocol: terminate the session (FR-2.3).
+    /// The session violated the protocol: terminate it (FR-2.3).
     Terminate {
+        /// The offending session.
+        session: Uuid,
         /// Diagnostic for logs.
         reason: String,
     },
@@ -259,76 +321,77 @@ pub enum ControlAction {
 #[derive(Debug)]
 pub struct ControlEngine {
     config: ControlConfig,
-    session_up: bool,
+    /// Sessions currently established. Membership is what makes a user
+    /// request valid and what a lost session is removed from.
+    established: BTreeSet<Uuid>,
+    /// This machine's control of a peer (the singleton outbound axis).
     outbound: Outbound,
-    /// True while the peer holds a grant over this machine.
-    peer_controls: bool,
+    /// A peer's control of this machine (the singleton inbound axis).
+    controlled: Option<Controlled>,
     next_request_id: u64,
     /// Last sequence sent while controlling (reset per grant).
     send_sequence: u64,
-    /// What this machine believes is held down on the peer (FR-4.3).
+    /// What this machine believes is held down on the controlled peer
+    /// (FR-4.3). Meaningful only while `outbound` is `Remote`.
     sent_state: InputState,
-    /// Last sequence applied while controlled (reset per grant).
-    applied_sequence: u64,
-    /// What this machine has applied for the peer (FR-4.3).
-    applied_state: InputState,
 }
 
 impl ControlEngine {
-    /// A fresh engine: local control, no session.
+    /// A fresh engine: local control, no sessions.
     #[must_use]
     pub fn new(config: ControlConfig) -> Self {
         Self {
             config,
-            session_up: false,
+            established: BTreeSet::new(),
             outbound: Outbound::Local,
-            peer_controls: false,
+            controlled: None,
             next_request_id: 0,
             send_sequence: 0,
             sent_state: InputState::new(),
-            applied_sequence: 0,
-            applied_state: InputState::new(),
         }
     }
 
-    /// Is this machine controlling the peer (capture should be active)?
+    /// Is this machine controlling a peer (capture should be active)?
     #[must_use]
     pub fn is_controlling(&self) -> bool {
-        self.outbound == Outbound::Remote
+        matches!(self.outbound, Outbound::Remote { .. })
     }
 
-    /// Is the peer controlling this machine?
+    /// Is a peer controlling this machine?
     #[must_use]
     pub fn is_controlled(&self) -> bool {
-        self.peer_controls
+        self.controlled.is_some()
     }
 
     /// Process one event. The returned actions must be executed in
     /// order.
     pub fn handle(&mut self, event: ControlEvent) -> Vec<ControlAction> {
         match event {
-            ControlEvent::UserRequestControl => self.on_user_request(),
+            ControlEvent::UserRequestControl { session } => self.on_user_request(session),
             ControlEvent::UserRelease => self.on_user_release(),
-            ControlEvent::SessionEstablished => {
-                self.session_up = true;
+            ControlEvent::SessionEstablished { session } => {
+                self.established.insert(session);
                 Vec::new()
             }
-            ControlEvent::SessionLost => self.on_session_lost(),
+            ControlEvent::SessionLost { session } => self.on_session_lost(session),
             ControlEvent::Captured(events) => self.on_captured(&events),
             ControlEvent::CaptureLost => self.on_capture_lost(),
-            ControlEvent::RequestTimeout { request_id } => self.on_request_timeout(request_id),
-            ControlEvent::Peer(message) => self.on_peer(message),
+            ControlEvent::RequestTimeout {
+                session,
+                request_id,
+            } => self.on_request_timeout(session, request_id),
+            ControlEvent::Peer { session, message } => self.on_peer(session, message),
         }
     }
 
-    fn on_user_request(&mut self) -> Vec<ControlAction> {
-        let blocked = if !self.session_up {
+    fn on_user_request(&mut self, session: Uuid) -> Vec<ControlAction> {
+        let blocked = if !self.established.contains(&session) {
             Some(RequestBlocked::NoSession)
-        } else if self.peer_controls {
+        } else if self.controlled.is_some() {
             Some(RequestBlocked::PeerHoldsControl)
         } else {
             match self.outbound {
-                Outbound::Remote => Some(RequestBlocked::AlreadyControlling),
+                Outbound::Remote { .. } => Some(RequestBlocked::AlreadyControlling),
                 Outbound::Requesting { .. } => Some(RequestBlocked::RequestPending),
                 Outbound::Local => None,
             }
@@ -339,10 +402,17 @@ impl ControlEngine {
 
         self.next_request_id += 1;
         let request_id = self.next_request_id;
-        self.outbound = Outbound::Requesting { request_id };
+        self.outbound = Outbound::Requesting {
+            session,
+            request_id,
+        };
         vec![
-            ControlAction::Send(OutboundControl::Request(ControlRequest { request_id })),
+            ControlAction::Send {
+                session,
+                message: OutboundControl::Request(ControlRequest { request_id }),
+            },
             ControlAction::ScheduleRequestTimeout {
+                session,
                 request_id,
                 delay: self.config.request_timeout,
             },
@@ -351,19 +421,27 @@ impl ControlEngine {
     }
 
     fn on_user_release(&mut self) -> Vec<ControlAction> {
+        // Ending outbound control takes precedence over revoking inbound:
+        // the outbound relationship is the one the user just initiated,
+        // and the two axes end independently across successive presses.
         match self.outbound {
             // Hand control back. StopCapture leads so no freshly captured
             // event can chase the release messages; ReleaseAllInput goes
             // before ControlRelease so TCP delivers them in that order.
-            Outbound::Remote => {
+            Outbound::Remote { session } => {
+                let after_sequence = self.send_sequence;
                 self.outbound = Outbound::Local;
                 self.sent_state = InputState::new();
                 vec![
                     ControlAction::StopCapture,
-                    ControlAction::Send(OutboundControl::ReleaseAll(ReleaseAllInput {
-                        after_sequence: self.send_sequence,
-                    })),
-                    ControlAction::Send(OutboundControl::Release),
+                    ControlAction::Send {
+                        session,
+                        message: OutboundControl::ReleaseAll(ReleaseAllInput { after_sequence }),
+                    },
+                    ControlAction::Send {
+                        session,
+                        message: OutboundControl::Release,
+                    },
                     ControlAction::Notify(ControlNotice::ControlEnded(
                         ControlEndReason::HandedBack,
                     )),
@@ -377,28 +455,35 @@ impl ControlEngine {
                     ControlEndReason::Cancelled,
                 ))]
             }
-            Outbound::Local if self.peer_controls => {
-                // Revoke the peer's grant: the local user's escape hatch.
-                self.peer_controls = false;
-                let releases = self.applied_state.release_all();
-                let mut actions = Vec::new();
-                if !releases.is_empty() {
-                    actions.push(ControlAction::Inject(releases));
+            Outbound::Local => {
+                // Revoke a peer's grant: the local user's escape hatch.
+                if let Some(controlled) = self.controlled.take() {
+                    let mut controlled = controlled;
+                    let releases = controlled.applied_state.release_all();
+                    let mut actions = Vec::new();
+                    if !releases.is_empty() {
+                        actions.push(ControlAction::Inject(releases));
+                    }
+                    actions.push(ControlAction::Send {
+                        session: controlled.session,
+                        message: OutboundControl::Release,
+                    });
+                    actions.push(ControlAction::Notify(ControlNotice::PeerControlRevoked));
+                    actions
+                } else {
+                    Vec::new() // nothing to release; silent
                 }
-                actions.push(ControlAction::Send(OutboundControl::Release));
-                actions.push(ControlAction::Notify(ControlNotice::PeerControlRevoked));
-                actions
             }
-            Outbound::Local => Vec::new(), // nothing to release; silent
         }
     }
 
-    fn on_session_lost(&mut self) -> Vec<ControlAction> {
-        self.session_up = false;
+    fn on_session_lost(&mut self, session: Uuid) -> Vec<ControlAction> {
+        self.established.remove(&session);
         let mut actions = Vec::new();
 
+        // Outbound axis, if it targets the lost session.
         match self.outbound {
-            Outbound::Remote => {
+            Outbound::Remote { session: s } if s == session => {
                 // The peer releases its own belief on its side of the
                 // loss (FR-4.4); nothing can be sent on a dead session.
                 self.outbound = Outbound::Local;
@@ -408,21 +493,26 @@ impl ControlEngine {
                     ControlEndReason::Disconnected,
                 )));
             }
-            Outbound::Requesting { .. } => {
+            Outbound::Requesting { session: s, .. } if s == session => {
                 self.outbound = Outbound::Local;
                 actions.push(ControlAction::Notify(ControlNotice::ControlEnded(
                     ControlEndReason::Disconnected,
                 )));
             }
-            Outbound::Local => {}
+            _ => {}
         }
 
-        if self.peer_controls {
+        // Inbound axis, if the lost session was controlling us.
+        if self
+            .controlled
+            .as_ref()
+            .is_some_and(|c| c.session == session)
+        {
             // FR-4.4, the path the spec calls release-blocking: the
             // destination synthesizes releases for everything it
             // believes is pressed, from its own records.
-            self.peer_controls = false;
-            let releases = self.applied_state.release_all();
+            let mut controlled = self.controlled.take().expect("checked just above");
+            let releases = controlled.applied_state.release_all();
             if !releases.is_empty() {
                 actions.push(ControlAction::Inject(releases));
             }
@@ -437,9 +527,9 @@ impl ControlEngine {
         // Anything captured outside REMOTE is a stray tail between the
         // stop decision and the platform actually stopping: drop it, or
         // it would act on a peer that no longer expects input.
-        if self.outbound != Outbound::Remote {
+        let Outbound::Remote { session } = self.outbound else {
             return Vec::new();
-        }
+        };
         let merged = coalesce(events);
         if merged.is_empty() {
             return Vec::new();
@@ -448,116 +538,137 @@ impl ControlEngine {
         for chunk in merged.chunks(MAX_INPUT_BATCH_EVENTS) {
             self.send_sequence += 1;
             self.sent_state.apply_all(chunk);
-            actions.push(ControlAction::Send(OutboundControl::Batch(InputBatch {
-                sequence: self.send_sequence,
-                events: chunk.iter().copied().map(to_wire).collect(),
-            })));
+            actions.push(ControlAction::Send {
+                session,
+                message: OutboundControl::Batch(InputBatch {
+                    sequence: self.send_sequence,
+                    events: chunk.iter().copied().map(to_wire).collect(),
+                }),
+            });
         }
         actions
     }
 
     fn on_capture_lost(&mut self) -> Vec<ControlAction> {
-        if self.outbound != Outbound::Remote {
+        let Outbound::Remote { session } = self.outbound else {
             return Vec::new();
-        }
+        };
         // Fail closed (ADR 0007): suppression is gone, so control is
         // over. The peer releases what we made it hold; the local
         // StopCapture is belt-and-braces on an already-dead capture.
+        let after_sequence = self.send_sequence;
         self.outbound = Outbound::Local;
         self.sent_state = InputState::new();
         vec![
             ControlAction::StopCapture,
-            ControlAction::Send(OutboundControl::ReleaseAll(ReleaseAllInput {
-                after_sequence: self.send_sequence,
-            })),
-            ControlAction::Send(OutboundControl::Release),
+            ControlAction::Send {
+                session,
+                message: OutboundControl::ReleaseAll(ReleaseAllInput { after_sequence }),
+            },
+            ControlAction::Send {
+                session,
+                message: OutboundControl::Release,
+            },
             ControlAction::Notify(ControlNotice::ControlEnded(ControlEndReason::CaptureLost)),
         ]
     }
 
-    fn on_request_timeout(&mut self, request_id: u64) -> Vec<ControlAction> {
+    fn on_request_timeout(&mut self, session: Uuid, request_id: u64) -> Vec<ControlAction> {
         // Only the timer for the request still in flight matters; a
         // stale timer (answered or superseded request) is a no-op.
-        if self.outbound != (Outbound::Requesting { request_id }) {
-            return Vec::new();
+        if self.outbound
+            == (Outbound::Requesting {
+                session,
+                request_id,
+            })
+        {
+            self.outbound = Outbound::Local;
+            vec![ControlAction::Notify(ControlNotice::RequestTimedOut)]
+        } else {
+            Vec::new()
         }
-        self.outbound = Outbound::Local;
-        vec![ControlAction::Notify(ControlNotice::RequestTimedOut)]
     }
 
-    fn on_peer(&mut self, message: InboundControl) -> Vec<ControlAction> {
+    fn on_peer(&mut self, session: Uuid, message: InboundControl) -> Vec<ControlAction> {
         match message {
-            InboundControl::Request(request) => self.on_peer_request(request),
-            InboundControl::Response(response) => self.on_peer_response(response),
-            InboundControl::Release => self.on_peer_release(),
-            InboundControl::Batch(batch) => self.on_peer_batch(&batch),
-            InboundControl::ReleaseAll(_) => {
-                // Release this machine's own belief (FR-4.4): more robust
-                // than any list the peer could send. Harmless when
-                // nothing is held.
-                let releases = self.applied_state.release_all();
-                if releases.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![ControlAction::Inject(releases)]
-                }
-            }
+            InboundControl::Request(request) => self.on_peer_request(session, request),
+            InboundControl::Response(response) => self.on_peer_response(session, response),
+            InboundControl::Release => self.on_peer_release(session),
+            InboundControl::Batch(batch) => self.on_peer_batch(session, &batch),
+            InboundControl::ReleaseAll(_) => self.on_peer_release_all(session),
         }
     }
 
-    fn on_peer_request(&mut self, request: ControlRequest) -> Vec<ControlAction> {
+    fn on_peer_request(&mut self, session: Uuid, request: ControlRequest) -> Vec<ControlAction> {
         let deny = |reason| {
-            vec![ControlAction::Send(OutboundControl::Response(
-                ControlResponse {
+            vec![ControlAction::Send {
+                session,
+                message: OutboundControl::Response(ControlResponse {
                     request_id: request.request_id,
                     verdict: ControlVerdict::Denied(reason),
-                },
-            ))]
+                }),
+            }]
         };
-        if self.peer_controls {
+        // One peer controls this machine at a time (single desktop): a
+        // request while already controlled — even by the same session —
+        // is denied.
+        if self.controlled.is_some() {
             return deny(DenyReason::AlreadyControlled);
         }
         match self.outbound {
             // Controlling or requesting: busy. Two simultaneous requests
             // thus produce two denials — deterministic (FR-5.1).
-            Outbound::Remote | Outbound::Requesting { .. } => deny(DenyReason::Busy),
+            Outbound::Remote { .. } | Outbound::Requesting { .. } => deny(DenyReason::Busy),
             Outbound::Local => {
-                self.peer_controls = true;
-                self.applied_sequence = 0;
-                self.applied_state = InputState::new();
+                self.controlled = Some(Controlled {
+                    session,
+                    applied_sequence: 0,
+                    applied_state: InputState::new(),
+                });
                 vec![
-                    ControlAction::Send(OutboundControl::Response(ControlResponse {
-                        request_id: request.request_id,
-                        verdict: ControlVerdict::Granted,
-                    })),
+                    ControlAction::Send {
+                        session,
+                        message: OutboundControl::Response(ControlResponse {
+                            request_id: request.request_id,
+                            verdict: ControlVerdict::Granted,
+                        }),
+                    },
                     ControlAction::Notify(ControlNotice::PeerTookControl),
                 ]
             }
         }
     }
 
-    fn on_peer_response(&mut self, response: ControlResponse) -> Vec<ControlAction> {
-        let Outbound::Requesting { request_id } = self.outbound else {
-            // Not waiting: if this is a grant, the peer now believes it
-            // is controlled by us (our request timed out or was
-            // cancelled meanwhile). Undo it explicitly, or it would sit
-            // granted-but-driverless forever.
-            if response.verdict == ControlVerdict::Granted {
-                return vec![ControlAction::Send(OutboundControl::Release)];
+    fn on_peer_response(&mut self, session: Uuid, response: ControlResponse) -> Vec<ControlAction> {
+        // Undo a grant we are not (or no longer) waiting for, sent back
+        // to the very session that issued it — otherwise that peer sits
+        // believing it is controlled by us, driverless, forever.
+        let undo_stray = |verdict: ControlVerdict| -> Vec<ControlAction> {
+            if verdict == ControlVerdict::Granted {
+                vec![ControlAction::Send {
+                    session,
+                    message: OutboundControl::Release,
+                }]
+            } else {
+                Vec::new()
             }
-            return Vec::new();
         };
-        if response.request_id != request_id {
-            // An answer to an older request. A stale grant still needs
-            // the undo; a stale denial is just late news.
-            if response.verdict == ControlVerdict::Granted {
-                return vec![ControlAction::Send(OutboundControl::Release)];
-            }
-            return Vec::new();
+
+        let Outbound::Requesting {
+            session: req_session,
+            request_id,
+        } = self.outbound
+        else {
+            return undo_stray(response.verdict);
+        };
+        // The answer must come from the session we asked, and match the
+        // id: a response from any other session is not our grant.
+        if session != req_session || response.request_id != request_id {
+            return undo_stray(response.verdict);
         }
         match response.verdict {
             ControlVerdict::Granted => {
-                self.outbound = Outbound::Remote;
+                self.outbound = Outbound::Remote { session };
                 self.send_sequence = 0;
                 self.sent_state = InputState::new();
                 vec![
@@ -572,14 +683,19 @@ impl ControlEngine {
         }
     }
 
-    fn on_peer_release(&mut self) -> Vec<ControlAction> {
-        if self.peer_controls {
-            // The controller handed back. Release everything it left
-            // held — normally its ReleaseAllInput already did, but this
-            // engine's belief is the authority and releasing twice is
-            // harmless where a stuck button is not (FR-4.4).
-            self.peer_controls = false;
-            let releases = self.applied_state.release_all();
+    fn on_peer_release(&mut self, session: Uuid) -> Vec<ControlAction> {
+        // Is `session` the peer controlling us handing back?
+        if self
+            .controlled
+            .as_ref()
+            .is_some_and(|c| c.session == session)
+        {
+            // Release everything it left held — normally its
+            // ReleaseAllInput already did, but this engine's belief is
+            // the authority and releasing twice is harmless where a
+            // stuck button is not (FR-4.4).
+            let mut controlled = self.controlled.take().expect("checked just above");
+            let releases = controlled.applied_state.release_all();
             let mut actions = Vec::new();
             if !releases.is_empty() {
                 actions.push(ControlAction::Inject(releases));
@@ -587,47 +703,66 @@ impl ControlEngine {
             actions.push(ControlAction::Notify(ControlNotice::PeerReleasedControl));
             return actions;
         }
-        match self.outbound {
-            // The controlled machine revoked our grant (its user's
-            // escape hatch): stop capturing immediately. It releases its
-            // own applied state.
-            Outbound::Remote => {
-                self.outbound = Outbound::Local;
-                self.sent_state = InputState::new();
-                vec![
-                    ControlAction::StopCapture,
-                    ControlAction::Notify(ControlNotice::ControlEnded(ControlEndReason::Revoked)),
-                ]
-            }
-            // A release with no relationship: the cleanup path for a
-            // grant we un-did, or a duplicate. Nothing to do.
-            Outbound::Requesting { .. } | Outbound::Local => Vec::new(),
+        // Is `session` the peer we are controlling, revoking our grant
+        // (its user's escape hatch)? Stop capturing immediately.
+        if self.outbound == (Outbound::Remote { session }) {
+            self.outbound = Outbound::Local;
+            self.sent_state = InputState::new();
+            return vec![
+                ControlAction::StopCapture,
+                ControlAction::Notify(ControlNotice::ControlEnded(ControlEndReason::Revoked)),
+            ];
         }
+        // A release from an unrelated session: the cleanup path for a
+        // grant we un-did, or a duplicate. Nothing to do.
+        Vec::new()
     }
 
-    fn on_peer_batch(&mut self, batch: &InputBatch) -> Vec<ControlAction> {
-        // Fail closed (FR-2.3): input without a grant is a violation,
-        // not a race — grants travel on the same ordered stream as
-        // batches, so an honest peer cannot interleave them wrongly.
-        if !self.peer_controls {
+    fn on_peer_batch(&mut self, session: Uuid, batch: &InputBatch) -> Vec<ControlAction> {
+        // Complete mediation (FR-2.3, FR-5.1): inject only for the one
+        // session that holds the grant. Input from any other session —
+        // even while this machine is legitimately controlled by someone
+        // else — is a violation, and grants travel on the same ordered
+        // stream as batches, so an honest peer cannot interleave them
+        // wrongly.
+        let Some(controlled) = self.controlled.as_mut().filter(|c| c.session == session) else {
             return vec![ControlAction::Terminate {
-                reason: "input batch received without a control grant".to_owned(),
+                session,
+                reason: "input batch from a session that holds no control grant".to_owned(),
             }];
-        }
+        };
         // TCP+TLS delivers what was sent, in order; a regression or
         // duplicate cannot be innocent (docs/PROTOCOL.md §6).
-        if batch.sequence <= self.applied_sequence {
+        if batch.sequence <= controlled.applied_sequence {
             return vec![ControlAction::Terminate {
+                session,
                 reason: format!(
                     "input batch sequence {} not after {}",
-                    batch.sequence, self.applied_sequence
+                    batch.sequence, controlled.applied_sequence
                 ),
             }];
         }
-        self.applied_sequence = batch.sequence;
+        controlled.applied_sequence = batch.sequence;
         let events: Vec<PointerEvent> = batch.events.iter().copied().map(from_wire).collect();
-        self.applied_state.apply_all(&events);
+        controlled.applied_state.apply_all(&events);
         vec![ControlAction::Inject(events)]
+    }
+
+    fn on_peer_release_all(&mut self, session: Uuid) -> Vec<ControlAction> {
+        // Only the controlling session's release-all releases this
+        // machine's belief (FR-4.4). From any other session it is
+        // meaningless — ignore rather than inject or terminate, since it
+        // can hold nothing to release.
+        if let Some(controlled) = self.controlled.as_mut().filter(|c| c.session == session) {
+            let releases = controlled.applied_state.release_all();
+            if releases.is_empty() {
+                Vec::new()
+            } else {
+                vec![ControlAction::Inject(releases)]
+            }
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -678,6 +813,7 @@ fn button_from_wire(button: WireButton) -> PointerButton {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
+    use uuid::Uuid;
 
     use crossover_protocol::{
         ControlRequest, ControlResponse, ControlVerdict, DenyReason, InputBatch, ReleaseAllInput,
@@ -690,35 +826,59 @@ mod tests {
     };
     use crate::input::{InputState, PointerButton, PointerEvent};
 
-    fn engine() -> ControlEngine {
+    /// The session the single-session tests operate on.
+    const SESSION: Uuid = Uuid::from_bytes([0xA1; 16]);
+    /// A second, distinct session, for the mediation tests.
+    const OTHER: Uuid = Uuid::from_bytes([0xB2; 16]);
+
+    /// A `Send` to [`SESSION`].
+    fn send(message: OutboundControl) -> ControlAction {
+        ControlAction::Send {
+            session: SESSION,
+            message,
+        }
+    }
+
+    /// A peer message from [`SESSION`].
+    fn peer(message: InboundControl) -> ControlEvent {
+        ControlEvent::Peer {
+            session: SESSION,
+            message,
+        }
+    }
+
+    /// A peer message from an arbitrary session.
+    fn peer_from(session: Uuid, message: InboundControl) -> ControlEvent {
+        ControlEvent::Peer { session, message }
+    }
+
+    fn established_engine() -> ControlEngine {
         let mut engine = ControlEngine::new(ControlConfig::default());
-        let actions = engine.handle(ControlEvent::SessionEstablished);
+        let actions = engine.handle(ControlEvent::SessionEstablished { session: SESSION });
         assert!(actions.is_empty());
         engine
     }
 
-    /// Drive the engine to REMOTE: request, then grant.
+    /// Drive the engine to REMOTE over [`SESSION`]: request, then grant.
     fn controlling_engine() -> ControlEngine {
-        let mut engine = engine();
-        let actions = engine.handle(ControlEvent::UserRequestControl);
+        let mut engine = established_engine();
+        let actions = engine.handle(ControlEvent::UserRequestControl { session: SESSION });
         let request_id = sent_request_id(&actions);
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Response(
-            ControlResponse {
-                request_id,
-                verdict: ControlVerdict::Granted,
-            },
-        )));
+        let actions = engine.handle(peer(InboundControl::Response(ControlResponse {
+            request_id,
+            verdict: ControlVerdict::Granted,
+        })));
         assert!(actions.contains(&ControlAction::StartCapture));
         assert!(engine.is_controlling());
         engine
     }
 
-    /// Drive the engine to being controlled: peer requests, we grant.
+    /// Drive the engine to being controlled by [`SESSION`].
     fn controlled_engine() -> ControlEngine {
-        let mut engine = engine();
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Request(
-            ControlRequest { request_id: 1 },
-        )));
+        let mut engine = established_engine();
+        let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
+            request_id: 1,
+        })));
         assert!(granted(&actions));
         assert!(engine.is_controlled());
         engine
@@ -728,7 +888,10 @@ mod tests {
         actions
             .iter()
             .find_map(|action| match action {
-                ControlAction::Send(OutboundControl::Request(r)) => Some(r.request_id),
+                ControlAction::Send {
+                    message: OutboundControl::Request(r),
+                    ..
+                } => Some(r.request_id),
                 _ => None,
             })
             .expect("no ControlRequest sent")
@@ -738,10 +901,13 @@ mod tests {
         actions.iter().any(|action| {
             matches!(
                 action,
-                ControlAction::Send(OutboundControl::Response(ControlResponse {
-                    verdict: ControlVerdict::Granted,
+                ControlAction::Send {
+                    message: OutboundControl::Response(ControlResponse {
+                        verdict: ControlVerdict::Granted,
+                        ..
+                    }),
                     ..
-                }))
+                }
             )
         })
     }
@@ -757,8 +923,8 @@ mod tests {
 
     #[test]
     fn request_grant_switch_in_that_order() {
-        let mut engine = engine();
-        let actions = engine.handle(ControlEvent::UserRequestControl);
+        let mut engine = established_engine();
+        let actions = engine.handle(ControlEvent::UserRequestControl { session: SESSION });
         // Request sent and timeout scheduled; nothing captured yet.
         assert!(!actions.contains(&ControlAction::StartCapture));
         assert!(
@@ -770,26 +936,23 @@ mod tests {
         assert!(!engine.is_controlling());
 
         // Capture starts only on the grant — the "switch" step.
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Response(
-            ControlResponse {
-                request_id,
-                verdict: ControlVerdict::Granted,
-            },
-        )));
+        let actions = engine.handle(peer(InboundControl::Response(ControlResponse {
+            request_id,
+            verdict: ControlVerdict::Granted,
+        })));
         assert_eq!(actions[0], ControlAction::StartCapture);
         assert!(engine.is_controlling());
     }
 
     #[test]
     fn denial_reverts_to_local_with_the_reason() {
-        let mut engine = engine();
-        let request_id = sent_request_id(&engine.handle(ControlEvent::UserRequestControl));
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Response(
-            ControlResponse {
-                request_id,
-                verdict: ControlVerdict::Denied(DenyReason::Busy),
-            },
-        )));
+        let mut engine = established_engine();
+        let request_id =
+            sent_request_id(&engine.handle(ControlEvent::UserRequestControl { session: SESSION }));
+        let actions = engine.handle(peer(InboundControl::Response(ControlResponse {
+            request_id,
+            verdict: ControlVerdict::Denied(DenyReason::Busy),
+        })));
         assert!(
             actions.contains(&ControlAction::Notify(ControlNotice::RequestDenied(
                 DenyReason::Busy
@@ -800,24 +963,26 @@ mod tests {
 
     #[test]
     fn timeout_reverts_to_local_and_a_late_grant_is_undone() {
-        let mut engine = engine();
-        let request_id = sent_request_id(&engine.handle(ControlEvent::UserRequestControl));
+        let mut engine = established_engine();
+        let request_id =
+            sent_request_id(&engine.handle(ControlEvent::UserRequestControl { session: SESSION }));
 
-        let actions = engine.handle(ControlEvent::RequestTimeout { request_id });
+        let actions = engine.handle(ControlEvent::RequestTimeout {
+            session: SESSION,
+            request_id,
+        });
         assert!(actions.contains(&ControlAction::Notify(ControlNotice::RequestTimedOut)));
         assert!(!engine.is_controlling());
 
         // The grant arrives after all. The peer believes it is now
         // controlled; the engine must undo that, not adopt it.
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Response(
-            ControlResponse {
-                request_id,
-                verdict: ControlVerdict::Granted,
-            },
-        )));
+        let actions = engine.handle(peer(InboundControl::Response(ControlResponse {
+            request_id,
+            verdict: ControlVerdict::Granted,
+        })));
         assert_eq!(
             actions,
-            vec![ControlAction::Send(OutboundControl::Release)],
+            vec![send(OutboundControl::Release)],
             "a grant nobody is waiting for must be explicitly released"
         );
         assert!(!engine.is_controlling());
@@ -827,17 +992,20 @@ mod tests {
     fn stale_timeout_after_grant_changes_nothing() {
         let mut engine = controlling_engine();
         // The timer for the (answered) request fires late.
-        let actions = engine.handle(ControlEvent::RequestTimeout { request_id: 1 });
+        let actions = engine.handle(ControlEvent::RequestTimeout {
+            session: SESSION,
+            request_id: 1,
+        });
         assert!(actions.is_empty());
         assert!(engine.is_controlling());
     }
 
     #[test]
     fn requests_are_blocked_with_reasons_not_silently() {
+        // No such session.
         let mut engine = ControlEngine::new(ControlConfig::default());
-        // No session yet.
         assert_eq!(
-            engine.handle(ControlEvent::UserRequestControl),
+            engine.handle(ControlEvent::UserRequestControl { session: SESSION }),
             vec![ControlAction::Notify(ControlNotice::RequestBlocked(
                 RequestBlocked::NoSession
             ))]
@@ -845,7 +1013,7 @@ mod tests {
 
         let mut engine = controlled_engine();
         assert_eq!(
-            engine.handle(ControlEvent::UserRequestControl),
+            engine.handle(ControlEvent::UserRequestControl { session: SESSION }),
             vec![ControlAction::Notify(ControlNotice::RequestBlocked(
                 RequestBlocked::PeerHoldsControl
             ))]
@@ -853,7 +1021,7 @@ mod tests {
 
         let mut engine = controlling_engine();
         assert_eq!(
-            engine.handle(ControlEvent::UserRequestControl),
+            engine.handle(ControlEvent::UserRequestControl { session: SESSION }),
             vec![ControlAction::Notify(ControlNotice::RequestBlocked(
                 RequestBlocked::AlreadyControlling
             ))]
@@ -863,19 +1031,17 @@ mod tests {
     #[test]
     fn simultaneous_requests_deny_deterministically() {
         // Our request is in flight when the peer's request arrives.
-        let mut engine = engine();
-        let _ = engine.handle(ControlEvent::UserRequestControl);
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Request(
-            ControlRequest { request_id: 9 },
-        )));
+        let mut engine = established_engine();
+        let _ = engine.handle(ControlEvent::UserRequestControl { session: SESSION });
+        let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
+            request_id: 9,
+        })));
         assert_eq!(
             actions,
-            vec![ControlAction::Send(OutboundControl::Response(
-                ControlResponse {
-                    request_id: 9,
-                    verdict: ControlVerdict::Denied(DenyReason::Busy),
-                }
-            ))]
+            vec![send(OutboundControl::Response(ControlResponse {
+                request_id: 9,
+                verdict: ControlVerdict::Denied(DenyReason::Busy),
+            }))]
         );
         assert!(!engine.is_controlled());
     }
@@ -883,17 +1049,15 @@ mod tests {
     #[test]
     fn a_controlled_machine_denies_further_requests() {
         let mut engine = controlled_engine();
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Request(
-            ControlRequest { request_id: 2 },
-        )));
+        let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
+            request_id: 2,
+        })));
         assert_eq!(
             actions,
-            vec![ControlAction::Send(OutboundControl::Response(
-                ControlResponse {
-                    request_id: 2,
-                    verdict: ControlVerdict::Denied(DenyReason::AlreadyControlled),
-                }
-            ))]
+            vec![send(OutboundControl::Response(ControlResponse {
+                request_id: 2,
+                verdict: ControlVerdict::Denied(DenyReason::AlreadyControlled),
+            }))]
         );
     }
 
@@ -909,7 +1073,7 @@ mod tests {
         ]));
         assert_eq!(
             actions,
-            vec![ControlAction::Send(OutboundControl::Batch(InputBatch {
+            vec![send(OutboundControl::Batch(InputBatch {
                 sequence: 1,
                 events: vec![
                     WireInputEvent::Motion { dx: 7, dy: 1 },
@@ -928,13 +1092,13 @@ mod tests {
         }]));
         assert!(matches!(
             &actions[0],
-            ControlAction::Send(OutboundControl::Batch(batch)) if batch.sequence == 2
+            ControlAction::Send { message: OutboundControl::Batch(batch), .. } if batch.sequence == 2
         ));
     }
 
     #[test]
     fn captured_events_outside_remote_are_dropped() {
-        let mut engine = engine();
+        let mut engine = established_engine();
         assert!(
             engine
                 .handle(ControlEvent::Captured(vec![press(PointerButton::Left)]))
@@ -956,7 +1120,11 @@ mod tests {
         let actions = engine.handle(ControlEvent::Captured(events));
         assert_eq!(actions.len(), 2, "burst must split into two batches");
         for action in &actions {
-            let ControlAction::Send(OutboundControl::Batch(batch)) = action else {
+            let ControlAction::Send {
+                message: OutboundControl::Batch(batch),
+                ..
+            } = action
+            else {
                 panic!("expected only batch sends, got {action:?}");
             };
             batch.validate().expect("chunk exceeds the wire bound");
@@ -973,10 +1141,10 @@ mod tests {
             actions,
             vec![
                 ControlAction::StopCapture,
-                ControlAction::Send(OutboundControl::ReleaseAll(ReleaseAllInput {
+                send(OutboundControl::ReleaseAll(ReleaseAllInput {
                     after_sequence: 1,
                 })),
-                ControlAction::Send(OutboundControl::Release),
+                send(OutboundControl::Release),
                 ControlAction::Notify(ControlNotice::ControlEnded(ControlEndReason::HandedBack)),
             ]
         );
@@ -991,11 +1159,11 @@ mod tests {
         let actions = engine.handle(ControlEvent::CaptureLost);
         assert!(actions.contains(&ControlAction::StopCapture));
         assert!(
-            actions.contains(&ControlAction::Send(OutboundControl::ReleaseAll(
-                ReleaseAllInput { after_sequence: 1 }
-            )))
+            actions.contains(&send(OutboundControl::ReleaseAll(ReleaseAllInput {
+                after_sequence: 1,
+            })))
         );
-        assert!(actions.contains(&ControlAction::Send(OutboundControl::Release)));
+        assert!(actions.contains(&send(OutboundControl::Release)));
         assert!(!engine.is_controlling());
 
         // Not controlling: further loss reports are noise.
@@ -1005,7 +1173,7 @@ mod tests {
     #[test]
     fn disconnect_while_controlling_stops_capture() {
         let mut engine = controlling_engine();
-        let actions = engine.handle(ControlEvent::SessionLost);
+        let actions = engine.handle(ControlEvent::SessionLost { session: SESSION });
         assert!(actions.contains(&ControlAction::StopCapture));
         assert!(
             actions.contains(&ControlAction::Notify(ControlNotice::ControlEnded(
@@ -1018,7 +1186,7 @@ mod tests {
     #[test]
     fn revocation_by_the_controlled_machine_stops_capture() {
         let mut engine = controlling_engine();
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Release));
+        let actions = engine.handle(peer(InboundControl::Release));
         assert_eq!(actions[0], ControlAction::StopCapture);
         assert!(!engine.is_controlling());
     }
@@ -1028,7 +1196,7 @@ mod tests {
     #[test]
     fn granted_input_is_injected_and_tracked() {
         let mut engine = controlled_engine();
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Batch(InputBatch {
+        let actions = engine.handle(peer(InboundControl::Batch(InputBatch {
             sequence: 1,
             events: vec![
                 WireInputEvent::Motion { dx: 5, dy: 5 },
@@ -1049,8 +1217,8 @@ mod tests {
 
     #[test]
     fn input_without_a_grant_terminates_the_session() {
-        let mut engine = engine();
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Batch(InputBatch {
+        let mut engine = established_engine();
+        let actions = engine.handle(peer(InboundControl::Batch(InputBatch {
             sequence: 1,
             events: vec![WireInputEvent::Motion { dx: 1, dy: 1 }],
         })));
@@ -1064,7 +1232,7 @@ mod tests {
     fn sequence_regression_terminates_the_session() {
         let mut engine = controlled_engine();
         let batch = |sequence| {
-            ControlEvent::Peer(InboundControl::Batch(InputBatch {
+            peer(InboundControl::Batch(InputBatch {
                 sequence,
                 events: vec![WireInputEvent::Motion { dx: 1, dy: 1 }],
             }))
@@ -1078,7 +1246,7 @@ mod tests {
     #[test]
     fn hand_back_releases_everything_the_peer_left_held() {
         let mut engine = controlled_engine();
-        let _ = engine.handle(ControlEvent::Peer(InboundControl::Batch(InputBatch {
+        let _ = engine.handle(peer(InboundControl::Batch(InputBatch {
             sequence: 1,
             events: vec![
                 WireInputEvent::Button {
@@ -1093,9 +1261,9 @@ mod tests {
         })));
 
         // The controller's explicit ReleaseAllInput releases the belief…
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::ReleaseAll(
-            ReleaseAllInput { after_sequence: 1 },
-        )));
+        let actions = engine.handle(peer(InboundControl::ReleaseAll(ReleaseAllInput {
+            after_sequence: 1,
+        })));
         assert_eq!(
             actions,
             vec![ControlAction::Inject(vec![
@@ -1111,7 +1279,7 @@ mod tests {
         );
 
         // …and the following ControlRelease finds nothing left to do.
-        let actions = engine.handle(ControlEvent::Peer(InboundControl::Release));
+        let actions = engine.handle(peer(InboundControl::Release));
         assert_eq!(
             actions,
             vec![ControlAction::Notify(ControlNotice::PeerReleasedControl)]
@@ -1125,7 +1293,7 @@ mod tests {
         // button is held. The destination must synthesize the release
         // from its own records.
         let mut engine = controlled_engine();
-        let _ = engine.handle(ControlEvent::Peer(InboundControl::Batch(InputBatch {
+        let _ = engine.handle(peer(InboundControl::Batch(InputBatch {
             sequence: 1,
             events: vec![WireInputEvent::Button {
                 button: WireButton::Left,
@@ -1133,7 +1301,7 @@ mod tests {
             }],
         })));
 
-        let actions = engine.handle(ControlEvent::SessionLost);
+        let actions = engine.handle(ControlEvent::SessionLost { session: SESSION });
         assert!(
             actions.contains(&ControlAction::Inject(vec![PointerEvent::Button {
                 button: PointerButton::Left,
@@ -1146,7 +1314,7 @@ mod tests {
     #[test]
     fn revoking_the_peer_releases_and_notifies_it() {
         let mut engine = controlled_engine();
-        let _ = engine.handle(ControlEvent::Peer(InboundControl::Batch(InputBatch {
+        let _ = engine.handle(peer(InboundControl::Batch(InputBatch {
             sequence: 1,
             events: vec![WireInputEvent::Button {
                 button: WireButton::Middle,
@@ -1162,11 +1330,106 @@ mod tests {
                     button: PointerButton::Middle,
                     pressed: false,
                 }]),
-                ControlAction::Send(OutboundControl::Release),
+                send(OutboundControl::Release),
                 ControlAction::Notify(ControlNotice::PeerControlRevoked),
             ]
         );
         assert!(!engine.is_controlled());
+    }
+
+    // ---- complete mediation: per-session grant identity (FR-2.3) ----
+
+    /// The security property this whole design exists for: while one
+    /// session legitimately controls this machine, input from a
+    /// *different* trusted session is never injected — it terminates the
+    /// intruding session instead. No riding another peer's grant.
+    #[test]
+    fn input_from_a_non_granting_session_is_rejected() {
+        let mut engine = controlled_engine(); // SESSION controls us
+        // A batch from a different established session.
+        let _ = engine.handle(ControlEvent::SessionEstablished { session: OTHER });
+        let actions = engine.handle(peer_from(
+            OTHER,
+            InboundControl::Batch(InputBatch {
+                sequence: 1,
+                events: vec![WireInputEvent::Button {
+                    button: WireButton::Left,
+                    pressed: true,
+                }],
+            }),
+        ));
+        match &actions[0] {
+            ControlAction::Terminate { session, .. } => assert_eq!(*session, OTHER),
+            other => panic!("intruder input must terminate its own session, got {other:?}"),
+        }
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ControlAction::Inject(_))),
+            "intruder input must never be injected"
+        );
+
+        // The legitimate controller's input is still injected.
+        let actions = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 1,
+            events: vec![WireInputEvent::Button {
+                button: WireButton::Right,
+                pressed: true,
+            }],
+        })));
+        assert_eq!(
+            actions,
+            vec![ControlAction::Inject(vec![press(PointerButton::Right)])]
+        );
+    }
+
+    /// A grant arriving from a session other than the one we requested is
+    /// undone against *that* session, and we do not adopt it.
+    #[test]
+    fn a_grant_from_the_wrong_session_is_undone_not_adopted() {
+        let mut engine = established_engine();
+        let _ = engine.handle(ControlEvent::SessionEstablished { session: OTHER });
+        let request_id =
+            sent_request_id(&engine.handle(ControlEvent::UserRequestControl { session: SESSION }));
+
+        // OTHER answers Granted to a request it was never sent.
+        let actions = engine.handle(peer_from(
+            OTHER,
+            InboundControl::Response(ControlResponse {
+                request_id,
+                verdict: ControlVerdict::Granted,
+            }),
+        ));
+        assert_eq!(
+            actions,
+            vec![ControlAction::Send {
+                session: OTHER,
+                message: OutboundControl::Release,
+            }],
+            "a grant from the wrong session must be undone against it"
+        );
+        assert!(
+            !engine.is_controlling(),
+            "we must not adopt the stray grant"
+        );
+    }
+
+    /// Two peers can each hold a grant in opposite directions at once:
+    /// this machine controls SESSION while OTHER is denied control of us
+    /// only if we are being controlled — but controlling and being
+    /// controlled are independent axes, so verify a batch from the peer
+    /// we *control* (not one controlling us) is rejected.
+    #[test]
+    fn a_batch_from_the_peer_we_control_is_rejected() {
+        let mut engine = controlling_engine(); // we control SESSION
+        // SESSION is the peer we drive; it holds no grant over us. If it
+        // sends input, that is a violation.
+        let actions = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 1,
+            events: vec![WireInputEvent::Motion { dx: 1, dy: 1 }],
+        })));
+        assert!(matches!(&actions[0], ControlAction::Terminate { .. }));
+        assert!(engine.is_controlling(), "our own control is unaffected");
     }
 
     // ---- fault injection: the Phase 3 exit criterion ----
@@ -1192,46 +1455,69 @@ mod tests {
         }
     }
 
+    /// Events drawn across two sessions, so the property covers
+    /// cross-session interleavings, not just one peer.
     fn arbitrary_event() -> impl Strategy<Value = ControlEvent> {
+        let session = prop_oneof![Just(SESSION), Just(OTHER)];
         prop_oneof![
-            Just(ControlEvent::UserRequestControl),
+            session
+                .clone()
+                .prop_map(|s| ControlEvent::UserRequestControl { session: s }),
             Just(ControlEvent::UserRelease),
-            Just(ControlEvent::SessionEstablished),
-            Just(ControlEvent::SessionLost),
+            session
+                .clone()
+                .prop_map(|s| ControlEvent::SessionEstablished { session: s }),
+            session
+                .clone()
+                .prop_map(|s| ControlEvent::SessionLost { session: s }),
             Just(ControlEvent::CaptureLost),
-            (1u64..4).prop_map(|request_id| ControlEvent::RequestTimeout { request_id }),
-            (1u64..4).prop_map(
-                |id| ControlEvent::Peer(InboundControl::Request(ControlRequest { request_id: id }))
+            (session.clone(), 1u64..4).prop_map(|(s, request_id)| ControlEvent::RequestTimeout {
+                session: s,
+                request_id
+            }),
+            (session.clone(), 1u64..4).prop_map(|(s, id)| ControlEvent::Peer {
+                session: s,
+                message: InboundControl::Request(ControlRequest { request_id: id }),
+            }),
+            (session.clone(), 1u64..4, any::<bool>()).prop_map(|(s, id, granted)| {
+                ControlEvent::Peer {
+                    session: s,
+                    message: InboundControl::Response(ControlResponse {
+                        request_id: id,
+                        verdict: if granted {
+                            ControlVerdict::Granted
+                        } else {
+                            ControlVerdict::Denied(DenyReason::Busy)
+                        },
+                    }),
+                }
+            }),
+            session.clone().prop_map(|s| ControlEvent::Peer {
+                session: s,
+                message: InboundControl::Release
+            }),
+            (session.clone(), 1u64..1000, 0usize..5, any::<bool>()).prop_map(
+                |(s, sequence, button, pressed)| ControlEvent::Peer {
+                    session: s,
+                    message: InboundControl::Batch(InputBatch {
+                        sequence,
+                        events: vec![WireInputEvent::Button {
+                            button: [
+                                WireButton::Left,
+                                WireButton::Right,
+                                WireButton::Middle,
+                                WireButton::X1,
+                                WireButton::X2,
+                            ][button],
+                            pressed,
+                        }],
+                    }),
+                }
             ),
-            (1u64..4, any::<bool>()).prop_map(|(id, granted)| {
-                ControlEvent::Peer(InboundControl::Response(ControlResponse {
-                    request_id: id,
-                    verdict: if granted {
-                        ControlVerdict::Granted
-                    } else {
-                        ControlVerdict::Denied(DenyReason::Busy)
-                    },
-                }))
+            session.clone().prop_map(|s| ControlEvent::Peer {
+                session: s,
+                message: InboundControl::ReleaseAll(ReleaseAllInput { after_sequence: 0 }),
             }),
-            Just(ControlEvent::Peer(InboundControl::Release)),
-            (1u64..1000, 0usize..5, any::<bool>()).prop_map(|(sequence, button, pressed)| {
-                ControlEvent::Peer(InboundControl::Batch(InputBatch {
-                    sequence,
-                    events: vec![WireInputEvent::Button {
-                        button: [
-                            WireButton::Left,
-                            WireButton::Right,
-                            WireButton::Middle,
-                            WireButton::X1,
-                            WireButton::X2,
-                        ][button],
-                        pressed,
-                    }],
-                }))
-            }),
-            Just(ControlEvent::Peer(InboundControl::ReleaseAll(
-                ReleaseAllInput { after_sequence: 0 }
-            ))),
             (0usize..5, any::<bool>()).prop_map(|(button, pressed)| {
                 ControlEvent::Captured(vec![PointerEvent::Button {
                     button: PointerButton::ALL[button],
@@ -1242,33 +1528,29 @@ mod tests {
     }
 
     proptest! {
-        /// The Phase 3 exit criterion, hermetically: whatever interleaving
-        /// of user actions, peer messages, grants, input, and faults
-        /// occurs, a session loss leaves nothing captured and nothing
-        /// held down — no stuck buttons, no dead mouse (FR-4.4, FR-6.1).
+        /// The Phase 3 exit criterion, hermetically, now across two
+        /// sessions: whatever interleaving of user actions, peer
+        /// messages, grants, input, and faults occurs, losing every
+        /// session leaves nothing captured and nothing held down — no
+        /// stuck buttons, no dead mouse (FR-4.4, FR-6.1).
         #[test]
         fn any_interleaving_ends_clean_on_disconnect(
             events in proptest::collection::vec(arbitrary_event(), 0..60),
         ) {
             let mut engine = ControlEngine::new(ControlConfig::default());
             let mut model = Model::default();
-            let mut terminated = false;
             for event in events {
                 let actions = engine.handle(event);
-                terminated |= actions
-                    .iter()
-                    .any(|a| matches!(a, ControlAction::Terminate { .. }));
                 model.apply(&actions);
             }
-            // The fault: the session dies now. (A Terminate would cause
-            // exactly this, so the invariant covers that path too.)
-            model.apply(&engine.handle(ControlEvent::SessionLost));
+            // The fault: every session dies now.
+            model.apply(&engine.handle(ControlEvent::SessionLost { session: SESSION }));
+            model.apply(&engine.handle(ControlEvent::SessionLost { session: OTHER }));
 
             prop_assert!(!model.capture_active, "capture left running after disconnect");
             prop_assert!(model.injected.is_clear(), "buttons left held after disconnect");
             prop_assert!(!engine.is_controlling());
             prop_assert!(!engine.is_controlled());
-            let _ = terminated; // documented: termination is a valid outcome
         }
 
         /// Capture is active exactly while the engine says REMOTE —
@@ -1289,6 +1571,48 @@ mod tests {
                     "capture activity diverged from engine state"
                 );
             }
+        }
+
+        /// Complete mediation as a property: whatever the interleaving,
+        /// the engine only ever emits Inject after a batch from the exact
+        /// session it recorded as its controller — never from any other.
+        #[test]
+        fn injection_only_ever_follows_the_granting_session(
+            events in proptest::collection::vec(arbitrary_event(), 0..60),
+        ) {
+            let mut engine = ControlEngine::new(ControlConfig::default());
+            for event in events {
+                let is_batch = matches!(
+                    &event,
+                    ControlEvent::Peer { message: InboundControl::Batch(_), .. }
+                );
+                let batch_session = match &event {
+                    ControlEvent::Peer { session, message: InboundControl::Batch(_) } => Some(*session),
+                    _ => None,
+                };
+                // The controller before handling (injection authority).
+                let controller_before = engine.controlled_session_for_test();
+                let actions = engine.handle(event);
+                let injected = actions.iter().any(|a| matches!(a, ControlAction::Inject(_)));
+                if injected && is_batch {
+                    // An injection produced by a batch is only legitimate
+                    // if that batch came from the session that held the
+                    // grant at the time.
+                    prop_assert_eq!(
+                        batch_session,
+                        controller_before,
+                        "injected a batch from a non-granting session"
+                    );
+                }
+            }
+        }
+    }
+
+    impl ControlEngine {
+        /// Test-only peek at which session (if any) currently controls
+        /// this machine.
+        fn controlled_session_for_test(&self) -> Option<Uuid> {
+            self.controlled.as_ref().map(|c| c.session)
         }
     }
 }

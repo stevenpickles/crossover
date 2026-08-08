@@ -17,8 +17,8 @@ use crossover_core::supervision::{
     KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
 };
 use crossover_core::{
-    ClipboardConfig, ControlConfig, ControlNotice, InputControlEvent, LocalNode, SessionCommand,
-    SessionListener, SessionOptions, SyncEvent, clipboard_sync, input_control,
+    ClipboardConfig, ControlConfig, ControlNotice, FrameTarget, InputControlEvent, LocalNode,
+    SessionCommand, SessionListener, SessionOptions, SyncEvent, clipboard_sync, input_control,
 };
 use crossover_platform::SecureStorage;
 use crossover_protocol::DEFAULT_PORT;
@@ -256,9 +256,11 @@ pub async fn run(
         control: control_events.clone(),
     };
 
-    // The mux's view of the current inbound session: its outbound sender
-    // and its kill switch (for the drivers' fail-closed verdicts).
-    let listener_slot: SessionSlotRef = Arc::new(std::sync::Mutex::new(None));
+    // Every live session, keyed by id, so the mux can route control and
+    // input frames to the exact session the engine named and broadcast
+    // clipboard frames to all.
+    let registry: SessionRegistry =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Both drivers emit the same SessionCommands; merge them into one
     // stream for the mux.
@@ -280,7 +282,7 @@ pub async fn run(
         None => (None, None),
     };
 
-    spawn_command_mux(handle.clone(), Arc::clone(&listener_slot), commands);
+    spawn_command_mux(Arc::clone(&registry), commands);
 
     // Inbound role: accept loop, one session at a time (two-machine scope).
     let listener = match &listen_bind {
@@ -312,9 +314,9 @@ pub async fn run(
             &certified,
             &storage,
             &fanout,
-            &listener_slot,
+            &registry,
         ) => {}
-        () = outbound_event_loop(events, &storage, &fanout) => {}
+        () = outbound_event_loop(events, handle.clone(), &storage, &fanout, &registry) => {}
     }
     if let Some(handle) = &handle {
         handle.shutdown();
@@ -479,51 +481,116 @@ async fn console_loop(control: &mpsc::Sender<InputControlEvent>) {
     }
 }
 
-/// Accept trusted peers forever; each session runs the shared session
-/// loop (pings answered, frames logged) until it ends, then accept again.
-type SessionSlotRef =
-    Arc<std::sync::Mutex<Option<(mpsc::Sender<(u16, Vec<u8>)>, watch::Sender<bool>)>>>;
+/// How to reach one live session: its frame sink, and its kill switch
+/// when it has one (inbound sessions do; the outbound supervisor has no
+/// per-session kill).
+#[derive(Clone)]
+struct SessionRoute {
+    sink: FrameSink,
+    kill: Option<watch::Sender<bool>>,
+}
 
-/// Route driver commands to every active session; enforce fail-closed
-/// terminations on the inbound session. (The supervisor offers no
-/// per-session kill — an accepted limitation logged when it matters: a
-/// malformed payload from a trusted, authenticated peer.)
-fn spawn_command_mux(
-    handle: Option<Arc<crossover_core::supervision::SupervisorHandle>>,
-    listener_slot: SessionSlotRef,
-    mut sync_commands: mpsc::Receiver<SessionCommand>,
-) {
+/// Where a session's outbound frames go. Cloned out from under the
+/// registry lock before any `.await`, so sends never hold it.
+#[derive(Clone)]
+enum FrameSink {
+    /// An accepted inbound session: frames queue to its writer task.
+    Inbound(mpsc::Sender<(u16, Vec<u8>)>),
+    /// The supervised outbound session: frames go through the handle,
+    /// which targets whatever session is currently established.
+    Outbound(Arc<crossover_core::supervision::SupervisorHandle>),
+}
+
+impl FrameSink {
+    async fn deliver(&self, message_type: u16, payload: Vec<u8>) {
+        match self {
+            Self::Inbound(tx) => {
+                let _ = tx.send((message_type, payload)).await;
+            }
+            Self::Outbound(handle) => {
+                let _ = handle.send(message_type, payload).await;
+            }
+        }
+    }
+}
+
+/// Every live session keyed by its locally generated id, so a command
+/// can be routed to exactly the session the driver named (control/input)
+/// or broadcast to all (clipboard, FR-5.4).
+type SessionRegistry = Arc<std::sync::Mutex<std::collections::HashMap<Uuid, SessionRoute>>>;
+
+fn registry_lock(
+    registry: &SessionRegistry,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<Uuid, SessionRoute>> {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Route driver commands to the session(s) they name: control and input
+/// frames to the one session the engine addressed (FR-5.1), clipboard
+/// frames broadcast (FR-5.4). Fail-closed terminations kill the named
+/// session where it can be killed — the supervised outbound session has
+/// no per-session kill, an accepted limitation logged when it bites.
+fn spawn_command_mux(registry: SessionRegistry, mut commands: mpsc::Receiver<SessionCommand>) {
     tokio::spawn(async move {
-        while let Some(command) = sync_commands.recv().await {
+        while let Some(command) = commands.recv().await {
             match command {
                 SessionCommand::SendFrame {
+                    target,
                     message_type,
                     payload,
                 } => {
-                    if let Some(handle) = &handle {
-                        let _ = handle.send(message_type, payload.clone()).await;
-                    }
-                    let maybe_tx = listener_slot
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .as_ref()
-                        .map(|(tx, _)| tx.clone());
-                    if let Some(tx) = maybe_tx {
-                        let _ = tx.send((message_type, payload)).await;
+                    // Collect matching sinks under the lock, then send
+                    // after releasing it (never hold a std Mutex over an
+                    // await).
+                    let sinks: Vec<FrameSink> = {
+                        let routes = registry_lock(&registry);
+                        match target {
+                            FrameTarget::Broadcast => {
+                                routes.values().map(|r| r.sink.clone()).collect()
+                            }
+                            FrameTarget::Session(id) => routes
+                                .get(&id)
+                                .map(|r| r.sink.clone())
+                                .into_iter()
+                                .collect(),
+                        }
+                    };
+                    for sink in sinks {
+                        sink.deliver(message_type, payload.clone()).await;
                     }
                 }
-                SessionCommand::TerminateSession { reason } => {
-                    tracing::error!(
-                        error = %reason,
-                        "peer payload violation; terminating inbound session"
-                    );
-                    let maybe_kill = listener_slot
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .as_ref()
-                        .map(|(_, kill)| kill.clone());
-                    if let Some(kill) = maybe_kill {
-                        let _ = kill.send(true);
+                SessionCommand::TerminateSession { target, reason } => {
+                    let kills: Vec<watch::Sender<bool>> = {
+                        let routes = registry_lock(&registry);
+                        match target {
+                            FrameTarget::Broadcast => {
+                                routes.values().filter_map(|r| r.kill.clone()).collect()
+                            }
+                            FrameTarget::Session(id) => routes
+                                .get(&id)
+                                .and_then(|r| r.kill.clone())
+                                .into_iter()
+                                .collect(),
+                        }
+                    };
+                    if kills.is_empty() {
+                        // No killable route: either the session already
+                        // ended, or it is the outbound session the
+                        // supervisor cannot kill per-session. Fail-closed
+                        // still holds — the driver emitted Terminate
+                        // instead of injecting — but say so (NFR-3).
+                        tracing::warn!(
+                            error = %reason,
+                            ?target,
+                            "payload violation with no killable session route"
+                        );
+                    } else {
+                        tracing::error!(error = %reason, ?target, "terminating session on violation");
+                        for kill in kills {
+                            let _ = kill.send(true);
+                        }
                     }
                 }
             }
@@ -537,7 +604,7 @@ async fn listener_loop(
     certified: &CertifiedIdentity,
     storage: &Arc<dyn SecureStorage>,
     fanout: &SessionFanout,
-    session_slot: &SessionSlotRef,
+    registry: &SessionRegistry,
 ) {
     let Some(listener) = listener else {
         return std::future::pending().await;
@@ -573,10 +640,13 @@ async fn listener_loop(
                 let (outbound_tx, mut outbound_rx) = mpsc::channel::<(u16, Vec<u8>)>(64);
                 let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
                 let session_id = info.session_id;
-                *session_slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some((outbound_tx, shutdown_tx));
+                registry_lock(registry).insert(
+                    session_id,
+                    SessionRoute {
+                        sink: FrameSink::Inbound(outbound_tx),
+                        kill: Some(shutdown_tx),
+                    },
+                );
                 fanout.established(session_id).await;
 
                 let frame_sink = fanout.clone();
@@ -597,9 +667,7 @@ async fn listener_loop(
                 .await;
                 drop(events_tx);
                 let _ = drain.await;
-                *session_slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                registry_lock(registry).remove(&session_id);
                 fanout.lost(session_id).await;
                 println!(
                     "Session with \"{}\" ended: {reason}.",
@@ -619,8 +687,10 @@ async fn listener_loop(
 /// outbound role.
 async fn outbound_event_loop(
     events: Option<mpsc::Receiver<SessionEvent>>,
+    handle: Option<Arc<crossover_core::supervision::SupervisorHandle>>,
     storage: &Arc<dyn SecureStorage>,
     fanout: &SessionFanout,
+    registry: &SessionRegistry,
 ) {
     let Some(mut events) = events else {
         return std::future::pending().await;
@@ -638,6 +708,18 @@ async fn outbound_event_loop(
                 );
                 touch_last_connected(&**storage, info.peer_fingerprint);
                 current_session = Some(info.session_id);
+                // Register the outbound session so control frames route to
+                // it by id. No kill switch: the supervisor has no
+                // per-session termination (an accepted limitation).
+                if let Some(handle) = &handle {
+                    registry_lock(registry).insert(
+                        info.session_id,
+                        SessionRoute {
+                            sink: FrameSink::Outbound(Arc::clone(handle)),
+                            kill: None,
+                        },
+                    );
+                }
                 fanout.established(info.session_id).await;
             }
             SessionEvent::Disconnected {
@@ -653,6 +735,7 @@ async fn outbound_event_loop(
                     None => println!("Outbound session ended ({reason})."),
                 }
                 current_session = None;
+                registry_lock(registry).remove(&session_id);
                 fanout.lost(session_id).await;
             }
             SessionEvent::ConnectFailed { error, retry_in } => {

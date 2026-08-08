@@ -95,10 +95,10 @@ fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
                     None => break,
                 },
                 maybe = sync_commands.recv() => match maybe {
-                    Some(SessionCommand::SendFrame { message_type, payload }) => {
+                    Some(SessionCommand::SendFrame { message_type, payload, .. }) => {
                         let _ = outbound_for_glue.send((message_type, payload)).await;
                     }
-                    Some(SessionCommand::TerminateSession { reason }) => {
+                    Some(SessionCommand::TerminateSession { reason, .. }) => {
                         panic!("unexpected session termination: {reason}");
                     }
                     None => break,

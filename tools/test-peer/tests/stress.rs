@@ -162,6 +162,7 @@ async fn sustained_contention_still_delivers_every_item() {
         let SessionCommand::SendFrame {
             message_type,
             payload,
+            ..
         } = next_command(&mut a.commands).await
         else {
             panic!("item {i}: unexpected termination");
@@ -219,6 +220,7 @@ async fn one_update(
     let SessionCommand::SendFrame {
         message_type,
         payload,
+        ..
     } = next_command(&mut source.commands).await
     else {
         panic!("update {i}: expected a frame, got a termination command");
@@ -249,6 +251,7 @@ async fn one_update(
     let SessionCommand::SendFrame {
         message_type,
         payload,
+        ..
     } = next_command(&mut sink.commands).await
     else {
         panic!("update {i}: sink terminated the session");

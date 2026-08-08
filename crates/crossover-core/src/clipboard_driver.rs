@@ -65,19 +65,36 @@ pub enum SyncEvent {
     SettleDue(u64),
 }
 
-/// What the driver asks the app to do.
+/// Which session(s) a [`SessionCommand`] is directed at.
+///
+/// Clipboard sync is session-agnostic (FR-5.4) and broadcasts; control
+/// and input traffic is authority for one authenticated session and is
+/// routed to exactly that one (FR-5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameTarget {
+    /// Every active session.
+    Broadcast,
+    /// One session, by its locally generated id.
+    Session(Uuid),
+}
+
+/// What a driver asks the app to do.
 #[derive(Debug)]
 pub enum SessionCommand {
-    /// Send this frame to the peer over the active session.
+    /// Send this frame to the target session(s).
     SendFrame {
+        /// Which session(s) to send it to.
+        target: FrameTarget,
         /// Frame message type.
         message_type: u16,
         /// Encoded payload.
         payload: Vec<u8>,
     },
-    /// The peer sent an invalid clipboard payload: terminate the session
-    /// (fail closed); supervision handles the rest.
+    /// The target sent an invalid payload: terminate it (fail closed);
+    /// supervision handles the rest.
     TerminateSession {
+        /// Which session(s) to terminate.
+        target: FrameTarget,
         /// Diagnostic for logs.
         reason: String,
     },
@@ -172,10 +189,15 @@ impl ClipboardSyncDriver {
                             Ok(Some(message)) => self.engine.on_peer_message(message),
                             Ok(None) => Vec::new(), // not clipboard traffic
                             Err(error) => {
-                                // Peer nonconformance: fail closed.
+                                // Peer nonconformance: fail closed. Clipboard
+                                // is session-agnostic and does not track which
+                                // session a frame arrived on, so the fail-
+                                // closed kill is a broadcast (two-machine: the
+                                // one session).
                                 let _ = self
                                     .commands_tx
                                     .send(SessionCommand::TerminateSession {
+                                        target: FrameTarget::Broadcast,
                                         reason: error.to_string(),
                                     })
                                     .await;
@@ -248,6 +270,7 @@ impl ClipboardSyncDriver {
                     let _ = self
                         .commands_tx
                         .send(SessionCommand::SendFrame {
+                            target: FrameTarget::Broadcast,
                             message_type: MessageType::ClipboardApplied.wire(),
                             payload,
                         })
@@ -324,6 +347,7 @@ impl ClipboardSyncDriver {
                         if self
                             .commands_tx
                             .send(SessionCommand::SendFrame {
+                                target: FrameTarget::Broadcast,
                                 message_type,
                                 payload,
                             })
@@ -438,6 +462,7 @@ mod tests {
         let SessionCommand::SendFrame {
             message_type,
             payload,
+            ..
         } = next_command(&mut rig).await
         else {
             panic!("expected SendFrame");
@@ -469,6 +494,7 @@ mod tests {
         let SessionCommand::SendFrame {
             message_type,
             payload,
+            ..
         } = next_command(&mut rig).await
         else {
             panic!("expected SendFrame");
@@ -590,6 +616,7 @@ mod tests {
         let SessionCommand::SendFrame {
             message_type,
             payload,
+            ..
         } = timeout(Duration::from_secs(3), rig.commands.recv())
             .await
             .expect("inbound item starved by read contention")
