@@ -107,6 +107,34 @@ pub fn open_input() -> anyhow::Result<(
     Ok((std::sync::Arc::new(capture), std::sync::Arc::new(injector)))
 }
 
+/// Open the local cursor mask (ADR 0009): hides the controller's frozen,
+/// edge-pinned cursor while it drives the peer, so only the peer's cursor
+/// is visible. Never fails — masking is a display nicety, so a platform
+/// that cannot create the overlay falls back to no masking and control
+/// still works.
+#[cfg(windows)]
+#[must_use]
+pub fn open_cursor_mask() -> std::sync::Arc<dyn crossover_platform::CursorMask> {
+    match crossover_platform_windows::WindowsCursorMask::new() {
+        Ok(mask) => std::sync::Arc::new(mask),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "cursor masking unavailable; the controller's cursor will stay visible"
+            );
+            std::sync::Arc::new(crossover_platform::NoopCursorMask)
+        }
+    }
+}
+
+/// No overlay off Windows yet (input forwarding is Windows-first); control
+/// works, just without cursor masking.
+#[cfg(not(windows))]
+#[must_use]
+pub fn open_cursor_mask() -> std::sync::Arc<dyn crossover_platform::CursorMask> {
+    std::sync::Arc::new(crossover_platform::NoopCursorMask)
+}
+
 /// Open the platform pointer-input capture and injector.
 ///
 /// # Errors

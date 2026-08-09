@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use crate::clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
+use crate::cursor::{CursorMask, CursorMaskError};
 use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
 use crate::input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerEvent,
@@ -447,6 +448,73 @@ impl DisplayInfo for FakeDisplay {
     fn cursor_position(&self) -> Result<CursorPoint, DisplayError> {
         self.guard()?;
         Ok(*lock(&self.cursor))
+    }
+}
+
+/// In-memory [`CursorMask`] recording hide/show calls and the resulting
+/// visibility, so tests can assert the driver hides the cursor while
+/// driving the peer and restores it on every exit.
+#[derive(Debug, Default)]
+pub struct FakeCursorMask {
+    hidden: Mutex<bool>,
+    hide_calls: Mutex<u32>,
+    show_calls: Mutex<u32>,
+    /// When set, both operations fail with this reason.
+    fail: Mutex<Option<String>>,
+}
+
+impl FakeCursorMask {
+    /// A visible cursor with no calls recorded.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the cursor is currently hidden per the recorded calls.
+    #[must_use]
+    pub fn is_hidden(&self) -> bool {
+        *lock(&self.hidden)
+    }
+
+    /// How many times [`CursorMask::hide`] has been called.
+    #[must_use]
+    pub fn hide_calls(&self) -> u32 {
+        *lock(&self.hide_calls)
+    }
+
+    /// How many times [`CursorMask::show`] has been called.
+    #[must_use]
+    pub fn show_calls(&self) -> u32 {
+        *lock(&self.show_calls)
+    }
+
+    /// Make both operations fail until cleared, simulating a platform that
+    /// cannot change cursor visibility.
+    pub fn fail_with(&self, reason: &str) {
+        *lock(&self.fail) = Some(reason.to_owned());
+    }
+
+    fn guard(&self) -> Result<(), CursorMaskError> {
+        match lock(&self.fail).clone() {
+            Some(reason) => Err(CursorMaskError::Failed { reason }),
+            None => Ok(()),
+        }
+    }
+}
+
+impl CursorMask for FakeCursorMask {
+    fn hide(&self) -> Result<(), CursorMaskError> {
+        self.guard()?;
+        *lock(&self.hidden) = true;
+        *lock(&self.hide_calls) += 1;
+        Ok(())
+    }
+
+    fn show(&self) -> Result<(), CursorMaskError> {
+        self.guard()?;
+        *lock(&self.hidden) = false;
+        *lock(&self.show_calls) += 1;
+        Ok(())
     }
 }
 

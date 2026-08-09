@@ -33,7 +33,9 @@ use crossover_security::{
 };
 
 use crate::console::{self, ConsoleCommand};
-use crate::storage::{open_clipboard_provider, open_display, open_input, open_secure_storage};
+use crate::storage::{
+    open_clipboard_provider, open_cursor_mask, open_display, open_input, open_secure_storage,
+};
 
 /// One ceremony's allowance, listener and connector alike. Generous
 /// enough to read a code off one screen and type it on another; bounded
@@ -216,6 +218,50 @@ pub fn status(device_name: &str) -> anyhow::Result<()> {
 /// transfer (Phase 3, FR-5.1); with `--left`/`--right`, crossing the
 /// linked screen edge transfers control automatically (Phase 5, ADR
 /// 0009). Ctrl-C or `q` stops.
+/// Bring up input control — capture/inject behind the platform traits, the
+/// control-transfer engine, cursor masking (ADR 0009), and, in seamless
+/// mode, the edge detector — spawning the driver, edge wiring, and notice
+/// printer. Returns the event sender and command receiver the session mux
+/// needs. Capture installs no hook until the first grant.
+fn setup_input_control(
+    side: Option<LinkSide>,
+    metrics: &Arc<Metrics>,
+) -> anyhow::Result<(
+    mpsc::Sender<InputControlEvent>,
+    mpsc::Receiver<SessionCommand>,
+)> {
+    let (capture, injector) = open_input()?;
+    let cursor_mask = open_cursor_mask();
+    let display = open_display()?;
+
+    // Log the display and the configured seamless edge at startup (ADR
+    // 0009), so a soak report shows the geometry each side used.
+    log_display_and_edge(&*display, side);
+
+    // Seamless mode (--left/--right): a topology and an edge detector, plus
+    // the mode channel that keeps the detector in step with control state.
+    // Built before input_control so its mode sender can ride in.
+    let (seamless, edge_wiring) = build_seamless(side, &display);
+
+    let (control_driver, control_events, control_commands, control_notices) = input_control(
+        capture,
+        injector,
+        cursor_mask,
+        seamless,
+        ControlConfig::default(),
+    );
+    tokio::spawn(control_driver.run());
+
+    // With the control driver up, run the edge detector and forward its
+    // crossings in as leave/return events.
+    if let Some((edge_driver, crossings)) = edge_wiring {
+        spawn_edge_wiring(edge_driver, crossings, control_events.clone());
+    }
+    tokio::spawn(print_control_notices(control_notices, Arc::clone(metrics)));
+
+    Ok((control_events, control_commands))
+}
+
 pub async fn run(
     device_name: &str,
     listen_bind: Option<String>,
@@ -263,31 +309,9 @@ pub async fn run(
     .context("starting clipboard sync")?;
     tokio::spawn(sync_driver.run());
 
-    // Input control: capture/inject behind the platform traits, driving
-    // the control-transfer engine. Capture installs no hook until the
-    // first grant.
-    let (capture, injector) = open_input()?;
-    let display = open_display()?;
-
-    // Log the primary display and the configured seamless edge at startup
-    // (ADR 0009), so a soak report shows the geometry each side used.
-    log_display_and_edge(&*display, side);
-
-    // Seamless mode (--left/--right): a topology and an edge detector, plus
-    // the mode channel that keeps the detector in step with control state.
-    // Built before input_control so its mode sender can ride in.
-    let (seamless, edge_wiring) = build_seamless(side, &display);
-
-    let (control_driver, control_events, control_commands, control_notices) =
-        input_control(capture, injector, seamless, ControlConfig::default());
-    tokio::spawn(control_driver.run());
-
-    // With the control driver up, run the edge detector and forward its
-    // crossings in as leave/return events.
-    if let Some((edge_driver, crossings)) = edge_wiring {
-        spawn_edge_wiring(edge_driver, crossings, control_events.clone());
-    }
-    tokio::spawn(print_control_notices(control_notices, Arc::clone(&metrics)));
+    // Input control: capture/inject, the transfer engine, cursor masking,
+    // and (in seamless mode) the edge detector.
+    let (control_events, control_commands) = setup_input_control(side, &metrics)?;
 
     // Session lifecycle and frames fan out to both drivers.
     let fanout = SessionFanout {

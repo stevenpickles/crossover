@@ -14,6 +14,8 @@ pub mod capture;
 #[cfg(windows)]
 pub mod clipboard;
 #[cfg(windows)]
+pub mod cursor;
+#[cfg(windows)]
 pub mod display;
 #[cfg(windows)]
 pub mod input;
@@ -26,6 +28,8 @@ pub mod secure_storage;
 pub use capture::WindowsInputCapture;
 #[cfg(windows)]
 pub use clipboard::WindowsClipboard;
+#[cfg(windows)]
+pub use cursor::WindowsCursorMask;
 #[cfg(windows)]
 pub use display::WindowsDisplayInfo;
 #[cfg(windows)]
