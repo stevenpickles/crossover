@@ -365,6 +365,13 @@ pub struct ControlEngine {
     /// What this machine believes is held down on the controlled peer
     /// (FR-4.3). Meaningful only while `outbound` is `Remote`.
     sent_state: InputState,
+    /// The session whose inbound grant this machine just gave up (by
+    /// revoke or edge return). Input still arriving from it is in-flight
+    /// from before it saw the release — a transition race, not an attack
+    /// — so it is *dropped*, not treated as a violation that terminates
+    /// the session (ADR 0009). Cleared when that session re-negotiates,
+    /// is lost, or a new grant is taken.
+    recently_released: Option<Uuid>,
 }
 
 impl ControlEngine {
@@ -379,6 +386,7 @@ impl ControlEngine {
             next_request_id: 0,
             send_sequence: 0,
             sent_state: InputState::new(),
+            recently_released: None,
         }
     }
 
@@ -509,6 +517,11 @@ impl ControlEngine {
                 // at the matching height (ADR 0009).
                 if let Some(controlled) = self.controlled.take() {
                     let mut controlled = controlled;
+                    // Input still in flight from this peer (sent before it
+                    // sees our release) is an expected transition race, not
+                    // a violation: remember the session so those batches
+                    // are dropped rather than terminating it.
+                    self.recently_released = Some(controlled.session);
                     let releases = drain_releases(&mut controlled.applied_state);
                     let mut actions = Vec::new();
                     if !releases.is_empty() {
@@ -529,6 +542,9 @@ impl ControlEngine {
 
     fn on_session_lost(&mut self, session: Uuid) -> Vec<ControlAction> {
         self.established.remove(&session);
+        if self.recently_released == Some(session) {
+            self.recently_released = None; // dead: no in-flight grace to keep
+        }
         let mut actions = Vec::new();
 
         // Outbound axis, if it targets the lost session.
@@ -650,6 +666,12 @@ impl ControlEngine {
     }
 
     fn on_peer_request(&mut self, session: Uuid, request: ControlRequest) -> Vec<ControlAction> {
+        // A request means this peer knows the prior grant ended and is
+        // re-negotiating, so the drop-in-flight grace no longer applies to
+        // it — any input after this must again come via a fresh grant.
+        if self.recently_released == Some(session) {
+            self.recently_released = None;
+        }
         let deny = |reason| {
             vec![ControlAction::Send {
                 session,
@@ -789,6 +811,14 @@ impl ControlEngine {
         // stream as batches, so an honest peer cannot interleave them
         // wrongly.
         let Some(controlled) = self.controlled.as_mut().filter(|c| c.session == session) else {
+            // A peer whose grant we just gave up may still have input in
+            // flight from before it saw the release: drop it (a transition
+            // race, ADR 0009), never inject it, and do not tear the session
+            // down. A batch from any *other* ungranted session is a real
+            // violation and fails closed (FR-2.3).
+            if self.recently_released == Some(session) {
+                return Vec::new();
+            }
             return vec![ControlAction::Terminate {
                 session,
                 reason: "input batch from a session that holds no control grant".to_owned(),
@@ -1721,6 +1751,71 @@ mod tests {
         let actions = controller.handle(peer(InboundControl::Release(None)));
         assert!(actions.contains(&ControlAction::StopCapture));
         assert!(placed_cursor(&actions).is_none());
+    }
+
+    // ---- graceful transition: the revoke race (ADR 0009) ----
+
+    #[test]
+    fn in_flight_input_after_a_return_is_dropped_not_terminated() {
+        // A is controlled by SESSION, then reclaims (edge return / revoke).
+        let mut engine = controlled_engine();
+        let _ = engine.handle(ControlEvent::UserRelease);
+        assert!(!engine.is_controlled());
+
+        // A batch still in flight from SESSION — sent before it saw the
+        // release — is dropped: not injected, and not a session kill.
+        let actions = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 9,
+            events: vec![WireInputEvent::Motion { dx: 1, dy: 1 }],
+        })));
+        assert!(
+            actions.is_empty(),
+            "in-flight input after a return must be silently dropped: {actions:?}"
+        );
+
+        // Once SESSION re-requests, the grace ends and the grant flow
+        // resumes normally.
+        let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
+            request_id: 2,
+            entry: None,
+        })));
+        assert!(granted(&actions));
+        let actions = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 1,
+            events: vec![WireInputEvent::Button {
+                button: WireButton::Left,
+                pressed: true,
+            }],
+        })));
+        assert_eq!(actions, vec![inject(vec![press(PointerButton::Left)])]);
+    }
+
+    #[test]
+    fn the_drop_grace_is_scoped_to_the_released_session() {
+        // Releasing SESSION's grant must not excuse a *different* ungranted
+        // session: complete mediation still fails closed for it (FR-2.3).
+        let mut engine = controlled_engine();
+        let _ = engine.handle(ControlEvent::SessionEstablished { session: OTHER });
+        let _ = engine.handle(ControlEvent::UserRelease); // release SESSION
+
+        let actions = engine.handle(peer_from(
+            OTHER,
+            InboundControl::Batch(InputBatch {
+                sequence: 1,
+                events: vec![WireInputEvent::Motion { dx: 1, dy: 1 }],
+            }),
+        ));
+        assert!(
+            matches!(&actions[0], ControlAction::Terminate { session, .. } if *session == OTHER),
+            "an unrelated ungranted session must still terminate: {actions:?}"
+        );
+
+        // SESSION's own in-flight input, meanwhile, is dropped.
+        let actions = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 9,
+            events: vec![WireInputEvent::Motion { dx: 1, dy: 1 }],
+        })));
+        assert!(actions.is_empty());
     }
 
     // ---- fault injection: the Phase 3 exit criterion ----
