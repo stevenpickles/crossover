@@ -18,27 +18,42 @@
 //!
 //! The window lives on its own thread with a message loop (a window needs
 //! one), mirroring the capture pump. `hide`/`show` post a message to that
-//! thread, which shows the overlay and **blanks the cursor with `SetCursor`
-//! right then** — because while controlling, the cursor is frozen (input is
-//! suppressed), so no mouse move would ever trigger `WM_SETCURSOR` to do it.
+//! thread. Hiding is not just showing the overlay: while controlling, the
+//! cursor is frozen (input is suppressed), so no mouse move ever reaches the
+//! overlay and a bare `SetCursor(None)` from another thread does not stick.
+//! The overlay thread therefore **warps the cursor onto the overlay** with
+//! `SetCursorPos`, which generates a genuine mouse move → `WM_SETCURSOR` on
+//! the thread owning the top-most window → the blank takes and holds. The
+//! warp produces no Raw Input and is invisible to the capture hook, so
+//! nothing is forwarded to the peer; the controlling machine's cursor
+//! position is irrelevant to edge detection (idle while driving). The saved
+//! position is restored when the overlay comes down.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use crossover_platform::{CursorMask, CursorMaskError};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
     GetSystemMetrics, HCURSOR, LWA_ALPHA, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
-    SW_SHOWNA, SetCursor, SetLayeredWindowAttributes, ShowWindow, TranslateMessage, WM_APP,
-    WM_DESTROY, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SW_SHOWNA, SetCursor, SetCursorPos, SetLayeredWindowAttributes, ShowWindow, TranslateMessage,
+    WM_APP, WM_DESTROY, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::w;
+
+/// The cursor position saved when the overlay is shown, restored when it
+/// comes down. Statics because the window procedure that reads and writes
+/// them holds no state of its own, and there is only ever one overlay.
+static SAVED_X: AtomicI32 = AtomicI32::new(0);
+static SAVED_Y: AtomicI32 = AtomicI32::new(0);
+/// Whether [`SAVED_X`]/[`SAVED_Y`] hold a position to restore.
+static SAVED_VALID: AtomicBool = AtomicBool::new(false);
 
 /// Post targets for the overlay thread. Show/hide are routed through the
 /// overlay's own thread (not `ShowWindowAsync` from the caller) so the
@@ -267,30 +282,53 @@ unsafe extern "system" fn overlay_wndproc(
 ) -> LRESULT {
     match msg {
         WM_APP_SHOW => {
-            // Bring the overlay to the top, then blank the cursor *now*,
-            // from this thread that owns the topmost window. The cursor is
-            // frozen while we control (input is suppressed), so no mouse
-            // move would ever trigger WM_SETCURSOR to do it for us.
+            // Show the overlay, then warp the cursor onto it so a real
+            // WM_SETCURSOR fires on this thread and the blank sticks (see
+            // the module docs). Save the current position first so it can
+            // be restored when the overlay comes down.
+            let mut point = POINT::default();
+            // SAFETY: GetCursorPos writes into our local POINT.
+            if unsafe { GetCursorPos(&raw mut point) }.is_ok() {
+                SAVED_X.store(point.x, Ordering::SeqCst);
+                SAVED_Y.store(point.y, Ordering::SeqCst);
+                SAVED_VALID.store(true, Ordering::SeqCst);
+            }
+            let (x, y, width, height) = virtual_desktop_rect();
+            // The desktop centre is unambiguously inside the overlay and
+            // (barring the cursor already sitting exactly there) a real
+            // move, which is what triggers WM_SETCURSOR.
+            let (cx, cy) = (x + width / 2, y + height / 2);
             // SAFETY: hwnd is our window; SW_SHOWNA shows without stealing
-            // focus, and SetCursor(None) hides the pointer.
+            // focus, SetCursorPos moves the cursor onto the overlay, and
+            // SetCursor(None) blanks it immediately for good measure.
             unsafe {
                 let _ = ShowWindow(hwnd, SW_SHOWNA);
+                let _ = SetCursorPos(cx, cy);
                 SetCursor(None);
             }
             LRESULT(0)
         }
         WM_APP_HIDE => {
-            // SAFETY: taking the overlay down lets the cursor be drawn by
-            // whatever window it is over again.
+            // Restore the cursor to where it was before we warped it, then
+            // take the overlay down so the cursor is drawn normally again.
+            let restore = SAVED_VALID.swap(false, Ordering::SeqCst);
+            // SAFETY: SetCursorPos/ShowWindow have no preconditions here; a
+            // hidden overlay leaves the cursor to whatever window it is over.
             unsafe {
+                if restore {
+                    let _ = SetCursorPos(
+                        SAVED_X.load(Ordering::SeqCst),
+                        SAVED_Y.load(Ordering::SeqCst),
+                    );
+                }
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
             LRESULT(0)
         }
         WM_SETCURSOR => {
-            // Keep the cursor blank if a move does occur while the overlay
-            // is up. Returning TRUE stops Windows resetting it to a
-            // class/parent cursor.
+            // The warp on WM_APP_SHOW lands here (and so does any later move
+            // while the overlay is up): blank the cursor. Returning TRUE
+            // stops Windows resetting it to a class/parent cursor.
             // SAFETY: SetCursor(None) hides the cursor; no preconditions.
             unsafe { SetCursor(None) };
             LRESULT(1)

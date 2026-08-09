@@ -210,11 +210,18 @@ hidden exactly while capturing and can never be left hidden (the mirror of
 the stuck-key invariant).
 
 The Windows implementation is a **full-desktop, fully transparent, top-most
-overlay window** that sets a null cursor (`WM_SETCURSOR` → `SetCursor(None)`).
-The two obvious alternatives were rejected: `ShowCursor(FALSE)` only affects
-the calling thread's own windows, not the cursor over other applications;
-and `SetSystemCursor` with a blank cursor is global and does **not** revert
-when the process dies, so a crash mid-control would strand the machine with
-no cursor. The overlay is the inverse — the window is destroyed with the
-process, so the cursor always returns. Masking is a display nicety: a
-failure to hide or show is logged and never disturbs control.
+overlay window** with a null cursor. Because the controlled cursor is frozen
+while driving the peer (input is suppressed), no mouse move ever reaches the
+overlay, so the blank must be forced: showing the overlay **warps the cursor
+onto it** (`SetCursorPos`), which generates a real `WM_SETCURSOR` on the
+overlay's own thread and blanks the pointer; the saved position is restored
+when the overlay comes down. The warp produces no Raw Input and is invisible
+to the capture hook, so nothing is forwarded to the peer, and the
+controlling machine's cursor position is irrelevant to detection (idle while
+driving). The two obvious alternatives were rejected: `ShowCursor(FALSE)`
+only affects the calling thread's own windows, not the cursor over other
+applications; and `SetSystemCursor` with a blank cursor is global and does
+**not** revert when the process dies, so a crash mid-control would strand the
+machine with no cursor. The overlay is the inverse — the window is destroyed
+with the process, so the cursor always returns. Masking is a display nicety:
+a failure to hide or show is logged and never disturbs control.
