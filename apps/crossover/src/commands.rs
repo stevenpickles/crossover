@@ -543,11 +543,11 @@ fn spawn_edge_wiring(
 /// startup (ADR 0009) — both structured (FR-7.3) and as a human line, so a
 /// soak report records the geometry each machine ran with.
 fn log_display_and_edge(display: &dyn DisplayInfo, side: Option<LinkSide>) {
-    let screen = match display.primary_screen() {
+    let screen = match display.desktop_bounds() {
         Ok(screen) => screen,
         Err(error) => {
-            tracing::warn!(error = %error, "could not read the primary display at startup");
-            println!("Primary display: unavailable ({error}).");
+            tracing::warn!(error = %error, "could not read the desktop geometry at startup");
+            println!("Desktop: unavailable ({error}).");
             return;
         }
     };
@@ -558,20 +558,20 @@ fn log_display_and_edge(display: &dyn DisplayInfo, side: Option<LinkSide>) {
             height = screen.height,
             ?side,
             linked_edge = ?edge,
-            "primary display and seamless edge"
+            "virtual desktop and seamless edge"
         );
         println!(
-            "Primary display: {}x{}. Seamless: {side:?} screen, crossing on its {edge:?} edge.",
+            "Desktop: {}x{} (all monitors). Seamless: {side:?} screen, crossing on its {edge:?} edge.",
             screen.width, screen.height,
         );
     } else {
         tracing::info!(
             width = screen.width,
             height = screen.height,
-            "primary display; seamless transfer disabled"
+            "virtual desktop; seamless transfer disabled"
         );
         println!(
-            "Primary display: {}x{}. Seamless edge transfer off (pass --left or --right).",
+            "Desktop: {}x{} (all monitors). Seamless edge transfer off (pass --left or --right).",
             screen.width, screen.height,
         );
     }

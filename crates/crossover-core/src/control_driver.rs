@@ -346,7 +346,7 @@ impl InputControlDriver {
             tracing::debug!("cursor placement requested but no topology configured");
             return;
         };
-        match seamless.display.primary_screen() {
+        match seamless.display.desktop_bounds() {
             Ok(screen) => {
                 let point = seamless.topology.entering(fraction, screen);
                 if let Err(error) = self.injector.place_cursor(point) {
