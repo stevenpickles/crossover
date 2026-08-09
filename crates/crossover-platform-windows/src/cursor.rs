@@ -17,8 +17,10 @@
 //!   always comes back (the hard requirement, the mirror of a stuck key).
 //!
 //! The window lives on its own thread with a message loop (a window needs
-//! one), mirroring the capture pump. `hide`/`show` post to it with
-//! `ShowWindowAsync`, which is safe to call cross-thread.
+//! one), mirroring the capture pump. `hide`/`show` post a message to that
+//! thread, which shows the overlay and **blanks the cursor with `SetCursor`
+//! right then** — because while controlling, the cursor is frozen (input is
+//! suppressed), so no mouse move would ever trigger `WM_SETCURSOR` to do it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -32,15 +34,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, HCURSOR, LWA_ALPHA, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
-    SW_SHOWNA, SetCursor, SetLayeredWindowAttributes, ShowWindowAsync, TranslateMessage, WM_APP,
+    SW_SHOWNA, SetCursor, SetLayeredWindowAttributes, ShowWindow, TranslateMessage, WM_APP,
     WM_DESTROY, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::w;
 
-/// Private message asking the overlay thread to destroy its window and
-/// exit — the only way to end a `GetMessage` loop from another thread.
-const WM_APP_CLOSE: u32 = WM_APP + 1;
+/// Post targets for the overlay thread. Show/hide are routed through the
+/// overlay's own thread (not `ShowWindowAsync` from the caller) so the
+/// cursor is blanked with `SetCursor` *there* — the thread owning the
+/// now-topmost window — the instant it is shown, rather than waiting for a
+/// mouse move that never comes while the cursor is frozen.
+const WM_APP_SHOW: u32 = WM_APP + 1;
+const WM_APP_HIDE: u32 = WM_APP + 2;
+/// Ask the overlay thread to destroy its window and exit — the only way to
+/// end a `GetMessage` loop from another thread.
+const WM_APP_CLOSE: u32 = WM_APP + 3;
 
 /// Transparent overlay that blanks the cursor while shown (ADR 0009).
 ///
@@ -89,29 +98,45 @@ impl WindowsCursorMask {
     }
 }
 
-impl CursorMask for WindowsCursorMask {
-    fn hide(&self) -> Result<(), CursorMaskError> {
+impl WindowsCursorMask {
+    /// Post a message to the overlay thread's window. `false` if the window
+    /// is not available (never created, or already torn down).
+    fn post(&self, message: u32) -> bool {
         let hwnd = self.hwnd.load(Ordering::SeqCst);
         if hwnd == 0 {
-            return Err(CursorMaskError::Failed {
-                reason: "overlay window not available".to_owned(),
-            });
+            return false;
         }
-        // SAFETY: ShowWindowAsync is safe to call from any thread (it posts
-        // to the owning thread); SW_SHOWNA shows without activating, so the
-        // overlay never steals focus. A stale handle fails harmlessly.
-        let _ = unsafe { ShowWindowAsync(HWND(hwnd as *mut core::ffi::c_void), SW_SHOWNA) };
-        Ok(())
+        // SAFETY: PostMessageW is thread-safe by contract; it queues the
+        // message to the overlay thread, which owns the window. A stale
+        // handle fails harmlessly.
+        let _ = unsafe {
+            PostMessageW(
+                Some(HWND(hwnd as *mut core::ffi::c_void)),
+                message,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+        true
+    }
+}
+
+impl CursorMask for WindowsCursorMask {
+    fn hide(&self) -> Result<(), CursorMaskError> {
+        tracing::debug!("cursor mask: hide (show overlay, blank cursor)");
+        if self.post(WM_APP_SHOW) {
+            Ok(())
+        } else {
+            Err(CursorMaskError::Failed {
+                reason: "overlay window not available".to_owned(),
+            })
+        }
     }
 
     fn show(&self) -> Result<(), CursorMaskError> {
-        let hwnd = self.hwnd.load(Ordering::SeqCst);
-        if hwnd == 0 {
-            return Ok(()); // nothing was ever hidden
-        }
-        // SAFETY: as in `hide`; SW_HIDE takes the overlay down so the
-        // cursor is drawn normally again.
-        let _ = unsafe { ShowWindowAsync(HWND(hwnd as *mut core::ffi::c_void), SW_HIDE) };
+        tracing::debug!("cursor mask: show (hide overlay, restore cursor)");
+        // A missing window means nothing was ever hidden — not an error.
+        let _ = self.post(WM_APP_HIDE);
         Ok(())
     }
 }
@@ -241,10 +266,31 @@ unsafe extern "system" fn overlay_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_APP_SHOW => {
+            // Bring the overlay to the top, then blank the cursor *now*,
+            // from this thread that owns the topmost window. The cursor is
+            // frozen while we control (input is suppressed), so no mouse
+            // move would ever trigger WM_SETCURSOR to do it for us.
+            // SAFETY: hwnd is our window; SW_SHOWNA shows without stealing
+            // focus, and SetCursor(None) hides the pointer.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOWNA);
+                SetCursor(None);
+            }
+            LRESULT(0)
+        }
+        WM_APP_HIDE => {
+            // SAFETY: taking the overlay down lets the cursor be drawn by
+            // whatever window it is over again.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            LRESULT(0)
+        }
         WM_SETCURSOR => {
-            // The overlay is shown only while we drive the peer, so any
-            // cursor over it is the frozen local one: blank it. Returning
-            // TRUE stops Windows resetting it to a class/parent cursor.
+            // Keep the cursor blank if a move does occur while the overlay
+            // is up. Returning TRUE stops Windows resetting it to a
+            // class/parent cursor.
             // SAFETY: SetCursor(None) hides the cursor; no preconditions.
             unsafe { SetCursor(None) };
             LRESULT(1)
