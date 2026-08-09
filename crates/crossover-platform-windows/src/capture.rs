@@ -189,6 +189,10 @@ fn enqueue_key(raw: RawKey) {
     }
 }
 
+/// Right Shift's Set-1 make code. Its extended flag is normalized away in
+/// [`translate_key`]; see there.
+const RIGHT_SHIFT_SCANCODE: u16 = 0x36;
+
 /// Translate a captured key to a [`KeyEvent`] (ADR 0008). `None` for a
 /// scan code Crossover does not carry — skipped rather than forwarded as
 /// the wrong key. Produced text is left empty: Phase 4 injects by scan
@@ -196,7 +200,21 @@ fn enqueue_key(raw: RawKey) {
 /// (which hides held modifiers from the OS) belongs with the later
 /// text-injection fallback.
 fn translate_key(raw: RawKey) -> Option<KeyEvent> {
-    let key = keymap::scancode_to_hid(raw.scancode, raw.extended)?;
+    // Right Shift (scan code 0x36) is a non-extended key in Set-1, but some
+    // keyboards/drivers report it through the low-level hook *with* the E0
+    // extended flag set. Left unhandled, the reverse lookup misses and the
+    // Shift press is dropped, so every shifted character on the right hand
+    // (?, :, ", >, etc.) loses its modifier and arrives unshifted on the
+    // peer. Normalize it: 0x36 is unambiguously Right Shift (no extended
+    // key shares it), and the phantom shift Windows synthesizes around the
+    // navigation cluster is always the *left* shift (E0 0x2A), never this
+    // one — so clearing the flag here is safe and does not swallow a phantom.
+    let extended = if raw.scancode == RIGHT_SHIFT_SCANCODE {
+        false
+    } else {
+        raw.extended
+    };
+    let key = keymap::scancode_to_hid(raw.scancode, extended)?;
     Some(KeyEvent {
         key,
         pressed: raw.pressed,
@@ -1085,6 +1103,34 @@ mod tests {
                 injected: false,
             })
             .is_none()
+        );
+    }
+
+    #[test]
+    fn right_shift_is_recognized_even_when_reported_extended() {
+        // Real hardware (Phase 5 soak): Right Shift arrives through the
+        // low-level hook as scan code 0x36 *with* the E0 extended flag. It
+        // must still map to Right Shift (HID 0xE5), not be dropped — else
+        // shifted characters typed with the right hand lose their modifier
+        // on the peer (e.g. '?' arrives as '/').
+        assert_eq!(
+            translate_key(RawKey {
+                scancode: 0x36,
+                extended: true,
+                pressed: true,
+                injected: false,
+            }),
+            Some(KeyEvent::press(0xE5))
+        );
+        // And the ordinary non-extended report maps identically.
+        assert_eq!(
+            translate_key(RawKey {
+                scancode: 0x36,
+                extended: false,
+                pressed: false,
+                injected: false,
+            }),
+            Some(KeyEvent::release(0xE5))
         );
     }
 
