@@ -404,6 +404,16 @@ as the mouse — one `c` takes both.
   character as the known limitation, not a defect.
 - Dead keys, IME composition, and global OS hotkeys the shell claims
   before the hook (e.g. `Ctrl+Alt+Del`) are out of scope for this phase.
+- **Apps with their own key handling interpret forwarded keys their own
+  way.** A native editor or IDE that binds Home/End itself (smart-home to
+  first non-whitespace, custom selection widgets like Scintilla) may
+  respond to a forwarded `Shift+Home`/`Shift+End` differently from a
+  plain text box — the forwarding is correct into standard controls
+  (`crossover-platform-windows` proves capture, injection, and
+  injection→selection all drive a shifted navigation selection), so any
+  divergence is the application's behavior. Confirm by pressing the same
+  chord on that machine's **local** keyboard in the same app: identical
+  behavior means it is the app, not Crossover.
 
 Record the outcome in the Phase 4 exit-criteria notes
 (docs/ROADMAP.md): how many control cycles, whether any key or modifier
