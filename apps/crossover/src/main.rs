@@ -47,6 +47,9 @@ enum Command {
     Status,
 }
 
+// A CLI flag struct is naturally a bag of independent bools (clap maps each
+// `--flag` to one); the excessive-bools heuristic does not apply.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 struct RunArgs {
     /// Accept inbound sessions from trusted peers.
@@ -73,6 +76,12 @@ struct RunArgs {
     /// crosses to the peer.
     #[arg(long)]
     right: bool,
+
+    /// Diagnostic: do not hide the local cursor while controlling the peer.
+    /// Isolates cursor-masking behavior from control transfer when a soak
+    /// misbehaves (ADR 0009).
+    #[arg(long)]
+    no_cursor_mask: bool,
 }
 
 #[derive(Debug, Args)]
@@ -140,7 +149,14 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
-            commands::run(&device_name, listen_bind, args.connect, side).await
+            commands::run(
+                &device_name,
+                listen_bind,
+                args.connect,
+                side,
+                args.no_cursor_mask,
+            )
+            .await
         }
         Command::Pair(args) => match args.address {
             Some(address) => commands::pair_connect(&device_name, &address).await,

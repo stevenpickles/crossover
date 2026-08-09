@@ -226,12 +226,20 @@ pub fn status(device_name: &str) -> anyhow::Result<()> {
 fn setup_input_control(
     side: Option<LinkSide>,
     metrics: &Arc<Metrics>,
+    no_cursor_mask: bool,
 ) -> anyhow::Result<(
     mpsc::Sender<InputControlEvent>,
     mpsc::Receiver<SessionCommand>,
 )> {
     let (capture, injector) = open_input()?;
-    let cursor_mask = open_cursor_mask();
+    // Diagnostic switch: run without masking to isolate cursor behavior
+    // from control transfer (ADR 0009).
+    let cursor_mask: Arc<dyn crossover_platform::CursorMask> = if no_cursor_mask {
+        tracing::info!("cursor masking disabled (--no-cursor-mask)");
+        Arc::new(crossover_platform::NoopCursorMask)
+    } else {
+        open_cursor_mask()
+    };
     let display = open_display()?;
 
     // Log the display and the configured seamless edge at startup (ADR
@@ -267,6 +275,7 @@ pub async fn run(
     listen_bind: Option<String>,
     connect: Option<String>,
     side: Option<LinkSide>,
+    no_cursor_mask: bool,
 ) -> anyhow::Result<()> {
     let storage: Arc<dyn SecureStorage> = Arc::from(open_secure_storage()?);
     let (identity, generated) = DeviceIdentity::load_or_generate(&*storage, device_name)
@@ -311,7 +320,7 @@ pub async fn run(
 
     // Input control: capture/inject, the transfer engine, cursor masking,
     // and (in seamless mode) the edge detector.
-    let (control_events, control_commands) = setup_input_control(side, &metrics)?;
+    let (control_events, control_commands) = setup_input_control(side, &metrics, no_cursor_mask)?;
 
     // Session lifecycle and frames fan out to both drivers.
     let fanout = SessionFanout {
