@@ -56,6 +56,9 @@ sha2 = "0.11"
 # tree via the dalek family). Stable 0.4 line, not the 0.5 pre-release.
 spake2 = "0.4"
 thiserror = "2"
+# Human-editable startup configuration file (Phase 6). default-features off
+# drops the datetime/display extras the config never uses.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 tokio = { version = "1", features = [
     "io-std",
     "io-util",

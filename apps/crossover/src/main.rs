@@ -8,6 +8,7 @@
 //! `anyhow` and renders concise user-facing messages.
 
 mod commands;
+mod config;
 mod console;
 mod logging;
 mod storage;
@@ -45,6 +46,8 @@ enum Command {
     },
     /// Report identity and trust status.
     Status,
+    /// Show the startup config file path and its effective settings.
+    Config,
 }
 
 // A CLI flag struct is naturally a bag of independent bools (clap maps each
@@ -126,35 +129,47 @@ async fn main() -> anyhow::Result<()> {
         "starting"
     );
 
-    let device_name = storage::resolve_device_name(cli.name);
     match cli.command {
         Command::Run(args) => {
-            if !args.listen && args.connect.is_none() {
+            // Merge CLI flags over the startup config file: a flag present on
+            // the command line wins; otherwise the file supplies the value
+            // (Phase 6). `--name` is global, so it rides in from `cli`.
+            let effective = config::load_run_config()?.merge(config::CliRun {
+                name: cli.name,
+                listen: args.listen,
+                bind: args.bind,
+                connect: args.connect,
+                left: args.left,
+                right: args.right,
+                no_cursor_mask: args.no_cursor_mask,
+            });
+            if !effective.listen && effective.connect.is_none() {
                 anyhow::bail!(
-                    "`crossover run` needs a role: --listen to accept trusted peers,                      --connect <address> to dial one, or both"
+                    "`crossover run` needs a role: --listen (or `listen = true` in \
+                     config.toml) to accept trusted peers, --connect <address> (or \
+                     `connect = ...`) to dial one, or both"
                 );
             }
-            if args.bind.is_some() && !args.listen {
-                anyhow::bail!("--bind only applies with --listen");
+            if effective.bind.is_some() && !effective.listen {
+                anyhow::bail!("a bind address only applies with --listen / listen = true");
             }
-            let listen_bind = args.listen.then(|| {
-                args.bind
+            let listen_bind = effective.listen.then(|| {
+                effective
+                    .bind
                     .clone()
                     .unwrap_or_else(|| format!("0.0.0.0:{}", crossover_protocol::DEFAULT_PORT))
             });
-            let side = if args.left {
-                Some(crossover_core::LinkSide::Left)
-            } else if args.right {
-                Some(crossover_core::LinkSide::Right)
-            } else {
-                None
-            };
+            let side = effective.side.map(|side| match side {
+                config::Side::Left => crossover_core::LinkSide::Left,
+                config::Side::Right => crossover_core::LinkSide::Right,
+            });
+            let device_name = storage::resolve_device_name(effective.name);
             let result = commands::run(
                 &device_name,
                 listen_bind,
-                args.connect,
+                effective.connect,
                 side,
-                args.no_cursor_mask,
+                effective.no_cursor_mask,
             )
             .await;
             // Seamless masking may have blanked the system cursor; restore it
@@ -164,15 +179,19 @@ async fn main() -> anyhow::Result<()> {
             crossover_platform_windows::restore_system_cursors();
             result
         }
-        Command::Pair(args) => match args.address {
-            Some(address) => commands::pair_connect(&device_name, &address).await,
-            None => commands::pair_listen(&device_name, args.bind).await,
-        },
+        Command::Pair(args) => {
+            let device_name = storage::resolve_device_name(cli.name);
+            match args.address {
+                Some(address) => commands::pair_connect(&device_name, &address).await,
+                None => commands::pair_listen(&device_name, args.bind).await,
+            }
+        }
         Command::Peers { action } => match action {
             None => commands::peers_list(),
             Some(PeersAction::Remove { device_id }) => commands::peers_remove(device_id),
         },
-        Command::Status => commands::status(&device_name),
+        Command::Status => commands::status(&storage::resolve_device_name(cli.name)),
+        Command::Config => commands::config_show(),
     }
 }
 
