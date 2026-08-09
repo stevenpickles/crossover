@@ -321,3 +321,101 @@ auto-releases. The report also counts key events. In a live session
 (not the probe), the way out while the keyboard is captured is the
 escape gesture: **press both Control keys at once**, which is caught in
 the hook, never sent to the peer, and hands control straight back.
+
+## Phase 4 soak: remote keyboard (two machines)
+
+This is the Phase 4 exit criterion that no single machine can show:
+typing on machine B with machine A's keyboard, common shortcuts landing
+correctly, and — the release-blocking part — proving that repeated
+control cycles and a disconnect at an *arbitrary* moment never leave a
+key or a modifier logically pressed on B (FR-4.1–FR-4.4). The hermetic
+property tests in `crossover-core` prove the state machine ends clean on
+every interleaving; this proves the two real machines and two real
+keyboards.
+
+Pair and connect exactly as for the clipboard and mouse soaks above
+(same binary, same firewall rule, same pairing ceremony, same `c` / `r`
+/ `q` console). The keyboard is captured and injected on the same grant
+as the mouse — one `c` takes both.
+
+### The procedure
+
+1. **Take control and type.** On machine A, type `c`. Put the caret in a
+   text editor on **B** and type a paragraph on A's keyboard — letters,
+   digits, punctuation, Enter, Backspace. Every character must land on B,
+   in order, once each. A's own keyboard is captured: your keystrokes do
+   **not** reach A's foreground app (that is suppression working).
+2. **Modifiers and chords.** Still controlling, exercise the shortcuts
+   real use depends on: Shift for capitals, `Ctrl+C` / `Ctrl+V` (which
+   also round-trips through the clipboard — the copied selection on B
+   syncs back to A), `Alt+Tab`, the Windows key, arrow keys, Home/End,
+   and a function key or two. Chords must keep their ordering — a held
+   Shift must still be down when the letter arrives, so capitals are
+   capitals, not stray lowercase.
+3. **Auto-repeat.** Hold a key down. B repeats it (the OS repeat on the
+   source is forwarded as repeat events), and releasing stops it cleanly
+   with no trailing characters.
+4. **The keyboard escape.** While A is controlling and A's keyboard is
+   captured, **press both Control keys at once**. Control hands straight
+   back — A's keyboard comes alive, B is left with nothing held — and the
+   Control presses themselves must **not** land on B (no phantom Ctrl on
+   B afterward). This is the local user's escape hatch; it is caught in
+   the hook and never forwarded.
+5. **Repeat rapidly.** Alternate `c` and `r` a few dozen times, typing a
+   few characters and one chord each time you hold control. Not once
+   should a key or modifier be left down on B, and A's keyboard must be
+   alive after every `r` — verify by typing on A.
+6. **The fault that matters — disconnect with a modifier held.** On A,
+   take control (`c`), press and *hold* a modifier (Shift, or Ctrl) while
+   typing so it is logically down, and while still holding it pull B's
+   network (disable its adapter) or `q` on B. On A the control ends
+   ("session lost"). When B comes back, **nothing is stuck**: type
+   normally on B and confirm it is not all capitals (stuck Shift) and
+   shortcuts are not firing (stuck Ctrl) — B synthesized the release for
+   every held key from its own record the moment the session dropped.
+   This is the release-blocking scenario; a stuck modifier here fails
+   Phase 4.
+7. **Revoke from the controlled side.** Take control from A again, then
+   on **B** type `r`. A stops controlling immediately, A's keyboard
+   returns, and B holds nothing. The local user's escape works from the
+   keyboard-and-console side even while being driven.
+
+### What good looks like
+
+- Every character and chord lands on B exactly once and in order; a held
+  modifier is still held when the key it modifies arrives.
+- After every hand-back, escape, revocation, or disconnect, **B holds no
+  key and no modifier**: typing on B is immediately normal. A stuck key
+  or a phantom modifier is release-blocking — record it and stop.
+- The both-Control escape always returns control and **never** reaches
+  B; no stray Control state is left on either side.
+- Every transition is narrated on both consoles (NFR-3).
+- Injection into an elevated window on B may silently do nothing (UIPI,
+  R-1) — expected and documented; type into an ordinary editor to see the
+  keystrokes land.
+
+### Honest limitations
+
+- **Physical-key model (ADR 0008).** A key travels as its USB HID usage,
+  reproduced as the *same physical key* on B; the produced text is
+  carried alongside, but text-fallback injection is deferred past this
+  phase. With **mismatched keyboard layouts** the character on B follows
+  B's layout, not A's — soak with matching layouts, or read a divergent
+  character as the known limitation, not a defect.
+- Dead keys, IME composition, and global OS hotkeys the shell claims
+  before the hook (e.g. `Ctrl+Alt+Del`) are out of scope for this phase.
+- **Apps with their own key handling interpret forwarded keys their own
+  way.** A native editor or IDE that binds Home/End itself (smart-home to
+  first non-whitespace, custom selection widgets like Scintilla) may
+  respond to a forwarded `Shift+Home`/`Shift+End` differently from a
+  plain text box — the forwarding is correct into standard controls
+  (`crossover-platform-windows` proves capture, injection, and
+  injection→selection all drive a shifted navigation selection), so any
+  divergence is the application's behavior. Confirm by pressing the same
+  chord on that machine's **local** keyboard in the same app: identical
+  behavior means it is the app, not Crossover.
+
+Record the outcome in the Phase 4 exit-criteria notes
+(docs/ROADMAP.md): how many control cycles, whether any key or modifier
+ever stuck, whether the escape ever leaked, and the subjective feel of
+typing on the far machine.

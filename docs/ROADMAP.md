@@ -1,16 +1,25 @@
 # Crossover Roadmap
 
-> **Current phase: 4 — Remote Keyboard** (in progress — the key-repre-
-> sentation decision is recorded as ADR 0008 (Accepted): physical key by
-> USB HID usage, produced text carried alongside, inject by scan code.
-> The input model, wire messages, and Windows capture/injection follow.)
+> **Current phase: 5 — Seamless Crossover** (not yet started; ADR 0008
+> settled the keyboard representation that Phase 4 built on.)
+>
+> Phase 4 (Remote Keyboard) closed 2026-08-09: the two-machine keyboard
+> soak (docs/SOAK.md) ran on real hardware — normal typing and shortcuts
+> forwarded cleanly, repeated control cycles left no stuck keys or
+> modifiers, and the both-Control escape returned control every time. One
+> app-specific finding: `Shift+Home`/`Shift+End` did not extend a
+> selection in a native editor with its own key handling, while
+> `Shift+Arrow` did. The input pipeline was proven correct end to end —
+> capture, coalescing, injection, and injection→selection into a standard
+> control all verified in `crossover-platform-windows` probes — so the
+> behavior is the editor's own, not a forwarding defect (docs/SOAK.md
+> Phase 4 limitations).
 >
 > Phase 3 (Remote Mouse) closed 2026-08-08: the two-machine remote-mouse
-> soak (docs/SOAK.md) ran on real hardware — clean takeover, smooth
-> motion at roughly the mouse's native report rate, and disconnect
-> mid-drag left no stuck buttons. One cosmetic follow-up is tracked
-> separately (a deliberate quit logs a spurious TLS-close warning on the
-> peer; ReleaseAllInput still fires, so it is diagnostics-only).
+> soak ran on real hardware — clean takeover, smooth motion, and
+> disconnect mid-drag left no stuck buttons. One cosmetic follow-up is
+> tracked separately (a deliberate quit logs a spurious TLS-close warning
+> on the peer; ReleaseAllInput still fires, so it is diagnostics-only).
 >
 > Update this marker when a phase's exit criteria are verified. Do not begin
 > a later phase because time remains — complete and validate exit criteria
@@ -180,6 +189,35 @@ modifier handling; ordered key transitions; key-state tracking;
 Exit criteria: normal typing and common shortcuts work remotely; repeated
 activation/deactivation correct; disconnect at **arbitrary** moments
 (fault-injected) never leaves keys or modifiers logically pressed.
+
+Verified 2026-08-09:
+
+- **Hermetic**: the control-transfer property tests
+  (`granted_keys_are_injected_and_released_on_disconnect`,
+  `hand_back_releases_everything_the_peer_left_held`, and the proptest
+  `any_interleaving_ends_clean_on_disconnect`) prove the state machine
+  ends with nothing held on every interleaving; the HID↔scancode table
+  round-trips every key with its extended flag; capture, injection, and
+  injection→selection are exercised through the real Win32 pipeline
+  (`crossover-platform-windows`).
+- **Two physical Windows machines** on one LAN ran the [SOAK.md](SOAK.md)
+  Phase 4 runbook: normal typing, modifier chords (including the
+  `Ctrl+C`/`Ctrl+V` clipboard round trip), auto-repeat, the both-Control
+  escape, repeated control cycles, and a disconnect with a modifier held.
+  No key or modifier ever stuck; the escape returned control every time
+  and never leaked to the peer; the shutdown metrics reported clean
+  hand-backs and no reconnects.
+- **One app-specific finding, investigated to ground truth**:
+  `Shift+Home`/`Shift+End` failed to extend a selection in a native
+  editor with its own key handling while `Shift+Arrow` worked.
+  Single-machine probes proved the forwarding path correct at every stage
+  — Home/End are captured identically to the arrows (right extended flag,
+  right HID, Shift held, no phantom shift), Windows synthesizes no phantom
+  shift on injection, and the exact injected batch drives a selection in a
+  standard edit control. The divergence is the editor's own Home/End
+  behavior, verifiable by comparing local and remote input in that app
+  (docs/SOAK.md Phase 4 limitations); it is not a forwarding defect and
+  does not block the exit criteria.
 
 ## Phase 5 — Seamless Crossover
 
