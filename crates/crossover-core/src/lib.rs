@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod net;
 pub mod pairing;
 pub mod supervision;
+pub mod topology;
 
 pub use clipboard::{ClipboardConfig, ClipboardEngine, RetryPolicy as ClipboardRetryPolicy};
 pub use clipboard_driver::{
@@ -38,6 +39,7 @@ pub use supervision::{
     DisconnectReason, KeepaliveConfig, ReconnectPolicy, SessionEvent, SupervisorConfig,
     SupervisorHandle, run_session, supervise_outbound,
 };
+pub use topology::{CursorPoint, Edge, EdgeFraction, LinkSide, Screen, Topology};
 
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str = "state machines, clipboard and input engines, topology, \
