@@ -28,7 +28,7 @@
 //! not that anything acted on them.
 
 use crossover_platform::{
-    InputError, InputEvent, InputInjector, KeyEvent, PointerButton, PointerEvent,
+    CursorPoint, InputError, InputEvent, InputInjector, KeyEvent, PointerButton, PointerEvent,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
@@ -40,7 +40,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 // The XBUTTON constants live under WindowsAndMessaging as u16 (those in
 // KeyboardAndMouse are virtual-key codes, a different thing) while
 // mouseData is u32, so widen once here rather than at each use.
-use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
+use windows::Win32::UI::WindowsAndMessaging::{SetCursorPos, XBUTTON1, XBUTTON2};
 
 use crate::keymap;
 
@@ -96,6 +96,19 @@ impl InputInjector for WindowsInputInjector {
                 ),
             })
         }
+    }
+
+    fn place_cursor(&self, position: CursorPoint) -> Result<(), InputError> {
+        // Absolute placement in screen pixels, the exact inverse of the
+        // GetCursorPos this process reads for detection, so the two share
+        // one coordinate space. Placement runs only while not capturing
+        // (control arriving or returning), so there is no hook to capture
+        // it back and no tag is needed.
+        // SAFETY: SetCursorPos takes screen coordinates and has no
+        // preconditions; it returns an error on failure.
+        unsafe { SetCursorPos(position.x, position.y) }.map_err(|e| InputError::InjectionFailed {
+            reason: format!("SetCursorPos failed: {e}"),
+        })
     }
 }
 

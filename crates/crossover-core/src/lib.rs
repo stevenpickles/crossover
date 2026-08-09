@@ -26,7 +26,7 @@ pub use control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
     OutboundControl,
 };
-pub use control_driver::{InputControlDriver, InputControlEvent, input_control};
+pub use control_driver::{InputControlDriver, InputControlEvent, SeamlessInputs, input_control};
 pub use edge_driver::{
     CrossingKind, EdgeCrossing, EdgeDetectDriver, EdgeDetector, EdgeMode, edge_detect,
 };

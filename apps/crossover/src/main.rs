@@ -62,6 +62,17 @@ struct RunArgs {
     /// Maintain an outbound session to this peer address.
     #[arg(long)]
     connect: Option<String>,
+
+    /// Seamless mode: this machine is the LEFT screen of a left–right
+    /// pair, so its right edge crosses to the peer (ADR 0009). The cursor
+    /// follows across the edge with no manual switch.
+    #[arg(long, conflicts_with = "right")]
+    left: bool,
+
+    /// Seamless mode: this machine is the RIGHT screen, so its left edge
+    /// crosses to the peer.
+    #[arg(long)]
+    right: bool,
 }
 
 #[derive(Debug, Args)]
@@ -118,7 +129,14 @@ async fn main() -> anyhow::Result<()> {
                     .clone()
                     .unwrap_or_else(|| format!("0.0.0.0:{}", crossover_protocol::DEFAULT_PORT))
             });
-            commands::run(&device_name, listen_bind, args.connect).await
+            let side = if args.left {
+                Some(crossover_core::LinkSide::Left)
+            } else if args.right {
+                Some(crossover_core::LinkSide::Right)
+            } else {
+                None
+            };
+            commands::run(&device_name, listen_bind, args.connect, side).await
         }
         Command::Pair(args) => match args.address {
             Some(address) => commands::pair_connect(&device_name, &address).await,

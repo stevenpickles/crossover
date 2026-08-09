@@ -42,14 +42,16 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crossover_platform::{InputCapture, InputInjector};
+use crossover_platform::{DisplayInfo, InputCapture, InputInjector};
 use crossover_protocol::RawFrame;
 
 use crate::clipboard_driver::{FrameTarget, SessionCommand};
 use crate::control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
 };
+use crate::edge_driver::EdgeMode;
 use crate::input::InputEvent;
+use crate::topology::{EdgeFraction, Topology};
 
 /// How often, while controlling, the driver polls the platform for a
 /// lost capture (R-2) and for the release escape gesture (ADR 0008). One
@@ -96,6 +98,18 @@ pub enum InputControlEvent {
     RequestControl,
     /// The user asked to end whichever control relationship exists.
     ReleaseControl,
+    /// The cursor crossed the linked edge while controlling this machine:
+    /// take control of the peer, carrying where it crossed (ADR 0009).
+    EdgeLeave {
+        /// Normalized crossing position along the edge.
+        position: EdgeFraction,
+    },
+    /// The cursor returned to the linked edge while the peer controls this
+    /// machine: reclaim control, carrying where it crossed (ADR 0009).
+    EdgeReturn {
+        /// Normalized crossing position along the edge.
+        position: EdgeFraction,
+    },
     /// One captured input event, pointer or key (platform sink bridge).
     Captured(InputEvent),
     /// A scheduled request timeout came due.
@@ -109,10 +123,31 @@ pub enum InputControlEvent {
 
 /// The control driver. Create with [`input_control`], then spawn
 /// [`InputControlDriver::run`].
+/// The extra wiring a machine configured for seamless transfer needs
+/// (ADR 0009). Absent for an explicit-only (console) run, which never
+/// places a cursor or drives an edge detector.
+pub struct SeamlessInputs {
+    /// This machine's screen topology (from `--left`/`--right`), for
+    /// mapping a `PlaceCursor` fraction to a pixel on the entry edge.
+    pub topology: Topology,
+    /// Display geometry for that mapping.
+    pub display: Arc<dyn DisplayInfo>,
+    /// Where the edge detector's watching mode is sent, derived from this
+    /// machine's control state so it watches to *leave* while local, to
+    /// *return* while controlled, and idles while it drives the peer.
+    pub edge_mode: mpsc::Sender<EdgeMode>,
+}
+
 pub struct InputControlDriver {
     engine: ControlEngine,
     capture: Arc<dyn InputCapture>,
     injector: Arc<dyn InputInjector>,
+    /// Seamless wiring, present exactly when the machine runs
+    /// `--left`/`--right`. `None` makes placement and edge-mode emission
+    /// no-ops (an explicit-only run).
+    seamless: Option<SeamlessInputs>,
+    /// The last edge mode emitted, so only changes are sent.
+    last_edge_mode: EdgeMode,
     events_rx: mpsc::Receiver<InputControlEvent>,
     events_tx: mpsc::Sender<InputControlEvent>,
     commands_tx: mpsc::Sender<SessionCommand>,
@@ -131,6 +166,7 @@ pub struct InputControlDriver {
 pub fn input_control(
     capture: Arc<dyn InputCapture>,
     injector: Arc<dyn InputInjector>,
+    seamless: Option<SeamlessInputs>,
     config: ControlConfig,
 ) -> (
     InputControlDriver,
@@ -146,6 +182,10 @@ pub fn input_control(
         engine: ControlEngine::new(config),
         capture,
         injector,
+        seamless,
+        // Idle until a session establishes: emitting the initial mode is
+        // the driver's job on the first state change.
+        last_edge_mode: EdgeMode::Idle,
         events_rx,
         events_tx: events_tx.clone(),
         commands_tx,
@@ -191,6 +231,9 @@ impl InputControlDriver {
                     }
                 }
             }
+            // Any branch may have changed the control state; keep the edge
+            // detector's watching mode in step with it (ADR 0009).
+            self.sync_edge_mode().await;
         }
         tracing::debug!("input control driver stopped");
     }
@@ -244,6 +287,13 @@ impl InputControlDriver {
                     ControlEvent::UserRequestControl { session }
                 }
                 InputControlEvent::ReleaseControl => ControlEvent::UserRelease,
+                InputControlEvent::EdgeLeave { position } => {
+                    // Same session choice as a console take-control, plus
+                    // where the cursor crossed (ADR 0009).
+                    let session = self.sessions.last().copied().unwrap_or_else(Uuid::nil);
+                    ControlEvent::EdgeLeave { session, position }
+                }
+                InputControlEvent::EdgeReturn { position } => ControlEvent::EdgeReturn { position },
                 InputControlEvent::RequestTimeout {
                     session,
                     request_id,
@@ -284,6 +334,58 @@ impl InputControlDriver {
             }
         }
         true
+    }
+
+    /// Actuate a `PlaceCursor` intent (ADR 0009): map the edge fraction to
+    /// a pixel on this machine's linked (entry) edge and inject an
+    /// absolute move, so the pointer appears where it crossed. A no-op
+    /// without a configured topology — placement is a seamless nicety, and
+    /// losing it never breaks control.
+    fn place_cursor(&self, fraction: EdgeFraction) {
+        let Some(seamless) = &self.seamless else {
+            tracing::debug!("cursor placement requested but no topology configured");
+            return;
+        };
+        match seamless.display.primary_screen() {
+            Ok(screen) => {
+                let point = seamless.topology.entering(fraction, screen);
+                if let Err(error) = self.injector.place_cursor(point) {
+                    tracing::warn!(error = %error, "cursor placement failed");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "cannot place cursor: display unavailable");
+            }
+        }
+    }
+
+    /// The edge detector's mode for this machine's current control state
+    /// (ADR 0009): watch to *leave* while it controls itself with a peer
+    /// present, to *return* while a peer controls it, and idle while it
+    /// drives the peer or has no session to cross to.
+    fn edge_mode(&self) -> EdgeMode {
+        if self.sessions.is_empty() || self.engine.is_controlling() {
+            EdgeMode::Idle
+        } else if self.engine.is_controlled() {
+            EdgeMode::Returning
+        } else {
+            EdgeMode::Leaving
+        }
+    }
+
+    /// Send the current edge mode to the detector when it has changed, so
+    /// detection tracks the control state.
+    async fn sync_edge_mode(&mut self) {
+        if self.seamless.is_none() {
+            return;
+        }
+        let mode = self.edge_mode();
+        if mode != self.last_edge_mode {
+            self.last_edge_mode = mode;
+            if let Some(seamless) = &self.seamless {
+                let _ = seamless.edge_mode.send(mode).await;
+            }
+        }
     }
 
     /// Execute engine actions in order. Returns `false` when the
@@ -346,17 +448,7 @@ impl InputControlDriver {
                         tracing::warn!(error = %error, "input injection failed");
                     }
                 }
-                ControlAction::PlaceCursor(position) => {
-                    // Cursor placement on seamless entry/return (ADR 0009)
-                    // maps the fraction through the local display geometry
-                    // and injects an absolute move. The seam is explicit
-                    // here; the actuation (topology + display + absolute
-                    // injection) is wired in the app layer.
-                    tracing::debug!(
-                        position = position.value(),
-                        "place cursor on the entry edge"
-                    );
-                }
+                ControlAction::PlaceCursor(fraction) => self.place_cursor(fraction),
                 ControlAction::ScheduleRequestTimeout {
                     session,
                     request_id,
@@ -432,18 +524,25 @@ mod tests {
     use tokio::time::timeout;
     use uuid::Uuid;
 
-    use crossover_platform::fakes::{FakeInputCapture, FakeInputInjector};
-    use crossover_platform::{InputCapture, InputInjector};
+    use crossover_platform::fakes::{FakeDisplay, FakeInputCapture, FakeInputInjector};
+    use crossover_platform::{DisplayInfo, InputCapture, InputInjector, Screen};
     use crossover_protocol::hello::MessageType;
     use crossover_protocol::{
-        ControlRequest, ControlResponse, ControlVerdict, DenyReason, InputBatch, RawFrame,
-        ReleaseAllInput, WireButton, WireInputEvent,
+        ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, InputBatch,
+        RawFrame, ReleaseAllInput, WireButton, WireInputEvent,
     };
 
     use super::{InputControlEvent, input_control};
     use crate::clipboard_driver::{FrameTarget, SessionCommand};
     use crate::control::{ControlConfig, ControlNotice};
+    use crate::edge_driver::EdgeMode;
     use crate::input::{InputEvent, KeyEvent, PointerButton, PointerEvent, hid};
+    use crate::topology::{EdgeFraction, LinkSide, Topology};
+
+    const HD: Screen = Screen {
+        width: 1920,
+        height: 1080,
+    };
 
     /// The session the single-session tests operate on.
     const SESSION: Uuid = Uuid::from_bytes([0xA1; 16]);
@@ -456,14 +555,25 @@ mod tests {
         events: mpsc::Sender<InputControlEvent>,
         commands: mpsc::Receiver<SessionCommand>,
         notices: mpsc::Receiver<ControlNotice>,
+        edge_modes: mpsc::Receiver<EdgeMode>,
     }
 
     fn rig() -> Rig {
         let capture = Arc::new(FakeInputCapture::new());
         let injector = Arc::new(FakeInputInjector::new());
+        let display = Arc::new(FakeDisplay::new(HD));
+        let (edge_mode_tx, edge_modes) = mpsc::channel(8);
+        // A left-member topology (links on the right edge) so PlaceCursor
+        // has geometry to map through; most tests never trigger it.
+        let seamless = super::SeamlessInputs {
+            topology: Topology::new(LinkSide::Left),
+            display: Arc::clone(&display) as Arc<dyn DisplayInfo>,
+            edge_mode: edge_mode_tx,
+        };
         let (driver, events, commands, notices) = input_control(
             Arc::clone(&capture) as Arc<dyn InputCapture>,
             Arc::clone(&injector) as Arc<dyn InputInjector>,
+            Some(seamless),
             ControlConfig {
                 request_timeout: Duration::from_millis(100),
             },
@@ -475,6 +585,7 @@ mod tests {
             events,
             commands,
             notices,
+            edge_modes,
         }
     }
 
@@ -490,6 +601,13 @@ mod tests {
             .await
             .expect("timed out waiting for a notice")
             .expect("notice channel closed")
+    }
+
+    async fn next_edge_mode(rig: &mut Rig) -> EdgeMode {
+        timeout(Duration::from_secs(5), rig.edge_modes.recv())
+            .await
+            .expect("timed out waiting for an edge mode")
+            .expect("edge-mode channel closed")
     }
 
     fn frame(message_type: MessageType, payload: Vec<u8>) -> InputControlEvent {
@@ -1138,5 +1256,90 @@ mod tests {
             ControlNotice::ControlEnded(crate::control::ControlEndReason::HandedBack)
         );
         assert!(!rig.capture.is_capturing(), "escape must stop capture");
+    }
+
+    /// An edge-driven grant places the cursor on the entry edge (ADR
+    /// 0009): the rig is a left member, so control enters on its right
+    /// edge, at the crossing fraction of the screen height.
+    #[tokio::test]
+    async fn an_edge_request_places_the_cursor_on_grant() {
+        let mut rig = rig();
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+
+        let position = EdgeFraction::new(0.5);
+        let request = ControlRequest {
+            request_id: 1,
+            entry: Some(position.to_wire()),
+        };
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                request.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        // Grant out, then PeerTookControl — after which PlaceCursor has run.
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+
+        let placements = rig.injector.placements();
+        assert_eq!(placements.len(), 1, "exactly one placement on entry");
+        assert_eq!(placements[0].x, 1919, "entered on the right (linked) edge");
+        assert!(
+            (placements[0].y - 540).abs() <= 1,
+            "placed at mid-height, got y={}",
+            placements[0].y
+        );
+    }
+
+    /// The edge detector's mode follows the control state (ADR 0009): idle
+    /// with no session, watching to leave while local, to return while
+    /// controlled, idle again when the session drops.
+    #[tokio::test]
+    async fn the_edge_mode_follows_the_control_state() {
+        let mut rig = rig();
+        // A session appears: now there is somewhere to cross to.
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        assert_eq!(next_edge_mode(&mut rig).await, EdgeMode::Leaving);
+
+        // The peer takes control of this machine: watch to return.
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest {
+                    request_id: 1,
+                    entry: None,
+                }
+                .encode_payload()
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_edge_mode(&mut rig).await, EdgeMode::Returning);
+
+        // The peer releases: back to watching to leave.
+        rig.events
+            .send(frame(
+                MessageType::ControlRelease,
+                ControlRelease { entry: None }.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_edge_mode(&mut rig).await, EdgeMode::Leaving);
+
+        // The session drops: nothing to cross to, so idle.
+        rig.events
+            .send(InputControlEvent::SessionLost { session: SESSION })
+            .await
+            .unwrap();
+        assert_eq!(next_edge_mode(&mut rig).await, EdgeMode::Idle);
     }
 }
