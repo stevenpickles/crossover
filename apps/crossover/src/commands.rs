@@ -209,6 +209,50 @@ pub fn status(device_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A commented example config for `crossover config` to show when no file
+/// exists yet — the user can save it verbatim and edit.
+const EXAMPLE_CONFIG: &str = "\
+# Crossover startup configuration. Any `crossover run` flag can live here;
+# a flag on the command line always overrides the file.
+name = \"machine-b\"
+connect = \"192.168.1.151:27677\"
+side = \"right\"           # or \"left\"
+# listen = true           # accept inbound peers (a listener)
+# bind = \"0.0.0.0:27677\"  # only with listen = true
+# no_cursor_mask = false
+";
+
+/// `crossover config` — show where the startup config lives and its
+/// current settings, or an example when there is none (Phase 6).
+pub fn config_show() -> anyhow::Result<()> {
+    let Some(path) = crate::config::config_path() else {
+        println!("Startup config is unavailable here (%LOCALAPPDATA% is not set).");
+        return Ok(());
+    };
+    println!("Startup config file:");
+    println!("  {}", path.display());
+    println!();
+    if path.exists() {
+        // Parse it first so a typo or bad value is reported, not hidden.
+        crate::config::load_run_config()?;
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        println!("Current contents (parsed OK):");
+        println!();
+        for line in contents.lines() {
+            println!("  {line}");
+        }
+    } else {
+        println!("No config file yet — `crossover run` uses CLI flags until you create one.");
+        println!("Save this as the file above and edit to taste:");
+        println!();
+        for line in EXAMPLE_CONFIG.lines() {
+            println!("  {line}");
+        }
+    }
+    Ok(())
+}
+
 /// `crossover run [--listen [--bind <addr>]] [--connect <addr>]`
 ///
 /// Foreground session maintenance: accept trusted peers, keep an
