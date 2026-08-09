@@ -143,11 +143,16 @@ pub struct InputControlDriver {
     engine: ControlEngine,
     capture: Arc<dyn InputCapture>,
     injector: Arc<dyn InputInjector>,
-    /// Hides the local cursor while this machine drives the peer, so the
-    /// controller's frozen, edge-pinned cursor is not a second visible
-    /// pointer (ADR 0009). A [`NoopCursorMask`](crossover_platform::NoopCursorMask)
-    /// for runs that opt out.
+    /// Hides the local cursor whenever the user is not working on this
+    /// machine — while it drives the peer, or after the cursor edge-crossed
+    /// away from it — so there is only ever one visible cursor, on the
+    /// active machine (ADR 0009). A
+    /// [`NoopCursorMask`](crossover_platform::NoopCursorMask) for runs that
+    /// opt out.
     cursor_mask: Arc<dyn CursorMask>,
+    /// Whether the cursor is currently hidden, so the mask is toggled only
+    /// on a real change of the active machine.
+    cursor_hidden: bool,
     /// Seamless wiring, present exactly when the machine runs
     /// `--left`/`--right`. `None` makes placement and edge-mode emission
     /// no-ops (an explicit-only run).
@@ -190,6 +195,7 @@ pub fn input_control(
         capture,
         injector,
         cursor_mask,
+        cursor_hidden: false,
         seamless,
         // Idle until a session establishes: emitting the initial mode is
         // the driver's job on the first state change.
@@ -423,6 +429,11 @@ impl InputControlDriver {
                     ..
                 }
         );
+        // A return crosses the cursor *off* this machine: if it was being
+        // controlled and now is not, the user has left, so the cursor must
+        // hide here even though this machine reverts to plain local control.
+        let is_edge_return = matches!(event, ControlEvent::EdgeReturn { .. });
+        let was_controlled = self.engine.is_controlled();
         if loud {
             tracing::debug!(
                 event = ?event,
@@ -441,7 +452,38 @@ impl InputControlDriver {
                 "control transition: result"
             );
         }
+        self.update_cursor(was_controlled, is_edge_return);
         actions
+    }
+
+    /// Hide or show the local cursor to match where the user now is (ADR
+    /// 0009): hidden while this machine drives the peer, and hidden after
+    /// the cursor edge-crossed away from it (a return while it was
+    /// controlled); shown whenever the user is working here — being
+    /// controlled, or local for any reason other than the cursor leaving.
+    /// Toggled only on a real change, so the mask is not poked per event.
+    fn update_cursor(&mut self, was_controlled: bool, is_edge_return: bool) {
+        let hidden = if self.engine.is_controlling() {
+            true // driving the peer: the user is on the far machine
+        } else if self.engine.is_controlled() {
+            false // being driven: the user is here
+        } else {
+            // Local: the cursor is here unless it just left via a return.
+            was_controlled && is_edge_return
+        };
+        if hidden == self.cursor_hidden {
+            return;
+        }
+        self.cursor_hidden = hidden;
+        let result = if hidden {
+            self.cursor_mask.hide()
+        } else {
+            self.cursor_mask.show()
+        };
+        if let Err(error) = result {
+            // Masking is a display nicety; a failure never disturbs control.
+            tracing::warn!(error = %error, hidden, "cursor mask toggle failed");
+        }
     }
 
     /// Execute engine actions in order. Returns `false` when the
@@ -486,11 +528,9 @@ impl InputControlDriver {
                         // local (fail closed, NFR-3 diagnostic included).
                         tracing::error!(error = %error, "start_capture failed; failing closed");
                         deferred.extend(self.dispatch(ControlEvent::CaptureLost));
-                    } else if let Err(error) = self.cursor_mask.hide() {
-                        // Masking is a nicety; a failure to hide never
-                        // disturbs control (ADR 0009). Only capture started.
-                        tracing::warn!(error = %error, "hiding the local cursor failed");
                     }
+                    // Cursor visibility follows the control-state transition
+                    // (see `update_cursor`), not this action.
                 }
                 ControlAction::StopCapture => {
                     let capture = Arc::clone(&self.capture);
@@ -500,12 +540,8 @@ impl InputControlDriver {
                         // stop exactly when it must not matter.
                         tracing::warn!(error = %error, "stop_capture reported failure");
                     }
-                    // Restore the cursor on every exit from controlling —
-                    // StopCapture brackets them all — so it can never be
-                    // left hidden (the inverse of a stuck key, ADR 0009).
-                    if let Err(error) = self.cursor_mask.show() {
-                        tracing::warn!(error = %error, "restoring the local cursor failed");
-                    }
+                    // Cursor visibility follows the control-state transition
+                    // (see `update_cursor`), not this action.
                 }
                 ControlAction::Inject(events) => {
                     if let Err(error) = self.injector.inject(&events) {
@@ -851,6 +887,84 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(rig.cursor_mask.show_calls(), 1, "restored exactly once");
+    }
+
+    /// The controlled machine hides its cursor when the user's cursor
+    /// edge-crosses *away* from it (a return), and shows it again when the
+    /// user arrives back (a fresh grant) — so there is only ever one visible
+    /// cursor, on the active machine (ADR 0009).
+    #[tokio::test]
+    async fn a_return_hides_the_controlled_cursor_and_re_entry_shows_it() {
+        let mut rig = rig();
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+
+        // The peer takes control via an edge crossing: the user is now here,
+        // so the cursor stays visible.
+        let take = ControlRequest {
+            request_id: 1,
+            entry: Some(EdgeFraction::new(0.5).to_wire()),
+        };
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                take.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+        assert!(
+            !rig.cursor_mask.is_hidden(),
+            "being controlled keeps the cursor visible"
+        );
+
+        // The cursor returns across this machine's edge: the user has left,
+        // so the cursor must hide even though control reverts to local.
+        rig.events
+            .send(InputControlEvent::EdgeReturn {
+                position: EdgeFraction::new(0.5),
+            })
+            .await
+            .unwrap();
+        let _release = next_command(&mut rig).await;
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::PeerControlRevoked
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !rig.cursor_mask.is_hidden() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cursor was never hidden after the return"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The user comes back — a fresh grant — so the cursor shows again.
+        let re_enter = ControlRequest {
+            request_id: 2,
+            entry: Some(EdgeFraction::new(0.5).to_wire()),
+        };
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                re_enter.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while rig.cursor_mask.is_hidden() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cursor was never shown on re-entry"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
