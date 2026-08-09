@@ -45,6 +45,7 @@ use crossover_protocol::{
 use uuid::Uuid;
 
 use crate::input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce_input};
+use crate::topology::EdgeFraction;
 
 /// Tuning for the negotiation.
 #[derive(Debug, Clone)]
@@ -111,6 +112,24 @@ pub enum ControlEvent {
     /// hand back control they hold, cancel a pending request, or revoke
     /// a peer's grant over this machine (the escape hatch).
     UserRelease,
+    /// The cursor crossed the linked edge while this machine controls
+    /// itself: request control of `session`, carrying where the cursor
+    /// left so the peer can place its own cursor (ADR 0009). The
+    /// edge-driven twin of [`Self::UserRequestControl`].
+    EdgeLeave {
+        /// The session to request control of.
+        session: Uuid,
+        /// Where the cursor crossed, as a fraction of the edge.
+        position: EdgeFraction,
+    },
+    /// The cursor returned to the linked edge while a peer controls this
+    /// machine: reclaim control, carrying where the cursor left so the
+    /// controller's cursor reappears at the matching height (ADR 0009).
+    /// The edge-driven twin of [`Self::UserRelease`] in its revoke role.
+    EdgeReturn {
+        /// Where the cursor crossed, as a fraction of the edge.
+        position: EdgeFraction,
+    },
     /// A session reached `ESTABLISHED`.
     SessionEstablished {
         /// The session.
@@ -151,8 +170,9 @@ pub enum InboundControl {
     Request(ControlRequest),
     /// Peer answered our request.
     Response(ControlResponse),
-    /// Peer ended the control relationship.
-    Release,
+    /// Peer ended the control relationship, carrying an edge-return
+    /// position when the reclaim came from a crossing (ADR 0009).
+    Release(Option<u16>),
     /// Input to replay here.
     Batch(InputBatch),
     /// Release everything this machine believes it has applied.
@@ -176,8 +196,8 @@ impl InboundControl {
                 ControlResponse::decode_payload(payload)?,
             ))),
             Some(MessageType::ControlRelease) => {
-                ControlRelease::decode_payload(payload)?;
-                Ok(Some(Self::Release))
+                let release = ControlRelease::decode_payload(payload)?;
+                Ok(Some(Self::Release(release.entry)))
             }
             Some(MessageType::InputBatch) => {
                 Ok(Some(Self::Batch(InputBatch::decode_payload(payload)?)))
@@ -197,8 +217,10 @@ pub enum OutboundControl {
     Request(ControlRequest),
     /// Answer a request.
     Response(ControlResponse),
-    /// End the relationship.
-    Release,
+    /// End the relationship, carrying an edge-return position when the
+    /// reclaim came from a crossing (ADR 0009); `None` for an explicit
+    /// hand-back or console revoke.
+    Release(Option<u16>),
     /// A batch of captured input.
     Batch(InputBatch),
     /// Tell the peer to release everything it applied for us.
@@ -216,9 +238,9 @@ impl OutboundControl {
         match self {
             Self::Request(m) => Ok((MessageType::ControlRequest.wire(), m.encode_payload()?)),
             Self::Response(m) => Ok((MessageType::ControlResponse.wire(), m.encode_payload()?)),
-            Self::Release => Ok((
+            Self::Release(entry) => Ok((
                 MessageType::ControlRelease.wire(),
-                ControlRelease {}.encode_payload()?,
+                ControlRelease { entry: *entry }.encode_payload()?,
             )),
             Self::Batch(m) => Ok((MessageType::InputBatch.wire(), m.encode_payload()?)),
             Self::ReleaseAll(m) => Ok((MessageType::ReleaseAllInput.wire(), m.encode_payload()?)),
@@ -283,7 +305,10 @@ pub enum ControlNotice {
 
 /// What the engine asks the driver to do. Order within the returned
 /// `Vec` is the required execution order.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// Not `Eq`: [`ControlAction::PlaceCursor`] carries a floating-point
+/// fraction. Equality is still available for assertions via `PartialEq`.
+#[derive(Debug, PartialEq)]
 pub enum ControlAction {
     /// Send this message to a specific session.
     Send {
@@ -298,6 +323,11 @@ pub enum ControlAction {
     StopCapture,
     /// Inject these events into this machine, pointer and key interleaved.
     Inject(Vec<InputEvent>),
+    /// Place this machine's cursor at the given normalized position along
+    /// the linked (entry) edge, as control arrives or returns here — the
+    /// driver maps the fraction through the local display's geometry and
+    /// injects an absolute move (ADR 0009).
+    PlaceCursor(EdgeFraction),
     /// Arrange a [`ControlEvent::RequestTimeout`] after `delay`.
     ScheduleRequestTimeout {
         /// The session the request went to.
@@ -368,8 +398,12 @@ impl ControlEngine {
     /// order.
     pub fn handle(&mut self, event: ControlEvent) -> Vec<ControlAction> {
         match event {
-            ControlEvent::UserRequestControl { session } => self.on_user_request(session),
-            ControlEvent::UserRelease => self.on_user_release(),
+            ControlEvent::UserRequestControl { session } => self.on_request(session, None),
+            ControlEvent::EdgeLeave { session, position } => {
+                self.on_request(session, Some(position))
+            }
+            ControlEvent::UserRelease => self.on_release(None),
+            ControlEvent::EdgeReturn { position } => self.on_release(Some(position)),
             ControlEvent::SessionEstablished { session } => {
                 self.established.insert(session);
                 Vec::new()
@@ -385,7 +419,10 @@ impl ControlEngine {
         }
     }
 
-    fn on_user_request(&mut self, session: Uuid) -> Vec<ControlAction> {
+    /// Request control of `session`, whether triggered by the console
+    /// (`entry` is `None`) or by an edge crossing (`entry` carries where
+    /// the cursor left, for the peer to place its cursor).
+    fn on_request(&mut self, session: Uuid, entry: Option<EdgeFraction>) -> Vec<ControlAction> {
         let blocked = if !self.established.contains(&session) {
             Some(RequestBlocked::NoSession)
         } else if self.controlled.is_some() {
@@ -410,7 +447,10 @@ impl ControlEngine {
         vec![
             ControlAction::Send {
                 session,
-                message: OutboundControl::Request(ControlRequest { request_id }),
+                message: OutboundControl::Request(ControlRequest {
+                    request_id,
+                    entry: entry.map(EdgeFraction::to_wire),
+                }),
             },
             ControlAction::ScheduleRequestTimeout {
                 session,
@@ -421,14 +461,20 @@ impl ControlEngine {
         ]
     }
 
-    fn on_user_release(&mut self) -> Vec<ControlAction> {
+    /// End whichever control relationship exists. `entry` is `Some` only
+    /// for an edge-return revoke, carrying where the reclaiming cursor
+    /// left so the controller places its own cursor (ADR 0009); the
+    /// console paths (hand-back, cancel, plain revoke) pass `None`.
+    fn on_release(&mut self, entry: Option<EdgeFraction>) -> Vec<ControlAction> {
         // Ending outbound control takes precedence over revoking inbound:
         // the outbound relationship is the one the user just initiated,
         // and the two axes end independently across successive presses.
         match self.outbound {
             // Hand control back. StopCapture leads so no freshly captured
             // event can chase the release messages; ReleaseAllInput goes
-            // before ControlRelease so TCP delivers them in that order.
+            // before ControlRelease so TCP delivers them in that order. A
+            // hand-back never carries a position — the controller's cursor
+            // is frozen at the edge, so only the controlled side returns.
             Outbound::Remote { session } => {
                 let after_sequence = self.send_sequence;
                 self.outbound = Outbound::Local;
@@ -441,7 +487,7 @@ impl ControlEngine {
                     },
                     ControlAction::Send {
                         session,
-                        message: OutboundControl::Release,
+                        message: OutboundControl::Release(None),
                     },
                     ControlAction::Notify(ControlNotice::ControlEnded(
                         ControlEndReason::HandedBack,
@@ -457,7 +503,10 @@ impl ControlEngine {
                 ))]
             }
             Outbound::Local => {
-                // Revoke a peer's grant: the local user's escape hatch.
+                // Revoke a peer's grant: the local user's escape hatch,
+                // and the reverse-edge return. On a return, the position
+                // rides on the release so the controller's cursor reappears
+                // at the matching height (ADR 0009).
                 if let Some(controlled) = self.controlled.take() {
                     let mut controlled = controlled;
                     let releases = drain_releases(&mut controlled.applied_state);
@@ -467,7 +516,7 @@ impl ControlEngine {
                     }
                     actions.push(ControlAction::Send {
                         session: controlled.session,
-                        message: OutboundControl::Release,
+                        message: OutboundControl::Release(entry.map(EdgeFraction::to_wire)),
                     });
                     actions.push(ControlAction::Notify(ControlNotice::PeerControlRevoked));
                     actions
@@ -568,7 +617,7 @@ impl ControlEngine {
             },
             ControlAction::Send {
                 session,
-                message: OutboundControl::Release,
+                message: OutboundControl::Release(None),
             },
             ControlAction::Notify(ControlNotice::ControlEnded(ControlEndReason::CaptureLost)),
         ]
@@ -594,7 +643,7 @@ impl ControlEngine {
         match message {
             InboundControl::Request(request) => self.on_peer_request(session, request),
             InboundControl::Response(response) => self.on_peer_response(session, response),
-            InboundControl::Release => self.on_peer_release(session),
+            InboundControl::Release(entry) => self.on_peer_release(session, entry),
             InboundControl::Batch(batch) => self.on_peer_batch(session, &batch),
             InboundControl::ReleaseAll(_) => self.on_peer_release_all(session),
         }
@@ -626,16 +675,22 @@ impl ControlEngine {
                     applied_sequence: 0,
                     applied_state: InputState::new(),
                 });
-                vec![
-                    ControlAction::Send {
-                        session,
-                        message: OutboundControl::Response(ControlResponse {
-                            request_id: request.request_id,
-                            verdict: ControlVerdict::Granted,
-                        }),
-                    },
-                    ControlAction::Notify(ControlNotice::PeerTookControl),
-                ]
+                let mut actions = vec![ControlAction::Send {
+                    session,
+                    message: OutboundControl::Response(ControlResponse {
+                        request_id: request.request_id,
+                        verdict: ControlVerdict::Granted,
+                    }),
+                }];
+                // An edge-driven request carries where the peer's cursor
+                // left; place ours at the matching height on the entry
+                // edge so the pointer appears to cross seamlessly (ADR
+                // 0009). A console request carries none.
+                if let Some(raw) = request.entry {
+                    actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(raw)));
+                }
+                actions.push(ControlAction::Notify(ControlNotice::PeerTookControl));
+                actions
             }
         }
     }
@@ -648,7 +703,7 @@ impl ControlEngine {
             if verdict == ControlVerdict::Granted {
                 vec![ControlAction::Send {
                     session,
-                    message: OutboundControl::Release,
+                    message: OutboundControl::Release(None),
                 }]
             } else {
                 Vec::new()
@@ -684,7 +739,7 @@ impl ControlEngine {
         }
     }
 
-    fn on_peer_release(&mut self, session: Uuid) -> Vec<ControlAction> {
+    fn on_peer_release(&mut self, session: Uuid, entry: Option<u16>) -> Vec<ControlAction> {
         // Is `session` the peer controlling us handing back?
         if self
             .controlled
@@ -705,14 +760,21 @@ impl ControlEngine {
             return actions;
         }
         // Is `session` the peer we are controlling, revoking our grant
-        // (its user's escape hatch)? Stop capturing immediately.
+        // (its user's escape hatch, or the reverse-edge return)? Stop
+        // capturing immediately. A return carries where the cursor left
+        // the peer's edge, so ours reappears at the matching height on the
+        // way back (ADR 0009).
         if self.outbound == (Outbound::Remote { session }) {
             self.outbound = Outbound::Local;
             self.sent_state = InputState::new();
-            return vec![
-                ControlAction::StopCapture,
-                ControlAction::Notify(ControlNotice::ControlEnded(ControlEndReason::Revoked)),
-            ];
+            let mut actions = vec![ControlAction::StopCapture];
+            if let Some(raw) = entry {
+                actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(raw)));
+            }
+            actions.push(ControlAction::Notify(ControlNotice::ControlEnded(
+                ControlEndReason::Revoked,
+            )));
+            return actions;
         }
         // A release from an unrelated session: the cleanup path for a
         // grant we un-did, or a duplicate. Nothing to do.
@@ -872,6 +934,7 @@ mod tests {
         InboundControl, OutboundControl, RequestBlocked,
     };
     use crate::input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, hid};
+    use crate::topology::EdgeFraction;
 
     /// The session the single-session tests operate on.
     const SESSION: Uuid = Uuid::from_bytes([0xA1; 16]);
@@ -925,6 +988,7 @@ mod tests {
         let mut engine = established_engine();
         let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
             request_id: 1,
+            entry: None,
         })));
         assert!(granted(&actions));
         assert!(engine.is_controlled());
@@ -1041,7 +1105,7 @@ mod tests {
         })));
         assert_eq!(
             actions,
-            vec![send(OutboundControl::Release)],
+            vec![send(OutboundControl::Release(None))],
             "a grant nobody is waiting for must be explicitly released"
         );
         assert!(!engine.is_controlling());
@@ -1094,6 +1158,7 @@ mod tests {
         let _ = engine.handle(ControlEvent::UserRequestControl { session: SESSION });
         let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
             request_id: 9,
+            entry: None,
         })));
         assert_eq!(
             actions,
@@ -1110,6 +1175,7 @@ mod tests {
         let mut engine = controlled_engine();
         let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
             request_id: 2,
+            entry: None,
         })));
         assert_eq!(
             actions,
@@ -1231,7 +1297,7 @@ mod tests {
                 send(OutboundControl::ReleaseAll(ReleaseAllInput {
                     after_sequence: 1,
                 })),
-                send(OutboundControl::Release),
+                send(OutboundControl::Release(None)),
                 ControlAction::Notify(ControlNotice::ControlEnded(ControlEndReason::HandedBack)),
             ]
         );
@@ -1250,7 +1316,7 @@ mod tests {
                 after_sequence: 1,
             })))
         );
-        assert!(actions.contains(&send(OutboundControl::Release)));
+        assert!(actions.contains(&send(OutboundControl::Release(None))));
         assert!(!engine.is_controlling());
 
         // Not controlling: further loss reports are noise.
@@ -1273,7 +1339,7 @@ mod tests {
     #[test]
     fn revocation_by_the_controlled_machine_stops_capture() {
         let mut engine = controlling_engine();
-        let actions = engine.handle(peer(InboundControl::Release));
+        let actions = engine.handle(peer(InboundControl::Release(None)));
         assert_eq!(actions[0], ControlAction::StopCapture);
         assert!(!engine.is_controlling());
     }
@@ -1366,7 +1432,7 @@ mod tests {
         );
 
         // …and the following ControlRelease finds nothing left to do.
-        let actions = engine.handle(peer(InboundControl::Release));
+        let actions = engine.handle(peer(InboundControl::Release(None)));
         assert_eq!(
             actions,
             vec![ControlAction::Notify(ControlNotice::PeerReleasedControl)]
@@ -1415,7 +1481,7 @@ mod tests {
                     button: PointerButton::Middle,
                     pressed: false,
                 }]),
-                send(OutboundControl::Release),
+                send(OutboundControl::Release(None)),
                 ControlAction::Notify(ControlNotice::PeerControlRevoked),
             ]
         );
@@ -1534,7 +1600,7 @@ mod tests {
             actions,
             vec![ControlAction::Send {
                 session: OTHER,
-                message: OutboundControl::Release,
+                message: OutboundControl::Release(None),
             }],
             "a grant from the wrong session must be undone against it"
         );
@@ -1560,6 +1626,101 @@ mod tests {
         })));
         assert!(matches!(&actions[0], ControlAction::Terminate { .. }));
         assert!(engine.is_controlling(), "our own control is unaffected");
+    }
+
+    // ---- seamless edge transfer (ADR 0009) ----
+
+    fn placed_cursor(actions: &[ControlAction]) -> Option<f64> {
+        actions.iter().find_map(|a| match a {
+            ControlAction::PlaceCursor(f) => Some(f.value()),
+            _ => None,
+        })
+    }
+
+    fn sent_request(actions: &[ControlAction]) -> ControlRequest {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                ControlAction::Send {
+                    message: OutboundControl::Request(r),
+                    ..
+                } => Some(*r),
+                _ => None,
+            })
+            .expect("no request sent")
+    }
+
+    #[test]
+    fn an_edge_leave_requests_control_carrying_the_crossing_position() {
+        let mut engine = established_engine();
+        let position = EdgeFraction::new(0.5);
+        let actions = engine.handle(ControlEvent::EdgeLeave {
+            session: SESSION,
+            position,
+        });
+        assert_eq!(sent_request(&actions).entry, Some(position.to_wire()));
+        // A console request carries no position, but is otherwise identical.
+        let mut engine = established_engine();
+        let actions = engine.handle(ControlEvent::UserRequestControl { session: SESSION });
+        assert_eq!(sent_request(&actions).entry, None);
+    }
+
+    #[test]
+    fn granting_an_edge_request_places_the_cursor_at_the_entry_fraction() {
+        let mut engine = established_engine();
+        let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
+            request_id: 1,
+            entry: Some(EdgeFraction::new(0.25).to_wire()),
+        })));
+        assert!(granted(&actions));
+        let placed = placed_cursor(&actions).expect("no cursor placed on an edge grant");
+        assert!((placed - 0.25).abs() < 1e-4, "placed at {placed}");
+        assert!(engine.is_controlled());
+
+        // A console grant places nothing.
+        let mut engine = established_engine();
+        let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
+            request_id: 1,
+            entry: None,
+        })));
+        assert!(granted(&actions));
+        assert!(placed_cursor(&actions).is_none());
+    }
+
+    #[test]
+    fn an_edge_return_revokes_with_the_position_and_the_controller_places_its_cursor() {
+        // Controlled side: reaching the linked edge returns control,
+        // carrying where the cursor left on the release.
+        let mut engine = controlled_engine();
+        let position = EdgeFraction::new(0.75);
+        let actions = engine.handle(ControlEvent::EdgeReturn { position });
+        let release_entry = actions
+            .iter()
+            .find_map(|a| match a {
+                ControlAction::Send {
+                    message: OutboundControl::Release(entry),
+                    ..
+                } => Some(*entry),
+                _ => None,
+            })
+            .expect("no release sent on return");
+        assert_eq!(release_entry, Some(position.to_wire()));
+        assert!(!engine.is_controlled());
+
+        // Controller side: receiving that release stops capture and places
+        // its own cursor at the matching height (ADR 0009).
+        let mut controller = controlling_engine();
+        let actions = controller.handle(peer(InboundControl::Release(Some(position.to_wire()))));
+        assert!(actions.contains(&ControlAction::StopCapture));
+        let placed = placed_cursor(&actions).expect("controller did not place its cursor");
+        assert!((placed - 0.75).abs() < 1e-4, "placed at {placed}");
+        assert!(!controller.is_controlling());
+
+        // A console revoke/hand-back carries no position, so no placement.
+        let mut controller = controlling_engine();
+        let actions = controller.handle(peer(InboundControl::Release(None)));
+        assert!(actions.contains(&ControlAction::StopCapture));
+        assert!(placed_cursor(&actions).is_none());
     }
 
     // ---- fault injection: the Phase 3 exit criterion ----
@@ -1607,7 +1768,10 @@ mod tests {
             }),
             (session.clone(), 1u64..4).prop_map(|(s, id)| ControlEvent::Peer {
                 session: s,
-                message: InboundControl::Request(ControlRequest { request_id: id }),
+                message: InboundControl::Request(ControlRequest {
+                    request_id: id,
+                    entry: None
+                }),
             }),
             (session.clone(), 1u64..4, any::<bool>()).prop_map(|(s, id, granted)| {
                 ControlEvent::Peer {
@@ -1624,7 +1788,7 @@ mod tests {
             }),
             session.clone().prop_map(|s| ControlEvent::Peer {
                 session: s,
-                message: InboundControl::Release
+                message: InboundControl::Release(None)
             }),
             (session.clone(), 1u64..1000, 0usize..5, any::<bool>()).prop_map(
                 |(s, sequence, button, pressed)| ControlEvent::Peer {

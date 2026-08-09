@@ -622,10 +622,10 @@ mod tests {
         let mut server_session = inbound.unwrap();
         let mut client_session = outbound.unwrap();
 
-        // Both sides agree on version 1 and name the peer they
+        // Both sides agree on the current version and name the peer they
         // authenticated by fingerprint and Hello metadata.
-        assert_eq!(client_session.info().protocol_version, 1);
-        assert_eq!(server_session.info().protocol_version, 1);
+        assert_eq!(client_session.info().protocol_version, 2);
+        assert_eq!(server_session.info().protocol_version, 2);
         assert_eq!(
             client_session.info().peer_fingerprint,
             b.certified.fingerprint()

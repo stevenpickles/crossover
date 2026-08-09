@@ -7,10 +7,15 @@
 use crate::ProtocolError;
 
 /// The highest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// v2 (Phase 5): the control-transfer messages carry a normalized edge
+/// crossing position (ADR 0009), an incompatible layout change from v1.
+pub const PROTOCOL_VERSION: u16 = 2;
 
-/// The lowest protocol version this build accepts.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 1;
+/// The lowest protocol version this build accepts. v1's control messages
+/// cannot be decoded by v2 (added fields), and there are no deployed v1
+/// peers, so v2 is the floor rather than a compatibility burden.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 2;
 
 /// An inclusive range of supported protocol versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
