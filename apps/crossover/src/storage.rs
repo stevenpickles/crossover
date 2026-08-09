@@ -53,6 +53,36 @@ pub fn open_clipboard_provider()
     }
 }
 
+/// Open the platform display-info provider (primary-display geometry and
+/// cursor position, ADR 0009).
+///
+/// # Errors
+///
+/// Always, on non-Windows platforms: display enumeration is Windows-first
+/// (macOS/Linux arrive in later phases — docs/ROADMAP.md).
+#[cfg(windows)]
+// The Windows provider is infallible to construct; the `Result` matches
+// the fallible non-Windows signature and the other `open_*` openers.
+#[allow(clippy::unnecessary_wraps)]
+pub fn open_display() -> anyhow::Result<std::sync::Arc<dyn crossover_platform::DisplayInfo>> {
+    Ok(std::sync::Arc::new(
+        crossover_platform_windows::WindowsDisplayInfo::new(),
+    ))
+}
+
+/// Open the platform display-info provider.
+///
+/// # Errors
+///
+/// Always, on non-Windows platforms (macOS/Linux arrive in later phases).
+#[cfg(not(windows))]
+pub fn open_display() -> anyhow::Result<std::sync::Arc<dyn crossover_platform::DisplayInfo>> {
+    anyhow::bail!(
+        "display enumeration is not implemented for this platform yet \
+         (Windows first; macOS/Linux arrive in later phases — docs/ROADMAP.md)"
+    )
+}
+
 /// Open the platform pointer-input capture and injector.
 ///
 /// Returned together because control transfer needs both, and both are

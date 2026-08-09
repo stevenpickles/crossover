@@ -17,10 +17,12 @@ use crossover_core::supervision::{
     KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
 };
 use crossover_core::{
-    ClipboardConfig, ControlConfig, ControlNotice, FrameTarget, InputControlEvent, LocalNode,
-    Metrics, SessionCommand, SessionListener, SessionOptions, SyncEvent, clipboard_sync,
+    ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
+    FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics, SeamlessInputs, SessionCommand,
+    SessionListener, SessionOptions, SyncEvent, Topology, clipboard_sync, edge_detect,
     input_control,
 };
+use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
 use crossover_protocol::DEFAULT_PORT;
 use crossover_protocol::hello::MessageType;
@@ -31,12 +33,17 @@ use crossover_security::{
 };
 
 use crate::console::{self, ConsoleCommand};
-use crate::storage::{open_clipboard_provider, open_input, open_secure_storage};
+use crate::storage::{open_clipboard_provider, open_display, open_input, open_secure_storage};
 
 /// One ceremony's allowance, listener and connector alike. Generous
 /// enough to read a code off one screen and type it on another; bounded
 /// because everything is (NFR-1).
 const PAIRING_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// How often the edge detector samples the cursor while watching an edge
+/// (ADR 0009). ~125 Hz: snappy enough that a crossing feels instant, and
+/// the cursor pins at the edge so nothing is missed between polls.
+const EDGE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 /// `crossover pair --listen [--bind <addr>]`
 pub async fn pair_listen(device_name: &str, bind: Option<String>) -> anyhow::Result<()> {
@@ -206,11 +213,14 @@ pub fn status(device_name: &str) -> anyhow::Result<()> {
 /// outbound session alive with reconnect, and run the clipboard and
 /// input-control engines over whichever session is live. Console
 /// commands (`c` take control, `r` release) drive explicit control
-/// transfer (Phase 3, FR-5.1); Ctrl-C or `q` stops.
+/// transfer (Phase 3, FR-5.1); with `--left`/`--right`, crossing the
+/// linked screen edge transfers control automatically (Phase 5, ADR
+/// 0009). Ctrl-C or `q` stops.
 pub async fn run(
     device_name: &str,
     listen_bind: Option<String>,
     connect: Option<String>,
+    side: Option<LinkSide>,
 ) -> anyhow::Result<()> {
     let storage: Arc<dyn SecureStorage> = Arc::from(open_secure_storage()?);
     let (identity, generated) = DeviceIdentity::load_or_generate(&*storage, device_name)
@@ -257,9 +267,26 @@ pub async fn run(
     // the control-transfer engine. Capture installs no hook until the
     // first grant.
     let (capture, injector) = open_input()?;
+    let display = open_display()?;
+
+    // Log the primary display and the configured seamless edge at startup
+    // (ADR 0009), so a soak report shows the geometry each side used.
+    log_display_and_edge(&*display, side);
+
+    // Seamless mode (--left/--right): a topology and an edge detector, plus
+    // the mode channel that keeps the detector in step with control state.
+    // Built before input_control so its mode sender can ride in.
+    let (seamless, edge_wiring) = build_seamless(side, &display);
+
     let (control_driver, control_events, control_commands, control_notices) =
-        input_control(capture, injector, ControlConfig::default());
+        input_control(capture, injector, seamless, ControlConfig::default());
     tokio::spawn(control_driver.run());
+
+    // With the control driver up, run the edge detector and forward its
+    // crossings in as leave/return events.
+    if let Some((edge_driver, crossings)) = edge_wiring {
+        spawn_edge_wiring(edge_driver, crossings, control_events.clone());
+    }
     tokio::spawn(print_control_notices(control_notices, Arc::clone(&metrics)));
 
     // Session lifecycle and frames fan out to both drivers.
@@ -462,6 +489,92 @@ fn merge_command_streams(
         }
     });
     merged_rx
+}
+
+/// Build the seamless wiring for a `--left`/`--right` run (ADR 0009): the
+/// [`SeamlessInputs`] the control driver takes, and the edge detector plus
+/// its crossing stream to spawn once the control driver is up. `(None,
+/// None)` for an explicit-only run.
+type EdgeWiring = (EdgeDetectDriver, mpsc::Receiver<EdgeCrossing>);
+fn build_seamless(
+    side: Option<LinkSide>,
+    display: &Arc<dyn DisplayInfo>,
+) -> (Option<SeamlessInputs>, Option<EdgeWiring>) {
+    let Some(side) = side else {
+        return (None, None);
+    };
+    let topology = Topology::new(side);
+    let (edge_driver, edge_mode, crossings_rx) =
+        edge_detect(Arc::clone(display), topology, EDGE_POLL_INTERVAL);
+    let seamless = SeamlessInputs {
+        topology,
+        display: Arc::clone(display),
+        edge_mode,
+    };
+    (Some(seamless), Some((edge_driver, crossings_rx)))
+}
+
+/// Run the edge detector and forward its crossings into the control driver
+/// as leave/return events (ADR 0009).
+fn spawn_edge_wiring(
+    edge_driver: EdgeDetectDriver,
+    mut crossings: mpsc::Receiver<EdgeCrossing>,
+    control_events: mpsc::Sender<InputControlEvent>,
+) {
+    tokio::spawn(edge_driver.run());
+    tokio::spawn(async move {
+        while let Some(crossing) = crossings.recv().await {
+            let event = match crossing.kind {
+                CrossingKind::Leave => InputControlEvent::EdgeLeave {
+                    position: crossing.position,
+                },
+                CrossingKind::Return => InputControlEvent::EdgeReturn {
+                    position: crossing.position,
+                },
+            };
+            if control_events.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Log the primary display's geometry and the configured seamless edge at
+/// startup (ADR 0009) — both structured (FR-7.3) and as a human line, so a
+/// soak report records the geometry each machine ran with.
+fn log_display_and_edge(display: &dyn DisplayInfo, side: Option<LinkSide>) {
+    let screen = match display.primary_screen() {
+        Ok(screen) => screen,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not read the primary display at startup");
+            println!("Primary display: unavailable ({error}).");
+            return;
+        }
+    };
+    if let Some(side) = side {
+        let edge = Topology::new(side).linked_edge();
+        tracing::info!(
+            width = screen.width,
+            height = screen.height,
+            ?side,
+            linked_edge = ?edge,
+            "primary display and seamless edge"
+        );
+        println!(
+            "Primary display: {}x{}. Seamless: {side:?} screen, crossing on its {edge:?} edge.",
+            screen.width, screen.height,
+        );
+    } else {
+        tracing::info!(
+            width = screen.width,
+            height = screen.height,
+            "primary display; seamless transfer disabled"
+        );
+        println!(
+            "Primary display: {}x{}. Seamless edge transfer off (pass --left or --right).",
+            screen.width, screen.height,
+        );
+    }
 }
 
 /// Print control-transfer state changes as they happen. Every failed or

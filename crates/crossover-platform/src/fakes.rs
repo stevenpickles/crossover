@@ -309,6 +309,7 @@ impl InputCapture for FakeInputCapture {
 #[derive(Default)]
 pub struct FakeInputInjector {
     injected: Mutex<Vec<InputEvent>>,
+    placements: Mutex<Vec<CursorPoint>>,
     fail_next: Mutex<Option<String>>,
 }
 
@@ -338,9 +339,16 @@ impl FakeInputInjector {
             .collect()
     }
 
+    /// The absolute cursor placements requested so far, in order.
+    #[must_use]
+    pub fn placements(&self) -> Vec<CursorPoint> {
+        lock(&self.placements).clone()
+    }
+
     /// Forget the record.
     pub fn clear(&self) {
         lock(&self.injected).clear();
+        lock(&self.placements).clear();
     }
 
     /// Make the next `inject` fail.
@@ -355,6 +363,11 @@ impl InputInjector for FakeInputInjector {
             return Err(InputError::InjectionFailed { reason });
         }
         lock(&self.injected).extend_from_slice(events);
+        Ok(())
+    }
+
+    fn place_cursor(&self, position: CursorPoint) -> Result<(), InputError> {
+        lock(&self.placements).push(position);
         Ok(())
     }
 }

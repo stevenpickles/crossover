@@ -279,4 +279,16 @@ pub trait InputInjector: Send + Sync {
     /// events. Success does **not** guarantee the destination window
     /// received them (UIPI, R-1).
     fn inject(&self, events: &[InputEvent]) -> Result<(), InputError>;
+
+    /// Place the pointer at an absolute `position` on the primary display
+    /// (top-left origin, the same pixel space [`DisplayInfo`] reports).
+    /// Seamless transfer uses this to make the cursor *appear* at the edge
+    /// it crossed (ADR 0009), which a relative delta cannot express. Only
+    /// meaningful while this machine is not capturing, which is exactly
+    /// when control arrives or returns.
+    ///
+    /// # Errors
+    ///
+    /// [`InputError::InjectionFailed`] if the platform refuses the move.
+    fn place_cursor(&self, position: crate::display::CursorPoint) -> Result<(), InputError>;
 }
