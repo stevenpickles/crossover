@@ -19,6 +19,12 @@ crossover-platform = { workspace = true }
 tracing = { workspace = true }
 windows = { workspace = true }
 
+# tracing-subscriber only for the manual key-capture probe, which prints
+# the per-key diagnostic (scan code, extended/injected flags, HID) to
+# stderr; the library itself installs no subscriber.
+[target.'cfg(windows)'.dev-dependencies]
+tracing-subscriber = { workspace = true }
+
 # The workspace forbids unsafe_code (NFR-6). This crate is the designated
 # exception: Win32 FFI requires `unsafe`. The relaxation is local and
 # deliberate — unsafe stays minimized, isolated here, documented with

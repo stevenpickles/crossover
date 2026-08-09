@@ -324,6 +324,7 @@ version = "0.1.0"
 dependencies = [
  "crossover-platform",
  "tracing",
+ "tracing-subscriber",
  "windows",
 ]
 
