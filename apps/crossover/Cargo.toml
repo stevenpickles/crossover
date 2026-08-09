@@ -12,6 +12,11 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 crossover-core = { workspace = true }
 crossover-platform = { workspace = true }
+# Depended on for all targets: off Windows it compiles as an empty shell
+# with no-op stubs (and pulls in no `windows` crate — that is Windows-gated
+# inside it), so the composition root can call platform hooks such as
+# `set_process_dpi_awareness` / `restore_system_cursors` unconditionally.
+crossover-platform-windows = { workspace = true }
 crossover-protocol = { workspace = true }
 crossover-security = { workspace = true }
 serde = { workspace = true }
@@ -20,10 +25,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-
-# Windows-only so non-Windows CI builds the app without the platform crate.
-[target.'cfg(windows)'.dependencies]
-crossover-platform-windows = { workspace = true }
 
 [lints]
 workspace = true
