@@ -1510,4 +1510,209 @@ mod tests {
         eprintln!("if the cursor moved or a keystroke landed while \"dead\", suppression failed.");
         assert!(healthy, "capture reported unhealthy during the probe");
     }
+
+    /// Injection-side probe for the Shift+navigation selection loss. Runs
+    /// unattended (no keys to press): while capture is installed, it
+    /// injects Shift+Home, Shift+End, Shift+Left, Shift+Right through the
+    /// real injector. Our own injections carry the tag and the hook passes
+    /// them through *unrecorded*, so anything the sink sees is generated
+    /// by Windows itself — the phantom Shift the OS synthesizes around a
+    /// navigation key under Shift+NumLock. If Home/End produce untagged
+    /// Shift events and the arrows do not, the divergence is on the
+    /// controlled machine's injection processing, not in our pipeline.
+    ///
+    /// ```text
+    /// cargo test -p crossover-platform-windows manual_probe_inject_shift_nav -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual probe: injects Shift+navigation to observe OS phantom shifts (docs/SOAK.md)"]
+    fn manual_probe_inject_shift_nav() {
+        use crossover_platform::InputInjector;
+
+        use crate::input::WindowsInputInjector;
+
+        // HID usage for Left Shift.
+        const LEFT_SHIFT: u16 = 0xE1;
+
+        let _serial = capture_lock();
+        let capture = WindowsInputCapture::new().unwrap();
+        let (sink, seen) = collecting_sink();
+        capture.start_capture(sink).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        let injector = WindowsInputInjector::new();
+        for (label, nav) in [
+            ("Home", 0x4Au16),
+            ("End", 0x4Du16),
+            ("Left", 0x50u16),
+            ("Right", 0x4Fu16),
+        ] {
+            eprintln!("injecting Shift+{label} (hid {nav:#04x})");
+            for event in [
+                KeyEvent::press(LEFT_SHIFT),
+                KeyEvent::press(nav),
+                KeyEvent::release(nav),
+                KeyEvent::release(LEFT_SHIFT),
+            ] {
+                injector.inject(&[InputEvent::Key(event)]).unwrap();
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        capture.stop_capture().unwrap();
+
+        let events = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        eprintln!();
+        eprintln!("OS-generated (untagged) key events observed during injection:");
+        let mut any = false;
+        for event in events.iter() {
+            if let InputEvent::Key(key) = event {
+                any = true;
+                eprintln!(
+                    "  hid={:#04x} {}",
+                    key.key,
+                    if key.pressed { "down" } else { "up" }
+                );
+            }
+        }
+        if !any {
+            eprintln!("  (none — Windows generated no phantom shifts for injected nav keys)");
+        }
+    }
+
+    /// The functional truth: inject Shift+Home and Shift+Left as the real
+    /// path does (one batch, exactly what `on_peer_batch` builds) into a
+    /// real EDIT control, and read back whether a selection resulted.
+    /// Determines, on one machine and unattended, whether our injection
+    /// actually drives a shifted navigation selection.
+    ///
+    /// ```text
+    /// cargo test -p crossover-platform-windows manual_probe_shift_nav_selects -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual probe: flashes a focused EDIT window and injects Shift+navigation"]
+    fn manual_probe_shift_nav_selects() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, MSG,
+            PM_REMOVE, PeekMessageW, SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW,
+            ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WS_POPUP, WS_VISIBLE,
+        };
+        use windows::core::w;
+
+        use crossover_platform::InputInjector;
+
+        use crate::input::WindowsInputInjector;
+
+        // EDIT control messages (the `Controls` crate feature is not
+        // enabled; these are stable numeric message ids). HID for Shift.
+        const EM_GETSEL: u32 = 0x00B0;
+        const EM_SETSEL: u32 = 0x00B1;
+        const LEFT_SHIFT: u16 = 0xE1;
+
+        let _serial = capture_lock();
+
+        let style =
+            WINDOW_STYLE(WS_VISIBLE.0 | WS_POPUP.0 | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32);
+        // SAFETY: standard top-level window creation from the prebuilt
+        // EDIT class; all handle/menu arguments are null.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                w!("crossover-select-probe"),
+                style,
+                200,
+                200,
+                420,
+                160,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("create EDIT window");
+
+        let pump = || {
+            let mut msg = MSG::default();
+            // SAFETY: draining this thread's own message queue.
+            unsafe {
+                while PeekMessageW(&raw mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&raw const msg);
+                    DispatchMessageW(&raw const msg);
+                }
+            }
+        };
+
+        // SAFETY: setting text, showing, and focusing a window this thread
+        // owns; the string is a static wide literal.
+        unsafe {
+            let _ = SetWindowTextW(hwnd, w!("hello world"));
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(Some(hwnd));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        pump();
+
+        let injector = WindowsInputInjector::new();
+        let mut outcomes = Vec::new();
+        for (label, nav) in [("Home", 0x4Au16), ("Left", 0x50u16)] {
+            // Caret to the end of "hello world" (11), no selection.
+            // SAFETY: EM_SETSEL on our own edit control.
+            unsafe { SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(11)), Some(LPARAM(11))) };
+            pump();
+            // Inject each transition as its own SendInput, the way separate
+            // network batches arrive — and repeat the held Shift, as the
+            // OS auto-repeat does while it is down (the real captured
+            // stream shows a dozen Shift-downs before the nav key).
+            let sequence = [
+                KeyEvent::press(LEFT_SHIFT),
+                KeyEvent::press(LEFT_SHIFT),
+                KeyEvent::press(LEFT_SHIFT),
+                KeyEvent::press(nav),
+                KeyEvent::release(nav),
+                KeyEvent::release(LEFT_SHIFT),
+            ];
+            for event in sequence {
+                injector.inject(&[InputEvent::Key(event)]).unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+                pump();
+            }
+            std::thread::sleep(Duration::from_millis(120));
+            pump();
+            // SAFETY: EM_GETSEL with null pointers returns the range packed
+            // into the LRESULT (start in the low word, end in the high).
+            let sel = unsafe { SendMessageW(hwnd, EM_GETSEL, None, None) };
+            // Low 32 bits pack start (low word) and end (high word); the
+            // mask keeps the value non-negative so the narrowing is exact.
+            let packed = u32::try_from(sel.0 & 0xFFFF_FFFF).unwrap_or(0);
+            let (start, end) = (packed & 0xFFFF, packed >> 16);
+            let selected = start != end;
+            eprintln!("Shift+{label}: sel start={start} end={end} -> {selected}");
+            outcomes.push((label, selected));
+        }
+
+        // SAFETY: destroying the window this thread created.
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+
+        eprintln!();
+        for (label, selected) in &outcomes {
+            eprintln!(
+                "  Shift+{label}: {}",
+                if *selected {
+                    "SELECTS"
+                } else {
+                    "does NOT select"
+                }
+            );
+        }
+    }
 }
