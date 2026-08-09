@@ -199,15 +199,29 @@ the per-monitor rectangle decides *where along it* the crossing lands, so
 mismatched-resolution pairs map exactly. The wire fraction and every
 decision above are unchanged.
 
-### Hiding the controller's idle cursor
+### One visible cursor, on the active machine
 
-While a machine drives the peer its own cursor is frozen, pinned at the
-linked edge — a second, motionless pointer with nothing to do. A new
-`CursorMask` trait hides it on the machine that is controlling and restores
-it the instant control ends; the driver brackets this on the same
-`StartCapture`/`StopCapture` the engine already emits, so the cursor is
-hidden exactly while capturing and can never be left hidden (the mirror of
-the stuck-key invariant).
+There must be exactly **one** visible cursor — on the machine the user is
+working on — never two, and never none. A new `CursorMask` trait hides the
+local cursor whenever the user is *not* here and shows it when they are. The
+driver derives that from the control-state transition, not a single action,
+because "the user is here" is broader than "I am controlling":
+
+- **Driving the peer** (`is_controlling`): the user is on the far machine →
+  hide here.
+- **Being driven** (`is_controlled`): the user is here → show.
+- **Local, but the cursor just returned across this machine's edge** (it was
+  controlled and a return revoked that grant): the user has *left* → hide,
+  even though control reverted to plain local. This is the case the first
+  cut missed — it hid only the controller, so after a return the just-
+  controlled machine kept a second cursor visible at its edge.
+- **Local otherwise** (returned from controlling, disconnect, startup): the
+  user is here → show.
+
+The mask is toggled only on a real change, and a failure to hide or show is
+logged, never a reason to disturb control. The cursor can never be left
+hidden — any exit from control that is not a deliberate cross-away shows it
+(the mirror of the stuck-key invariant).
 
 The Windows implementation blanks the **system cursors** (`SetSystemCursor`
 with a transparent cursor for each standard type), restoring the defaults
