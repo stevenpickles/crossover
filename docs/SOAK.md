@@ -444,16 +444,20 @@ crossover --name machine-a run --listen --left  > soak-a.log 2>&1
 crossover --name machine-b run --connect <A-address>:27677 --right > soak-b.log 2>&1
 ```
 
-Each side prints its geometry and edge at startup — check it:
+Each side prints its whole-desktop geometry and edge at startup — check it:
 
 ```
-Primary display: 1920x1080. Seamless: Left screen, crossing on its Right edge.
-Primary display: 2560x1440. Seamless: Right screen, crossing on its Left edge.
+Desktop: 7680x2400 (all monitors). Seamless: Left screen, crossing on its Right edge.
+Desktop: 3840x2160 (all monitors). Seamless: Right screen, crossing on its Left edge.
 ```
 
 The left machine's **right** edge links to the right machine's **left**
 edge. Differing resolutions are fine — the crossing position travels as a
-fraction, mapped through each machine's own geometry.
+fraction of the *edge monitor*, mapped through each machine's own geometry,
+so mismatched resolutions and DPI land the cursor at the matching height.
+
+If a soak ever needs to separate cursor behavior from control transfer, add
+`--no-cursor-mask` to either side to run with the cursor never hidden.
 
 ### The procedure
 
@@ -468,18 +472,26 @@ fraction, mapped through each machine's own geometry.
 3. **Cross back.** Drive B's cursor (with A's mouse) into B's **left**
    edge. Control returns on its own: B reclaims, A's pointer comes back to
    life at A's right edge at the matching height, and A is local again.
-4. **Repeat, many times.** Move A → B → A through the edges a few dozen
+4. **One cursor, on the active machine.** Throughout, exactly one cursor
+   should be visible — on whichever machine you are driving. Crossing A → B
+   hides A's cursor and shows B's; returning shows A's and hides B's. Never
+   two cursors, and never (for long) none.
+5. **The cursor fail-safe.** If a cursor ever goes missing, just move the
+   mouse or press a key on the machine you are sitting at — its cursor
+   reappears within a moment. This is the safety net (ADR 0009): local
+   input on a machine that is not driving the peer means the user is there.
+6. **Repeat, many times.** Move A → B → A through the edges a few dozen
    times, using only the mouse — never the console. Every cycle should
    transfer cleanly, place the cursor sensibly, and leave **no stuck key
    or button** on either machine.
-5. **Clipboard rides along.** At points during the cycling, copy on one
+7. **Clipboard rides along.** At points during the cycling, copy on one
    machine and paste on the other (both directions). Clipboard sync must
    keep working throughout the control transfers — the two subsystems are
    independent (FR-5.4).
-6. **The overrides still work.** The console `c` / `r` and the
+8. **The overrides still work.** The console `c` / `r` and the
    both-Control escape remain: while controlling, the escape hands back
    instantly; `c` / `r` force a transfer or reclaim regardless of edges.
-7. **The fault that matters — converge under loss.** Induce packet delay
+9. **The fault that matters — converge under loss.** Induce packet delay
    or loss *during* a crossing — a tool like `clumsy`, or disabling B's
    adapter for a couple of seconds mid-transfer. Confirm the system always
    converges to **exactly one owner**: never both machines controlling,
@@ -496,6 +508,10 @@ fraction, mapped through each machine's own geometry.
 - After every A → B → A cycle, **both machines hold no key and no
   button**, and both pointers are alive; the escape and console overrides
   still work.
+- **Exactly one cursor is visible** at a time — on the machine you are
+  driving. A stray missing cursor is rescued by touching that machine's
+  mouse or keyboard, and quitting (`q` / Ctrl-C) or losing the connection
+  always restores the cursor.
 - Copied content matches across the machines throughout the cycling.
 - Under induced delay or loss, exactly one machine ends up in control — or
   both end local after a disconnect. Never a split brain, never a dead
@@ -510,19 +526,32 @@ fraction, mapped through each machine's own geometry.
   at once — there is no dwell or push-through this phase. A cursor parked
   against that edge will cross; if accidental crossings prove annoying in
   the soak, that is the trade recorded in ADR 0009 to revisit, not a bug.
-- **Whole virtual desktop.** A machine with several monitors treats them
-  as one desktop: the crossing edge is the *outer* edge of the whole
-  desktop, not a seam between monitors, and the vertical position maps
-  across the full desktop height. So on a machine whose monitors differ in
-  height, a crossing that originates from the shorter monitor can only
-  reach the fraction of the edge that monitor covers — a quirk, not a bug.
+- **Multi-monitor edge.** A machine with several monitors treats them as
+  one desktop, so the crossing edge is the *outer* edge of the whole
+  desktop, not a seam between monitors. The crossing fraction maps against
+  the specific monitor on that edge (the outermost one), so mismatched-
+  resolution monitors and the dead space between them place the cursor
+  correctly — a crossing from a 2160-tall monitor lands at the matching
+  height on a 2160-tall one, not shifted by a taller neighbour.
 - **DPI.** The process is per-monitor DPI aware, so geometry and cursor
   coordinates are real pixels across mixed-DPI monitors (the startup line
   shows the true resolution, e.g. a 3840×2400 panel as 3840×2400, not its
   scaled size). The crossing itself maps by fraction, so differing
   resolutions transfer regardless.
+- **Cursor visibility is a display nicety, with a fail-safe.** Only one
+  cursor is shown — on the active machine — by blanking the system cursor
+  on the machine you are not on (`SetSystemCursor`). It is applied off the
+  control loop and restored on quit, on lost connection, and on the next
+  launch; and, whatever happens, local input on a machine that is not
+  driving the peer shows its cursor again. **Known latent item:** a brief
+  cross-machine state disagreement during a crossing can momentarily leave
+  a machine "controlling" with no visible cursor; the local-input fail-safe
+  recovers it within a health tick (~200 ms), so it is a tidy-up to revisit,
+  not a blocker. `--no-cursor-mask` turns masking off entirely.
 - The Phase 4 keyboard caveat still applies: a native editor with its own
   Home/End handling may treat forwarded shifted-navigation its own way.
+  (The separate Right-Shift-drops-symbols defect the seamless soak found —
+  Right Shift arriving E0-extended — is fixed, not a limitation.)
 
 Record the outcome in the Phase 5 exit-criteria notes (docs/ROADMAP.md):
 how many A → B → A cycles, whether control ever split or stuck, how

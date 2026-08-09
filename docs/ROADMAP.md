@@ -1,7 +1,31 @@
 # Crossover Roadmap
 
-> **Current phase: 5 — Seamless Crossover** (not yet started; ADR 0008
-> settled the keyboard representation that Phase 4 built on.)
+> **Current phase: 6 — Windows Prototype Hardening** (not yet started.)
+>
+> Phase 5 (Seamless Crossover) closed 2026-08-09: the two-machine seamless
+> soak ran on real hardware — a two-monitor, mixed-DPI machine paired with a
+> single-monitor one. The cursor crosses a screen edge and control *and*
+> keyboard follow on their own, control returns at the reverse edge with no
+> console command, the clipboard stays synced throughout, and exactly one
+> cursor is visible — on the active machine. ADR 0009 records the design:
+> the edge crossing is a new trigger on the existing control engine, the
+> crossing position travels as a fraction of the *edge monitor* (so
+> mismatched resolution and DPI land the cursor at the matching height), and
+> the return is an instant controlled-side revoke.
+>
+> The soak drove several fixes: Right Shift arrives E0-extended on real
+> hardware and was being dropped, un-shifting right-hand symbols (fixed in
+> capture); the crossing fraction now maps against the specific edge
+> monitor, not the mismatched bounding box; and "one visible cursor" went
+> through the wringer — a transparent overlay could not span mismatched
+> monitors, so masking is done with `SetSystemCursor`, applied off the
+> control loop, restored synchronously on quit / lost connection / next
+> launch, and — the safety net — shown again the instant local input is
+> seen on a hidden-but-not-driving machine. One handshake race is parked as
+> a known latent item: a brief cross-machine state disagreement can leave a
+> machine controlling with no visible cursor; the local-input fail-safe
+> recovers it within ~200 ms, so it is a tidy-up, not a blocker
+> (docs/SOAK.md Phase 5 limitations).
 >
 > Phase 4 (Remote Keyboard) closed 2026-08-09: the two-machine keyboard
 > soak (docs/SOAK.md) ran on real hardware — normal typing and shortcuts
