@@ -262,6 +262,20 @@ pub trait InputCapture: Send + Sync {
     fn escape_requested(&self) -> bool {
         false
     }
+
+    /// A monotonic tick (milliseconds since boot, on Windows) of the most
+    /// recent local keyboard or mouse input, or `None` if unavailable.
+    ///
+    /// This is a **system-wide** query, independent of whether capture is
+    /// active — it reports physical local input as well as injected input.
+    /// The control driver uses it as the cursor fail-safe (ADR 0009): while
+    /// the cursor is hidden and this machine is *not* driving the peer,
+    /// fresh local input means the user is here, so the cursor is shown
+    /// again. Platforms without the query keep the default and simply do
+    /// not offer the fail-safe.
+    fn last_input_tick(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Injects pointer and keyboard input on this machine.
