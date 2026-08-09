@@ -232,6 +232,19 @@ loop only publishes the latest desired visibility to a `watch` channel; a
 separate task coalesces to it and applies it on a blocking thread, so a
 burst of crossings converges to the correct final cursor without a backlog.
 
+**Two safety nets guarantee the cursor is never lost.** First, a blanked
+system cursor persists past process death, so the binary restores the
+defaults *synchronously* on every exit, and again when a mask is created —
+so a quit, a lost connection, or even a crash never strands the machine
+cursor-less. Second, a **local-input fail-safe**: while the cursor is hidden
+and this machine is *not* driving the peer, the driver watches the
+last-local-input tick (`GetLastInputInfo`); any change means the user has
+touched *this* machine, so the cursor is shown again — recovering from any
+state-machine confusion that hid it, without the user needing to know the
+escape gesture. It deliberately does not fire while driving the peer, where
+local input is *meant* for the far machine and the escape chord is the way
+back.
+
 The Windows implementation blanks the **system cursors** (`SetSystemCursor`
 with a transparent cursor for each standard type), restoring the defaults
 when control ends. A transparent top-most overlay window was tried first and

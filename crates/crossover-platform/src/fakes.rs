@@ -224,6 +224,9 @@ pub struct FakeInputCapture {
     /// Simulates the user pressing the release escape gesture (both
     /// Control keys on Windows); read-and-cleared by `escape_requested`.
     escape: Mutex<bool>,
+    /// Scriptable last-local-input tick for the cursor fail-safe; `None`
+    /// (the default) reports no query available.
+    last_input: Mutex<Option<u32>>,
 }
 
 impl FakeInputCapture {
@@ -276,6 +279,12 @@ impl FakeInputCapture {
     pub fn request_escape(&self) {
         *lock(&self.escape) = true;
     }
+
+    /// Set the tick `last_input_tick` reports — simulating local input
+    /// activity for the cursor fail-safe.
+    pub fn set_last_input_tick(&self, tick: u32) {
+        *lock(&self.last_input) = Some(tick);
+    }
 }
 
 impl InputCapture for FakeInputCapture {
@@ -303,6 +312,10 @@ impl InputCapture for FakeInputCapture {
     fn escape_requested(&self) -> bool {
         let mut escape = lock(&self.escape);
         std::mem::replace(&mut escape, false)
+    }
+
+    fn last_input_tick(&self) -> Option<u32> {
+        *lock(&self.last_input)
     }
 }
 

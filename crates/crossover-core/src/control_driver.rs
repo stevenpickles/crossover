@@ -155,6 +155,11 @@ pub struct InputControlDriver {
     /// The last visibility this driver sent, so it signals only on a real
     /// change of the active machine.
     cursor_hidden: bool,
+    /// The local-input tick observed when the cursor was hidden while not
+    /// driving the peer, for the fail-safe (ADR 0009): if a later poll sees
+    /// a different tick, the user has touched this machine, so the cursor is
+    /// shown again. `None` until the first poll after hiding sets it.
+    cursor_wake_baseline: Option<u32>,
     /// Seamless wiring, present exactly when the machine runs
     /// `--left`/`--right`. `None` makes placement and edge-mode emission
     /// no-ops (an explicit-only run).
@@ -203,6 +208,7 @@ pub fn input_control(
         injector,
         cursor_tx,
         cursor_hidden: false,
+        cursor_wake_baseline: None,
         seamless,
         // Idle until a session establishes: emitting the initial mode is
         // the driver's job on the first state change.
@@ -249,6 +255,12 @@ impl InputControlDriver {
                                 return;
                             }
                         }
+                    } else {
+                        // Fail-safe: while the cursor is hidden and we are
+                        // not driving the peer, fresh local input means the
+                        // user is at this machine — show the cursor, whatever
+                        // state confusion hid it (ADR 0009).
+                        self.wake_cursor_on_local_input();
                     }
                 }
             }
@@ -490,9 +502,38 @@ impl InputControlDriver {
             return;
         }
         self.cursor_hidden = hidden;
+        // Record the input tick when hiding so the fail-safe can notice the
+        // user touching this machine afterwards; clear it when showing.
+        self.cursor_wake_baseline = if hidden {
+            self.capture.last_input_tick()
+        } else {
+            None
+        };
         tracing::debug!(hidden, "cursor: active-machine changed");
         // Non-blocking: the applier coalesces to this latest value.
         let _ = self.cursor_tx.send(hidden);
+    }
+
+    /// Cursor fail-safe (ADR 0009): while the cursor is hidden and this
+    /// machine is not driving the peer, a change in the local-input tick
+    /// since the cursor was hidden means the user has touched this machine —
+    /// so show the cursor, recovering from whatever state confusion hid it.
+    /// A no-op on platforms without the input-tick query.
+    fn wake_cursor_on_local_input(&mut self) {
+        if !self.cursor_hidden {
+            return;
+        }
+        let (Some(tick), Some(baseline)) =
+            (self.capture.last_input_tick(), self.cursor_wake_baseline)
+        else {
+            return; // no query, or no baseline was recorded
+        };
+        if tick != baseline {
+            tracing::debug!("cursor: local input while hidden — showing");
+            self.cursor_hidden = false;
+            self.cursor_wake_baseline = None;
+            let _ = self.cursor_tx.send(false);
+        }
     }
 
     /// Execute engine actions in order. Returns `false` when the
@@ -984,6 +1025,51 @@ mod tests {
             .unwrap();
         let _grant = next_command(&mut rig).await;
         assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+        await_cursor(&rig, false).await;
+    }
+
+    /// The fail-safe (ADR 0009): a cursor hidden while this machine is not
+    /// driving the peer is shown again the moment local input is detected —
+    /// the user is here, whatever state confusion hid it.
+    #[tokio::test]
+    async fn local_input_wakes_a_hidden_cursor() {
+        let mut rig = rig();
+        rig.capture.set_last_input_tick(1000);
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+
+        // Be controlled, then return → hidden, and no longer controlled.
+        let take = ControlRequest {
+            request_id: 1,
+            entry: Some(EdgeFraction::new(0.5).to_wire()),
+        };
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                take.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+        rig.events
+            .send(InputControlEvent::EdgeReturn {
+                position: EdgeFraction::new(0.5),
+            })
+            .await
+            .unwrap();
+        let _release = next_command(&mut rig).await;
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::PeerControlRevoked
+        );
+        await_cursor(&rig, true).await;
+
+        // The user touches this machine: the input tick advances, and the
+        // health-tick fail-safe brings the cursor back.
+        rig.capture.set_last_input_tick(2000);
         await_cursor(&rig, false).await;
     }
 

@@ -80,7 +80,9 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
     HID_USAGE_GENERIC_MOUSE, HID_USAGE_PAGE_GENERIC,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_RCONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetLastInputInfo, LASTINPUTINFO, VK_LCONTROL, VK_RCONTROL,
+};
 use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE,
@@ -475,6 +477,21 @@ impl InputCapture for WindowsInputCapture {
         // Read-and-clear: the keyboard hook set it (both Control keys),
         // and the caller acting on it releases control (ADR 0008).
         ESCAPE_REQUESTED.swap(false, Ordering::Relaxed)
+    }
+
+    fn last_input_tick(&self) -> Option<u32> {
+        let mut info = LASTINPUTINFO {
+            cbSize: u32::try_from(size_of::<LASTINPUTINFO>()).ok()?,
+            dwTime: 0,
+        };
+        // SAFETY: GetLastInputInfo writes the last-input tick into the
+        // struct we pass, whose cbSize we set; it returns false on failure
+        // and touches nothing else.
+        if unsafe { GetLastInputInfo(&raw mut info) }.as_bool() {
+            Some(info.dwTime)
+        } else {
+            None
+        }
     }
 }
 
