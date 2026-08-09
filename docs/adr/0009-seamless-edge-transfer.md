@@ -218,10 +218,19 @@ because "the user is here" is broader than "I am controlling":
 - **Local otherwise** (returned from controlling, disconnect, startup): the
   user is here → show.
 
-The mask is toggled only on a real change, and a failure to hide or show is
-logged, never a reason to disturb control. The cursor can never be left
+Visibility is **sticky**: it changes on a genuine active-machine transition,
+never on the input events between transitions, so a machine hidden by a
+return stays hidden until the user returns. A failure to hide or show is
+logged, never a reason to disturb control, and the cursor can never be left
 hidden — any exit from control that is not a deliberate cross-away shows it
 (the mirror of the stuck-key invariant).
+
+The platform mask's Win32 calls (`SetSystemCursor`, `SystemParametersInfo`)
+can block, so they are **not** run on the control loop — that stalled event
+processing and made the cursor lag reality during quick back-and-forth. The
+loop only publishes the latest desired visibility to a `watch` channel; a
+separate task coalesces to it and applies it on a blocking thread, so a
+burst of crossings converges to the correct final cursor without a backlog.
 
 The Windows implementation blanks the **system cursors** (`SetSystemCursor`
 with a transparent cursor for each standard type), restoring the defaults
