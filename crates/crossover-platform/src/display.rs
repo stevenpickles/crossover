@@ -1,34 +1,41 @@
 //! The display boundary and the geometry it speaks (ADR 0009).
 //!
-//! Seamless control transfer needs two facts from the OS: the primary
-//! display's pixel size, and where the cursor is. Both come through this
-//! trait, and the geometry *vocabulary* lives here — not in
+//! Seamless control transfer needs two facts from the OS: the size of the
+//! desktop the cursor roams, and where the cursor is within it. Both come
+//! through this trait, and the geometry *vocabulary* lives here — not in
 //! `crossover-core` — for the same reason the input vocabulary does: the
 //! trait must speak it and core cannot be a dependency of the trait that
 //! describes it (docs/ARCHITECTURE.md §2). The *policy* — which edge
 //! links to the peer, how a crossing maps to a fraction of the edge —
 //! stays in core's topology model (ADR 0009).
+//!
+//! The reported region is the whole **virtual desktop** — every monitor,
+//! as one rectangle — so the crossing edge is the outer edge of the
+//! desktop, not a seam between two monitors (a primary-only region turns
+//! the boundary between monitors into a false edge). Coordinates are
+//! normalized to the desktop's top-left, so the cursor is always in
+//! `0..width`×`0..height` and the topology model needs no origin.
 
 use thiserror::Error;
 
-/// The primary display's pixel size, origin at its top-left (ADR 0009:
-/// the primary display, this phase).
+/// The virtual desktop's pixel size — all monitors as one rectangle, its
+/// origin normalized to the top-left (ADR 0009).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Screen {
-    /// Width in pixels.
+    /// Width in pixels across every monitor.
     pub width: u32,
-    /// Height in pixels.
+    /// Height in pixels across every monitor.
     pub height: u32,
 }
 
-/// A cursor position in the primary display's pixel space, top-left
-/// origin. Signed so a coordinate at or just past an edge — or, later, on
-/// another monitor — is representable without wrapping.
+/// A cursor position in the virtual desktop's pixel space, normalized to
+/// its top-left origin (so it lies within [`Screen`]). Signed so a
+/// coordinate at or just past an edge is representable without wrapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorPoint {
-    /// Rightward pixels from the left edge.
+    /// Rightward pixels from the desktop's left edge.
     pub x: i32,
-    /// Downward pixels from the top edge.
+    /// Downward pixels from the desktop's top edge.
     pub y: i32,
 }
 
@@ -46,24 +53,25 @@ pub enum DisplayError {
     },
 }
 
-/// Read-only access to the local display geometry and cursor (ADR 0009).
+/// Read-only access to the local virtual-desktop geometry and cursor
+/// (ADR 0009).
 ///
-/// Implementations report the **primary** display this phase. Coordinates
-/// are pixels in that display's space, consistent with each other: the
-/// screen size and the cursor position come from the same process, so
-/// edge detection compares like with like regardless of the process's DPI
-/// context (R-3). Cross-machine mapping never uses these pixels directly —
-/// it goes through the fraction in core's topology model.
+/// The size and the cursor come from the same process and the same
+/// (normalized) coordinate space, so edge detection compares like with
+/// like. The process is expected to be per-monitor DPI aware (R-3) so the
+/// numbers are real pixels; cross-machine mapping never uses these pixels
+/// directly — it goes through the fraction in core's topology model.
 pub trait DisplayInfo: Send + Sync {
-    /// The primary display's pixel size.
+    /// The virtual desktop's pixel size (all monitors as one rectangle).
     ///
     /// # Errors
     ///
     /// [`DisplayError::Unavailable`] if the platform cannot report the
-    /// primary display's geometry.
-    fn primary_screen(&self) -> Result<Screen, DisplayError>;
+    /// desktop geometry.
+    fn desktop_bounds(&self) -> Result<Screen, DisplayError>;
 
-    /// The cursor's current position, in the primary display's space.
+    /// The cursor's current position, normalized to the virtual desktop's
+    /// top-left origin.
     ///
     /// # Errors
     ///

@@ -418,7 +418,7 @@ impl FakeDisplay {
 }
 
 impl DisplayInfo for FakeDisplay {
-    fn primary_screen(&self) -> Result<Screen, DisplayError> {
+    fn desktop_bounds(&self) -> Result<Screen, DisplayError> {
         self.guard()?;
         Ok(*lock(&self.screen))
     }
@@ -727,7 +727,7 @@ mod display_tests {
             height: 1080,
         });
         assert_eq!(
-            display.primary_screen().unwrap(),
+            display.desktop_bounds().unwrap(),
             Screen {
                 width: 1920,
                 height: 1080,
@@ -747,7 +747,7 @@ mod display_tests {
             width: 2560,
             height: 1440,
         });
-        assert_eq!(display.primary_screen().unwrap().width, 2560);
+        assert_eq!(display.desktop_bounds().unwrap().width, 2560);
     }
 
     #[test]
@@ -758,7 +758,7 @@ mod display_tests {
         });
         display.fail_with("no display attached");
         assert!(matches!(
-            display.primary_screen(),
+            display.desktop_bounds(),
             Err(DisplayError::Unavailable { .. })
         ));
         assert!(matches!(

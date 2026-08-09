@@ -99,15 +99,19 @@ impl InputInjector for WindowsInputInjector {
     }
 
     fn place_cursor(&self, position: CursorPoint) -> Result<(), InputError> {
-        // Absolute placement in screen pixels, the exact inverse of the
-        // GetCursorPos this process reads for detection, so the two share
-        // one coordinate space. Placement runs only while not capturing
-        // (control arriving or returning), so there is no hook to capture
-        // it back and no tag is needed.
+        // `position` is normalized to the virtual desktop's top-left (as
+        // DisplayInfo reports the cursor); SetCursorPos wants absolute
+        // screen coordinates, so add the desktop origin back — the exact
+        // inverse of the normalization detection applied. Placement runs
+        // only while not capturing (control arriving or returning), so no
+        // hook captures it back and no tag is needed.
+        let (origin_x, origin_y) = crate::display::desktop_origin();
         // SAFETY: SetCursorPos takes screen coordinates and has no
         // preconditions; it returns an error on failure.
-        unsafe { SetCursorPos(position.x, position.y) }.map_err(|e| InputError::InjectionFailed {
-            reason: format!("SetCursorPos failed: {e}"),
+        unsafe { SetCursorPos(position.x + origin_x, position.y + origin_y) }.map_err(|e| {
+            InputError::InjectionFailed {
+                reason: format!("SetCursorPos failed: {e}"),
+            }
         })
     }
 }

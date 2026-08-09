@@ -186,7 +186,7 @@ impl EdgeDetectDriver {
     /// Read the cursor once and prime the detector's edge state.
     fn prime(&mut self) {
         if let (Ok(screen), Ok(cursor)) = (
-            self.display.primary_screen(),
+            self.display.desktop_bounds(),
             self.display.cursor_position(),
         ) {
             self.detector.prime(cursor, screen);
@@ -196,7 +196,7 @@ impl EdgeDetectDriver {
     /// One poll: read the display, and emit a crossing if one just began.
     /// Returns `false` only when the crossings receiver is gone.
     async fn poll(&mut self) -> bool {
-        let screen = match self.display.primary_screen() {
+        let screen = match self.display.desktop_bounds() {
             Ok(screen) => screen,
             Err(error) => {
                 // A transient display query failure skips this tick rather

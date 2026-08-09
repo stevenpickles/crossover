@@ -104,6 +104,10 @@ enum PeersAction {
 async fn main() -> anyhow::Result<()> {
     // Parse first so `--help`/`--version` exit without emitting log lines.
     let cli = Cli::parse();
+    // Become per-monitor DPI aware before anything reads display geometry
+    // or creates a window/hook, so coordinates are real pixels across
+    // mixed-DPI monitors (R-3, ADR 0009).
+    crossover_platform_windows::set_process_dpi_awareness();
     logging::init()?;
     // Structured-field exemplar (docs/ARCHITECTURE.md §10): values as
     // fields, snake_case canonical names, message as the human summary.

@@ -170,3 +170,18 @@ both with no separate keyboard-ownership message.
   under the existing version rules; a peer that does not understand them
   simply never triggers a seamless crossing and the explicit path still
   works.
+
+## Refinement (2026-08-09, Phase 5 soak)
+
+The two-machine soak showed the "primary display, this phase" scope above
+was not merely a limitation but a defect on a multi-monitor machine: with
+geometry taken from the primary monitor, the cursor roaming onto a second
+monitor sat permanently past the primary's edge, so the seam *between*
+monitors fired constant spurious transfers (a grant/revoke loop). The
+geometry now uses the whole **virtual desktop** — every monitor as one
+rectangle, the cursor normalized to its top-left — so the crossing edge is
+the outer edge of the desktop, not an internal seam. The decision above
+(edge as trigger, position as a fraction, immediate crossing) is
+unchanged; only "which region" is. The process is also made per-monitor
+DPI aware (R-3), which the design had assumed but had never set, so
+coordinates are real pixels across mixed-DPI monitors.

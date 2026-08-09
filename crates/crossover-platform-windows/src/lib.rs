@@ -33,6 +33,34 @@ pub use input::WindowsInputInjector;
 #[cfg(windows)]
 pub use secure_storage::DpapiSecureStorage;
 
+/// Make this process **per-monitor DPI aware** (R-3), so display geometry
+/// and cursor coordinates are real pixels across mixed-DPI monitors rather
+/// than the OS's scaled, virtualized values (ADR 0007, ADR 0009). Call
+/// once at startup, before any window, hook, or metric read — after that
+/// the context is fixed for the process.
+///
+/// A failure (already set, or an OS too old for the V2 context) is
+/// non-fatal: coordinates stay virtualized, which still works, only less
+/// precisely on mixed-DPI setups.
+#[cfg(windows)]
+pub fn set_process_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
+    // SAFETY: SetProcessDpiAwarenessContext has no preconditions; it is
+    // safe to call once at process start and returns an error rather than
+    // faulting if the context cannot be applied.
+    let result =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not set per-monitor DPI awareness; coordinates may be scaled");
+    }
+}
+
+/// No-op off Windows: DPI awareness is a Win32 concept.
+#[cfg(not(windows))]
+pub fn set_process_dpi_awareness() {}
+
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =
     "Win32 implementations of the crossover-platform traits (docs/ARCHITECTURE.md §4)";
