@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use crate::clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
-use crate::display::{CursorPoint, DisplayError, DisplayInfo, Screen};
+use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
 use crate::input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerEvent,
 };
@@ -377,18 +377,28 @@ impl InputInjector for FakeInputInjector {
 pub struct FakeDisplay {
     screen: Mutex<Screen>,
     cursor: Mutex<CursorPoint>,
+    /// The monitor layout. Defaults to a single monitor covering the whole
+    /// screen; multi-monitor tests override it via [`Self::set_monitors`].
+    monitors: Mutex<Vec<MonitorRect>>,
     /// When set, both queries fail with this reason — the platform
     /// refusing to report geometry.
     fail: Mutex<Option<String>>,
 }
 
 impl FakeDisplay {
-    /// A display of `screen`, cursor parked at the top-left.
+    /// A display of `screen`, cursor parked at the top-left, with a single
+    /// monitor covering the whole screen.
     #[must_use]
     pub fn new(screen: Screen) -> Self {
         Self {
             screen: Mutex::new(screen),
             cursor: Mutex::new(CursorPoint { x: 0, y: 0 }),
+            monitors: Mutex::new(vec![MonitorRect {
+                left: 0,
+                top: 0,
+                width: screen.width,
+                height: screen.height,
+            }]),
             fail: Mutex::new(None),
         }
     }
@@ -398,9 +408,15 @@ impl FakeDisplay {
         *lock(&self.cursor) = cursor;
     }
 
-    /// Change the fake screen size.
+    /// Change the fake screen size. Leaves the monitor layout untouched —
+    /// call [`Self::set_monitors`] to change that.
     pub fn set_screen(&self, screen: Screen) {
         *lock(&self.screen) = screen;
+    }
+
+    /// Replace the monitor layout, for multi-monitor edge-mapping tests.
+    pub fn set_monitors(&self, monitors: Vec<MonitorRect>) {
+        *lock(&self.monitors) = monitors;
     }
 
     /// Make both queries fail until cleared, simulating a platform that
@@ -421,6 +437,11 @@ impl DisplayInfo for FakeDisplay {
     fn desktop_bounds(&self) -> Result<Screen, DisplayError> {
         self.guard()?;
         Ok(*lock(&self.screen))
+    }
+
+    fn monitors(&self) -> Result<Vec<MonitorRect>, DisplayError> {
+        self.guard()?;
+        Ok(lock(&self.monitors).clone())
     }
 
     fn cursor_position(&self) -> Result<CursorPoint, DisplayError> {
@@ -718,7 +739,7 @@ mod tests {
 #[cfg(test)]
 mod display_tests {
     use super::FakeDisplay;
-    use crate::display::{CursorPoint, DisplayError, DisplayInfo, Screen};
+    use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
 
     #[test]
     fn reports_the_scripted_screen_and_cursor() {
@@ -763,6 +784,47 @@ mod display_tests {
         ));
         assert!(matches!(
             display.cursor_position(),
+            Err(DisplayError::Unavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn monitors_default_to_one_covering_the_screen_and_are_scriptable() {
+        let display = FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        });
+        // The default layout is a single monitor spanning the whole screen.
+        assert_eq!(
+            display.monitors().unwrap(),
+            vec![MonitorRect {
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            }]
+        );
+
+        // A scripted multi-monitor layout is reported verbatim.
+        let laptop = MonitorRect {
+            left: 0,
+            top: 0,
+            width: 3840,
+            height: 2400,
+        };
+        let external = MonitorRect {
+            left: 3840,
+            top: 0,
+            width: 3840,
+            height: 2160,
+        };
+        display.set_monitors(vec![laptop, external]);
+        assert_eq!(display.monitors().unwrap(), vec![laptop, external]);
+
+        // A scripted failure surfaces here too.
+        display.fail_with("no display attached");
+        assert!(matches!(
+            display.monitors(),
             Err(DisplayError::Unavailable { .. })
         ));
     }

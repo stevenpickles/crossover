@@ -185,3 +185,16 @@ the outer edge of the desktop, not an internal seam. The decision above
 unchanged; only "which region" is. The process is also made per-monitor
 DPI aware (R-3), which the design had assumed but had never set, so
 coordinates are real pixels across mixed-DPI monitors.
+
+A second soak exposed a follow-on defect from the virtual-desktop scope:
+the desktop bounding box of two *different-resolution* monitors has dead
+space (a 3840×2160 external beside a 3840×2400 laptop panel leaves a
+240-pixel gap on one), and mapping the crossing fraction against the box's
+full height put the peer's cursor at the wrong row. The fraction is now
+taken against the specific monitor on the linked edge — the outermost one
+in the linked direction, from an added `DisplayInfo::monitors()`
+(`EnumDisplayMonitors` on Windows) — not the bounding box. The desktop
+bounds still decide *whether* a monitor seam is the crossing edge (above);
+the per-monitor rectangle decides *where along it* the crossing lands, so
+mismatched-resolution pairs map exactly. The wire fraction and every
+decision above are unchanged.

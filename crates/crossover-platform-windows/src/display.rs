@@ -1,22 +1,26 @@
 //! Virtual-desktop geometry and cursor position (ADR 0009).
 //!
 //! [`WindowsDisplayInfo`] reports the **virtual desktop** — every monitor
-//! as one rectangle — via `GetSystemMetrics(SM_*VIRTUALSCREEN)`, and the
-//! cursor via `GetCursorPos`, normalized to the desktop's top-left. Using
-//! the whole desktop (not the primary monitor) is what keeps the seam
-//! *between* two monitors from being treated as the crossing edge: on a
-//! multi-monitor machine, a primary-only region put a false edge at the
-//! primary's boundary, and the cursor roaming onto the second monitor
-//! triggered spurious transfers. Both reads come from this process and
-//! (with per-monitor DPI awareness, R-3) are real pixels; cross-machine
-//! mapping goes through the fraction in core's topology model.
+//! as one rectangle — via `GetSystemMetrics(SM_*VIRTUALSCREEN)`, the
+//! per-monitor layout via `EnumDisplayMonitors`, and the cursor via
+//! `GetCursorPos`, all normalized to the desktop's top-left. The desktop
+//! bounds keep the seam *between* two monitors from being treated as the
+//! crossing edge (a primary-only region put a false edge at the primary's
+//! boundary, so roaming onto the second monitor triggered spurious
+//! transfers); the per-monitor layout lets core map a crossing against the
+//! actual monitor on the linked edge, not the mismatched-resolution
+//! bounding box (ADR 0009). All reads come from this process and (with
+//! per-monitor DPI awareness, R-3) are real pixels; cross-machine mapping
+//! goes through the fraction in core's topology model.
 
-use crossover_platform::{CursorPoint, DisplayError, DisplayInfo, Screen};
-use windows::Win32::Foundation::POINT;
+use crossover_platform::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
+use windows::Win32::Foundation::{LPARAM, POINT, RECT, TRUE};
+use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN,
 };
+use windows::core::BOOL;
 
 /// Win32 [`DisplayInfo`]. Stateless — the queries read live system state.
 #[derive(Debug, Default)]
@@ -80,6 +84,58 @@ impl DisplayInfo for WindowsDisplayInfo {
             y: point.y - origin_y,
         })
     }
+
+    fn monitors(&self) -> Result<Vec<MonitorRect>, DisplayError> {
+        let mut monitors: Vec<MonitorRect> = Vec::new();
+        // SAFETY: EnumDisplayMonitors synchronously invokes `collect_monitor`
+        // once per monitor; the lparam carries a pointer to `monitors`,
+        // which lives for the whole call, and the callback only pushes to
+        // it. A null device context and clip rectangle enumerate all
+        // monitors.
+        let ok = unsafe {
+            EnumDisplayMonitors(
+                None,
+                None,
+                Some(collect_monitor),
+                LPARAM(&raw mut monitors as isize),
+            )
+        };
+        if !ok.as_bool() || monitors.is_empty() {
+            return Err(DisplayError::Unavailable {
+                reason: "EnumDisplayMonitors reported no monitors".to_owned(),
+            });
+        }
+        Ok(monitors)
+    }
+}
+
+/// `EnumDisplayMonitors` callback: append each monitor's bounds,
+/// normalized to the desktop origin, to the `Vec` behind `lparam`.
+unsafe extern "system" fn collect_monitor(
+    _monitor: HMONITOR,
+    _hdc: HDC,
+    rect: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    // SAFETY: EnumDisplayMonitors passes the exact lparam we handed it — a
+    // live `*mut Vec<MonitorRect>` borrowed only for this synchronous call.
+    let monitors = unsafe { &mut *(lparam.0 as *mut Vec<MonitorRect>) };
+    // SAFETY: `rect` is the valid, aligned monitor rectangle the OS
+    // provides; we only read it.
+    let rect = unsafe { *rect };
+    let (origin_x, origin_y) = virtual_origin();
+    if let (Ok(width), Ok(height)) = (
+        u32::try_from(rect.right - rect.left),
+        u32::try_from(rect.bottom - rect.top),
+    ) {
+        monitors.push(MonitorRect {
+            left: rect.left - origin_x,
+            top: rect.top - origin_y,
+            width,
+            height,
+        });
+    }
+    TRUE // keep enumerating
 }
 
 /// The virtual desktop's top-left origin in absolute screen coordinates,

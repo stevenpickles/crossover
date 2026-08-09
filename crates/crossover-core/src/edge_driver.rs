@@ -24,7 +24,7 @@ use tokio::time::MissedTickBehavior;
 
 use crossover_platform::DisplayInfo;
 
-use crate::topology::{CursorPoint, EdgeFraction, Screen, Topology};
+use crate::topology::{CursorPoint, EdgeFraction, MonitorRect, Topology};
 
 /// What the detector is currently watching for — driven by the control
 /// state (ADR 0009).
@@ -99,16 +99,20 @@ impl EdgeDetector {
     /// crossing. Used when detection (re)starts, so a cursor already
     /// sitting at the edge does not fire an immediate, unintended
     /// transfer — only a fresh arrival does.
-    pub fn prime(&mut self, cursor: CursorPoint, screen: Screen) {
-        self.at_edge = self.topology.leaving(cursor, screen).is_some();
+    pub fn prime(&mut self, cursor: CursorPoint, monitors: &[MonitorRect]) {
+        self.at_edge = self.topology.leaving(cursor, monitors).is_some();
     }
 
     /// Observe a cursor position. Returns the crossing fraction only on
     /// the rising edge — the cursor reaching the linked edge after being
     /// away from it — and `None` otherwise (away, or still pinned).
     #[must_use]
-    pub fn observe(&mut self, cursor: CursorPoint, screen: Screen) -> Option<EdgeFraction> {
-        let touching = self.topology.leaving(cursor, screen);
+    pub fn observe(
+        &mut self,
+        cursor: CursorPoint,
+        monitors: &[MonitorRect],
+    ) -> Option<EdgeFraction> {
+        let touching = self.topology.leaving(cursor, monitors);
         let rising = touching.is_some() && !self.at_edge;
         self.at_edge = touching.is_some();
         if rising { touching } else { None }
@@ -185,23 +189,22 @@ impl EdgeDetectDriver {
 
     /// Read the cursor once and prime the detector's edge state.
     fn prime(&mut self) {
-        if let (Ok(screen), Ok(cursor)) = (
-            self.display.desktop_bounds(),
-            self.display.cursor_position(),
-        ) {
-            self.detector.prime(cursor, screen);
+        if let (Ok(monitors), Ok(cursor)) =
+            (self.display.monitors(), self.display.cursor_position())
+        {
+            self.detector.prime(cursor, &monitors);
         }
     }
 
     /// One poll: read the display, and emit a crossing if one just began.
     /// Returns `false` only when the crossings receiver is gone.
     async fn poll(&mut self) -> bool {
-        let screen = match self.display.desktop_bounds() {
-            Ok(screen) => screen,
+        let monitors = match self.display.monitors() {
+            Ok(monitors) => monitors,
             Err(error) => {
                 // A transient display query failure skips this tick rather
                 // than spinning; a persistent one is the platform's fault.
-                tracing::debug!(%error, "edge poll: primary display unavailable");
+                tracing::debug!(%error, "edge poll: monitor layout unavailable");
                 return true;
             }
         };
@@ -212,7 +215,7 @@ impl EdgeDetectDriver {
                 return true;
             }
         };
-        if let Some(position) = self.detector.observe(cursor, screen) {
+        if let Some(position) = self.detector.observe(cursor, &monitors) {
             let Some(kind) = self.mode.crossing_kind() else {
                 return true; // idle: nothing to emit (unreachable while polling)
             };
@@ -241,12 +244,21 @@ mod tests {
     use crossover_platform::fakes::FakeDisplay;
 
     use super::{CrossingKind, EdgeCrossing, EdgeDetector, EdgeMode, edge_detect};
-    use crate::topology::{CursorPoint, LinkSide, Screen, Topology};
+    use crate::topology::{CursorPoint, LinkSide, MonitorRect, Screen, Topology};
 
     const HD: Screen = Screen {
         width: 1920,
         height: 1080,
     };
+
+    /// The same 1920×1080 as [`HD`], as a one-monitor layout for the pure
+    /// detector (which speaks monitors, not the [`FakeDisplay`]'s screen).
+    const HD_MON: [MonitorRect; 1] = [MonitorRect {
+        left: 0,
+        top: 0,
+        width: 1920,
+        height: 1080,
+    }];
 
     fn at(x: i32, y: i32) -> CursorPoint {
         CursorPoint { x, y }
@@ -259,27 +271,27 @@ mod tests {
         // Left member links on its right edge (x == 1919).
         let mut d = EdgeDetector::new(Topology::new(LinkSide::Left));
         // Away from the edge: nothing.
-        assert!(d.observe(at(960, 540), HD).is_none());
+        assert!(d.observe(at(960, 540), &HD_MON).is_none());
         // Arrival at the edge: one crossing.
-        let crossing = d.observe(at(1919, 300), HD);
+        let crossing = d.observe(at(1919, 300), &HD_MON);
         assert!(crossing.is_some());
         // Still pinned: no repeat.
-        assert!(d.observe(at(1919, 300), HD).is_none());
-        assert!(d.observe(at(1919, 305), HD).is_none());
+        assert!(d.observe(at(1919, 300), &HD_MON).is_none());
+        assert!(d.observe(at(1919, 305), &HD_MON).is_none());
         // Leaves and returns: fires again.
-        assert!(d.observe(at(900, 305), HD).is_none());
-        assert!(d.observe(at(1919, 305), HD).is_some());
+        assert!(d.observe(at(900, 305), &HD_MON).is_none());
+        assert!(d.observe(at(1919, 305), &HD_MON).is_some());
     }
 
     #[test]
     fn priming_suppresses_a_crossing_for_a_cursor_already_at_the_edge() {
         let mut d = EdgeDetector::new(Topology::new(LinkSide::Right)); // links left, x == 0
-        d.prime(at(0, 500), HD);
+        d.prime(at(0, 500), &HD_MON);
         // Already at the edge when detection began: no crossing.
-        assert!(d.observe(at(0, 500), HD).is_none());
+        assert!(d.observe(at(0, 500), &HD_MON).is_none());
         // Only after leaving and returning does it fire.
-        assert!(d.observe(at(400, 500), HD).is_none());
-        assert!(d.observe(at(0, 500), HD).is_some());
+        assert!(d.observe(at(400, 500), &HD_MON).is_none());
+        assert!(d.observe(at(0, 500), &HD_MON).is_some());
     }
 
     // ---- the async driver ----
