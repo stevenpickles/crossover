@@ -198,3 +198,23 @@ bounds still decide *whether* a monitor seam is the crossing edge (above);
 the per-monitor rectangle decides *where along it* the crossing lands, so
 mismatched-resolution pairs map exactly. The wire fraction and every
 decision above are unchanged.
+
+### Hiding the controller's idle cursor
+
+While a machine drives the peer its own cursor is frozen, pinned at the
+linked edge — a second, motionless pointer with nothing to do. A new
+`CursorMask` trait hides it on the machine that is controlling and restores
+it the instant control ends; the driver brackets this on the same
+`StartCapture`/`StopCapture` the engine already emits, so the cursor is
+hidden exactly while capturing and can never be left hidden (the mirror of
+the stuck-key invariant).
+
+The Windows implementation is a **full-desktop, fully transparent, top-most
+overlay window** that sets a null cursor (`WM_SETCURSOR` → `SetCursor(None)`).
+The two obvious alternatives were rejected: `ShowCursor(FALSE)` only affects
+the calling thread's own windows, not the cursor over other applications;
+and `SetSystemCursor` with a blank cursor is global and does **not** revert
+when the process dies, so a crash mid-control would strand the machine with
+no cursor. The overlay is the inverse — the window is destroyed with the
+process, so the cursor always returns. Masking is a display nicety: a
+failure to hide or show is logged and never disturbs control.

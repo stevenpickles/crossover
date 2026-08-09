@@ -42,7 +42,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crossover_platform::{DisplayInfo, InputCapture, InputInjector};
+use crossover_platform::{CursorMask, DisplayInfo, InputCapture, InputInjector};
 use crossover_protocol::RawFrame;
 
 use crate::clipboard_driver::{FrameTarget, SessionCommand};
@@ -142,6 +142,11 @@ pub struct InputControlDriver {
     engine: ControlEngine,
     capture: Arc<dyn InputCapture>,
     injector: Arc<dyn InputInjector>,
+    /// Hides the local cursor while this machine drives the peer, so the
+    /// controller's frozen, edge-pinned cursor is not a second visible
+    /// pointer (ADR 0009). A [`NoopCursorMask`](crossover_platform::NoopCursorMask)
+    /// for runs that opt out.
+    cursor_mask: Arc<dyn CursorMask>,
     /// Seamless wiring, present exactly when the machine runs
     /// `--left`/`--right`. `None` makes placement and edge-mode emission
     /// no-ops (an explicit-only run).
@@ -166,6 +171,7 @@ pub struct InputControlDriver {
 pub fn input_control(
     capture: Arc<dyn InputCapture>,
     injector: Arc<dyn InputInjector>,
+    cursor_mask: Arc<dyn CursorMask>,
     seamless: Option<SeamlessInputs>,
     config: ControlConfig,
 ) -> (
@@ -182,6 +188,7 @@ pub fn input_control(
         engine: ControlEngine::new(config),
         capture,
         injector,
+        cursor_mask,
         seamless,
         // Idle until a session establishes: emitting the initial mode is
         // the driver's job on the first state change.
@@ -234,6 +241,11 @@ impl InputControlDriver {
             // Any branch may have changed the control state; keep the edge
             // detector's watching mode in step with it (ADR 0009).
             self.sync_edge_mode().await;
+        }
+        // The driver is shutting down: make sure the cursor is not left
+        // hidden if we stop mid-control (idempotent when already shown).
+        if let Err(error) = self.cursor_mask.show() {
+            tracing::warn!(error = %error, "restoring the local cursor on shutdown failed");
         }
         tracing::debug!("input control driver stopped");
     }
@@ -430,6 +442,10 @@ impl InputControlDriver {
                         // local (fail closed, NFR-3 diagnostic included).
                         tracing::error!(error = %error, "start_capture failed; failing closed");
                         deferred.extend(self.engine.handle(ControlEvent::CaptureLost));
+                    } else if let Err(error) = self.cursor_mask.hide() {
+                        // Masking is a nicety; a failure to hide never
+                        // disturbs control (ADR 0009). Only capture started.
+                        tracing::warn!(error = %error, "hiding the local cursor failed");
                     }
                 }
                 ControlAction::StopCapture => {
@@ -439,6 +455,12 @@ impl InputControlDriver {
                         // Lenient by trait contract: error paths call
                         // stop exactly when it must not matter.
                         tracing::warn!(error = %error, "stop_capture reported failure");
+                    }
+                    // Restore the cursor on every exit from controlling —
+                    // StopCapture brackets them all — so it can never be
+                    // left hidden (the inverse of a stuck key, ADR 0009).
+                    if let Err(error) = self.cursor_mask.show() {
+                        tracing::warn!(error = %error, "restoring the local cursor failed");
                     }
                 }
                 ControlAction::Inject(events) => {
@@ -524,8 +546,10 @@ mod tests {
     use tokio::time::timeout;
     use uuid::Uuid;
 
-    use crossover_platform::fakes::{FakeDisplay, FakeInputCapture, FakeInputInjector};
-    use crossover_platform::{DisplayInfo, InputCapture, InputInjector, Screen};
+    use crossover_platform::fakes::{
+        FakeCursorMask, FakeDisplay, FakeInputCapture, FakeInputInjector,
+    };
+    use crossover_platform::{CursorMask, DisplayInfo, InputCapture, InputInjector, Screen};
     use crossover_protocol::hello::MessageType;
     use crossover_protocol::{
         ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, InputBatch,
@@ -552,6 +576,7 @@ mod tests {
     struct Rig {
         capture: Arc<FakeInputCapture>,
         injector: Arc<FakeInputInjector>,
+        cursor_mask: Arc<FakeCursorMask>,
         events: mpsc::Sender<InputControlEvent>,
         commands: mpsc::Receiver<SessionCommand>,
         notices: mpsc::Receiver<ControlNotice>,
@@ -561,6 +586,7 @@ mod tests {
     fn rig() -> Rig {
         let capture = Arc::new(FakeInputCapture::new());
         let injector = Arc::new(FakeInputInjector::new());
+        let cursor_mask = Arc::new(FakeCursorMask::new());
         let display = Arc::new(FakeDisplay::new(HD));
         let (edge_mode_tx, edge_modes) = mpsc::channel(8);
         // A left-member topology (links on the right edge) so PlaceCursor
@@ -573,6 +599,7 @@ mod tests {
         let (driver, events, commands, notices) = input_control(
             Arc::clone(&capture) as Arc<dyn InputCapture>,
             Arc::clone(&injector) as Arc<dyn InputInjector>,
+            Arc::clone(&cursor_mask) as Arc<dyn CursorMask>,
             Some(seamless),
             ControlConfig {
                 request_timeout: Duration::from_millis(100),
@@ -582,6 +609,7 @@ mod tests {
         Rig {
             capture,
             injector,
+            cursor_mask,
             events,
             commands,
             notices,
@@ -716,6 +744,48 @@ mod tests {
             ControlNotice::ControlEnded(crate::control::ControlEndReason::HandedBack)
         );
         assert!(!rig.capture.is_capturing(), "hand-back must stop capture");
+    }
+
+    /// The local cursor is hidden while this machine drives the peer and
+    /// restored the moment control ends (ADR 0009): the controller's frozen
+    /// cursor must not linger as a second visible pointer, and it must
+    /// always come back.
+    #[tokio::test]
+    async fn controlling_hides_the_local_cursor_and_return_shows_it() {
+        let mut rig = rig();
+        // Not controlling yet: the cursor is untouched.
+        assert!(!rig.cursor_mask.is_hidden());
+
+        make_controlling(&mut rig).await;
+        // Capture started, so the cursor is hidden exactly once.
+        assert!(
+            rig.cursor_mask.is_hidden(),
+            "gaining control must hide the cursor"
+        );
+        assert_eq!(rig.cursor_mask.hide_calls(), 1);
+        assert_eq!(rig.cursor_mask.show_calls(), 0);
+
+        // Hand control back: capture stops and the cursor is restored.
+        rig.events
+            .send(InputControlEvent::ReleaseControl)
+            .await
+            .unwrap();
+        let _release_all = next_command(&mut rig).await;
+        let _release = next_command(&mut rig).await;
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::ControlEnded(crate::control::ControlEndReason::HandedBack)
+        );
+        // Give the StopCapture action time to run its show().
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while rig.cursor_mask.is_hidden() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cursor was never restored after control ended"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(rig.cursor_mask.show_calls(), 1, "restored exactly once");
     }
 
     #[tokio::test]
