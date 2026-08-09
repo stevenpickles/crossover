@@ -14,6 +14,8 @@ pub mod capture;
 #[cfg(windows)]
 pub mod clipboard;
 #[cfg(windows)]
+pub mod display;
+#[cfg(windows)]
 pub mod input;
 #[cfg(windows)]
 pub mod keymap;
@@ -24,6 +26,8 @@ pub mod secure_storage;
 pub use capture::WindowsInputCapture;
 #[cfg(windows)]
 pub use clipboard::WindowsClipboard;
+#[cfg(windows)]
+pub use display::WindowsDisplayInfo;
 #[cfg(windows)]
 pub use input::WindowsInputInjector;
 #[cfg(windows)]

@@ -66,26 +66,12 @@ impl Edge {
     }
 }
 
-/// The primary display's pixel size (ADR 0009: the primary display, this
-/// phase). Plain data the platform fills in; the origin is its top-left.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Screen {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-}
-
-/// A cursor position in the primary display's pixel space, top-left
-/// origin. Signed so a coordinate at or just past an edge is
-/// representable without wrapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CursorPoint {
-    /// Rightward pixels from the left edge.
-    pub x: i32,
-    /// Downward pixels from the top edge.
-    pub y: i32,
-}
+// The display geometry vocabulary — the primary screen size and a cursor
+// position — lives in `crossover-platform`, because the display HAL trait
+// must speak it and core cannot be its dependency (docs/ARCHITECTURE.md
+// §2), exactly as with the input vocabulary. Re-exported so the topology
+// model reads as one module.
+pub use crossover_platform::{CursorPoint, Screen};
 
 /// A normalized position along an edge, clamped to `[0, 1]`: `0.0` is the
 /// top of a vertical edge, `1.0` the bottom. This is what crosses the

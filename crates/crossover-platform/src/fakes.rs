@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use crate::clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
+use crate::display::{CursorPoint, DisplayError, DisplayInfo, Screen};
 use crate::input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerEvent,
 };
@@ -358,6 +359,63 @@ impl InputInjector for FakeInputInjector {
     }
 }
 
+/// In-memory [`DisplayInfo`] with a scriptable screen size and cursor, so
+/// edge-detection logic is exercisable with no real display.
+pub struct FakeDisplay {
+    screen: Mutex<Screen>,
+    cursor: Mutex<CursorPoint>,
+    /// When set, both queries fail with this reason — the platform
+    /// refusing to report geometry.
+    fail: Mutex<Option<String>>,
+}
+
+impl FakeDisplay {
+    /// A display of `screen`, cursor parked at the top-left.
+    #[must_use]
+    pub fn new(screen: Screen) -> Self {
+        Self {
+            screen: Mutex::new(screen),
+            cursor: Mutex::new(CursorPoint { x: 0, y: 0 }),
+            fail: Mutex::new(None),
+        }
+    }
+
+    /// Move the fake cursor.
+    pub fn set_cursor(&self, cursor: CursorPoint) {
+        *lock(&self.cursor) = cursor;
+    }
+
+    /// Change the fake screen size.
+    pub fn set_screen(&self, screen: Screen) {
+        *lock(&self.screen) = screen;
+    }
+
+    /// Make both queries fail until cleared, simulating a platform that
+    /// cannot report geometry.
+    pub fn fail_with(&self, reason: &str) {
+        *lock(&self.fail) = Some(reason.to_owned());
+    }
+
+    fn guard(&self) -> Result<(), DisplayError> {
+        match lock(&self.fail).clone() {
+            Some(reason) => Err(DisplayError::Unavailable { reason }),
+            None => Ok(()),
+        }
+    }
+}
+
+impl DisplayInfo for FakeDisplay {
+    fn primary_screen(&self) -> Result<Screen, DisplayError> {
+        self.guard()?;
+        Ok(*lock(&self.screen))
+    }
+
+    fn cursor_position(&self) -> Result<CursorPoint, DisplayError> {
+        self.guard()?;
+        Ok(*lock(&self.cursor))
+    }
+}
+
 /// Locks a mutex, recovering from poisoning: a panicked test thread must
 /// not cascade opaque failures into unrelated tests.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -641,5 +699,58 @@ mod tests {
         // The failure was consumed; the store is usable again.
         storage.store("k", b"secret").unwrap();
         assert!(storage.load("k").unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::FakeDisplay;
+    use crate::display::{CursorPoint, DisplayError, DisplayInfo, Screen};
+
+    #[test]
+    fn reports_the_scripted_screen_and_cursor() {
+        let display = FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        });
+        assert_eq!(
+            display.primary_screen().unwrap(),
+            Screen {
+                width: 1920,
+                height: 1080,
+            }
+        );
+        // Cursor starts parked at the origin, then moves where scripted.
+        assert_eq!(
+            display.cursor_position().unwrap(),
+            CursorPoint { x: 0, y: 0 }
+        );
+        display.set_cursor(CursorPoint { x: 1919, y: 540 });
+        assert_eq!(
+            display.cursor_position().unwrap(),
+            CursorPoint { x: 1919, y: 540 }
+        );
+        display.set_screen(Screen {
+            width: 2560,
+            height: 1440,
+        });
+        assert_eq!(display.primary_screen().unwrap().width, 2560);
+    }
+
+    #[test]
+    fn scripted_failure_surfaces_on_both_queries() {
+        let display = FakeDisplay::new(Screen {
+            width: 800,
+            height: 600,
+        });
+        display.fail_with("no display attached");
+        assert!(matches!(
+            display.primary_screen(),
+            Err(DisplayError::Unavailable { .. })
+        ));
+        assert!(matches!(
+            display.cursor_position(),
+            Err(DisplayError::Unavailable { .. })
+        ));
     }
 }
