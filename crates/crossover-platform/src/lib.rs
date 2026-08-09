@@ -13,7 +13,7 @@ pub mod input;
 pub mod secure_storage;
 
 pub use clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
-pub use display::{CursorPoint, DisplayError, DisplayInfo, Screen};
+pub use display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
 pub use input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerButton,
     PointerEvent, SCROLL_UNITS_PER_DETENT, hid,

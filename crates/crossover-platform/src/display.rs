@@ -39,6 +39,23 @@ pub struct CursorPoint {
     pub y: i32,
 }
 
+/// One monitor's bounds, normalized to the virtual desktop's top-left
+/// origin (like [`CursorPoint`]). Crossing maps the edge fraction against
+/// the specific monitor on the crossing edge — not the whole bounding-box
+/// desktop — so monitors of different resolution, and the dead space
+/// between mismatched ones, map correctly (ADR 0009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorRect {
+    /// Left pixel (desktop-relative).
+    pub left: i32,
+    /// Top pixel (desktop-relative).
+    pub top: i32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
 /// Failures from a [`DisplayInfo`] backend.
 #[non_exhaustive]
 #[derive(Debug, Error)]
@@ -69,6 +86,16 @@ pub trait DisplayInfo: Send + Sync {
     /// [`DisplayError::Unavailable`] if the platform cannot report the
     /// desktop geometry.
     fn desktop_bounds(&self) -> Result<Screen, DisplayError>;
+
+    /// Every monitor's bounds, normalized to the desktop origin, so the
+    /// crossing edge can be mapped against the actual monitor on it rather
+    /// than the bounding box (ADR 0009). At least one on any real display.
+    ///
+    /// # Errors
+    ///
+    /// [`DisplayError::Unavailable`] if the platform cannot enumerate the
+    /// monitors.
+    fn monitors(&self) -> Result<Vec<MonitorRect>, DisplayError>;
 
     /// The cursor's current position, normalized to the virtual desktop's
     /// top-left origin.
