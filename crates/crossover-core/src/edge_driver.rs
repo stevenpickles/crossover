@@ -170,6 +170,7 @@ impl EdgeDetectDriver {
                 update = self.mode_rx.recv() => {
                     let Some(mode) = update else { break }; // wiring gone
                     self.mode = mode;
+                    tracing::debug!(?mode, "edge: watching mode changed");
                     if mode != EdgeMode::Idle {
                         // Begin from the current cursor so a position
                         // already at the edge does not fire immediately.
@@ -219,6 +220,13 @@ impl EdgeDetectDriver {
             let Some(kind) = self.mode.crossing_kind() else {
                 return true; // idle: nothing to emit (unreachable while polling)
             };
+            tracing::debug!(
+                ?kind,
+                position = position.value(),
+                cursor_x = cursor.x,
+                cursor_y = cursor.y,
+                "edge: crossing detected"
+            );
             if self
                 .crossings_tx
                 .send(EdgeCrossing { kind, position })

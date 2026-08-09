@@ -48,6 +48,7 @@ use crossover_protocol::RawFrame;
 use crate::clipboard_driver::{FrameTarget, SessionCommand};
 use crate::control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
+    OutboundControl,
 };
 use crate::edge_driver::EdgeMode;
 use crate::input::InputEvent;
@@ -221,7 +222,7 @@ impl InputControlDriver {
                         // is_capturing (R-2); this poll turns it into the
                         // engine's fail-closed transition.
                         if !self.capture.is_capturing() {
-                            let actions = self.engine.handle(ControlEvent::CaptureLost);
+                            let actions = self.dispatch(ControlEvent::CaptureLost);
                             if !self.execute(actions).await {
                                 return;
                             }
@@ -230,7 +231,7 @@ impl InputControlDriver {
                             // (both Control keys); hand control back — the
                             // only way out while the keyboard is captured
                             // and the console is unreachable (ADR 0008).
-                            let actions = self.engine.handle(ControlEvent::UserRelease);
+                            let actions = self.dispatch(ControlEvent::UserRelease);
                             if !self.execute(actions).await {
                                 return;
                             }
@@ -334,7 +335,7 @@ impl InputControlDriver {
                     }
                 }
             };
-            let actions = self.engine.handle(engine_event);
+            let actions = self.dispatch(engine_event);
             if !self.execute(actions).await {
                 return false;
             }
@@ -361,6 +362,12 @@ impl InputControlDriver {
         match seamless.display.monitors() {
             Ok(monitors) => {
                 let point = seamless.topology.entering(fraction, &monitors);
+                tracing::debug!(
+                    fraction = fraction.value(),
+                    x = point.x,
+                    y = point.y,
+                    "control: placing cursor on entry edge"
+                );
                 if let Err(error) = self.injector.place_cursor(point) {
                     tracing::warn!(error = %error, "cursor placement failed");
                 }
@@ -393,11 +400,48 @@ impl InputControlDriver {
         }
         let mode = self.edge_mode();
         if mode != self.last_edge_mode {
+            tracing::debug!(?mode, "control: edge mode -> detector");
             self.last_edge_mode = mode;
             if let Some(seamless) = &self.seamless {
                 let _ = seamless.edge_mode.send(mode).await;
             }
         }
+    }
+
+    /// Hand `event` to the engine, tracing the transition — unless it is
+    /// high-frequency input (local capture or a peer input batch), which
+    /// would drown the log. A soak with `RUST_LOG=crossover_core=debug`
+    /// then reads as the exact sequence of control transitions on this
+    /// machine, so a misbehaving transfer can be diagnosed from the two
+    /// machines' logs side by side (ADR 0009 diagnostics).
+    fn dispatch(&mut self, event: ControlEvent) -> Vec<ControlAction> {
+        let loud = !matches!(
+            event,
+            ControlEvent::Captured(_)
+                | ControlEvent::Peer {
+                    message: InboundControl::Batch(_),
+                    ..
+                }
+        );
+        if loud {
+            tracing::debug!(
+                event = ?event,
+                controlling = self.engine.is_controlling(),
+                controlled = self.engine.is_controlled(),
+                "control transition: event"
+            );
+        }
+        let actions = self.engine.handle(event);
+        if loud {
+            let labels: Vec<&'static str> = actions.iter().map(action_label).collect();
+            tracing::debug!(
+                controlling = self.engine.is_controlling(),
+                controlled = self.engine.is_controlled(),
+                actions = ?labels,
+                "control transition: result"
+            );
+        }
+        actions
     }
 
     /// Execute engine actions in order. Returns `false` when the
@@ -441,7 +485,7 @@ impl InputControlDriver {
                         // lost path releases the peer and reverts to
                         // local (fail closed, NFR-3 diagnostic included).
                         tracing::error!(error = %error, "start_capture failed; failing closed");
-                        deferred.extend(self.engine.handle(ControlEvent::CaptureLost));
+                        deferred.extend(self.dispatch(ControlEvent::CaptureLost));
                     } else if let Err(error) = self.cursor_mask.hide() {
                         // Masking is a nicety; a failure to hide never
                         // disturbs control (ADR 0009). Only capture started.
@@ -534,6 +578,27 @@ impl InputControlDriver {
                 reason: format!("start_capture task failed: {join_error}"),
             })
         })
+    }
+}
+
+/// A short label for a control action, for the transition trace. Kept
+/// coarse (message *kind*, not contents) so the log never carries input.
+fn action_label(action: &ControlAction) -> &'static str {
+    match action {
+        ControlAction::Send { message, .. } => match message {
+            OutboundControl::Request(_) => "Send(Request)",
+            OutboundControl::Response(_) => "Send(Response)",
+            OutboundControl::Release(_) => "Send(Release)",
+            OutboundControl::Batch(_) => "Send(Batch)",
+            OutboundControl::ReleaseAll(_) => "Send(ReleaseAll)",
+        },
+        ControlAction::StartCapture => "StartCapture",
+        ControlAction::StopCapture => "StopCapture",
+        ControlAction::Inject(_) => "Inject",
+        ControlAction::PlaceCursor(_) => "PlaceCursor",
+        ControlAction::ScheduleRequestTimeout { .. } => "ScheduleRequestTimeout",
+        ControlAction::Terminate { .. } => "Terminate",
+        ControlAction::Notify(_) => "Notify",
     }
 }
 
