@@ -209,19 +209,21 @@ it the instant control ends; the driver brackets this on the same
 hidden exactly while capturing and can never be left hidden (the mirror of
 the stuck-key invariant).
 
-The Windows implementation is a **full-desktop, fully transparent, top-most
-overlay window** with a null cursor. Because the controlled cursor is frozen
-while driving the peer (input is suppressed), no mouse move ever reaches the
-overlay, so the blank must be forced: showing the overlay **warps the cursor
-onto it** (`SetCursorPos`), which generates a real `WM_SETCURSOR` on the
-overlay's own thread and blanks the pointer; the saved position is restored
-when the overlay comes down. The warp produces no Raw Input and is invisible
-to the capture hook, so nothing is forwarded to the peer, and the
-controlling machine's cursor position is irrelevant to detection (idle while
-driving). The two obvious alternatives were rejected: `ShowCursor(FALSE)`
-only affects the calling thread's own windows, not the cursor over other
-applications; and `SetSystemCursor` with a blank cursor is global and does
-**not** revert when the process dies, so a crash mid-control would strand the
-machine with no cursor. The overlay is the inverse — the window is destroyed
-with the process, so the cursor always returns. Masking is a display nicety:
-a failure to hide or show is logged and never disturbs control.
+The Windows implementation blanks the **system cursors** (`SetSystemCursor`
+with a transparent cursor for each standard type), restoring the defaults
+when control ends. A transparent top-most overlay window was tried first and
+rejected: it hid the pointer on a single monitor but not on a machine with
+**two monitors of different size and DPI** — one window spanning the
+mismatched virtual desktop, and a frozen cursor that needs warping to fire
+`WM_SETCURSOR`, which then perturbs capture. The Phase 5 soak demonstrated
+exactly that asymmetry. `ShowCursor(FALSE)` was never viable: it affects only
+the calling thread's own windows.
+
+`SetSystemCursor` is geometry-, monitor-, and DPI-independent — it swaps the
+cursor image, touches no window, and never moves the pointer (removing a
+source of capture interference the warp introduced). Its cost is that a
+blanked system cursor does not revert on process death; that is mitigated by
+restoring the defaults on every exit from control and on shutdown, **and** by
+restoring them when a mask is created, so the next launch of Crossover
+self-heals a crash's blanking. Masking is a display nicety: a failure to hide
+or restore is logged and never disturbs control.
