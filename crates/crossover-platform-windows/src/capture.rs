@@ -88,8 +88,8 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetSystemMetrics, HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_UP, MSG,
-    MSLLHOOKSTRUCT, PostMessageW, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP,
+    GetSystemMetrics, HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP,
+    MSG, MSLLHOOKSTRUCT, PostMessageW, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP,
     RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, RI_MOUSE_HWHEEL, RI_MOUSE_LEFT_BUTTON_DOWN,
     RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP,
     RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, RI_MOUSE_WHEEL, SM_CXSCREEN,
@@ -173,6 +173,11 @@ struct RawKey {
     scancode: u16,
     extended: bool,
     pressed: bool,
+    /// Whether Windows marked the event `LLKHF_INJECTED` — i.e. some
+    /// process (or the keyboard driver itself) synthesized it rather than
+    /// a physical keypress. Recorded to diagnose the phantom-shift the
+    /// driver injects around navigation keys under Shift+NumLock.
+    injected: bool,
 }
 
 /// Enqueue a raw key for the pump, bounded (NFR-1). Same-thread with the
@@ -243,6 +248,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 scancode: u16::try_from(info.scanCode).unwrap_or(0),
                 extended: info.flags.0 & LLKHF_EXTENDED.0 != 0,
                 pressed,
+                injected: info.flags.0 & LLKHF_INJECTED.0 != 0,
             });
             let hwnd = PUMP_HWND.load(Ordering::Relaxed);
             if hwnd != 0 {
@@ -870,11 +876,26 @@ impl Pump {
             let mut queue = KEY_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
             queue.drain(..).collect()
         };
-        let events: Vec<InputEvent> = drained
-            .into_iter()
-            .filter_map(translate_key)
-            .map(InputEvent::Key)
-            .collect();
+        let mut events = Vec::with_capacity(drained.len());
+        for raw in drained {
+            let hid = keymap::scancode_to_hid(raw.scancode, raw.extended);
+            // Diagnostic (RUST_LOG=crossover_platform_windows=debug): the
+            // exact scan code, extended and injected flags, and resulting
+            // HID for every captured key — the ground truth for the
+            // phantom-shift the driver injects around navigation keys
+            // under Shift+NumLock.
+            tracing::debug!(
+                scancode = raw.scancode,
+                extended = raw.extended,
+                injected = raw.injected,
+                pressed = raw.pressed,
+                ?hid,
+                "captured key"
+            );
+            if let Some(event) = translate_key(raw) {
+                events.push(InputEvent::Key(event));
+            }
+        }
         if events.is_empty() {
             return;
         }
@@ -1040,6 +1061,7 @@ mod tests {
                 scancode: 0x1E,
                 extended: false,
                 pressed: true,
+                injected: false,
             }),
             Some(KeyEvent::press(0x04))
         );
@@ -1050,6 +1072,7 @@ mod tests {
                 scancode: 0x1D,
                 extended: true,
                 pressed: false,
+                injected: false,
             }),
             Some(KeyEvent::release(0xE4))
         );
@@ -1059,6 +1082,7 @@ mod tests {
                 scancode: 0x00,
                 extended: false,
                 pressed: true,
+                injected: false,
             })
             .is_none()
         );
@@ -1435,6 +1459,13 @@ mod tests {
     #[ignore = "manual probe: freezes the local mouse AND keyboard for 10 seconds (docs/SOAK.md)"]
     fn manual_probe_capture() {
         let _serial = capture_lock();
+        // Surface the per-key diagnostic on_key_ready emits at DEBUG (scan
+        // code, extended/injected flags, HID) so a single machine can show
+        // the phantom-shift sequence around Shift+Home/End.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::stderr)
+            .try_init();
         let capture = WindowsInputCapture::new().unwrap();
         let (sink, seen) = collecting_sink();
 
@@ -1442,6 +1473,10 @@ mod tests {
         eprintln!("capturing for 10 seconds: the mouse AND keyboard should go DEAD locally;");
         eprintln!("move, click, scroll, and type anyway — events are being counted.");
         eprintln!("(you cannot Ctrl-C during this; it releases itself after 10s.)");
+        eprintln!(
+            "to diagnose Shift+navigation: with NumLock ON, press and hold Shift and tap \
+             Home, End, Left, Right — each 'captured key' line shows what is forwarded."
+        );
         capture.start_capture(sink).unwrap();
         std::thread::sleep(Duration::from_secs(10));
         let healthy = capture.is_capturing();
