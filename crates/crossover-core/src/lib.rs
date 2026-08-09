@@ -10,6 +10,7 @@ pub mod clipboard;
 pub mod clipboard_driver;
 pub mod control;
 pub mod control_driver;
+pub mod edge_driver;
 pub mod input;
 pub mod metrics;
 pub mod net;
@@ -26,6 +27,9 @@ pub use control::{
     OutboundControl,
 };
 pub use control_driver::{InputControlDriver, InputControlEvent, input_control};
+pub use edge_driver::{
+    CrossingKind, EdgeCrossing, EdgeDetectDriver, EdgeDetector, EdgeMode, edge_detect,
+};
 pub use input::{
     InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce, coalesce_input, hid,
 };
