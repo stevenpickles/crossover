@@ -419,3 +419,112 @@ Record the outcome in the Phase 4 exit-criteria notes
 (docs/ROADMAP.md): how many control cycles, whether any key or modifier
 ever stuck, whether the escape ever leaked, and the subjective feel of
 typing on the far machine.
+
+## Phase 5 soak: seamless edge transfer (two machines)
+
+This is the Phase 5 exit criterion, and the payoff of the whole project:
+the two machines behave like neighboring monitors. The cursor crosses a
+screen edge and control — pointer *and* keyboard — follows on its own,
+then returns at the reverse edge, with no console command. The hermetic
+tests prove the topology math, the edge detector, the engine, and the
+placement seam in isolation; only two real machines side by side prove
+they compose into the seamless illusion (ADR 0009).
+
+### Setup
+
+Pair and connect exactly as for the earlier soaks (same binary, firewall
+rule, pairing ceremony). Then run each machine with its **side of the
+pair**, arranged physically as `A | B` — A on the left, B on the right:
+
+```
+# Machine A (left screen), listening:
+crossover --name machine-a run --listen --left  > soak-a.log 2>&1
+
+# Machine B (right screen), dialing A:
+crossover --name machine-b run --connect <A-address>:27677 --right > soak-b.log 2>&1
+```
+
+Each side prints its geometry and edge at startup — check it:
+
+```
+Primary display: 1920x1080. Seamless: Left screen, crossing on its Right edge.
+Primary display: 2560x1440. Seamless: Right screen, crossing on its Left edge.
+```
+
+The left machine's **right** edge links to the right machine's **left**
+edge. Differing resolutions are fine — the crossing position travels as a
+fraction, mapped through each machine's own geometry.
+
+### The procedure
+
+1. **Cross to the peer.** Both start local. Move A's cursor into A's
+   **right** edge. Control transfers on its own: A's console prints "You
+   now control the peer", B's prints "The peer is now controlling this
+   machine", and **B's cursor appears at B's left edge at the same height
+   the cursor left A**. A's own pointer is now frozen; moving A's mouse
+   drives B's cursor.
+2. **Keyboard follows.** With B under control, type — the keystrokes land
+   on B, no separate action. Try a shortcut or two.
+3. **Cross back.** Drive B's cursor (with A's mouse) into B's **left**
+   edge. Control returns on its own: B reclaims, A's pointer comes back to
+   life at A's right edge at the matching height, and A is local again.
+4. **Repeat, many times.** Move A → B → A through the edges a few dozen
+   times, using only the mouse — never the console. Every cycle should
+   transfer cleanly, place the cursor sensibly, and leave **no stuck key
+   or button** on either machine.
+5. **Clipboard rides along.** At points during the cycling, copy on one
+   machine and paste on the other (both directions). Clipboard sync must
+   keep working throughout the control transfers — the two subsystems are
+   independent (FR-5.4).
+6. **The overrides still work.** The console `c` / `r` and the
+   both-Control escape remain: while controlling, the escape hands back
+   instantly; `c` / `r` force a transfer or reclaim regardless of edges.
+7. **The fault that matters — converge under loss.** Induce packet delay
+   or loss *during* a crossing — a tool like `clumsy`, or disabling B's
+   adapter for a couple of seconds mid-transfer. Confirm the system always
+   converges to **exactly one owner**: never both machines controlling,
+   never a dead cursor on both. A lost acknowledgement times out back to
+   local; a disconnect mid-control releases everything (`ReleaseAllInput`)
+   and returns both to local until the session re-establishes.
+
+### What good looks like
+
+- Crossing the edge transfers within a moment; the cursor appears on the
+  far machine at the same proportional height and keeps moving smoothly
+  (the Phase 3 pointer feel carries over).
+- The keyboard follows the pointer with no extra step.
+- After every A → B → A cycle, **both machines hold no key and no
+  button**, and both pointers are alive; the escape and console overrides
+  still work.
+- Copied content matches across the machines throughout the cycling.
+- Under induced delay or loss, exactly one machine ends up in control — or
+  both end local after a disconnect. Never a split brain, never a dead
+  cursor on both.
+- Every transition is narrated on both consoles (NFR-3).
+- The shutdown metrics (on `q` / Ctrl-C) report the control gains, given,
+  and hand-backs — a rough tally of how many crossings the run drove.
+
+### Honest limitations
+
+- **Immediate crossing (ADR 0009).** Touching the linked edge transfers
+  at once — there is no dwell or push-through this phase. A cursor parked
+  against that edge will cross; if accidental crossings prove annoying in
+  the soak, that is the trade recorded in ADR 0009 to revisit, not a bug.
+- **Whole virtual desktop.** A machine with several monitors treats them
+  as one desktop: the crossing edge is the *outer* edge of the whole
+  desktop, not a seam between monitors, and the vertical position maps
+  across the full desktop height. So on a machine whose monitors differ in
+  height, a crossing that originates from the shorter monitor can only
+  reach the fraction of the edge that monitor covers — a quirk, not a bug.
+- **DPI.** The process is per-monitor DPI aware, so geometry and cursor
+  coordinates are real pixels across mixed-DPI monitors (the startup line
+  shows the true resolution, e.g. a 3840×2400 panel as 3840×2400, not its
+  scaled size). The crossing itself maps by fraction, so differing
+  resolutions transfer regardless.
+- The Phase 4 keyboard caveat still applies: a native editor with its own
+  Home/End handling may treat forwarded shifted-navigation its own way.
+
+Record the outcome in the Phase 5 exit-criteria notes (docs/ROADMAP.md):
+how many A → B → A cycles, whether control ever split or stuck, how
+accurately the cursor landed on entry, whether the clipboard stayed
+consistent, and what happened to ownership under induced loss.
