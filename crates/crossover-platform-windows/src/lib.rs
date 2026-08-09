@@ -29,9 +29,15 @@ pub use capture::WindowsInputCapture;
 #[cfg(windows)]
 pub use clipboard::WindowsClipboard;
 #[cfg(windows)]
-pub use cursor::WindowsCursorMask;
+pub use cursor::{WindowsCursorMask, restore_system_cursors};
 #[cfg(windows)]
 pub use display::WindowsDisplayInfo;
+
+/// Restore the default system cursors — a no-op off Windows, where there is
+/// no cursor masking. Called on shutdown so a quit never leaves the cursor
+/// blanked (ADR 0009).
+#[cfg(not(windows))]
+pub fn restore_system_cursors() {}
 #[cfg(windows)]
 pub use input::WindowsInputInjector;
 #[cfg(windows)]

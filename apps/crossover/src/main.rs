@@ -149,14 +149,20 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
-            commands::run(
+            let result = commands::run(
                 &device_name,
                 listen_bind,
                 args.connect,
                 side,
                 args.no_cursor_mask,
             )
-            .await
+            .await;
+            // Seamless masking may have blanked the system cursor; restore it
+            // synchronously on the way out so a quit — however `run` ended —
+            // never leaves the machine cursor-less (ADR 0009). Idempotent
+            // when nothing was masked.
+            crossover_platform_windows::restore_system_cursors();
+            result
         }
         Command::Pair(args) => match args.address {
             Some(address) => commands::pair_connect(&device_name, &address).await,
