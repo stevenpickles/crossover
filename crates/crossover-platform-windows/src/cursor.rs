@@ -126,7 +126,11 @@ impl Drop for WindowsCursorMask {
 
 /// Reload the default system cursors from the user's settings, undoing any
 /// blanking (ours or a prior crash's). Best-effort; a failure is logged.
-fn restore_system_cursors() {
+/// Public so the binary can call it **synchronously** on shutdown — a quit
+/// or lost connection must never leave the machine with a blanked cursor,
+/// and the async applier's restore cannot be relied on to run before the
+/// process exits.
+pub fn restore_system_cursors() {
     // SAFETY: SPI_SETCURSORS reloads the cursors and takes no in/out
     // parameter, so a null pvparam is correct.
     let result = unsafe {
