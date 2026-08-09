@@ -161,15 +161,20 @@ Unicode `text` for mismatched layouts (ADR 0008).
 
 Ownership is explicit, negotiated state (FR-5.1) — request → acknowledge →
 switch (FR-5.3). Phase 3 triggers requests explicitly (CLI command); Phase 5
-will trigger them from edge crossings without changing these messages.
+also triggers them from edge crossings, which carry a normalized `entry`
+position so the destination places the cursor where the pointer crossed
+(ADR 0009). The `entry` is `Option<u16>` — `0` top, `u16::MAX` bottom, a
+fraction of the edge that is resolution- and DPI-independent; `None` for
+an explicit (console) transfer, which places no cursor. Carrying it grew
+the request and release layouts, which is the v1 → **v2** protocol bump.
 
 ```
-A -> B   ControlRequest   { request_id }             // A asks to control B
-B -> A   ControlResponse  { request_id, verdict }    // Granted | Denied(reason)
+A -> B   ControlRequest   { request_id, entry }        // A asks to control B
+B -> A   ControlResponse  { request_id, verdict }      // Granted | Denied(reason)
 A        on Granted: starts capture, sends InputBatch frames
 ...
-A -> B   ReleaseAllInput  { after_sequence }         // hand-back begins
-A -> B   ControlRelease   { }                        // relationship ends
+A -> B   ReleaseAllInput  { after_sequence }           // hand-back begins
+A -> B   ControlRelease   { entry }                    // relationship ends
 ```
 
 Rules, all fail-closed:
@@ -186,7 +191,9 @@ Rules, all fail-closed:
 - A request left unanswered past the requester's timeout reverts the
   requester to local control; nothing was captured in the interim.
 - `ControlRelease` from the *controlled* side revokes an active grant (the
-  local user's escape hatch). The ex-controller stops capturing on receipt.
+  local user's escape hatch) and is also the reverse-edge return; when it
+  carries an `entry`, the ex-controller places its cursor there on the way
+  back (ADR 0009). The ex-controller stops capturing on receipt.
 - Disconnect in any state releases everything: the controlled side executes
   `ReleaseAllInput` locally (FR-4.4), the controller stops capture, and
   both sides are local until a new negotiation.

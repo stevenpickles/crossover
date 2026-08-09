@@ -210,8 +210,8 @@ mod tests {
 
     fn sample() -> Hello {
         Hello {
-            protocol_version: 1,
-            min_protocol_version: 1,
+            protocol_version: 2,
+            min_protocol_version: 2,
             device_id: Uuid::from_bytes([0x11; 16]),
             device_name: "left".to_owned(),
             operating_system: OsFamily::Windows,
@@ -233,7 +233,7 @@ mod tests {
     fn golden_wire_snapshot_v1() {
         let encoded = sample().encode_payload().unwrap();
         let expected: Vec<u8> = [
-            &[0x01, 0x01][..],                   // versions 1, 1 (varints)
+            &[0x02, 0x02][..],                   // versions 2, 2 (varints)
             &[0x10],                             // device_id: 16-byte length
             &[0x11; 16][..],                     // device_id bytes
             &[0x04, b'l', b'e', b'f', b't'][..], // device_name
@@ -243,7 +243,7 @@ mod tests {
         .concat();
         assert_eq!(
             encoded, expected,
-            "v1 Hello wire layout changed: bump the protocol version (ADR 0001)"
+            "Hello wire layout changed: bump the protocol version (ADR 0001)"
         );
     }
 

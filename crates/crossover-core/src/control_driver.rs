@@ -346,6 +346,17 @@ impl InputControlDriver {
                         tracing::warn!(error = %error, "input injection failed");
                     }
                 }
+                ControlAction::PlaceCursor(position) => {
+                    // Cursor placement on seamless entry/return (ADR 0009)
+                    // maps the fraction through the local display geometry
+                    // and injects an absolute move. The seam is explicit
+                    // here; the actuation (topology + display + absolute
+                    // injection) is wired in the app layer.
+                    tracing::debug!(
+                        position = position.value(),
+                        "place cursor on the entry edge"
+                    );
+                }
                 ControlAction::ScheduleRequestTimeout {
                     session,
                     request_id,
@@ -598,7 +609,10 @@ mod tests {
             .unwrap();
 
         // Peer requests; we grant.
-        let request = ControlRequest { request_id: 7 };
+        let request = ControlRequest {
+            request_id: 7,
+            entry: None,
+        };
         rig.events
             .send(frame(
                 MessageType::ControlRequest,
@@ -774,7 +788,10 @@ mod tests {
             .unwrap();
 
         // Grant, receive a press, then the peer hands back properly.
-        let request = ControlRequest { request_id: 1 };
+        let request = ControlRequest {
+            request_id: 1,
+            entry: None,
+        };
         rig.events
             .send(frame(
                 MessageType::ControlRequest,
@@ -808,7 +825,12 @@ mod tests {
             .await
             .unwrap();
         rig.events
-            .send(frame(MessageType::ControlRelease, Vec::new()))
+            .send(frame(
+                MessageType::ControlRelease,
+                crossover_protocol::ControlRelease { entry: None }
+                    .encode_payload()
+                    .unwrap(),
+            ))
             .await
             .unwrap();
         assert_eq!(
@@ -853,7 +875,12 @@ mod tests {
         rig.events
             .send(frame(
                 MessageType::ControlRequest,
-                ControlRequest { request_id: 1 }.encode_payload().unwrap(),
+                ControlRequest {
+                    request_id: 1,
+                    entry: None,
+                }
+                .encode_payload()
+                .unwrap(),
             ))
             .await
             .unwrap();
@@ -949,7 +976,12 @@ mod tests {
         rig.events
             .send(frame(
                 MessageType::ControlRequest,
-                ControlRequest { request_id: 1 }.encode_payload().unwrap(),
+                ControlRequest {
+                    request_id: 1,
+                    entry: None,
+                }
+                .encode_payload()
+                .unwrap(),
             ))
             .await
             .unwrap();
@@ -967,7 +999,12 @@ mod tests {
             .send(frame_on(
                 OTHER_SESSION,
                 MessageType::ControlRequest,
-                ControlRequest { request_id: 5 }.encode_payload().unwrap(),
+                ControlRequest {
+                    request_id: 5,
+                    entry: None,
+                }
+                .encode_payload()
+                .unwrap(),
             ))
             .await
             .unwrap();
@@ -1005,7 +1042,12 @@ mod tests {
         rig.events
             .send(frame(
                 MessageType::ControlRequest,
-                ControlRequest { request_id: 1 }.encode_payload().unwrap(),
+                ControlRequest {
+                    request_id: 1,
+                    entry: None,
+                }
+                .encode_payload()
+                .unwrap(),
             ))
             .await
             .unwrap();

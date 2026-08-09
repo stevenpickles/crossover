@@ -98,6 +98,25 @@ impl EdgeFraction {
         self.0
     }
 
+    /// The wire encoding of the position (ADR 0009): the fraction scaled
+    /// onto `0..=u16::MAX`, so it travels as a compact, always-valid
+    /// integer rather than a float. `0` is the top of the edge, `u16::MAX`
+    /// the bottom.
+    #[must_use]
+    pub fn to_wire(self) -> u16 {
+        // self.0 ∈ [0, 1], so the product rounds into [0, u16::MAX]: it
+        // cannot truncate or lose sign.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let scaled = (self.0 * f64::from(u16::MAX)).round() as u16;
+        scaled
+    }
+
+    /// Decode a wire position ([`to_wire`](Self::to_wire)'s inverse).
+    #[must_use]
+    pub fn from_wire(raw: u16) -> Self {
+        Self(f64::from(raw) / f64::from(u16::MAX))
+    }
+
     /// The fraction of a `height`-tall edge at pixel row `y`. Rows map to
     /// the full `[0, 1]` range — row `0` is `0.0`, the last row is `1.0`
     /// — so a round trip through [`to_pixel`](Self::to_pixel) on the same
@@ -302,6 +321,20 @@ mod tests {
         assert!(approx(EdgeFraction::new(9.0).value(), 1.0));
         assert!(approx(EdgeFraction::new(f64::NAN).value(), 0.0));
         assert!(approx(EdgeFraction::new(0.25).value(), 0.25));
+    }
+
+    #[test]
+    fn the_wire_encoding_round_trips_within_one_pixel() {
+        // Endpoints are exact; interior values recover within the u16 grid.
+        assert_eq!(EdgeFraction::new(0.0).to_wire(), 0);
+        assert_eq!(EdgeFraction::new(1.0).to_wire(), u16::MAX);
+        for raw in [0u16, 1, 12_345, 32_768, u16::MAX] {
+            assert_eq!(EdgeFraction::from_wire(raw).to_wire(), raw);
+        }
+        // A wire value maps onto the same pixel row it came from.
+        let frac = EdgeFraction::from_pixel(720, HD.height);
+        let recovered = EdgeFraction::from_wire(frac.to_wire());
+        assert!((recovered.to_pixel(HD.height) - 720).abs() <= 1);
     }
 
     #[test]
