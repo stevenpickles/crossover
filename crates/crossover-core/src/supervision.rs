@@ -4,7 +4,11 @@
 //! [`supervise_outbound`] owns the connector role for one peer: establish,
 //! run with keepalive, and on loss retry forever with bounded exponential
 //! backoff — attempts are deliberately unbounded (reconnection *is* the
-//! product requirement), the delay between them is what NFR-1 bounds.
+//! product requirement), the delay between them is what NFR-1 bounds. The
+//! backoff resets only after a session that lasted long enough to count as a
+//! real recovery; a session that dies fast is treated as a *flap* and the
+//! backoff keeps climbing, so a persistently-broken link is retried ever
+//! more slowly instead of churning at the floor delay for days.
 //! [`run_session`] is the per-session loop, exposed separately so the
 //! listener side runs the same keepalive and dispatch logic without the
 //! reconnect wrapper.
@@ -31,6 +35,11 @@ pub struct ReconnectPolicy {
     pub initial_delay: Duration,
     /// Ceiling every later delay is clamped to.
     pub max_delay: Duration,
+    /// How long a session must last to count as a genuine recovery and reset
+    /// the backoff. A session that dies sooner is a *flap*: the backoff keeps
+    /// escalating so a persistently-broken link is retried ever more slowly
+    /// instead of churning at the floor delay forever (multi-day hardening).
+    pub reset_after: Duration,
 }
 
 impl Default for ReconnectPolicy {
@@ -38,6 +47,9 @@ impl Default for ReconnectPolicy {
         Self {
             initial_delay: Duration::from_millis(500),
             max_delay: Duration::from_secs(30),
+            // Comfortably longer than a keepalive round-trip (5 s interval,
+            // 15 s timeout): a session that outlives this really connected.
+            reset_after: Duration::from_secs(30),
         }
     }
 }
@@ -52,6 +64,13 @@ impl ReconnectPolicy {
         self.initial_delay
             .saturating_mul(factor)
             .min(self.max_delay)
+    }
+
+    /// Whether a session that lasted `lifetime` was stable enough to reset
+    /// the backoff — a real recovery, not a flap.
+    #[must_use]
+    pub fn resets_backoff(&self, lifetime: Duration) -> bool {
+        lifetime >= self.reset_after
     }
 }
 
@@ -230,7 +249,6 @@ async fn run_supervisor(
 
         match connect(peer_addr.as_str(), &local, &config.session).await {
             Ok(session) => {
-                attempt = 0;
                 let info = session.info().clone();
                 if events
                     .send(SessionEvent::Established(info.clone()))
@@ -240,6 +258,7 @@ async fn run_supervisor(
                     // Application dropped the event stream: stop.
                     break;
                 }
+                let established_at = tokio::time::Instant::now();
                 let reason = run_session(
                     session,
                     &events,
@@ -248,6 +267,12 @@ async fn run_supervisor(
                     &config.keepalive,
                 )
                 .await;
+                // Reset the backoff only if the session was stable — a real
+                // recovery. A session that dies fast is a flap, and letting
+                // the backoff keep climbing stops a broken link from churning.
+                if config.reconnect.resets_backoff(established_at.elapsed()) {
+                    attempt = 0;
+                }
                 let is_shutdown = matches!(reason, DisconnectReason::ShutdownRequested);
                 let retry_in = (!is_shutdown).then(|| config.reconnect.delay_for_attempt(attempt));
                 let _ = events
@@ -476,6 +501,7 @@ mod tests {
         let policy = ReconnectPolicy {
             initial_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(2),
+            ..ReconnectPolicy::default()
         };
         assert_eq!(policy.delay_for_attempt(0), Duration::from_millis(100));
         assert_eq!(policy.delay_for_attempt(1), Duration::from_millis(200));
@@ -485,6 +511,20 @@ mod tests {
         // Far past the clamp — including shift overflow territory.
         assert_eq!(policy.delay_for_attempt(40), Duration::from_secs(2));
         assert_eq!(policy.delay_for_attempt(u32::MAX), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn only_a_session_that_outlives_the_threshold_resets_the_backoff() {
+        let policy = ReconnectPolicy {
+            reset_after: Duration::from_secs(30),
+            ..ReconnectPolicy::default()
+        };
+        // A flap (dies before the threshold) keeps the backoff climbing.
+        assert!(!policy.resets_backoff(Duration::from_secs(0)));
+        assert!(!policy.resets_backoff(Duration::from_secs(29)));
+        // A session that reaches the threshold is a real recovery.
+        assert!(policy.resets_backoff(Duration::from_secs(30)));
+        assert!(policy.resets_backoff(Duration::from_secs(45)));
     }
 
     proptest! {
@@ -498,6 +538,7 @@ mod tests {
             let policy = ReconnectPolicy {
                 initial_delay: Duration::from_millis(initial_ms),
                 max_delay: Duration::from_millis(max_ms),
+                ..ReconnectPolicy::default()
             };
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             prop_assert!(policy.delay_for_attempt(lo) <= policy.delay_for_attempt(hi));
@@ -552,6 +593,9 @@ mod tests {
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(50),
                 max_delay: Duration::from_millis(200),
+                // Any session in these fast tests counts as stable (resetting
+                // the backoff), matching the pre-flap-protection behavior.
+                reset_after: Duration::from_millis(1),
             },
             keepalive: KeepaliveConfig {
                 interval: Duration::from_millis(500),

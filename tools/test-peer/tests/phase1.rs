@@ -235,6 +235,8 @@ async fn supervisor_reestablishes_through_the_test_peer() {
         reconnect: ReconnectPolicy {
             initial_delay: Duration::from_millis(50),
             max_delay: Duration::from_millis(200),
+            // Any session here counts as stable (resets the backoff).
+            reset_after: Duration::from_millis(1),
         },
         keepalive: KeepaliveConfig {
             interval: Duration::from_secs(2),
