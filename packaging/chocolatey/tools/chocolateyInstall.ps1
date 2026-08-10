@@ -23,4 +23,4 @@ Start-Service -Name $serviceName
 # Chocolatey shims the exes in tools\ onto PATH for CLI access. The service uses
 # this Program Files copy (registered by `service install`); the shims are for
 # running `crossover` by hand.
-Write-Host "Crossover installed to $installDir; the service is running. Set a role in %LOCALAPPDATA%\Crossover\config.toml (see ``crossover config``) so the worker has something to do."
+Write-Host "Crossover installed to $installDir; the service is running. Set a role in ~\.crossover\config.toml (see ``crossover config``) so the worker has something to do."

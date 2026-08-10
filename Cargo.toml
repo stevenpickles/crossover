@@ -71,6 +71,8 @@ tokio = { version = "1", features = [
 ] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tracing = "0.1"
+# Rolling file logs for the (often headless, service-launched) worker.
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 x509-parser = "0.18"

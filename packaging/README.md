@@ -87,5 +87,7 @@ SmartScreen does not warn. Neither is needed for personal or internal use.
 ## After install
 
 The service starts the worker, but the worker needs a role. Create
-`%LOCALAPPDATA%\Crossover\config.toml` (see `crossover config` for an example)
-with a `[network]` role and, for seamless mode, a `[seamless] side`.
+`~/.crossover/config.toml` (see `crossover config` for an example) with a
+`[network]` role and, for seamless mode, a `[seamless] side`. (Config and logs
+live under `~/.crossover`; identity and the trust store stay under
+`%LOCALAPPDATA%\Crossover`.)

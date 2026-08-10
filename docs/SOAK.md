@@ -589,7 +589,7 @@ the security boundary. So it happens once, up front, and its trust persists:
 ### Configuration (the service reads config.toml, not flags)
 
 The service starts `crossover run` with no arguments, so each machine's role and
-side come from `%LOCALAPPDATA%\Crossover\config.toml` (not CLI flags). Arranged
+side come from `~/.crossover/config.toml` (not CLI flags). Arranged
 `A | B` — A left, B right:
 
 Machine A (left screen, listens):
@@ -656,12 +656,12 @@ Then use the machines normally. Over the soak window (target: multiple days):
   console, so the `c` / `r` console commands are unavailable — control transfer
   is edge-driven only. The both-Control **escape still works** (it lives in the
   key path, not the console).
-- **Observability.** The service worker is headless, so its logs and shutdown
-  metrics currently go to `NUL` (the console-less-safety fix, ADR 0011) — a
-  multi-day service run is a black box for diagnosis. **File logging to
-  `%LOCALAPPDATA%\Crossover\logs` is the prerequisite to land before relying on
-  this soak to learn anything**; until then, observation is limited to
-  `crossover status`, Task Manager, and the seamless behavior itself.
+- **Observability is the log file.** The service worker is headless, so its
+  console output goes to `NUL` (ADR 0011) — but it also writes structured logs
+  to **`~/.crossover/logs`** (daily-rotating `crossover.<date>.log`, a week
+  kept), which is where you read back reconnects, control transfers, worker
+  relaunches, and errors after a multi-day run. `crossover status` and Task
+  Manager give the at-a-glance state; the log files give the history.
 
 Record the outcome in the Phase 6 exit-criteria notes (docs/ROADMAP.md): the
 soak duration, reboots and network interruptions survived, any manual

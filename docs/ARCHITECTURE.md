@@ -225,9 +225,10 @@ transaction logic, control transfer) remain in Crossover code.
 
 ## 8. Configuration (initial shape)
 
-The startup config file (`%LOCALAPPDATA%\Crossover\config.toml`) is sectioned
-and versioned so it can evolve without breaking a hand-edited file. Every
-field is optional and every CLI flag overrides its file counterpart.
+The startup config file (`~/.crossover/config.toml`) is sectioned and versioned
+so it can evolve without breaking a hand-edited file. Every field is optional
+and every CLI flag overrides its file counterpart. (Config and logs live under
+`~/.crossover`; secrets stay DPAPI-encrypted under `%LOCALAPPDATA%\Crossover`.)
 
 ```toml
 schema_version = 1

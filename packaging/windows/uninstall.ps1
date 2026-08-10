@@ -57,4 +57,4 @@ if (($machinePath -split ';') -contains $InstallDir) {
     Write-Host "Removed $InstallDir from the machine PATH."
 }
 
-Write-Host 'Crossover uninstalled. Your identity, trust store, and config under %LOCALAPPDATA%\Crossover are left intact.'
+Write-Host 'Crossover uninstalled. Your identity and trust store under %LOCALAPPDATA%\Crossover, and your config and logs under ~\.crossover, are left intact.'

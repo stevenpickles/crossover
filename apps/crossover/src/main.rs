@@ -11,6 +11,7 @@ mod commands;
 mod config;
 mod console;
 mod logging;
+mod paths;
 mod storage;
 
 use clap::{Args, Parser, Subcommand};
@@ -140,7 +141,9 @@ async fn main() -> anyhow::Result<()> {
     // or creates a window/hook, so coordinates are real pixels across
     // mixed-DPI monitors (R-3, ADR 0009).
     crossover_platform_windows::set_process_dpi_awareness();
-    logging::init()?;
+    // Hold the guard for the whole process: dropping it flushes and stops the
+    // rolling-file writer (docs/SOAK.md Phase 6 observability).
+    let _log_guard = logging::init()?;
     // Structured-field exemplar (docs/ARCHITECTURE.md §10): values as
     // fields, snake_case canonical names, message as the human summary.
     tracing::info!(

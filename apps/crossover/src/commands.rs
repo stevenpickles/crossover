@@ -259,8 +259,8 @@ side = \"right\"                      # \"left\" | \"right\"
 /// `crossover config` — show where the startup config lives and its
 /// current settings, or an example when there is none (Phase 6).
 pub fn config_show() -> anyhow::Result<()> {
-    let Some(path) = crate::config::config_path() else {
-        println!("Startup config is unavailable here (%LOCALAPPDATA% is not set).");
+    let Some(path) = crate::paths::config_path() else {
+        println!("Startup config is unavailable here (home directory could not be determined).");
         return Ok(());
     };
     println!("Startup config file:");
