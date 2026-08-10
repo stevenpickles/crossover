@@ -210,11 +210,28 @@ pub fn status(device_name: &str) -> anyhow::Result<()> {
     let store = TrustStore::load(&*storage).context("loading trust store")?;
     println!();
     println!("Trusted peers: {}", store.peers().len());
-    println!();
-    println!(
-        "Live session status will be reported here once `crossover run` \
-         is implemented."
-    );
+
+    // Background service (ADR 0011): surfaced here so a user can tell at a
+    // glance whether unattended operation is set up, without opening
+    // services.msc. Quiet on platforms with no service implementation.
+    match open_service_manager()?.status() {
+        Ok(ServiceStatus::NotInstalled) => {
+            println!();
+            println!("Background service: not installed (`crossover service install`)");
+        }
+        Ok(ServiceStatus::Installed { running }) => {
+            println!();
+            println!(
+                "Background service: installed, {}",
+                if running { "running" } else { "stopped" }
+            );
+        }
+        Err(ServiceError::Unsupported) => {}
+        Err(error) => {
+            println!();
+            println!("Background service: status unavailable ({error})");
+        }
+    }
     Ok(())
 }
 
