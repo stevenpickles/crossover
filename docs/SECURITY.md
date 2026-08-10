@@ -88,8 +88,10 @@ addresses.
   can be enforced later without migration.
 - `crossover peers` lists the store; `crossover peers remove <device-id>`
   revokes (a `show` subcommand can come later). Removal revokes
-  authorization immediately (FR-1.4): active sessions from that identity
-  are terminated and future connections rejected.
+  authorization immediately (FR-1.4): future connections are rejected (the
+  store is re-read on every accept/attempt), and active sessions from that
+  identity are terminated within the running process's trust-store poll
+  ([ADR 0010](adr/0010-active-session-revocation.md)).
 - The store contains **no private keys** — only the local device's public
   metadata and peers' public credentials. Theft of the trust store without
   the private key must not enable impersonation.

@@ -40,6 +40,12 @@ one gap was found in T6 (active-session revocation).**
 
 ## Finding — T6: active-session revocation is not enforced
 
+**Status: resolved** by [ADR 0010](adr/0010-active-session-revocation.md) —
+the running process now reloads the trust store on a 2 s poll and terminates
+any live session whose peer is no longer trusted (inbound kill switch, or
+outbound supervisor shutdown), closing the active-session half below. The
+original finding is retained for the record.
+
 **Severity: medium.** SECURITY.md §4 and the T6 defense state that removal
 "revokes authorization immediately: active sessions from that identity are
 terminated and future connections rejected." Only the second half holds.

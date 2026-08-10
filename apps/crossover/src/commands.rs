@@ -47,6 +47,12 @@ const PAIRING_TIMEOUT: Duration = Duration::from_mins(2);
 /// the cursor pins at the edge so nothing is missed between polls.
 const EDGE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 
+/// How often the running process reloads the trust store to enforce
+/// revocation on *active* sessions (ADR 0010). A deliberate LAN revocation
+/// tolerates a bounded few-second latency; this reuses the listener's
+/// per-accept load path.
+const REVOCATION_POLL: Duration = Duration::from_secs(2);
+
 /// `crossover pair --listen [--bind <addr>]`
 pub async fn pair_listen(device_name: &str, bind: Option<String>) -> anyhow::Result<()> {
     let storage = open_secure_storage()?;
@@ -171,7 +177,8 @@ pub fn peers_remove(device_id: Uuid) -> anyhow::Result<()> {
     store.save(&*storage).context("persisting trust store")?;
 
     println!(
-        "Revoked \"{}\" ({}). Its connections will be rejected from now on.",
+        "Revoked \"{}\" ({}). New connections are rejected; any active \
+         session ends within a couple of seconds (ADR 0010).",
         removed.device_name(),
         removed.peer_id()
     );
@@ -430,6 +437,8 @@ pub async fn run(
             &registry,
             &metrics,
         ) => {}
+        // Enforce revocation on live sessions, not just new ones (ADR 0010).
+        () = enforce_revocations(&storage, &registry) => {}
     }
     if let Some(handle) = &handle {
         handle.shutdown();
@@ -771,13 +780,15 @@ async fn console_loop(control: &mpsc::Sender<InputControlEvent>) {
     }
 }
 
-/// How to reach one live session: its frame sink, and its kill switch
-/// when it has one (inbound sessions do; the outbound supervisor has no
-/// per-session kill).
+/// How to reach one live session: its frame sink, its kill switch when it
+/// has one (inbound sessions do; the outbound supervisor has no per-session
+/// kill), and the peer's pinned fingerprint so revocation can find and
+/// terminate it (ADR 0010).
 #[derive(Clone)]
 struct SessionRoute {
     sink: FrameSink,
     kill: Option<watch::Sender<bool>>,
+    peer_fingerprint: SpkiFingerprint,
 }
 
 /// Where a session's outbound frames go. Cloned out from under the
@@ -815,6 +826,66 @@ fn registry_lock(
     registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Which of the live sessions belong to a peer that is no longer trusted —
+/// a session whose pinned fingerprint is absent from the current store
+/// (ADR 0010). Pure, so it is unit-tested; the wiring is integration.
+fn revoked_session_ids(live: &[(Uuid, SpkiFingerprint)], trust: &TrustStore) -> Vec<Uuid> {
+    live.iter()
+        .filter(|(_, fingerprint)| trust.find_by_fingerprint(*fingerprint).is_none())
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// Terminate one session on revocation: fire an inbound session's kill
+/// switch, or shut the outbound supervisor down (its one peer is now
+/// untrusted, so stopping reconnection to it is correct). The normal
+/// disconnect path then releases any held input (FR-4.4).
+fn terminate_on_revocation(route: &SessionRoute) {
+    match &route.sink {
+        FrameSink::Inbound(_) => {
+            if let Some(kill) = &route.kill {
+                let _ = kill.send(true);
+            }
+        }
+        FrameSink::Outbound(handle) => handle.shutdown(),
+    }
+}
+
+/// Enforce revocation on *active* sessions (ADR 0010): periodically reload
+/// the trust store and terminate any live session whose peer is no longer
+/// trusted. New connections are already rejected by the per-accept/attempt
+/// trust read; this closes the active-session half of SECURITY.md §4 / T6.
+/// Never returns — runs as a branch of the foreground select.
+async fn enforce_revocations(storage: &Arc<dyn SecureStorage>, registry: &SessionRegistry) {
+    let mut ticker = tokio::time::interval(REVOCATION_POLL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let trust = match TrustStore::load(&**storage) {
+            Ok(trust) => trust,
+            // Transient read failure: keep the sessions and try next tick,
+            // rather than tearing down live peers on a blip.
+            Err(error) => {
+                tracing::debug!(error = %error, "revocation check: trust store unreadable");
+                continue;
+            }
+        };
+        let live: Vec<(Uuid, SpkiFingerprint)> = registry_lock(registry)
+            .iter()
+            .map(|(id, route)| (*id, route.peer_fingerprint))
+            .collect();
+        for id in revoked_session_ids(&live, &trust) {
+            // Remove and terminate under the same intent; the session's own
+            // teardown also removes by id (a harmless no-op) and fans out
+            // the loss so input is released.
+            if let Some(route) = registry_lock(registry).remove(&id) {
+                tracing::warn!(session = %id, "peer revoked; terminating active session");
+                terminate_on_revocation(&route);
+            }
+        }
+    }
 }
 
 /// Route driver commands to the session(s) they name: control and input
@@ -953,6 +1024,7 @@ async fn listener_loop(
                     SessionRoute {
                         sink: FrameSink::Inbound(outbound_tx),
                         kill: Some(shutdown_tx),
+                        peer_fingerprint: info.peer_fingerprint,
                     },
                 );
                 fanout.established(session_id).await;
@@ -1036,6 +1108,7 @@ async fn outbound_event_loop(
                         SessionRoute {
                             sink: FrameSink::Outbound(Arc::clone(handle)),
                             kill: None,
+                            peer_fingerprint: info.peer_fingerprint,
                         },
                     );
                 }
@@ -1151,7 +1224,46 @@ fn age(unix: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::age;
+    use uuid::Uuid;
+
+    use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore, TrustedPeer};
+
+    use super::{age, revoked_session_ids};
+
+    #[test]
+    fn revoked_sessions_are_those_whose_peer_left_the_trust_store() {
+        // Two identities; only `kept` stays trusted.
+        let mk = |name: &str| {
+            let id = DeviceIdentity::generate(name).unwrap();
+            let cert = CertifiedIdentity::from_identity(&id).unwrap();
+            (
+                id.device_id(),
+                id.device_name().to_owned(),
+                cert.fingerprint(),
+            )
+        };
+        let (kept_id, kept_name, kept_fp) = mk("kept");
+        let (_revoked_id, _revoked_name, revoked_fp) = mk("revoked");
+
+        let mut trust = TrustStore::new();
+        trust
+            .add_peer(TrustedPeer::new(kept_id, &kept_name, kept_fp).unwrap())
+            .unwrap();
+
+        let kept_session = Uuid::from_bytes([0x11; 16]);
+        let revoked_session = Uuid::from_bytes([0x22; 16]);
+        let live = vec![(kept_session, kept_fp), (revoked_session, revoked_fp)];
+
+        // Only the session whose fingerprint is no longer trusted is returned.
+        assert_eq!(revoked_session_ids(&live, &trust), vec![revoked_session]);
+        // With both trusted, nothing is revoked.
+        trust
+            .add_peer(
+                TrustedPeer::new(Uuid::from_bytes([0x33; 16]), "revoked", revoked_fp).unwrap(),
+            )
+            .unwrap();
+        assert!(revoked_session_ids(&live, &trust).is_empty());
+    }
 
     #[test]
     fn ages_read_naturally() {
