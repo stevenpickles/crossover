@@ -58,7 +58,7 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0008](0008-keyboard-key-representation.md) | Keyboard key representation: physical key by USB HID usage, text carried, inject by scan code | Accepted |
 | [0009](0009-seamless-edge-transfer.md) | Seamless control transfer: edge crossing triggers the negotiated engine, position as a fraction | Accepted |
 | [0010](0010-active-session-revocation.md) | Revocation terminates active sessions via a trust-store poll, not just new connections | Accepted |
-| [0011](0011-background-service-launcher.md) | Background operation: a minimal LocalSystem service launches the worker into the user session | Proposed |
+| [0011](0011-background-service-launcher.md) | Background operation: a minimal LocalSystem service launches the worker into the user session, behind a `ServiceManager` boundary | Accepted |
 
 ## Known decisions awaiting an ADR
 
