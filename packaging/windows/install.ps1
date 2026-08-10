@@ -31,6 +31,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ServiceName = 'Crossover'
+$env:RUST_LOG = 'warn'  # quiet the CLI's startup log so only result lines show
 
 # Re-launch elevated if needed: writing to Program Files and touching the SCM
 # both require administrator. Forward the bound parameters so an elevated

@@ -1,0 +1,4 @@
+# Presence of this file tells Chocolatey's shim generator NOT to create a shim
+# for crossover.exe. The package deploys the real binary to Program Files and
+# puts that directory on PATH, so the shim (which would point at this staging
+# copy instead) is redundant and would diverge from the copy the service runs.

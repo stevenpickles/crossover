@@ -17,6 +17,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ServiceName = 'Crossover'
+$env:RUST_LOG = 'warn'  # quiet the CLI's startup log so only result lines show
 
 $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
