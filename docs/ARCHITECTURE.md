@@ -220,6 +220,10 @@ transaction logic, control transfer) remain in Crossover code.
 
 ## 8. Configuration (initial shape)
 
+The startup config file (`%LOCALAPPDATA%\Crossover\config.toml`) is sectioned
+and versioned so it can evolve without breaking a hand-edited file. Every
+field is optional and every CLI flag overrides its file counterpart.
+
 ```toml
 schema_version = 1
 
@@ -227,17 +231,22 @@ schema_version = 1
 name = "workstation-left"
 
 [network]
-listen = "0.0.0.0:<port>"        # default port fixed by ADR
+listen = "0.0.0.0:27677"          # present = accept inbound peers (default port, ADR 0004)
+connect = "192.168.1.25:27677"    # dial this peer
 
-[peer.workstation-right]
-address = "192.168.1.25:<port>"
+[seamless]
+side = "right"                    # "left" | "right" — this machine's screen side
 
-[layout]
-right = "workstation-right"
+[cursor]
+mask = true                       # hide the local cursor while driving the peer
 ```
 
-Validated on load with actionable errors; deterministic defaults; no private
-keys in this file (they live in `SecureStorage`).
+Validated on load with actionable errors (unknown keys and unsupported
+`schema_version` are rejected); deterministic defaults; no private keys in
+this file (they live in `SecureStorage`). The two-machine model needs a
+single peer, so the peer is named inline under `[network]`; a richer
+`[peer.<name>]` / named-`[layout]` model can be added under a new
+`schema_version` if multi-peer arrangements arrive.
 
 ## 9. Error-handling conventions
 
