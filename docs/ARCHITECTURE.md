@@ -58,7 +58,12 @@ Rules:
 crossover/
     Cargo.toml                      # workspace root
     apps/
-        crossover/                  # the binary: CLI, config, wiring
+        crossover/                  # the binary: CLI, config, wiring, worker
+        crossover-svc/              # the service daemon (ADR 0011): a minimal
+                                    #   Windows LocalSystem launcher. Depends
+                                    #   ONLY on crossover-platform-windows —
+                                    #   never on core/protocol/security — so the
+                                    #   privileged process links no network code.
     crates/
         crossover-protocol/         # wire messages, framing, validation
         crossover-core/             # state machines, clipboard + input engines,

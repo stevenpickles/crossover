@@ -24,23 +24,33 @@ security-sensitive area (§7).
 
 ## Decision
 
-Two processes with a strict privilege split:
+Two processes with a strict privilege split — and, deliberately, **two
+separate binaries**, so the split is enforced by the build, not just at
+runtime:
 
-1. **The launcher service** — a **LocalSystem** Windows service whose *only*
-   responsibilities are:
+1. **The launcher service — a separate binary, `crossover-svc.exe`** — a
+   **LocalSystem** Windows service whose *only* responsibilities are:
    - detect the active console session (`WTSGetActiveConsoleSessionId`) and
      react to logon/logoff via `SERVICE_CONTROL_SESSIONCHANGE`;
    - obtain that session's user token (`WTSQueryUserToken`), duplicate it
-     (`DuplicateTokenEx`), and start `crossover run` in the session as that
+     (`DuplicateTokenEx`), and start `crossover.exe run` in the session as that
      user with `CreateProcessAsUser`;
    - **supervise**: if the child exits while a user is logged on, relaunch it
      after a bounded backoff (crash recovery); on logoff, stop the child (no
      session to inject into) and start a fresh one on the next logon.
 
-2. **The worker** — `crossover run`, started **as the logged-in user** in
+   It is a distinct workspace binary (`apps/crossover-svc`) that depends **only**
+   on `crossover-platform-windows` — never on `crossover-core`, `-protocol`, or
+   `-security`. See the security invariant below for why the separation is a
+   binary boundary and not merely a `crossover.exe` sub-command.
+
+2. **The worker — `crossover.exe run`** — started **as the logged-in user** in
    their session, doing everything it does today: reads `config.toml` for its
    role/peer/side (ADR 0011 relies on the startup-config file), pairs are
    already established, and it forwards input/clipboard at *user* privilege.
+   This is the full Crossover binary; the CLI's `crossover service
+   install/uninstall/status` subcommands manage `crossover-svc.exe`'s SCM
+   registration.
 
 ### The security invariant that makes a SYSTEM service acceptable
 
@@ -53,6 +63,18 @@ So the service's LocalSystem context carries **minimal** attack surface, and
 compromising Crossover's network handling yields user, not SYSTEM. This
 invariant is load-bearing and must not erode: no feature may push
 network/peer handling into the service.
+
+**The separate binary makes this invariant structural.** `crossover-svc.exe`
+depends only on `crossover-platform-windows`; its dependency graph excludes
+`crossover-core`, `-protocol`, and `-security` entirely. The SYSTEM-privileged
+process therefore does not merely *avoid running* the network/TLS/clipboard
+code — it does not **contain** that code, so it cannot be steered into it by
+any bug. A reviewer verifies the invariant by reading one `Cargo.toml` and
+`cargo tree`, not by auditing control flow. Were the service instead a mode of
+`crossover.exe`, the LocalSystem process would link the whole protocol stack
+and the invariant would rest on discipline alone. Keeping the two as distinct
+binaries is thus a security decision, not packaging convenience; no change may
+add a Crossover network/protocol crate to `crossover-svc`'s dependencies.
 
 The worker runs as the **user**, not SYSTEM — no privilege escalation of the
 input path; injection targets the user's own desktop, as now.
@@ -110,6 +132,11 @@ just exit code, gates a relaunch.
 
 - A new **LocalSystem service** exists on installed machines; installation
   needs admin. This is the cost of the chosen robustness.
+- The product now ships **two executables**: `crossover.exe` (CLI + worker)
+  and `crossover-svc.exe` (the service daemon). Packaging installs both; the
+  service is registered to run `crossover-svc.exe`, which launches
+  `crossover.exe run`. A second (small) binary to build and sign is the
+  accepted cost of making the minimal-service invariant structural.
 - The launcher/watchdog is a small, testable state machine (session state +
   child lifecycle); the privileged Win32 (`WTSQueryUserToken`,
   `DuplicateTokenEx`, `CreateProcessAsUser`, SCM/`SERVICE_CONTROL_*`) is
