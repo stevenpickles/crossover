@@ -1,0 +1,4 @@
+# Presence of this file tells Chocolatey's shim generator NOT to create a shim
+# for crossover-svc.exe. It is the service daemon, only ever launched by the
+# Service Control Manager — never a command a user runs, so it must not become
+# one on PATH.

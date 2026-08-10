@@ -8,3 +8,10 @@ $installDir = Join-Path $env:ProgramFiles 'Crossover'
 if (Test-Path $installDir) {
     Remove-Item -Path $installDir -Recurse -Force
 }
+
+# Undo the PATH entry chocolateyInstall added.
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';') -contains $installDir) {
+    $trimmed = ($machinePath -split ';' | Where-Object { $_ -ne $installDir }) -join ';'
+    [Environment]::SetEnvironmentVariable('Path', $trimmed, 'Machine')
+}

@@ -9,6 +9,7 @@ $installDir = Join-Path $env:ProgramFiles 'Crossover'
 $serviceName = 'Crossover'
 
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+    $env:RUST_LOG = 'warn'  # quiet the CLI's startup log during packaging
     $installedCli = Join-Path $installDir 'crossover.exe'
     if (Test-Path $installedCli) {
         & $installedCli service uninstall | Out-Null

@@ -14,9 +14,17 @@ foreach ($binary in @('crossover.exe', 'crossover-svc.exe')) {
 }
 
 # The service runs crossover-svc.exe as LocalSystem, so it must live in this
-# protected location — never a user-writable directory (ADR 0011).
+# protected location — never a user-writable directory (ADR 0011). Quiet the
+# CLI's startup log so only its result lines show in Chocolatey's output.
+$env:RUST_LOG = 'warn'
 & (Join-Path $installDir 'crossover.exe') service install
 Start-Service -Name $serviceName
 
-Write-Host "Crossover installed to $installDir and the service is running."
-Write-Host 'Set a role in %LOCALAPPDATA%\Crossover\config.toml (see `crossover config`) so the worker has something to do.'
+# Put the install dir on PATH so `crossover` resolves to this same Program Files
+# copy (shims are suppressed via the .ignore files beside the exes).
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';') -notcontains $installDir) {
+    [Environment]::SetEnvironmentVariable('Path', "$machinePath;$installDir", 'Machine')
+}
+
+Write-Host "Crossover installed to $installDir; the service is running. Set a role in %LOCALAPPDATA%\Crossover\config.toml (see ``crossover config``) so the worker has something to do."
