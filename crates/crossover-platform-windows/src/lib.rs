@@ -25,6 +25,10 @@ pub mod keymap;
 pub mod secure_storage;
 #[cfg(windows)]
 pub mod service;
+// Pure watchdog logic (ADR 0011), deliberately not Windows-gated so it is
+// compiled and unit-tested on every CI OS even though only the Windows daemon
+// drives it.
+pub mod worker_supervisor;
 
 #[cfg(windows)]
 pub use capture::WindowsInputCapture;
@@ -46,6 +50,7 @@ pub use input::WindowsInputInjector;
 pub use secure_storage::DpapiSecureStorage;
 #[cfg(windows)]
 pub use service::{WindowsServiceManager, run_service_daemon};
+pub use worker_supervisor::{SessionId, WorkerAction, WorkerSupervisor, WorkerSupervisorConfig};
 
 /// Make this process **per-monitor DPI aware** (R-3), so display geometry
 /// and cursor coordinates are real pixels across mixed-DPI monitors rather
