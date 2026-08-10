@@ -2,18 +2,13 @@
 //! (ADR 0011). Two responsibilities live here, both privileged Win32 kept
 //! behind the platform boundary rather than in the app or the thin binaries:
 //!
-//! - [`WindowsServiceManager`] — the [`ServiceManager`] implementation the
-//!   `crossover.exe service` subcommands call: register / remove / query the
-//!   service with the Service Control Manager (SCM). Install and uninstall
-//!   need Administrator; status does not.
-//! - [`run_service_daemon`] — the entry point the separate `crossover-svc.exe`
-//!   binary runs *as* the service: the SCM dispatcher and the user-session
-//!   launcher/watchdog (stub for now — see its docs).
+//! This module holds [`WindowsServiceManager`] — the [`ServiceManager`]
+//! implementation the `crossover.exe service` subcommands call: register /
+//! remove / query the service with the Service Control Manager (SCM). Install
+//! and uninstall need Administrator; status does not.
 //!
-//! Load-bearing invariant (ADR 0011 §security): the daemon's only inputs are
-//! OS session state and its child's exit code — never the network, clipboard,
-//! or peer data. `crossover-svc` links no `crossover-core` / `-protocol` /
-//! `-security` code, so that invariant is enforced by the dependency graph.
+//! The service *daemon* it registers — the process the SCM actually runs, which
+//! launches and supervises the worker — lives in [`crate::service_daemon`].
 
 use std::path::{Path, PathBuf};
 
@@ -238,21 +233,6 @@ fn quoted_wide_path(path: &Path) -> Vec<u16> {
         .chain(std::iter::once(quote))
         .chain(std::iter::once(0))
         .collect()
-}
-
-/// Run as the Windows service: connect to the SCM dispatcher and supervise the
-/// worker inside the active user session (ADR 0011). This is the entry point
-/// the `crossover-svc` binary calls.
-///
-/// Not yet implemented: the dispatcher, user-session launcher, and
-/// session-change watchdog land in a follow-up. For now it logs and returns so
-/// the binary, its minimal dependency graph, and the platform boundary exist
-/// and are verified by CI before the privileged code is written.
-pub fn run_service_daemon() {
-    tracing::warn!(
-        "crossover-svc: service daemon is not yet implemented; the SCM \
-         dispatcher and user-session launcher (ADR 0011) land next"
-    );
 }
 
 #[cfg(test)]
