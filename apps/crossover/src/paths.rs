@@ -28,6 +28,12 @@ pub fn config_path() -> Option<PathBuf> {
     crossover_home().map(|home| home.join("config.toml"))
 }
 
+/// `~/.crossover/logs` — the directory for rotating log files.
+#[must_use]
+pub fn log_dir() -> Option<PathBuf> {
+    crossover_home().map(|home| home.join("logs"))
+}
+
 /// The user's home directory: `%USERPROFILE%` on Windows, `$HOME` elsewhere.
 /// Explicit rather than `std::env::home_dir` so the resolution is obvious and
 /// identical in the service worker's inherited environment.
