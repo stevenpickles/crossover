@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>crossover</id>
+    <!-- Keep in step with apps/crossover/Cargo.toml; pack.ps1 can stamp it. -->
+    <version>0.1.0</version>
+    <title>Crossover</title>
+    <authors>Steven Pickles</authors>
+    <owners>Steven Pickles</owners>
+    <projectUrl>https://github.com/stevenpickles/crossover</projectUrl>
+    <licenseUrl>https://github.com/stevenpickles/crossover/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <tags>crossover kvm keyboard mouse clipboard synergy remote-input</tags>
+    <summary>Secure keyboard, mouse, and clipboard sharing between trusted computers.</summary>
+    <description>
+Crossover shares one keyboard, mouse, and clipboard across two trusted
+computers over a pinned mutual-TLS link. Installing deploys crossover.exe and
+crossover-svc.exe to Program Files and registers a background service that
+launches the worker into your logon session and keeps it running (ADR 0011).
+
+The binaries are embedded in this package (suited to a local or private feed).
+For the public community repository, switch tools\chocolateyInstall.ps1 to
+download the executables from a release URL instead.
+    </description>
+  </metadata>
+  <files>
+    <!-- tools\ carries the install scripts and the staged executables. -->
+    <file src="tools\**" target="tools" />
+  </files>
+</package>
