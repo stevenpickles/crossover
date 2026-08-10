@@ -1,0 +1,3 @@
+# Build artifacts staged/produced by pack.ps1 — never committed.
+chocolatey/tools/*.exe
+chocolatey/*.nupkg
