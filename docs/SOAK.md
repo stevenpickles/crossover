@@ -557,3 +557,113 @@ Record the outcome in the Phase 5 exit-criteria notes (docs/ROADMAP.md):
 how many A → B → A cycles, whether control ever split or stuck, how
 accurately the cursor landed on entry, whether the clipboard stayed
 consistent, and what happened to ownership under induced loss.
+
+## Phase 6 soak: unattended background operation (two machines)
+
+This is the Phase 6 exit criterion: the seamless pair from Phase 5, but running
+**unattended via the background service** (ADR 0011) across multiple days and
+reboots, with no console babysitting. What Phase 5 proved by hand, Phase 6 must
+sustain on its own. Run the Phase 5 procedure *inside* this — the seamless
+behavior is what must keep working; this section adds the service, the config,
+and the endurance.
+
+### One-time pairing bootstrap
+
+Pairing is a deliberate interactive ceremony (ADR 0002) — one machine shows a
+code, you type it on the other — and is **not** automatable; that human step is
+the security boundary. So it happens once, up front, and its trust persists:
+
+- Trust lives in the logged-in user's DPAPI store. The service launches the
+  worker **as that same console user**, so it reuses the trust with no
+  re-pairing. **Pair as the exact Windows user who will be logged in during the
+  soak** — pairing as a different user creates an identity the soaking worker
+  will not have, and it silently will not connect.
+- Pair with the service **stopped** (or before installing it): pairing and the
+  worker both bind port 27677, so they cannot both listen at once.
+- Confirm with `crossover peers` on each side; each must list the other's
+  *current* identity. Revoke stale duplicates with `crossover peers remove
+  <id>` so it is unambiguous which identity is live — a regenerated identity (a
+  wiped store, or a run under a different user) leaves an old entry that will
+  never connect again.
+
+### Configuration (the service reads config.toml, not flags)
+
+The service starts `crossover run` with no arguments, so each machine's role and
+side come from `%LOCALAPPDATA%\Crossover\config.toml` (not CLI flags). Arranged
+`A | B` — A left, B right:
+
+Machine A (left screen, listens):
+
+```toml
+schema_version = 1
+[device]
+name = "machine-a"
+[network]
+listen = "0.0.0.0:27677"
+[seamless]
+side = "left"
+```
+
+Machine B (right screen, dials A at its LAN address):
+
+```toml
+schema_version = 1
+[device]
+name = "machine-b"
+[network]
+connect = "192.168.1.151:27677"
+[seamless]
+side = "right"
+```
+
+The dialing side (B) owns the reconnect supervisor, so pointing B at A means a
+reboot of either machine recovers on its own: B retries until A is back;
+A's listener re-accepts when B returns.
+
+### Install and run unattended
+
+On each machine, as the soak user, from an elevated console:
+
+1. `crossover service install` (or `choco install crossover -y -s <source>`).
+2. `sc.exe start Crossover` — or reboot; auto-start brings it up.
+3. `crossover status` shows `Background service: installed, running`, and a
+   `crossover.exe` runs **as the user** (Task Manager → Details → User name).
+
+Then use the machines normally. Over the soak window (target: multiple days):
+
+- Cross A ↔ B through the linked edges per the Phase 5 procedure — seamless
+  transfer, keyboard follow, one visible cursor, clipboard riding along — and
+  confirm it keeps working across the whole window.
+- **Reboot** each machine at least once: the service must auto-start and the
+  link re-establish with no manual step and no re-pairing.
+- **Pull the network** briefly (unplug or disable the adapter): both workers
+  reconnect on their own when it returns.
+- **Kill the worker** (`Stop-Process` on the `crossover.exe` running as you):
+  the service must relaunch it within ~1 s.
+
+### What good looks like
+
+- Multi-day continuous operation with **no manual intervention**: the service
+  stays running, the worker stays up (or is relaunched fast), and seamless
+  crossing keeps working the whole time.
+- Reboots and transient network loss recover automatically, never re-pairing.
+- Clipboard reliability still holds under the soak (Phase 2 requirements).
+- No stuck key or button after any transfer, disconnect, or relaunch.
+
+### Honest limitations
+
+- **Headless: no console overrides.** Under the service the worker has no
+  console, so the `c` / `r` console commands are unavailable — control transfer
+  is edge-driven only. The both-Control **escape still works** (it lives in the
+  key path, not the console).
+- **Observability.** The service worker is headless, so its logs and shutdown
+  metrics currently go to `NUL` (the console-less-safety fix, ADR 0011) — a
+  multi-day service run is a black box for diagnosis. **File logging to
+  `%LOCALAPPDATA%\Crossover\logs` is the prerequisite to land before relying on
+  this soak to learn anything**; until then, observation is limited to
+  `crossover status`, Task Manager, and the seamless behavior itself.
+
+Record the outcome in the Phase 6 exit-criteria notes (docs/ROADMAP.md): the
+soak duration, reboots and network interruptions survived, any manual
+intervention required, worker relaunches observed, and whether clipboard and
+input reliability held throughout.
