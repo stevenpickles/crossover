@@ -1,6 +1,22 @@
 # Crossover Roadmap
 
-> **Current phase: 6 — Windows Prototype Hardening** (not yet started.)
+> **Current phase: 6 — Windows Prototype Hardening** (in progress.)
+>
+> Phase 6 progress (2026-08-10): most deliverables are done and, where they
+> touch the OS, validated on real hardware — hardened reconnect (backoff resets
+> only after a stable session), sectioned/versioned startup configuration,
+> active-session revocation ([ADR 0010](adr/0010-active-session-revocation.md)),
+> a dedicated security review against [SECURITY.md](SECURITY.md) §6-§7
+> (docs/security-review-phase6.md; the T6 active-session gap resolved by ADR
+> 0010), reconnect-recovery metrics, and — the largest piece — unattended
+> background operation ([ADR 0011](adr/0011-background-service-launcher.md)): a
+> minimal LocalSystem service (`crossover-svc.exe`) launches and supervises the
+> worker in the user's session, validated end-to-end on machine A (install,
+> user-session launch *as the user*, crash-relaunch, clean uninstall), plus
+> Windows packaging (self-elevating PowerShell scripts and a Chocolatey
+> package). The remaining exit criterion is the **multi-day two-machine soak** —
+> continuous unattended operation between two Windows workstations — which gates
+> closing the phase.
 >
 > Phase 5 (Seamless Crossover) closed 2026-08-09: the two-machine seamless
 > soak ran on real hardware — a two-monitor, mixed-DPI machine paired with a
