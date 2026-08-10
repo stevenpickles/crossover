@@ -1011,6 +1011,8 @@ async fn outbound_event_loop(
     let mut current_session: Option<uuid::Uuid> = None;
     // When the live session was established, for its connected duration.
     let mut established_at: Option<Instant> = None;
+    // When the link dropped, to measure how long recovery took (§4).
+    let mut down_since: Option<Instant> = None;
     while let Some(event) = events.recv().await {
         match event {
             SessionEvent::Established(info) => {
@@ -1020,6 +1022,9 @@ async fn outbound_event_loop(
                 );
                 touch_last_connected(&**storage, info.peer_fingerprint);
                 metrics.record_session_established(false);
+                if let Some(down) = down_since.take() {
+                    metrics.record_reconnect_recovery(down.elapsed());
+                }
                 established_at = Some(Instant::now());
                 current_session = Some(info.session_id);
                 // Register the outbound session so control frames route to
@@ -1045,10 +1050,14 @@ async fn outbound_event_loop(
                     metrics.record_session_ended(&reason, since.elapsed());
                 }
                 match retry_in {
-                    Some(delay) => println!(
-                        "Outbound session ended ({reason}); retrying in {}s.",
-                        delay.as_secs_f32()
-                    ),
+                    Some(delay) => {
+                        // Will retry: start the recovery clock.
+                        down_since = Some(Instant::now());
+                        println!(
+                            "Outbound session ended ({reason}); retrying in {}s.",
+                            delay.as_secs_f32()
+                        );
+                    }
                     None => println!("Outbound session ended ({reason})."),
                 }
                 current_session = None;
