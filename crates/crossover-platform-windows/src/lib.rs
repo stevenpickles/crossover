@@ -45,7 +45,7 @@ pub use input::WindowsInputInjector;
 #[cfg(windows)]
 pub use secure_storage::DpapiSecureStorage;
 #[cfg(windows)]
-pub use service::run_service_daemon;
+pub use service::{WindowsServiceManager, run_service_daemon};
 
 /// Make this process **per-monitor DPI aware** (R-3), so display geometry
 /// and cursor coordinates are real pixels across mixed-DPI monitors rather
