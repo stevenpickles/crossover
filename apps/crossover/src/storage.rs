@@ -152,6 +152,44 @@ pub fn open_input() -> anyhow::Result<(
     )
 }
 
+/// Open the platform's auto-start [`ServiceManager`] (ADR 0011).
+///
+/// On Windows, the manager registers `crossover-svc.exe` — resolved as a
+/// sibling of the running `crossover.exe`, since the two binaries ship
+/// together. On other platforms it returns the `Unsupported` manager, so
+/// `crossover service` reports a clear "not on this platform yet" rather than
+/// being absent.
+///
+/// # Errors
+///
+/// On Windows, if the running executable's path or its parent directory cannot
+/// be determined (needed to locate the sibling daemon binary).
+#[cfg(windows)]
+pub fn open_service_manager() -> anyhow::Result<Box<dyn crossover_platform::ServiceManager>> {
+    use anyhow::Context;
+    let exe = std::env::current_exe().context("locating the running executable")?;
+    let dir = exe
+        .parent()
+        .context("the running executable has no parent directory")?;
+    let service_binary = dir.join("crossover-svc.exe");
+    Ok(Box::new(
+        crossover_platform_windows::WindowsServiceManager::new(service_binary),
+    ))
+}
+
+/// Open the platform's auto-start [`ServiceManager`] (ADR 0011).
+///
+/// # Errors
+///
+/// Never on non-Windows: returns the `Unsupported` manager so the command
+/// reports a clear platform message. The `Result` matches the Windows
+/// signature, which is fallible.
+#[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)]
+pub fn open_service_manager() -> anyhow::Result<Box<dyn crossover_platform::ServiceManager>> {
+    Ok(Box::new(crossover_platform::UnsupportedServiceManager))
+}
+
 /// Resolve the local device name: `--name` flag, else the machine's
 /// hostname-ish environment, else a fixed fallback — truncated on a char
 /// boundary to the identity bound.

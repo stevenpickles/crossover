@@ -24,6 +24,7 @@ use crossover_core::{
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
+use crossover_platform::{ServiceError, ServiceStatus};
 use crossover_protocol::DEFAULT_PORT;
 use crossover_protocol::hello::MessageType;
 use crossover_protocol::input::{InputBatch, WireInputEvent};
@@ -35,6 +36,7 @@ use crossover_security::{
 use crate::console::{self, ConsoleCommand};
 use crate::storage::{
     open_clipboard_provider, open_cursor_mask, open_display, open_input, open_secure_storage,
+    open_service_manager,
 };
 
 /// One ceremony's allowance, listener and connector alike. Generous
@@ -266,6 +268,107 @@ pub fn config_show() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `crossover service install` — register the background service (ADR 0011).
+pub fn service_install() -> anyhow::Result<()> {
+    let manager = open_service_manager()?;
+    match manager.status() {
+        Ok(ServiceStatus::Installed { running }) => {
+            println!(
+                "The Crossover background service is already installed ({}).",
+                if running { "running" } else { "stopped" }
+            );
+            return Ok(());
+        }
+        Ok(ServiceStatus::NotInstalled) => {}
+        Err(ServiceError::Unsupported) => {
+            print_service_unsupported();
+            return Ok(());
+        }
+        Err(error) => return Err(service_failure(&error, "checking the Crossover service")),
+    }
+
+    manager
+        .install()
+        .map_err(|error| service_failure(&error, "installing the Crossover service"))?;
+    println!("Installed the Crossover background service (auto-start, runs as LocalSystem).");
+    println!(
+        "It starts at boot and launches `crossover run` in your session, restarting it on \
+         crash (ADR 0011)."
+    );
+    Ok(())
+}
+
+/// `crossover service uninstall` — stop and remove the background service.
+pub fn service_uninstall() -> anyhow::Result<()> {
+    let manager = open_service_manager()?;
+    match manager.status() {
+        Ok(ServiceStatus::NotInstalled) => {
+            println!("The Crossover background service is not installed; nothing to remove.");
+            return Ok(());
+        }
+        Ok(ServiceStatus::Installed { .. }) => {}
+        Err(ServiceError::Unsupported) => {
+            print_service_unsupported();
+            return Ok(());
+        }
+        Err(error) => return Err(service_failure(&error, "checking the Crossover service")),
+    }
+
+    manager
+        .uninstall()
+        .map_err(|error| service_failure(&error, "removing the Crossover service"))?;
+    println!("Removed the Crossover background service.");
+    Ok(())
+}
+
+/// `crossover service status` — report whether the service is installed.
+pub fn service_status() -> anyhow::Result<()> {
+    let manager = open_service_manager()?;
+    match manager.status() {
+        Ok(ServiceStatus::NotInstalled) => {
+            println!(
+                "The Crossover background service is not installed. Install it with \
+                 `crossover service install` from an elevated console."
+            );
+        }
+        Ok(ServiceStatus::Installed { running: true }) => {
+            println!("The Crossover background service is installed and running.");
+        }
+        Ok(ServiceStatus::Installed { running: false }) => {
+            println!("The Crossover background service is installed but not running.");
+        }
+        Err(ServiceError::Unsupported) => {
+            print_service_unsupported();
+            return Ok(());
+        }
+        Err(error) => return Err(service_failure(&error, "checking the Crossover service")),
+    }
+    Ok(())
+}
+
+/// Report that auto-start has no implementation on this platform yet, without
+/// treating it as a command failure — the CLI surface is intentionally
+/// platform-neutral (ADR 0011).
+fn print_service_unsupported() {
+    println!(
+        "The background service is not available on this platform yet. On Linux and macOS, \
+         auto-start will use the OS-native user-session mechanism (systemd --user / launchd) \
+         when those ports land (docs/ROADMAP.md)."
+    );
+}
+
+/// Render a `ServiceManager` failure as an actionable CLI error, calling out
+/// elevation for the common permission case (FR-7.3).
+fn service_failure(error: &ServiceError, context: &str) -> anyhow::Error {
+    match error {
+        ServiceError::PermissionDenied { reason } => anyhow::anyhow!(
+            "{context}: {reason}. Re-run this command from an elevated console \
+             (right-click → Run as administrator)."
+        ),
+        other => anyhow::anyhow!("{context}: {other}"),
+    }
 }
 
 /// `crossover run [--listen [--bind <addr>]] [--connect <addr>]`

@@ -48,6 +48,21 @@ enum Command {
     Status,
     /// Show the startup config file path and its effective settings.
     Config,
+    /// Manage the background service that runs Crossover unattended (ADR 0011).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+enum ServiceAction {
+    /// Install and register the background service (requires Administrator).
+    Install,
+    /// Stop and remove the background service (requires Administrator).
+    Uninstall,
+    /// Report whether the background service is installed and running.
+    Status,
 }
 
 // A CLI flag struct is naturally a bag of independent bools (clap maps each
@@ -192,6 +207,11 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Status => commands::status(&storage::resolve_device_name(cli.name)),
         Command::Config => commands::config_show(),
+        Command::Service { action } => match action {
+            ServiceAction::Install => commands::service_install(),
+            ServiceAction::Uninstall => commands::service_uninstall(),
+            ServiceAction::Status => commands::service_status(),
+        },
     }
 }
 
@@ -199,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, PeersAction};
+    use super::{Cli, Command, PeersAction, ServiceAction};
 
     // Catches invalid clap derive configurations (conflicting flags,
     // ambiguous subcommands) at test time instead of first invocation.
@@ -258,6 +278,26 @@ mod tests {
         assert_eq!(cli.name.as_deref(), Some("left"));
         let cli = Cli::try_parse_from(["crossover", "status", "--name", "left"]).unwrap();
         assert_eq!(cli.name.as_deref(), Some("left"));
+    }
+
+    #[test]
+    fn service_parses_its_three_subcommands() {
+        for (args, expected) in [
+            (["crossover", "service", "install"], ServiceAction::Install),
+            (
+                ["crossover", "service", "uninstall"],
+                ServiceAction::Uninstall,
+            ),
+            (["crossover", "service", "status"], ServiceAction::Status),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Service { action } = cli.command else {
+                panic!("expected service command for {args:?}");
+            };
+            assert_eq!(action, expected);
+        }
+        // `service` with no subcommand is a usage error, not a default action.
+        assert!(Cli::try_parse_from(["crossover", "service"]).is_err());
     }
 
     #[test]
