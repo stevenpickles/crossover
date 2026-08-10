@@ -180,6 +180,11 @@ pub struct Metrics {
     sessions_inbound: AtomicU64,
     sessions_outbound: AtomicU64,
     reconnect_attempts: AtomicU64,
+    // Recovery time: from a session dropping to the next one establishing —
+    // how long the peer link was actually down (TESTING.md §4).
+    reconnect_recoveries: AtomicU64,
+    reconnect_recovery_total_ms: AtomicU64,
+    reconnect_recovery_max_ms: AtomicU64,
     disconnects: [AtomicU64; 5],
     total_connected_ms: AtomicU64,
     longest_session_ms: AtomicU64,
@@ -261,6 +266,17 @@ impl Metrics {
     /// TCP's own retransmits are invisible above the socket.
     pub fn record_reconnect_attempt(&self) {
         self.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record how long the peer link was down before a session came back —
+    /// from the drop to the next establishment (TESTING.md §4).
+    pub fn record_reconnect_recovery(&self, downtime: Duration) {
+        let ms = u64::try_from(downtime.as_millis()).unwrap_or(u64::MAX);
+        self.reconnect_recoveries.fetch_add(1, Ordering::Relaxed);
+        self.reconnect_recovery_total_ms
+            .fetch_add(ms, Ordering::Relaxed);
+        self.reconnect_recovery_max_ms
+            .fetch_max(ms, Ordering::Relaxed);
     }
 
     // ---- clipboard ----
@@ -385,6 +401,13 @@ impl Metrics {
             sessions_inbound: load(&self.sessions_inbound),
             sessions_outbound: load(&self.sessions_outbound),
             reconnect_attempts: load(&self.reconnect_attempts),
+            reconnect_recoveries: load(&self.reconnect_recoveries),
+            reconnect_recovery_avg_ms: {
+                let n = load(&self.reconnect_recoveries);
+                (n > 0).then(|| load(&self.reconnect_recovery_total_ms) / n)
+            },
+            reconnect_recovery_max_ms: (load(&self.reconnect_recoveries) > 0)
+                .then(|| load(&self.reconnect_recovery_max_ms)),
             disconnects: DisconnectKind::ALL.map(|k| load(&self.disconnects[k.index()])),
             total_connected_ms: load(&self.total_connected_ms),
             longest_session_ms: load(&self.longest_session_ms),
@@ -450,6 +473,12 @@ pub struct Report {
     pub sessions_outbound: u64,
     /// Reconnection attempts.
     pub reconnect_attempts: u64,
+    /// Recoveries: sessions that came back after a drop.
+    pub reconnect_recoveries: u64,
+    /// Mean downtime per recovery, milliseconds (`None` if none yet).
+    pub reconnect_recovery_avg_ms: Option<u64>,
+    /// Worst downtime before a recovery, milliseconds (`None` if none yet).
+    pub reconnect_recovery_max_ms: Option<u64>,
     /// Disconnects, per reason in `DisconnectKind::ALL` order.
     pub disconnects: [u64; 5],
     /// Total connected time across all sessions, milliseconds.
@@ -516,6 +545,9 @@ impl Report {
             bytes_sent = self.bytes_sent,
             bytes_received = self.bytes_received,
             reconnect_attempts = self.reconnect_attempts,
+            reconnect_recoveries = self.reconnect_recoveries,
+            reconnect_recovery_avg_ms = self.reconnect_recovery_avg_ms,
+            reconnect_recovery_max_ms = self.reconnect_recovery_max_ms,
             sessions_inbound = self.sessions_inbound,
             sessions_outbound = self.sessions_outbound,
             total_connected_ms = self.total_connected_ms,
@@ -592,6 +624,18 @@ impl fmt::Display for Report {
             human_ms(self.total_connected_ms),
             human_ms(self.longest_session_ms),
         )?;
+        if let (Some(avg), Some(max)) = (
+            self.reconnect_recovery_avg_ms,
+            self.reconnect_recovery_max_ms,
+        ) {
+            writeln!(
+                f,
+                "                recovered {} time(s): downtime avg {}, max {}",
+                self.reconnect_recoveries,
+                human_ms(avg),
+                human_ms(max),
+            )?;
+        }
 
         writeln!(
             f,
@@ -703,6 +747,23 @@ mod tests {
         assert_eq!(r.sent_by_class[FrameClass::Input.index()], 1);
         assert_eq!(r.sent_by_class[FrameClass::Keepalive.index()], 1);
         assert_eq!(r.received_by_class[FrameClass::Clipboard.index()], 1);
+    }
+
+    #[test]
+    fn reconnect_recovery_reports_count_avg_and_max_downtime() {
+        let m = Metrics::new();
+        // No recoveries yet: the fields stay absent (nothing to average).
+        let r = m.snapshot();
+        assert_eq!(r.reconnect_recoveries, 0);
+        assert_eq!(r.reconnect_recovery_avg_ms, None);
+        assert_eq!(r.reconnect_recovery_max_ms, None);
+
+        m.record_reconnect_recovery(Duration::from_millis(200));
+        m.record_reconnect_recovery(Duration::from_millis(800));
+        let r = m.snapshot();
+        assert_eq!(r.reconnect_recoveries, 2);
+        assert_eq!(r.reconnect_recovery_avg_ms, Some(500)); // (200 + 800) / 2
+        assert_eq!(r.reconnect_recovery_max_ms, Some(800));
     }
 
     #[test]
