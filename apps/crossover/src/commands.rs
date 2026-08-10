@@ -219,14 +219,22 @@ pub fn status(device_name: &str) -> anyhow::Result<()> {
 /// A commented example config for `crossover config` to show when no file
 /// exists yet — the user can save it verbatim and edit.
 const EXAMPLE_CONFIG: &str = "\
-# Crossover startup configuration. Any `crossover run` flag can live here;
-# a flag on the command line always overrides the file.
+# Crossover startup configuration (sectioned, versioned). Any `crossover run`
+# flag can live here; a flag on the command line always overrides the file.
+schema_version = 1
+
+[device]
 name = \"machine-b\"
-connect = \"192.168.1.151:27677\"
-side = \"right\"           # or \"left\"
-# listen = true           # accept inbound peers (a listener)
-# bind = \"0.0.0.0:27677\"  # only with listen = true
-# no_cursor_mask = false
+
+[network]
+# connect = \"192.168.1.151:27677\"   # dial this peer
+listen = \"0.0.0.0:27677\"            # or accept inbound peers (presence = listen)
+
+[seamless]
+side = \"right\"                      # \"left\" | \"right\"
+
+[cursor]
+# mask = false                       # default true; false = never hide the cursor
 ";
 
 /// `crossover config` — show where the startup config lives and its
