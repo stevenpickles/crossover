@@ -1,0 +1,22 @@
+[package]
+name = "crossover-svc"
+version = "0.1.0"
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The service daemon is a Windows-only concept (ADR 0011). On other targets
+# the binary still builds (tri-OS CI) but does nothing, so its dependencies —
+# including the platform crate — are Windows-gated. This crate deliberately
+# does NOT depend on crossover-core, -protocol, or -security: the LocalSystem
+# process must not link any network, TLS, clipboard, or protocol-parsing code,
+# so the "minimal launcher, no untrusted input" invariant (ADR 0011) is
+# enforced by the dependency graph rather than by discipline.
+[target.'cfg(windows)'.dependencies]
+tracing-subscriber = { workspace = true }
+crossover-platform-windows = { workspace = true }
+
+[lints]
+workspace = true

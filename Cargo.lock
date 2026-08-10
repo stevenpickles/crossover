@@ -363,6 +363,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossover-svc"
+version = "0.1.0"
+dependencies = [
+ "crossover-platform-windows",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "crossover-test-peer"
 version = "0.1.0"
 dependencies = [

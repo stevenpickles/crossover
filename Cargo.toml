@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/crossover",
+    "apps/crossover-svc",
     "crates/crossover-core",
     "crates/crossover-platform",
     "crates/crossover-platform-windows",
