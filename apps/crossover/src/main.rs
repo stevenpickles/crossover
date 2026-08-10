@@ -131,6 +131,11 @@ enum PeersAction {
 async fn main() -> anyhow::Result<()> {
     // Parse first so `--help`/`--version` exit without emitting log lines.
     let cli = Cli::parse();
+    // When launched by the background service there is no console, so invalid
+    // stdout/stderr would make the first `println!`/log line panic and crash
+    // the worker into a relaunch loop. Repoint them at NUL before any output
+    // (a no-op for interactive runs and redirections) (ADR 0011).
+    crossover_platform_windows::ensure_standard_streams();
     // Become per-monitor DPI aware before anything reads display geometry
     // or creates a window/hook, so coordinates are real pixels across
     // mixed-DPI monitors (R-3, ADR 0009).

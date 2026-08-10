@@ -27,6 +27,8 @@ pub mod secure_storage;
 pub mod service;
 #[cfg(windows)]
 pub mod service_daemon;
+#[cfg(windows)]
+pub mod stdio;
 // Pure watchdog logic (ADR 0011), deliberately not Windows-gated so it is
 // compiled and unit-tested on every CI OS even though only the Windows daemon
 // drives it.
@@ -54,7 +56,15 @@ pub use secure_storage::DpapiSecureStorage;
 pub use service::WindowsServiceManager;
 #[cfg(windows)]
 pub use service_daemon::run_service_daemon;
+#[cfg(windows)]
+pub use stdio::ensure_standard_streams;
 pub use worker_supervisor::{SessionId, WorkerAction, WorkerSupervisor, WorkerSupervisorConfig};
+
+/// Repoint invalid standard streams so output never panics in a console-less
+/// session — a no-op off Windows, where a service-launched process still has
+/// usable streams (ADR 0011).
+#[cfg(not(windows))]
+pub fn ensure_standard_streams() {}
 
 /// Make this process **per-monitor DPI aware** (R-3), so display geometry
 /// and cursor coordinates are real pixels across mixed-DPI monitors rather
