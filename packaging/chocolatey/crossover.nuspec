@@ -10,6 +10,9 @@
     <projectUrl>https://github.com/stevenpickles/crossover</projectUrl>
     <licenseUrl>https://github.com/stevenpickles/crossover/blob/main/LICENSE</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <!-- Chocolatey CLI does not support the embedded <icon> element (CHCU0002);
+         it references the logo by URL. Resolves once the logo is on `main`. -->
+    <iconUrl>https://raw.githubusercontent.com/stevenpickles/crossover/main/assets/branding/crossover-logo.png</iconUrl>
     <tags>crossover kvm keyboard mouse clipboard synergy remote-input</tags>
     <summary>Secure keyboard, mouse, and clipboard sharing between trusted computers.</summary>
     <description>

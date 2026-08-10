@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/branding/crossover-logo.png" alt="Crossover logo" width="120">
+</p>
+
 # Crossover
 
 Secure keyboard, mouse, and clipboard sharing between computers over an IP
