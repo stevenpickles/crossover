@@ -1,6 +1,6 @@
 # 0011. Background operation: a minimal LocalSystem service launches the real process into the user session
 
-Status: Proposed
+Status: Accepted
 Date: 2026-08-09
 
 ## Context
@@ -56,6 +56,28 @@ network/peer handling into the service.
 
 The worker runs as the **user**, not SYSTEM — no privilege escalation of the
 input path; injection targets the user's own desktop, as now.
+
+### Cross-platform shape: a `ServiceManager` boundary
+
+Auto-start is a **new category** of platform concern. Every existing platform
+trait is dependency inversion — core needs a capability, the platform provides
+it. Auto-start is the inverse: an OS lifecycle mechanism that *wraps* the app.
+And the "launch into the user session" dance is a Windows-specific solution to
+a Windows-specific problem (session-0 isolation): macOS **LaunchAgents** and
+Linux **systemd `--user`** units already run in the user's GUI session and
+need no launcher at all.
+
+So the OS-specific machinery must not leak into the app or core. Auto-start is
+abstracted at the **goal** level — install / uninstall / status — behind a
+`ServiceManager` trait in `crossover-platform`, with each OS providing its own
+implementation (Windows: the SCM service + user-session launcher below;
+macOS: a LaunchAgent plist; Linux: a `systemd --user` unit). The app's
+`crossover service` command is platform-neutral; the composition root selects
+the implementation, exactly as it does for the other platform traits.
+Platforms without an implementation yet return `Unsupported`. The Windows
+service + `CreateProcessAsUser` launcher is therefore an *internal detail* of
+the Windows `ServiceManager`, not app-level code — keeping this feature as
+portable as the rest of the boundary (architecture review, 2026-08-09).
 
 ### Install / uninstall / status
 

@@ -15,6 +15,7 @@ use crate::input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerEvent,
 };
 use crate::secure_storage::{SecureStorage, SecureStorageError};
+use crate::service::{ServiceError, ServiceManager, ServiceStatus};
 
 /// In-memory [`SecureStorage`] with scriptable fault injection.
 #[derive(Debug, Default)]
@@ -528,6 +529,73 @@ impl CursorMask for FakeCursorMask {
         *lock(&self.hidden) = false;
         *lock(&self.show_calls) += 1;
         Ok(())
+    }
+}
+
+/// In-memory [`ServiceManager`] recording install/uninstall and reporting a
+/// scriptable running state, for exercising the `crossover service` command
+/// wiring without touching a real OS service.
+#[derive(Debug, Default)]
+pub struct FakeServiceManager {
+    installed: Mutex<bool>,
+    running: Mutex<bool>,
+    install_calls: Mutex<u32>,
+    uninstall_calls: Mutex<u32>,
+}
+
+impl FakeServiceManager {
+    /// Not installed, not running.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `install` has left it installed.
+    #[must_use]
+    pub fn is_installed(&self) -> bool {
+        *lock(&self.installed)
+    }
+
+    /// How many times `install` was called.
+    #[must_use]
+    pub fn install_calls(&self) -> u32 {
+        *lock(&self.install_calls)
+    }
+
+    /// How many times `uninstall` was called.
+    #[must_use]
+    pub fn uninstall_calls(&self) -> u32 {
+        *lock(&self.uninstall_calls)
+    }
+
+    /// Script whether an installed service reports as running.
+    pub fn set_running(&self, running: bool) {
+        *lock(&self.running) = running;
+    }
+}
+
+impl ServiceManager for FakeServiceManager {
+    fn install(&self) -> Result<(), ServiceError> {
+        *lock(&self.installed) = true;
+        *lock(&self.install_calls) += 1;
+        Ok(())
+    }
+
+    fn uninstall(&self) -> Result<(), ServiceError> {
+        *lock(&self.installed) = false;
+        *lock(&self.running) = false;
+        *lock(&self.uninstall_calls) += 1;
+        Ok(())
+    }
+
+    fn status(&self) -> Result<ServiceStatus, ServiceError> {
+        if *lock(&self.installed) {
+            Ok(ServiceStatus::Installed {
+                running: *lock(&self.running),
+            })
+        } else {
+            Ok(ServiceStatus::NotInstalled)
+        }
     }
 }
 

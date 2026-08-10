@@ -12,6 +12,7 @@ pub mod display;
 pub mod fakes;
 pub mod input;
 pub mod secure_storage;
+pub mod service;
 
 pub use clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
 pub use cursor::{CursorMask, CursorMaskError, NoopCursorMask};
@@ -21,6 +22,7 @@ pub use input::{
     PointerEvent, SCROLL_UNITS_PER_DETENT, hid,
 };
 pub use secure_storage::{SecureStorage, SecureStorageError};
+pub use service::{ServiceError, ServiceManager, ServiceStatus, UnsupportedServiceManager};
 
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =
