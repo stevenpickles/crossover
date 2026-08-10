@@ -2,9 +2,9 @@
 //!
 //! For continuous daily use the run parameters — role, peer address, seamless
 //! side, device name — should not have to be retyped every launch. They live
-//! in a human-editable TOML file at `%LOCALAPPDATA%\Crossover\config.toml`
-//! (next to the `secure` store), and `crossover run` reads them when the
-//! corresponding CLI flag is absent.
+//! in a human-editable TOML file at `~/.crossover/config.toml`
+//! ([`crate::paths`]), and `crossover run` reads them when the corresponding
+//! CLI flag is absent.
 //!
 //! The schema is **sectioned and versioned** (ARCHITECTURE.md §8): a
 //! `schema_version` guards evolution, and settings are grouped so new areas
@@ -31,10 +31,10 @@
 //! command line overrides the file for that field. Nothing secret goes here —
 //! identity and trust stay in the DPAPI-encrypted store.
 
-use std::path::PathBuf;
-
 use anyhow::{Context, bail};
 use serde::Deserialize;
+
+use crate::paths::config_path;
 
 /// The config schema version this build understands. A file may omit it
 /// (assumed current) but must not name a newer one.
@@ -201,19 +201,6 @@ impl RunConfig {
             no_cursor_mask: cli.no_cursor_mask || self.cursor.mask == Some(false),
         }
     }
-}
-
-/// The config file path, `%LOCALAPPDATA%\Crossover\config.toml`, or `None`
-/// if the per-user location cannot be determined (e.g. `%LOCALAPPDATA%`
-/// unset, or off Windows) — in which case there is simply no config file.
-#[must_use]
-pub fn config_path() -> Option<PathBuf> {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")?;
-    Some(
-        PathBuf::from(local_app_data)
-            .join("Crossover")
-            .join("config.toml"),
-    )
 }
 
 /// Load the config file, or an empty config if there is none.

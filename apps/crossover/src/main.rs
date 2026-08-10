@@ -11,6 +11,7 @@ mod commands;
 mod config;
 mod console;
 mod logging;
+mod paths;
 mod storage;
 
 use clap::{Args, Parser, Subcommand};

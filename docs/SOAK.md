@@ -589,7 +589,7 @@ the security boundary. So it happens once, up front, and its trust persists:
 ### Configuration (the service reads config.toml, not flags)
 
 The service starts `crossover run` with no arguments, so each machine's role and
-side come from `%LOCALAPPDATA%\Crossover\config.toml` (not CLI flags). Arranged
+side come from `~/.crossover/config.toml` (not CLI flags). Arranged
 `A | B` — A left, B right:
 
 Machine A (left screen, listens):

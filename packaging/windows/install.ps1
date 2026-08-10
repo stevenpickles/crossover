@@ -102,4 +102,4 @@ Write-Host 'Registering and starting the Crossover service...'
 Start-Service -Name $ServiceName
 Write-Host ''
 Write-Host 'Crossover installed and the service is running.'
-Write-Host 'Set a role in %LOCALAPPDATA%\Crossover\config.toml (see `crossover config`) so the worker has something to do.'
+Write-Host 'Set a role in ~\.crossover\config.toml (see `crossover config`) so the worker has something to do.'
