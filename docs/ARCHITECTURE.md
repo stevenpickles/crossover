@@ -189,6 +189,79 @@ IDLE → CONNECTING → AUTHENTICATING → NEGOTIATING → ESTABLISHED
   backpressure. Loss of the session while `REMOTE` triggers the control
   transfer fallback above.
 
+### 5.4 Outbound send path: two priority classes
+
+A session is a **single TLS-over-TCP stream**, so every frame the
+application sends is serialized onto one ordered byte pipe. Phase 7's rich
+clipboard puts multi-megabyte payloads on that pipe, and a plain FIFO would
+let one of them head-of-line block the pointer and keyboard — violating
+NFR-5 and priority #5. [ADR 0013](adr/0013-interactive-over-bulk-prioritization.md)
+splits the path into two classes; `crossover-core::outbound` implements it.
+
+**Classification** is by message type, at the moment a frame enters the
+path:
+
+| Class | Messages | Why |
+|-------|----------|-----|
+| **High** | `InputBatch`, `ReleaseAllInput`, `ControlRequest`/`Response`/`Release`, `Ping`/`Pong`, `Hello`, pairing | the live input path, and the negotiation that decides who owns it |
+| **Background** | the whole clipboard transaction — `Offer`, `Accept`, `Decline`, `Data`, `Applied` — and any message type this build does not recognize | bulk, and things whose latency budget we cannot vouch for |
+
+The small clipboard messages ride Background *with* the bulk ones
+deliberately. Splitting a transaction across classes would let its
+acknowledgement overtake its data, and the transaction state machine
+(ADR 0005) depends on those messages arriving in the order they were
+produced. One lane per transaction keeps that invariant for free and costs
+the clipboard only latency — which SPECIFICATION.md §2 never ranks above
+input. `TerminateSession`, the fail-closed kill, is High: it is a security
+action and must not queue behind a transfer.
+
+**The split spans every hop, not just the last one.** Each driver's
+`SessionCommand` stream is classified where the streams merge; from there
+High and Background are separate queues, drained by **separate mux tasks**,
+into **separate per-session lanes**, to the writer. This is not decoration:
+the mux *awaits* delivery into a session's queue, so one task draining both
+classes would let a saturated Background path stall input for every
+session — the head-of-line block moved upstream rather than removed. No
+Background backpressure at any hop can delay a High frame.
+
+**Drain policy: strict High-first, no aging.** The writer takes everything
+queued High before a *single* Background frame, then re-checks High. Because
+it writes exactly one frame per iteration, the re-check happens between
+every pair of frames — which is what keeps the kernel send buffer shallow
+enough for app-level priority to reach the wire; queueing several bulk
+frames at once would put input bytes behind them where no scheduler can
+reach. Strict priority admits unbounded Background starvation in theory, and
+that is the accepted trade: real input is bursty, so bulk progresses in the
+gaps, while a clipboard transfer has no deadline and a late `ReleaseAllInput`
+is a stuck key. Aging (promoting starved bulk) would buy liveness nobody
+needs at the cost of the one guarantee this exists to provide. If sustained
+input ever does stall a transfer in practice, that is a measurement to act
+on, not a policy to pre-empt.
+
+**Bulk is reordered, never dropped.** Each class keeps its own FIFO order;
+cross-class reordering is the only thing prioritization changes
+([PROTOCOL.md](PROTOCOL.md) §4). Nothing is discarded to keep up.
+
+**Bounds** (NFR-1) are named constants in `crossover-core::outbound`. The
+High lane is bounded by message count (`MAX_HIGH_QUEUE_FRAMES` = 64;
+interactive frames are tens of bytes). The Background lane is bounded by
+**bytes** as well as messages (`MAX_BACKGROUND_QUEUE_BYTES` = 8 MiB,
+`MAX_BACKGROUND_QUEUE_FRAMES` = 64) — sixty-four queued maximum-size
+clipboard frames would be a quarter-gigabyte commitment per hop. The byte
+budget is held until a frame has been *written*, not merely dequeued, and a
+frame larger than the whole budget still passes on an empty lane rather than
+deadlocking. Producers block on these bounds; that backpressure is the
+design, and it never crosses into the High lane.
+
+Keepalive never enters the queues at all: `run_session` writes `Ping`
+straight to the writer on its idle tick and answers `Pong` from the dispatch
+path — the strongest form of High there is.
+
+Preemption granularity is bounded below by one frame: a frame in flight is
+unpreemptable. [ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md)'s
+chunking is what shrinks that unit, which is why chunk size is a *latency*
+knob answering to this section, not just a memory one.
+
 ## 6. Concurrency model
 
 - Async runtime: **tokio** (multi-threaded). Chosen for maturity; revisit
@@ -197,9 +270,13 @@ IDLE → CONNECTING → AUTHENTICATING → NEGOTIATING → ESTABLISHED
   threads owned by the platform crate — Windows hook callbacks must return
   in microseconds (risk R-2) — and forward events into core over bounded
   channels.
-- All queues are bounded (NFR-1). Backpressure policy differs by class:
-  pointer motion coalesces (newest wins), keyboard and clipboard messages
-  are lossless and ordered, per [PROTOCOL.md](PROTOCOL.md) §6.
+- All queues are bounded (NFR-1) — bulk queues by bytes as well as message
+  count, since a message count alone is not a memory bound once payloads
+  are megabytes (§5.4). Backpressure policy differs by class: pointer motion
+  coalesces (newest wins), keyboard and clipboard messages are lossless and
+  ordered, per [PROTOCOL.md](PROTOCOL.md) §6. Backpressure on a bulk queue
+  must never propagate to an interactive one, which is why the send path
+  runs a task per priority class rather than a task per stage (§5.4).
 - No global mutable state; no sleeps as synchronization; state machines are
   deterministic functions of (state, event) for testability.
 

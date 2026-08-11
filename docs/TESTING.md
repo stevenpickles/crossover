@@ -68,7 +68,17 @@ Deliberately induced, asserted-on scenarios: dropped connections and
 reconnects, delayed/duplicate/stale messages, clipboard lock contention
 (fake `ClipboardProvider` returns transient failures), missing
 acknowledgements, peer crash mid-transaction, abrupt TLS termination,
-disconnect while keys are held down, rapid clipboard replacement bursts.
+disconnect while keys are held down, rapid clipboard replacement bursts,
+and a **saturating background transfer** — every send queue full and the
+socket stalled behind a peer that will not read — with live input injected
+into the middle of it (ADR 0013; `tools/test-peer/tests/priority.rs`).
+
+That last one asserts *structurally*: arrival positions and frame counts,
+never elapsed time. A wall-clock latency bound on a loaded CI runner
+measures the runner, so the guarantee is stated as "everything still queued
+arrives after the input frame, and nothing is dropped" rather than as a
+number of milliseconds. Numeric latency belongs in §4's measurement, not in
+a gate.
 
 Fault injection is the primary evidence for the reliability requirements
 (FR-6.x) and clipboard guarantees (FR-3.x).
