@@ -149,6 +149,10 @@ these, the resolution is noted inline — bookkeeping, not a change of decision.
 - The chunk size ADR 0013 left to this ADR. **Settled: 64 KiB**
   (`MAX_CHUNK_BYTES`), derived from the input-latency budget; arithmetic in
   [PROTOCOL.md](../PROTOCOL.md) §8.
+- Clarifying the Amends header above: the 64 KiB inline threshold is
+  unchanged as a **text** rule, but it is now type-scoped — chunked types have
+  no inline flow and are always offered, at any size
+  ([PROTOCOL.md](../PROTOCOL.md) §5).
 - Which clipboard formats to capture and restore, and whether to advertise more
   than one format on the far side for maximum paste compatibility.
 - Interaction with clipboard citizenship (FR-3.1a) — how long the far side owns

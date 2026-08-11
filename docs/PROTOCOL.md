@@ -42,6 +42,25 @@ Requirements:
 - Unknown *message types* within a known-valid frame are skippable when the
   version negotiation permits it (§3), enabling forward compatibility.
 
+**Forward compatibility is asymmetric, and the asymmetry is load-bearing:**
+
+| Extension | A peer that predates it |
+|-----------|-------------------------|
+| A new **message type** | Skips the frame (§7): survivable, though the sender gets no answer |
+| A new **feature bit** | Ignores it (§3.1): the feature simply never activates |
+| A new **variant of an enum inside a payload** (`ContentType`, `DeclineReason`, `ApplyResult`, …) | **Cannot decode the payload at all.** Its decoder rejects the unknown discriminant, and a malformed payload is fatal (§7) — the session terminates |
+
+The third row is the trap: appending an enum variant looks like the same
+kind of additive change as the first two, and is not. A `ClipboardDecline`
+carrying a reason an older peer does not know does not degrade to "unknown
+reason" — it kills that peer's session.
+
+Therefore: **every payload-enum extension must be feature-gated by the
+sender** (§3.1), which is why the gate lives on the send path where no
+caller can skip it, and why `FeatureFlags::ADVERTISED` stays empty until a
+build can genuinely honour the capability. This applies to every future
+addition of the kind, `ContentType::Files` among them.
+
 ## 3. Session establishment and versioning
 
 After TLS establishment and peer authorization, each side sends `Hello`:
@@ -79,11 +98,14 @@ Rules, all of them deliberate:
 - **Advertising is a promise to handle, not a statement of intent to
   send.** A build sets a bit only when it can receive that traffic and
   complete the transaction.
-- **Senders gate on the negotiated set before anything travels.** This is
-  not an optimization: per §2 an unknown *message type* is skipped rather
-  than fatal, so content a peer cannot decode would be answered by nothing
-  at all — a silently stalled transaction, which NFR-3 forbids. Asking
-  first is what turns "no answer" into a typed `Decline`.
+- **Senders gate on the negotiated set before anything travels**, at the
+  send path itself (`gate_outbound` in `crossover-core::net`), so the
+  check cannot be forgotten by a caller. This is not an optimization. Per
+  §2 an unknown *message type* is skipped, so an un-negotiated chunk would
+  be answered by nothing at all — a silently stalled transaction, which
+  NFR-3 forbids. Worse, an un-negotiated *content type* is not skipped at
+  all: it fails the peer's payload decode and terminates its session. The
+  gate is what turns both outcomes into a local refusal.
 
 | Bit | Name | Meaning |
 |-----|------|---------|
