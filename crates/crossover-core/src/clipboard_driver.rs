@@ -273,6 +273,21 @@ impl ClipboardSyncDriver {
         kept
     }
 
+    /// Pull the fail-closed lever: the same session kill a malformed
+    /// payload triggers (docs/PROTOCOL.md §7), reached instead by
+    /// repetition of individually-survivable violations. `false` once the
+    /// app side is gone.
+    async fn terminate_session(&self, reason: String) -> bool {
+        tracing::warn!(error = %reason, "terminating session on clipboard violations");
+        self.commands_tx
+            .send(SessionCommand::TerminateSession {
+                target: FrameTarget::Broadcast,
+                reason,
+            })
+            .await
+            .is_ok()
+    }
+
     /// Execute engine actions, feeding results back through the engine
     /// until the queue drains. Returns `false` when the app side is gone.
     async fn execute(&mut self, actions: Vec<Action>) -> bool {
@@ -357,6 +372,11 @@ impl ClipboardSyncDriver {
                         tokio::time::sleep(delay).await;
                         let _ = notify.send(SyncEvent::RetryDue(id)).await;
                     });
+                }
+                Action::TerminateSession { reason } => {
+                    if !self.terminate_session(reason).await {
+                        return false;
+                    }
                 }
                 Action::ScheduleSettle { delay } => {
                     // Bump the generation: any timer already in flight
