@@ -167,6 +167,13 @@ pub struct InputControlDriver {
     /// here — and control is relinquished to neutral. `None` while not
     /// controlled, or on a platform without the tick query (detection off).
     controlled_input_baseline: Option<u32>,
+    /// The cursor visibility a transition wants, held until *after* its actions
+    /// run (ADR 0009). `update_cursor` records the desired state during the
+    /// engine step; `execute` flushes it once `StartCapture`/`StopCapture` and
+    /// any `PlaceCursor` have completed, so the visual cue tracks the real
+    /// capture state and placement instead of racing ahead of them. `None`
+    /// between transitions.
+    pending_cursor: Option<bool>,
     /// Seamless wiring, present exactly when the machine runs
     /// `--left`/`--right`. `None` makes placement and edge-mode emission
     /// no-ops (an explicit-only run).
@@ -217,6 +224,7 @@ pub fn input_control(
         cursor_hidden: false,
         cursor_wake_baseline: None,
         controlled_input_baseline: None,
+        pending_cursor: None,
         seamless,
         // Idle until a session establishes: emitting the initial mode is
         // the driver's job on the first state change.
@@ -518,8 +526,13 @@ impl InputControlDriver {
     ///   return); otherwise shown (disconnect, escape — the machine is the
     ///   user's again).
     ///
-    /// The actual (blocking) mask call happens in [`cursor_applier`]; here
-    /// we only record the latest desired state.
+    /// The desired state is not published here but held in `pending_cursor`
+    /// and flushed at the end of [`execute`], *after* the transition's
+    /// `StartCapture`/`StopCapture` and any `PlaceCursor` have run — so the cursor
+    /// hides only once capture is actually suppressing local input, and
+    /// reappears (placed) only once capture has stopped, keeping the visual cue
+    /// in step with which machine is really live. The actual (blocking) mask
+    /// call then happens in [`cursor_applier`].
     fn update_cursor(&mut self, was_controlling: bool, was_controlled: bool, is_edge_return: bool) {
         let is_controlling = self.engine.is_controlling();
         let is_controlled = self.engine.is_controlled();
@@ -544,8 +557,9 @@ impl InputControlDriver {
             None
         };
         tracing::debug!(hidden, "cursor: active-machine changed");
-        // Non-blocking: the applier coalesces to this latest value.
-        let _ = self.cursor_tx.send(hidden);
+        // Held, not sent: `execute` flushes it after this transition's actions
+        // run, so the cue never precedes the capture/placement it stands for.
+        self.pending_cursor = Some(hidden);
     }
 
     /// Cursor fail-safe (ADR 0009): while the cursor is hidden and this
@@ -704,8 +718,17 @@ impl InputControlDriver {
         }
         if !deferred.is_empty() {
             // Depth is bounded: the fail-closed transition never emits
-            // another StartCapture.
+            // another StartCapture. The nested call flushes `pending_cursor`
+            // (the fail-closed transition overwrote it), so it is applied once,
+            // with the final value.
             return Box::pin(self.execute(deferred)).await;
+        }
+        // The transition's actions have all run; now let the cursor follow, so
+        // the hide lands only after capture suppresses local input and the show
+        // only after capture stops and the cursor is placed (ADR 0009).
+        if let Some(hidden) = self.pending_cursor.take() {
+            // Non-blocking: the applier coalesces to this latest value.
+            let _ = self.cursor_tx.send(hidden);
         }
         true
     }
@@ -1030,6 +1053,48 @@ mod tests {
             ControlNotice::ControlEnded(crate::control::ControlEndReason::HandedBack)
         );
         await_cursor(&rig, false).await;
+    }
+
+    /// When the peer returns across the edge (a Release carrying an entry
+    /// fraction), the controller stops capturing, places its cursor where
+    /// control came back, and only *then* shows it — the cursor never appears
+    /// at the stale capture edge and jumps. Guards the deferred cursor emission
+    /// (ADR 0009): visibility follows the transition's actions, not races ahead.
+    #[tokio::test]
+    async fn a_returning_controller_places_the_cursor_before_showing_it() {
+        let mut rig = rig();
+        make_controlling(&mut rig).await;
+        await_cursor(&rig, true).await; // hidden while driving the peer
+        assert!(
+            rig.injector.placements().is_empty(),
+            "no placement yet while driving"
+        );
+
+        // The peer hands control back across the edge, carrying where it left.
+        let release = ControlRelease {
+            entry: Some(EdgeFraction::new(0.5).to_wire()),
+        };
+        rig.events
+            .send(frame(
+                MessageType::ControlRelease,
+                release.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::ControlEnded(crate::control::ControlEndReason::Revoked)
+        );
+
+        // The cursor is shown only after execute has run StopCapture and the
+        // placement: by the time it is visible again, the entry placement is
+        // already recorded — so it was placed before it was shown.
+        await_cursor(&rig, false).await;
+        assert_eq!(
+            rig.injector.placements().len(),
+            1,
+            "the returning cursor is placed before it is shown"
+        );
     }
 
     /// The controlled machine hides its cursor when the user's cursor
