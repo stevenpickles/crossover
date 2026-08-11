@@ -1434,24 +1434,288 @@ mod tests {
         assert_eq!(super::dib_logical_len(&rle), None);
     }
 
-    /// NFR-1: header bytes are network-influenced (a peer's image is
-    /// installed, read back, and canonicalized), so malformed input must
-    /// never panic and must never *grow* a blob.
+    /// A `BITMAPINFOHEADER` with every field under the test's control, so
+    /// the fuzz corpus can reach the arithmetic instead of bouncing off
+    /// the first field check.
+    #[derive(Clone, Copy)]
+    struct Header {
+        size: u32,
+        width: i32,
+        height: i32,
+        planes: u16,
+        bit_count: u16,
+        compression: u32,
+        size_image: u32,
+        clr_used: u32,
+    }
+
+    impl Header {
+        /// The 40 bytes, always — `size` is the *declared* header size,
+        /// which is a field like any other and may disagree.
+        fn bytes(self) -> Vec<u8> {
+            let mut out = Vec::with_capacity(40);
+            out.extend_from_slice(&self.size.to_le_bytes());
+            out.extend_from_slice(&self.width.to_le_bytes());
+            out.extend_from_slice(&self.height.to_le_bytes());
+            out.extend_from_slice(&self.planes.to_le_bytes());
+            out.extend_from_slice(&self.bit_count.to_le_bytes());
+            out.extend_from_slice(&self.compression.to_le_bytes());
+            out.extend_from_slice(&self.size_image.to_le_bytes());
+            out.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+            out.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+            out.extend_from_slice(&self.clr_used.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+            out
+        }
+    }
+
+    /// The DIB length, computed independently of the implementation:
+    /// textbook row-stride arithmetic, written out longhand, for the
+    /// uncompressed layouts only. A cross-check, not a mirror — if the
+    /// production arithmetic is refactored into agreement with itself but
+    /// out of agreement with the format, this disagrees.
+    fn textbook_len(h: Header) -> Option<usize> {
+        if h.size != 40 || h.planes != 1 || h.width <= 0 || h.height == 0 {
+            return None;
+        }
+        let table = match h.bit_count {
+            1 | 4 | 8 => {
+                let entries = if h.clr_used == 0 {
+                    1usize << h.bit_count
+                } else {
+                    usize::try_from(h.clr_used).ok()?
+                };
+                if entries > 256 {
+                    return None;
+                }
+                entries * 4
+            }
+            16 | 24 | 32 => {
+                let masks = match h.compression {
+                    3 => 12,
+                    6 => 16,
+                    _ => 0,
+                };
+                masks + usize::try_from(h.clr_used).ok()? * 4
+            }
+            _ => return None,
+        };
+        if !matches!(h.compression, 0 | 3 | 6) {
+            return None; // compressed payloads are not computable
+        }
+        let row_bits = usize::try_from(h.width).ok()? * usize::from(h.bit_count);
+        let stride = row_bits.div_ceil(32) * 4;
+        let pixels = (stride * usize::try_from(h.height.unsigned_abs()).ok()?)
+            .max(usize::try_from(h.size_image).ok()?);
+        Some(40 + table + pixels)
+    }
+
+    /// What one corpus case exercised, so the caller can prove the corpus
+    /// reaches the code rather than assuming it.
+    struct CaseOutcome {
+        /// The blob was longer than its canonical form: the trimming path
+        /// ran.
+        trimmed: bool,
+        /// The canonical form describes itself completely, so the loop
+        /// guard property applies to it.
+        self_describing: bool,
+    }
+
+    /// The four properties, asserted over one blob. Extracted so the
+    /// corpus generator stays readable; every assertion names the
+    /// iteration, so a failure is reproducible from the seed.
+    fn assert_canonical_properties(blob: &[u8], header: Header, iteration: u32) -> CaseOutcome {
+        // 1 + 2: no panic, and the result is a prefix — never grown,
+        // never rewritten.
+        let once = super::canonical_dib(blob.to_vec());
+        assert!(
+            once.len() <= blob.len() && once.as_slice() == &blob[..once.len()],
+            "canonicalization must return a prefix (iteration {iteration})"
+        );
+
+        // 3: idempotent.
+        assert_eq!(
+            super::canonical_dib(once.clone()),
+            once,
+            "canonicalization is not idempotent (iteration {iteration})"
+        );
+
+        // Cross-check: the independent formula must agree wherever it has
+        // an opinion and the blob is long enough to satisfy it.
+        if let Some(expected) = textbook_len(header)
+            && expected <= blob.len()
+        {
+            assert_eq!(
+                super::dib_logical_len(blob),
+                Some(expected),
+                "the implementation and the textbook formula disagree \
+                 (iteration {iteration})"
+            );
+        }
+
+        // 4: the loop guard, over blobs that describe themselves.
+        let self_describing = super::dib_logical_len(&once).is_some();
+        if self_describing {
+            for pad in [1usize, 7, 32] {
+                let mut padded = once.clone();
+                padded.resize(padded.len() + pad, 0);
+                assert_eq!(
+                    super::canonical_dib(padded),
+                    once,
+                    "allocator slack changed the canonical form — our own write \
+                     would read back as new content and loop (iteration {iteration})"
+                );
+            }
+        }
+
+        CaseOutcome {
+            trimmed: once.len() < blob.len(),
+            self_describing,
+        }
+    }
+
+    /// **The properties the loop guard rests on, over a corpus that
+    /// actually reaches the arithmetic.**
+    ///
+    /// The predecessor of this test fed unstructured random bytes, which
+    /// meant every single case died on the first field check (a random
+    /// `u32` is `40` with probability 2⁻³²) and none of the geometry
+    /// arithmetic below it ever ran — a refactor of that arithmetic would
+    /// have sailed through green. So the corpus is built from headers
+    /// instead of from noise, and the test asserts it measurably reaches
+    /// the trimming path rather than trusting that it does.
+    ///
+    /// Four properties, over both a *coherent* corpus (blobs sized to
+    /// their own geometry, plus slack) and a *hostile* one (fields chosen
+    /// to fight the arithmetic — zero and absurd depths, every
+    /// compression, palette counts either side of 256, extreme and
+    /// negative dimensions, header sizes from every `BITMAPINFO` variant):
+    ///
+    /// 1. no panic on anything (NFR-1: these bytes are network-influenced,
+    ///    since a peer's image is installed, read back, and canonicalized);
+    /// 2. the output is always a *prefix* — never grown, never rewritten;
+    /// 3. canonicalization is idempotent;
+    /// 4. **the loop guard itself**: for a blob that describes itself
+    ///    completely, appending allocator slack cannot change the result.
+    ///    That is the fixed point FR-3.3 needs — our own write reads back
+    ///    identical, so its content hash matches and the item is not
+    ///    offered back to the peer that sent it.
+    ///
+    /// Property 4 is stated over self-describing blobs on purpose, and the
+    /// exclusion is honest rather than convenient: a blob *shorter* than
+    /// its own header claims is kept whole (conservative, so a valid image
+    /// is never cut short), and appending enough bytes can complete it, so
+    /// its canonical form legitimately changes. Reaching that needs a
+    /// malformed source DIB *and* allocator rounding large enough to close
+    /// the gap, and even then it costs one extra bounce and then settles —
+    /// the completed blob is self-describing, so the next hop is stable.
+    /// It is not an unbounded loop, and the test says which set it covers.
     #[test]
-    fn canonicalization_never_panics_on_arbitrary_bytes() {
+    fn dib_length_arithmetic_holds_over_a_corpus_that_reaches_it() {
+        const HEADER_SIZES: [u32; 6] = [12, 40, 52, 56, 108, 124];
+        const WIDTHS: [i32; 12] = [0, 1, 2, 3, 5, 16, 64, 1024, 3840, 7680, i32::MAX, i32::MIN];
+        const HEIGHTS: [i32; 10] = [0, 1, 2, 3, 16, 1080, 2160, -1, -16, i32::MIN];
+        const PLANES: [u16; 4] = [0, 1, 2, u16::MAX];
+        const BIT_COUNTS: [u16; 10] = [0, 1, 2, 4, 8, 16, 24, 32, 48, 64];
+        const COMPRESSIONS: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, u32::MAX];
+        const SIZE_IMAGES: [u32; 6] = [0, 1, 64, 4096, 1 << 20, u32::MAX];
+        const CLR_USEDS: [u32; 6] = [0, 1, 255, 256, 257, u32::MAX];
+        const SLACKS: [usize; 6] = [0, 1, 3, 8, 16, 64];
+
+        // Deterministic, so a failure is reproducible from the seed alone.
         let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pick = |len: usize, r: u64| usize::try_from(r % len as u64).unwrap_or(0);
+
+        let mut trimmed = 0usize; // property-4 evidence
+        let mut modelled = 0usize; // headers the arithmetic accepted
+
+        for iteration in 0..40_000u32 {
+            // Half the corpus is coherent — sized to its own geometry, so
+            // the trimming path is genuinely reached — and half is
+            // hostile, sized independently of what the header claims.
+            let coherent = iteration % 2 == 0;
+            let r = [
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+            ];
+            let header = if coherent {
+                Header {
+                    size: 40,
+                    width: [1, 2, 3, 5, 16, 64, 127, 256][pick(8, r[0])],
+                    height: [1, 2, 3, 16, 64, -1, -16, -64][pick(8, r[1])],
+                    planes: 1,
+                    bit_count: [1, 4, 8, 16, 24, 32][pick(6, r[2])],
+                    compression: [0, 3, 6][pick(3, r[3])],
+                    size_image: [0, 0, 0, 16][pick(4, r[4])],
+                    clr_used: [0, 0, 1, 16, 255, 256][pick(6, r[5])],
+                }
+            } else {
+                Header {
+                    size: HEADER_SIZES[pick(HEADER_SIZES.len(), r[0])],
+                    width: WIDTHS[pick(WIDTHS.len(), r[1])],
+                    height: HEIGHTS[pick(HEIGHTS.len(), r[2])],
+                    planes: PLANES[pick(PLANES.len(), r[3])],
+                    bit_count: BIT_COUNTS[pick(BIT_COUNTS.len(), r[4])],
+                    compression: COMPRESSIONS[pick(COMPRESSIONS.len(), r[5])],
+                    size_image: SIZE_IMAGES[pick(SIZE_IMAGES.len(), r[6])],
+                    clr_used: CLR_USEDS[pick(CLR_USEDS.len(), r[7])],
+                }
+            };
+            let slack = SLACKS[pick(SLACKS.len(), next())];
+
+            let mut blob = header.bytes();
+            if coherent {
+                // Grow to exactly what an independent reading of the
+                // format says this geometry needs, then add slack.
+                if let Some(len) = textbook_len(header)
+                    && len <= 1 << 20
+                {
+                    blob.resize(len, 0x5A);
+                }
+            } else {
+                let body = [0usize, 4, 40, 111, 1024, 4096][pick(6, next())];
+                blob.resize(40 + body, 0x5A);
+            }
+            blob.resize(blob.len() + slack, 0xAB);
+
+            let outcome = assert_canonical_properties(&blob, header, iteration);
+            trimmed += usize::from(outcome.trimmed);
+            modelled += usize::from(outcome.self_describing);
+        }
+
+        // Without this the test could silently regress into the shape it
+        // replaced: green, and never once past the first field check.
+        assert!(
+            trimmed > 1_000,
+            "the corpus barely reached the trimming path ({trimmed} trims); \
+             it is not testing the arithmetic"
+        );
+        assert!(
+            modelled > 1_000,
+            "too few self-describing blobs ({modelled}) to pin the loop guard"
+        );
+        eprintln!("structured DIB corpus: {trimmed} trims, {modelled} self-describing");
+
+        // Unstructured noise still must not panic — cheap, and the old
+        // test's one genuine contribution.
         for len in 0..200usize {
             let blob: Vec<u8> = (0..len)
-                .map(|_| {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    u8::try_from(state & 0xFF).unwrap_or(0)
-                })
+                .map(|_| u8::try_from(next() & 0xFF).unwrap_or(0))
                 .collect();
             let out = super::canonical_dib(blob.clone());
-            assert!(out.len() <= blob.len(), "canonicalization grew a blob");
-            assert_eq!(out.as_slice(), &blob[..out.len()], "it must stay a prefix");
+            assert_eq!(out.as_slice(), &blob[..out.len()]);
         }
     }
 
