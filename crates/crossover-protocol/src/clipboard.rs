@@ -717,7 +717,10 @@ impl ChunkReassembly {
     ///
     /// [`ProtocolError::Malformed`] if the meta is invalid, if the type
     /// does not travel as chunks, or if the declared length cannot be
-    /// represented as a buffer on this target.
+    /// represented as a buffer on this target;
+    /// [`ProtocolError::ResourceExhausted`] if the (bounded, validated)
+    /// buffer cannot be reserved — the caller declines the transfer
+    /// rather than the process dying.
     pub fn begin(meta: ClipboardMeta) -> Result<Self, ProtocolError> {
         meta.validate()?;
         if !meta.content_type.is_chunked() {
@@ -735,10 +738,22 @@ impl ChunkReassembly {
                 ),
             });
         };
+        // `try_reserve`, not `with_capacity`: the length is legal and
+        // bounded, but a legal 64 MiB is still 64 MiB, and infallible
+        // allocation turns a memory-pressured machine into an aborted
+        // process at a peer's choosing. The ordering NFR-1 cares about is
+        // unchanged — validate, *then* allocate.
+        let mut buffer = Vec::new();
+        if buffer.try_reserve_exact(capacity).is_err() {
+            return Err(ProtocolError::ResourceExhausted {
+                what: "a clipboard reassembly buffer",
+                requested: meta.content_length,
+            });
+        }
         Ok(Self {
             meta,
             plan: None,
-            buffer: Vec::with_capacity(capacity),
+            buffer,
             next_index: 0,
             complete: false,
         })
@@ -806,7 +821,10 @@ impl ChunkReassembly {
 
         // Chunk 0 fixes the sender's chunk size, and with it the whole
         // plan — reconciled against the offered length before a byte of it
-        // is kept.
+        // is kept. Computed here but **not stored yet**: a rejection must
+        // leave no trace in a fail-closed parser, and storing before the
+        // checks below would let a refused chunk decide how the rest of
+        // the transfer is measured.
         let plan = if let Some(plan) = self.plan {
             plan
         } else {
@@ -815,9 +833,7 @@ impl ChunkReassembly {
                     reason: "chunk payload length is not representable".to_owned(),
                 });
             };
-            let plan = ChunkPlan::derive(self.meta.content_length, chunk_bytes)?;
-            self.plan = Some(plan);
-            plan
+            ChunkPlan::derive(self.meta.content_length, chunk_bytes)?
         };
 
         let Some(expected) = plan.chunk_len(chunk.index) else {
@@ -839,6 +855,8 @@ impl ChunkReassembly {
             });
         }
 
+        // Accepted: only now does any of it become state.
+        self.plan = Some(plan);
         self.buffer.extend_from_slice(&chunk.payload);
         self.next_index = self.next_index.saturating_add(1);
         if self.next_index < plan.chunk_count() {
@@ -1808,7 +1826,13 @@ mod tests {
             let Ok(mut reassembly) = ChunkReassembly::begin(meta) else { return Ok(()); };
             for (index, payload) in chunks {
                 let chunk = ClipboardChunk { id: meta.id, index, payload };
+                let (bytes_before, plan_before) =
+                    (reassembly.received_bytes(), reassembly.plan());
                 if reassembly.accept(&chunk).is_err() {
+                    // A rejection leaves no trace: nothing buffered, and
+                    // no plan fixed by a chunk that was refused.
+                    prop_assert_eq!(reassembly.received_bytes(), bytes_before);
+                    prop_assert_eq!(reassembly.plan(), plan_before);
                     break; // fail closed: the transfer is over
                 }
             }

@@ -114,6 +114,22 @@ pub enum ProtocolError {
     /// diagnostics never blame a peer for our own encoding failure.
     #[error("encoding outbound message failed: {reason}")]
     Encode { reason: String },
+
+    /// A bounded, already-validated allocation could not be made.
+    ///
+    /// Distinct from [`ProtocolError::Malformed`] because the peer did
+    /// nothing wrong: the length was inside its limit, and this machine
+    /// could not honour it anyway. It exists so that path returns a value
+    /// the caller can decline with, instead of the process aborting —
+    /// Rust's default on allocation failure is `abort`, and a remote peer
+    /// must never be able to reach it (NFR-1).
+    #[error("cannot reserve {requested} bytes for {what}")]
+    ResourceExhausted {
+        /// What the memory was for, for the diagnostic.
+        what: &'static str,
+        /// How many bytes were asked for.
+        requested: u64,
+    },
 }
 
 #[cfg(test)]
