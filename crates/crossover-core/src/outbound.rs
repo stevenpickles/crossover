@@ -59,6 +59,19 @@ pub const MAX_BACKGROUND_QUEUE_FRAMES: usize = 64;
 /// Producers wait for room; nothing is ever discarded to stay inside it.
 pub const MAX_BACKGROUND_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
+/// The clamp in `BudgetedSender::charge` keeps an over-budget item moving by
+/// charging it the whole budget, which serializes it against every other
+/// producer. That is a deadlock-avoidance fallback, not a mode the session
+/// path should ever enter — so assert at compile time that the largest frame
+/// the protocol can carry genuinely fits inside the budget. If
+/// `MAX_PAYLOAD_BYTES` ever grows past it, this fails the build rather than
+/// silently degrading the Background lane to one frame at a time.
+const _: () = assert!(
+    crossover_protocol::framing::MAX_PAYLOAD_BYTES < MAX_BACKGROUND_QUEUE_BYTES,
+    "MAX_BACKGROUND_QUEUE_BYTES must exceed the largest protocol payload, or \
+     every maximum-size frame serializes the Background lane"
+);
+
 /// Which lane an outbound frame rides (ADR 0013).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendPriority {
@@ -115,12 +128,6 @@ impl SendPriority {
             )
             | None => Self::Background,
         }
-    }
-
-    /// Whether this is the interactive class.
-    #[must_use]
-    pub const fn is_high(self) -> bool {
-        matches!(self, Self::High)
     }
 }
 
@@ -220,11 +227,17 @@ impl<T> BudgetedSender<T> {
 
     /// Queue `item` only if it fits right now.
     ///
+    /// **Not fair against [`Self::send`].** A `try_send` takes budget with
+    /// tokio's `try_acquire`, which barges past producers already queued on
+    /// the semaphore rather than joining the queue behind them. Mixing the
+    /// two on one lane can therefore starve a parked producer indefinitely,
+    /// so production code picks one: `send` for real traffic, `try_send`
+    /// only to *probe* saturation (which is what tests do here).
+    ///
     /// # Errors
     ///
     /// The item itself, handed back untouched, when the lane is at one of
-    /// its bounds or closed — a *rejection*, never a silent drop. Used to
-    /// probe saturation without blocking.
+    /// its bounds or closed — a *rejection*, never a silent drop.
     pub fn try_send(&self, item: T, bytes: usize) -> Result<(), T> {
         let Ok(permit) = Arc::clone(&self.budget).try_acquire_many_owned(self.charge(bytes)) else {
             return Err(item);
@@ -242,9 +255,25 @@ impl<T> BudgetedSender<T> {
 }
 
 /// Receiving half of a byte-budgeted queue.
+///
+/// Dropping it **closes the byte budget**, not just the queue. Without that,
+/// a producer parked in `acquire_many_owned` would wait forever whenever the
+/// budget it needs is held by a [`BudgetHold`] that outlived the receiver —
+/// which is the normal state during teardown, because the writer holds the
+/// in-flight frame's budget until the write finishes. Closing makes every
+/// parked producer unwind to [`OutboundClosed`] instead.
 #[derive(Debug)]
 pub struct BudgetedReceiver<T> {
     rx: mpsc::Receiver<Budgeted<T>>,
+    budget: Arc<Semaphore>,
+}
+
+impl<T> Drop for BudgetedReceiver<T> {
+    fn drop(&mut self) {
+        // Existing permits are unaffected; only waiters and future
+        // acquisitions are failed, which is exactly the teardown signal.
+        self.budget.close();
+    }
 }
 
 impl<T> BudgetedReceiver<T> {
@@ -267,20 +296,27 @@ impl<T> BudgetedReceiver<T> {
 
 /// A queue bounded by `max_items` messages *and* `max_bytes` of queued
 /// payload, whichever binds first.
+///
+/// `max_bytes` is clamped to what a semaphore can actually represent —
+/// `Semaphore::MAX_PERMITS` first (which is `usize::MAX >> 3`, and so is the
+/// binding limit on a 32-bit target), then `u32::MAX` (the width
+/// `acquire_many` takes). A request beyond the clamp is a bound the caller
+/// asked for and did not get, never a panic.
 #[must_use]
 pub fn budgeted_channel<T>(
     max_items: usize,
     max_bytes: usize,
 ) -> (BudgetedSender<T>, BudgetedReceiver<T>) {
     let (tx, rx) = mpsc::channel(max_items);
-    let capacity_bytes = u32::try_from(max_bytes).unwrap_or(u32::MAX);
+    let capacity_bytes = u32::try_from(max_bytes.min(Semaphore::MAX_PERMITS)).unwrap_or(u32::MAX);
+    let budget = Arc::new(Semaphore::new(capacity_bytes as usize));
     (
         BudgetedSender {
             tx,
-            budget: Arc::new(Semaphore::new(capacity_bytes as usize)),
+            budget: Arc::clone(&budget),
             capacity_bytes,
         },
-        BudgetedReceiver { rx },
+        BudgetedReceiver { rx, budget },
     )
 }
 
@@ -468,6 +504,10 @@ pub fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
     use crossover_protocol::hello::MessageType;
 
     use super::{
@@ -678,6 +718,92 @@ mod tests {
             order.push(*item);
         }
         assert_eq!(order, vec![1, 2, 3, 4], "queued items kept their order");
+    }
+
+    /// Session teardown must not strand a producer. The writer holds the
+    /// in-flight frame's budget while it writes, so at the moment a session
+    /// dies the budget is routinely held by something the queue no longer
+    /// owns — and a producer parked on that budget would wait for a permit
+    /// nobody will ever return.
+    #[tokio::test]
+    async fn a_producer_parked_on_the_budget_unwinds_when_the_writer_goes_away() {
+        let (tx, mut rx) = outbound_channel();
+        let mut queued = 0usize;
+        while tx
+            .try_send(MessageType::ClipboardData.wire(), vec![0u8; 1024 * 1024])
+            .is_ok()
+        {
+            queued += 1;
+            assert!(queued < 1000, "the byte budget never bound");
+        }
+
+        // A maximum-size frame: it needs the *whole* budget, so draining the
+        // queue is not enough — the in-flight frame alone keeps it parked,
+        // which is the case that strands a producer.
+        let parked = {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                tx.send(
+                    MessageType::ClipboardData.wire(),
+                    vec![0u8; MAX_BACKGROUND_QUEUE_BYTES],
+                )
+                .await
+            })
+        };
+        // Take one frame out: its budget now lives with the "writer".
+        let in_flight = rx.recv().await.expect("a frame");
+        assert!(!parked.is_finished(), "the producer did not actually park");
+
+        drop(rx);
+        let outcome = timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("a producer parked on the byte budget never unwound");
+        assert!(
+            outcome.expect("the producer task panicked").is_err(),
+            "teardown must report the path closed"
+        );
+        drop(in_flight);
+    }
+
+    /// The same teardown, reduced to its sharpest form: the *only* thing
+    /// holding budget is a frame the writer already took.
+    #[tokio::test]
+    async fn teardown_unwinds_even_when_only_an_in_flight_frame_holds_budget() {
+        let (tx, mut rx) = outbound_channel();
+        tx.send(
+            MessageType::ClipboardData.wire(),
+            vec![0u8; MAX_BACKGROUND_QUEUE_BYTES],
+        )
+        .await
+        .unwrap();
+        let in_flight = rx.recv().await.expect("a frame");
+
+        let parked = {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                tx.send(MessageType::ClipboardData.wire(), vec![0u8; 8])
+                    .await
+            })
+        };
+        // Nothing is queued and nothing can be: the in-flight frame holds
+        // the entire budget.
+        assert!(
+            timeout(Duration::from_millis(200), async {
+                while !parked.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "the producer did not park on the budget"
+        );
+
+        drop(rx);
+        let outcome = timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("the in-flight frame's budget stranded the producer forever");
+        assert!(outcome.expect("the producer task panicked").is_err());
+        drop(in_flight);
     }
 
     /// The byte budget is a *bound*, not a ceiling on what can be sent: a
