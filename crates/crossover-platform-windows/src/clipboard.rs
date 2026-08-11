@@ -58,6 +58,12 @@
 //!   reads mean this slice adds a capability without changing any existing
 //!   item's outcome.
 //!
+//! One carve-out, because precedence must not become suppression: the text
+//! has to be **non-empty** to win. A source publishing a zero-length
+//! `CF_UNICODETEXT` beside a picture would otherwise propagate `""` and
+//! blank the peer's clipboard — strictly worse than sending either
+//! content. An empty text with no image behind it is unchanged.
+//!
 //! **The bytes are canonicalized to the DIB's own length.** `GlobalSize`
 //! reports the *allocation*, which may be larger than the bitmap inside
 //! it, and trailing allocator slack is not part of the image. Worse, it
@@ -178,19 +184,30 @@ impl ClipboardProvider for WindowsClipboard {
     /// rendering of its own text, and the transaction carries one type.
     /// The reasoning is on the module.
     ///
+    /// **Non-empty** text, precisely. A source may publish a zero-length
+    /// `CF_UNICODETEXT` beside a picture, and letting that win would
+    /// propagate `""` — blanking the peer's clipboard instead of sending
+    /// the image, which is worse than either content type. So an empty
+    /// text representation steps aside for an image, and only for an
+    /// image: an empty clipboard with no picture behind it still reads
+    /// exactly as it always has.
+    ///
     /// An image past [`MAX_CLIPBOARD_IMAGE_BYTES`] reads as *absent* —
     /// the trait's meaning for "nothing this backend represents" — and is
     /// refused before its bytes are copied, never truncated (FR-3.6).
     fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
-        if let Some(text) = read_unicode_text()? {
-            return Ok(Some(ClipboardContent::Text(text)));
+        match read_unicode_text()? {
+            Some(text) if !text.is_empty() => Ok(Some(ClipboardContent::Text(text))),
+            empty_or_absent => {
+                if let Some(bytes) = read_dib(MAX_CLIPBOARD_IMAGE_BYTES)? {
+                    return Ok(Some(ClipboardContent::Image {
+                        format: ClipboardImageFormat::Dib,
+                        bytes,
+                    }));
+                }
+                Ok(empty_or_absent.map(ClipboardContent::Text))
+            }
         }
-        Ok(
-            read_dib(MAX_CLIPBOARD_IMAGE_BYTES)?.map(|bytes| ClipboardContent::Image {
-                format: ClipboardImageFormat::Dib,
-                bytes,
-            }),
-        )
     }
 
     /// Writes `CF_UNICODETEXT`, `CF_DIB`, or the registered `"PNG"`
@@ -1170,6 +1187,56 @@ mod tests {
                 .map(|b| b.len()),
             Some(picture.len()),
             "the mixed clipboard was supposed to hold an image as well"
+        );
+    }
+
+    /// Precedence must not become suppression. A `CF_UNICODETEXT` that is
+    /// nothing but its terminator reads as `Some("")`, and letting that
+    /// win over a picture beside it would propagate an empty string —
+    /// **blanking the peer's clipboard** instead of sending the image,
+    /// which is worse than either content type. The carve-out is narrow:
+    /// only an image displaces empty text, and an empty clipboard with no
+    /// picture behind it must read exactly as it always has.
+    #[test]
+    fn empty_text_steps_aside_for_an_image_but_nothing_else() {
+        use crossover_platform::ClipboardContent;
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        let terminator_only = 0u16.to_le_bytes(); // an empty CF_UNICODETEXT
+        let picture = dib(10, 6);
+        with_retry(|| {
+            super::install_formats(&[
+                (
+                    u32::from(windows::Win32::System::Ole::CF_UNICODETEXT.0),
+                    &terminator_only,
+                ),
+                (u32::from(windows::Win32::System::Ole::CF_DIB.0), &picture),
+            ])
+        })
+        .unwrap();
+
+        match with_retry(|| clipboard.read()).unwrap() {
+            Some(ClipboardContent::Image { bytes, .. }) => assert_eq!(bytes, picture),
+            other => panic!(
+                "empty text must not mask an image, got {:?}",
+                other.map(|c| c.byte_len())
+            ),
+        }
+
+        // No image behind it: unchanged behaviour, empty text reads as
+        // empty text rather than becoming absent.
+        with_retry(|| {
+            super::install_formats(&[(
+                u32::from(windows::Win32::System::Ole::CF_UNICODETEXT.0),
+                &terminator_only,
+            )])
+        })
+        .unwrap();
+        assert_eq!(
+            with_retry(|| clipboard.read()).unwrap(),
+            Some(ClipboardContent::Text(String::new()))
         );
     }
 
