@@ -76,6 +76,40 @@ Both cases are "my real cursor reached my linked edge"; only the control
 state decides what it means. Using the machine whose cursor is actually
 moving keeps detection exact.
 
+### Reversing direction is done by reclaiming to neutral, not re-crossing
+
+The linked edge does double duty — *leave* while local, *return* while
+controlled — and immediately after a transfer the cursor rests **on** that
+edge. Reversing the control direction there (be controlled, then take the
+peer instead) means the very next crossing is ambiguous, and a rising-edge
+detector that primes on the resting cursor swallows it: the first push does
+nothing, the second works. Trying to disambiguate by cursor position alone
+failed both ways in soak — placing the entry cursor a few pixels inside the
+edge turned into a hair-trigger that bounced the forward crossing, and a
+short dwell before firing added palpable latency and a path-repeat glitch.
+
+The resolution keeps the instant, position-only crossing and disambiguates
+by a *different* signal: **genuine local input on the controlled machine
+reclaims control to neutral.** When the user touches the controlled
+machine's own mouse or keyboard, the user is there — so that machine gives
+up the peer's grant exactly like the secure-desktop give-up (drains what it
+holds, tells the peer to release, which returns the peer to local) and
+comes to rest in **neutral**: neither machine controls the other. From
+neutral the cursor is free in the machine's interior, so the next edge
+crossing is an ordinary, unambiguous rising edge — reversing direction is
+just "touch this machine, then cross the edge," with no dwell and no
+re-cross.
+
+"Genuine local input" is distinguished from the peer's own injected driving
+by the system input tick (`GetLastInputInfo` on Windows), **re-baselined
+after every injection the controlled machine makes**, so injected motion
+does not read as the user's. The common case — the user walks over while
+the peer sits idle — is caught cleanly; simultaneous driving-and-touching
+can let the peer's next injection re-baseline past a local event, but that
+contention is not the reversal case and resolves the moment the peer
+pauses. A platform without the tick query simply does not offer the
+reclaim.
+
 ### Crossing position travels as a fraction, not pixels
 
 The point along the edge where the cursor crosses is a normalized

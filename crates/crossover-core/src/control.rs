@@ -152,6 +152,13 @@ pub enum ControlEvent {
     /// drive this machine, so any grant it holds is given up rather than
     /// left wedged pretending to be driven (feature/87). Controlled side.
     InputDesktopUnavailable,
+    /// The user produced genuine local input — mouse or keyboard — on this
+    /// machine while a peer controls it. The user is *here*, so give up the
+    /// peer's grant and come to rest in neutral: neither machine controls the
+    /// other until an edge is deliberately crossed again (ADR 0009). The
+    /// machine-driven sibling of [`Self::InputDesktopUnavailable`], on the
+    /// controlled side.
+    LocalInputReclaim,
     /// The request timeout scheduled for a session's request came due.
     RequestTimeout {
         /// The session the request went to.
@@ -310,6 +317,10 @@ pub enum ControlNotice {
     /// to one it cannot inject into (a UAC/secure-desktop or lock prompt);
     /// its input was released locally (feature/87).
     PeerControlLostToDesktop,
+    /// A peer's control of this machine ended because the user produced local
+    /// input here — the machine came to rest in neutral and its input was
+    /// released locally (ADR 0009).
+    PeerControlReclaimedLocally,
 }
 
 /// What the engine asks the driver to do. Order within the returned
@@ -429,6 +440,7 @@ impl ControlEngine {
             ControlEvent::Captured(events) => self.on_captured(&events),
             ControlEvent::CaptureLost => self.on_capture_lost(),
             ControlEvent::InputDesktopUnavailable => self.on_input_desktop_unavailable(),
+            ControlEvent::LocalInputReclaim => self.on_local_input_reclaim(),
             ControlEvent::RequestTimeout {
                 session,
                 request_id,
@@ -558,6 +570,24 @@ impl ControlEngine {
     /// *why* control dropped. The peer, on the `Release`, returns to local
     /// and un-hides its cursor (feature/87). No-op if no peer holds control.
     fn on_input_desktop_unavailable(&mut self) -> Vec<ControlAction> {
+        self.relinquish_controlled(ControlNotice::PeerControlLostToDesktop)
+    }
+
+    /// Give up a peer's control of this machine because the user produced
+    /// local input here: the user is at this machine, so come to rest in
+    /// neutral — neither side controls the other until an edge is crossed
+    /// again (ADR 0009). Distinct from a hand-back: no control moves to the
+    /// peer, it simply returns to local on the resulting `Release`.
+    fn on_local_input_reclaim(&mut self) -> Vec<ControlAction> {
+        self.relinquish_controlled(ControlNotice::PeerControlReclaimedLocally)
+    }
+
+    /// Shared body of the machine-driven give-ups (secure desktop, local
+    /// input): drain what we hold locally so nothing sticks, tell the peer to
+    /// release — it returns to local and un-hides its cursor — and report
+    /// `notice` so a headless log says *why* control dropped. No-op if no peer
+    /// holds control.
+    fn relinquish_controlled(&mut self, notice: ControlNotice) -> Vec<ControlAction> {
         let Some(mut controlled) = self.controlled.take() else {
             return Vec::new();
         };
@@ -573,9 +603,7 @@ impl ControlEngine {
             session: controlled.session,
             message: OutboundControl::Release(None),
         });
-        actions.push(ControlAction::Notify(
-            ControlNotice::PeerControlLostToDesktop,
-        ));
+        actions.push(ControlAction::Notify(notice));
         actions
     }
 
@@ -1593,6 +1621,43 @@ mod tests {
                 .handle(ControlEvent::InputDesktopUnavailable)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn local_input_reclaims_the_peers_grant_to_neutral() {
+        // ADR 0009: genuine local input while a peer controls this machine
+        // means the user is here — give up the grant exactly like the secure-
+        // desktop path (drain what we hold, tell the peer to release, which
+        // returns it to local) but report it distinctly so a headless log says
+        // the user reclaimed rather than a secure prompt intervening. Control
+        // comes to rest in neutral: nothing moves to the peer.
+        let mut engine = controlled_engine();
+        let _ = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 1,
+            events: vec![WireInputEvent::Button {
+                button: WireButton::Left,
+                pressed: true,
+            }],
+        })));
+
+        let actions = engine.handle(ControlEvent::LocalInputReclaim);
+        assert_eq!(
+            actions,
+            vec![
+                inject(vec![PointerEvent::Button {
+                    button: PointerButton::Left,
+                    pressed: false,
+                }]),
+                send(OutboundControl::Release(None)),
+                ControlAction::Notify(ControlNotice::PeerControlReclaimedLocally),
+            ]
+        );
+        assert!(!engine.is_controlled());
+        // Neutral: this machine is not driving the peer either.
+        assert!(!engine.is_controlling());
+
+        // No peer holds control now, so a second reclaim is a no-op.
+        assert!(engine.handle(ControlEvent::LocalInputReclaim).is_empty());
     }
 
     /// Keyboard through the engine (ADR 0008): a granted key batch injects

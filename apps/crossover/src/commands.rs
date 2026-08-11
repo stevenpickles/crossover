@@ -883,6 +883,11 @@ fn describe_notice(notice: ControlNotice) -> String {
              (e.g. UAC); input released."
                 .to_owned()
         }
+        ControlNotice::PeerControlReclaimedLocally => {
+            "Reclaimed control: local input detected on this machine; input released, \
+             neither machine now controls the other."
+                .to_owned()
+        }
     }
 }
 
