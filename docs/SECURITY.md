@@ -126,6 +126,7 @@ table:
 | T8 | Input injection before authorization completes | Input/clipboard handlers unreachable until session `ESTABLISHED` (state machine, [ARCHITECTURE.md](ARCHITECTURE.md) §5.3) |
 | T9 | Clipboard exfiltration by unauthorized peer | Same as T8, plus per-peer clipboard permissions (§4) |
 | T10 | Secrets leaking via logs/diagnostics | Invariant 6; log-content tests in CI |
+| T11 | Compromise of the high-integrity worker yields local admin | Escalation gated behind install (admin) + a trusted-peer session; bounded/validated parsing (NFR-1) and the T8/T9 authorization gates still contain untrusted input; SYSTEM stays unreachable (the service links no network code, ADR 0011). The worker runs high-integrity for admin users so it can drive elevated windows ([ADR 0012](adr/0012-elevated-worker-integrity.md)) |
 
 Out of scope (documented, not defended): a fully compromised trusted peer
 machine — a peer you paired with and that is now malicious can do whatever
