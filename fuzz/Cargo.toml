@@ -53,6 +53,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "clipboard_chunk"
+path = "fuzz_targets/clipboard_chunk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "clipboard_control"
 path = "fuzz_targets/clipboard_control.rs"
 test = false
