@@ -1087,15 +1087,16 @@ fn spawn_command_mux(
     let high_metrics = metrics.clone();
     tokio::spawn(async move {
         while let Some(command) = high.recv().await {
-            dispatch_command(&high_registry, high_metrics.as_ref(), &command).await;
+            dispatch_command(&high_registry, high_metrics.as_ref(), command).await;
         }
     });
     tokio::spawn(async move {
         while let Some(command) = background.recv().await {
-            dispatch_command(&registry, metrics.as_ref(), &command).await;
-            // The command's byte budget returns here, once it has been
+            let (command, hold) = command.into_parts();
+            dispatch_command(&registry, metrics.as_ref(), command).await;
+            // The byte budget returns here, once the command has been
             // handed to every sink — not merely dequeued.
-            drop(command);
+            drop(hold);
         }
     });
 }
@@ -1105,7 +1106,7 @@ fn spawn_command_mux(
 async fn dispatch_command(
     registry: &SessionRegistry,
     metrics: Option<&Arc<Metrics>>,
-    command: &SessionCommand,
+    command: SessionCommand,
 ) {
     match command {
         SessionCommand::SendFrame {
@@ -1115,27 +1116,37 @@ async fn dispatch_command(
         } => {
             // Count input events forwarded to the peer as they pass
             // through the one place every outbound frame does.
-            if *message_type == MessageType::InputBatch.wire()
+            if message_type == MessageType::InputBatch.wire()
                 && let Some(metrics) = metrics
-                && let Some((total, keys)) = input_counts(payload)
+                && let Some((total, keys)) = input_counts(&payload)
             {
                 metrics.record_input_sent(total, keys);
             }
             // Collect matching sinks under the lock, then send
             // after releasing it (never hold a std Mutex over an
             // await).
-            let sinks: Vec<FrameSink> = {
+            let mut sinks: Vec<FrameSink> = {
                 let routes = registry_lock(registry);
                 match target {
                     FrameTarget::Broadcast => routes.values().map(|r| r.sink.clone()).collect(),
-                    FrameTarget::Session(id) => {
-                        routes.get(id).map(|r| r.sink.clone()).into_iter().collect()
-                    }
+                    FrameTarget::Session(id) => routes
+                        .get(&id)
+                        .map(|r| r.sink.clone())
+                        .into_iter()
+                        .collect(),
                 }
             };
+            // The last sink takes the payload itself. Broadcast is the
+            // rare case and one session the common one, so copying a
+            // multi-megabyte clipboard frame for the only recipient would
+            // be pure waste (ADR 0014 makes this traffic routine).
+            let Some(last) = sinks.pop() else {
+                return; // no live session matches this target
+            };
             for sink in sinks {
-                sink.deliver(*message_type, payload.clone()).await;
+                sink.deliver(message_type, payload.clone()).await;
             }
+            last.deliver(message_type, payload).await;
         }
         SessionCommand::TerminateSession { target, reason } => {
             let kills: Vec<watch::Sender<bool>> = {
@@ -1145,7 +1156,7 @@ async fn dispatch_command(
                         routes.values().filter_map(|r| r.kill.clone()).collect()
                     }
                     FrameTarget::Session(id) => routes
-                        .get(id)
+                        .get(&id)
                         .and_then(|r| r.kill.clone())
                         .into_iter()
                         .collect(),
