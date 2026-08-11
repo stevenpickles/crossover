@@ -2877,4 +2877,31 @@ mod tests {
         let actions = e.on_peer_message(InboundMessage::Data(data));
         assert_eq!(written_text(&actions).as_deref(), Some(big.as_str()));
     }
+
+    /// The platform boundary mirrors the protocol's image vocabulary
+    /// because `crossover-platform` may carry no dependencies
+    /// (docs/ARCHITECTURE.md §4). This crate is where the two meet, so it
+    /// is where the mirror is proved: every format survives the round trip
+    /// in both directions, and the size ceiling the platform crate states
+    /// at its boundary is the protocol's ceiling, not a second opinion.
+    #[test]
+    fn the_platform_mirror_agrees_with_the_protocol() {
+        use crossover_protocol::clipboard::MAX_CLIPBOARD_IMAGE_BYTES;
+
+        for format in [ImageFormat::Dib, ImageFormat::Png, ImageFormat::Jpeg] {
+            assert_eq!(super::wire_format(super::platform_format(format)), format);
+        }
+        for format in [
+            ClipboardImageFormat::Dib,
+            ClipboardImageFormat::Png,
+            ClipboardImageFormat::Jpeg,
+        ] {
+            assert_eq!(super::platform_format(super::wire_format(format)), format);
+        }
+        assert_eq!(
+            crossover_platform::MAX_CLIPBOARD_IMAGE_BYTES,
+            MAX_CLIPBOARD_IMAGE_BYTES,
+            "the platform boundary's ceiling drifted from the protocol's"
+        );
+    }
 }
