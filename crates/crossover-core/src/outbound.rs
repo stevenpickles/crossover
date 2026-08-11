@@ -95,7 +95,10 @@ impl SendPriority {
     /// session is alive at all — both are interactive by consequence.
     ///
     /// **Every clipboard message rides Background**, including the small
-    /// `Offer`/`Accept`/`Decline`/`Applied` ones the ADR left open. Splitting
+    /// `Offer`/`Accept`/`Decline`/`Applied` ones the ADR left open, and
+    /// `ClipboardChunk` — which is the reason the lane exists at all: a
+    /// chunk *is* the preemption unit (ADR 0014), and the writer takes one
+    /// of them between High checks. Splitting
     /// a transaction across classes would let its acknowledgement overtake
     /// its data, and the transaction state machine (ADR 0005) depends on
     /// those messages arriving in the order they were produced. One lane for
@@ -126,6 +129,7 @@ impl SendPriority {
                 | MessageType::ClipboardAccept
                 | MessageType::ClipboardDecline
                 | MessageType::ClipboardData
+                | MessageType::ClipboardChunk
                 | MessageType::ClipboardApplied,
             )
             | None => Self::Background,
@@ -716,6 +720,7 @@ mod tests {
             MessageType::ClipboardAccept,
             MessageType::ClipboardDecline,
             MessageType::ClipboardData,
+            MessageType::ClipboardChunk,
             MessageType::ClipboardApplied,
         ] {
             assert_eq!(

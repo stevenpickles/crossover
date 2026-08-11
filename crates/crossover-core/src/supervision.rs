@@ -676,6 +676,7 @@ async fn dispatch_frame(
             | MessageType::ClipboardAccept
             | MessageType::ClipboardDecline
             | MessageType::ClipboardData
+            | MessageType::ClipboardChunk
             | MessageType::ClipboardApplied
             | MessageType::InputBatch
             | MessageType::ReleaseAllInput
