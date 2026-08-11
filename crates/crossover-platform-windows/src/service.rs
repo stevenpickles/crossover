@@ -111,7 +111,7 @@ impl ServiceManager for WindowsServiceManager {
 
     fn uninstall(&self) -> Result<(), ServiceError> {
         let scm = open_scm(SC_MANAGER_CONNECT)?;
-        let Some(service) = open_service(&scm, SERVICE_ALL_ACCESS)? else {
+        let Some(service) = open_service(&scm, SERVICE_NAME, SERVICE_ALL_ACCESS)? else {
             return Err(ServiceError::Backend {
                 reason: "the Crossover service is not installed".to_owned(),
             });
@@ -141,22 +141,7 @@ impl ServiceManager for WindowsServiceManager {
     }
 
     fn status(&self) -> Result<ServiceStatus, ServiceError> {
-        let scm = open_scm(SC_MANAGER_CONNECT)?;
-        let Some(service) = open_service(&scm, SERVICE_QUERY_STATUS)? else {
-            return Ok(ServiceStatus::NotInstalled);
-        };
-
-        let mut status = SERVICE_STATUS::default();
-        // SAFETY: `service` is a live handle opened with query-status access;
-        // QueryServiceStatus fills `status` with the current service state.
-        unsafe { QueryServiceStatus(service.0, &raw mut status) }.map_err(|err| {
-            ServiceError::Backend {
-                reason: format!("querying Crossover service status: {err}"),
-            }
-        })?;
-        Ok(ServiceStatus::Installed {
-            running: status.dwCurrentState == SERVICE_RUNNING,
-        })
+        query_status(SERVICE_NAME)
     }
 }
 
@@ -194,22 +179,50 @@ fn open_scm(access: u32) -> Result<ScHandle, ServiceError> {
     Ok(ScHandle(handle))
 }
 
-/// Open the Crossover service with `access`. `Ok(None)` means it is not
-/// installed — a normal state, not an error.
-fn open_service(scm: &ScHandle, access: u32) -> Result<Option<ScHandle>, ServiceError> {
-    let name = wide(SERVICE_NAME);
+/// Open a service by name with `access`. `Ok(None)` means it is not
+/// installed — a normal state, not an error. Parameterized by name so the
+/// status path is testable against a definitely-absent service, independent of
+/// whether the real Crossover service happens to be installed on the host.
+fn open_service(
+    scm: &ScHandle,
+    service_name: &str,
+    access: u32,
+) -> Result<Option<ScHandle>, ServiceError> {
+    let name = wide(service_name);
     // SAFETY: `scm` is a live SCM handle; `name` is a null-terminated wide
     // string valid for the duration of the call.
     match unsafe { OpenServiceW(scm.0, PCWSTR(name.as_ptr()), access) } {
         Ok(handle) => Ok(Some(ScHandle(handle))),
         Err(err) if is_win32(&err, ERROR_SERVICE_DOES_NOT_EXIST) => Ok(None),
         Err(err) if is_win32(&err, ERROR_ACCESS_DENIED) => Err(ServiceError::PermissionDenied {
-            reason: "access to the Crossover service was denied".to_owned(),
+            reason: "access to the service was denied".to_owned(),
         }),
         Err(err) => Err(ServiceError::Backend {
-            reason: format!("opening the Crossover service: {err}"),
+            reason: format!("opening the service: {err}"),
         }),
     }
+}
+
+/// Query a service's status by name. `NotInstalled` when it does not exist.
+/// Factored out of [`WindowsServiceManager::status`] so the SCM open + query +
+/// does-not-exist mapping is tested with a name that is guaranteed absent.
+fn query_status(service_name: &str) -> Result<ServiceStatus, ServiceError> {
+    let scm = open_scm(SC_MANAGER_CONNECT)?;
+    let Some(service) = open_service(&scm, service_name, SERVICE_QUERY_STATUS)? else {
+        return Ok(ServiceStatus::NotInstalled);
+    };
+
+    let mut status = SERVICE_STATUS::default();
+    // SAFETY: `service` is a live handle opened with query-status access;
+    // QueryServiceStatus fills `status` with the current service state.
+    unsafe { QueryServiceStatus(service.0, &raw mut status) }.map_err(|err| {
+        ServiceError::Backend {
+            reason: format!("querying service status: {err}"),
+        }
+    })?;
+    Ok(ServiceStatus::Installed {
+        running: status.dwCurrentState == SERVICE_RUNNING,
+    })
 }
 
 /// Whether a Win32 API error carries the given status code.
@@ -244,14 +257,14 @@ mod tests {
     use super::WindowsServiceManager;
 
     // Status is read-only (SC_MANAGER_CONNECT, no elevation), so it is safe to
-    // exercise against the real SCM on CI: Crossover is not installed there, so
-    // the query must resolve to NotInstalled. This proves the SCM open + status
-    // + does-not-exist error mapping against live Win32, not a mock.
+    // exercise against the real SCM. Querying a name that cannot exist proves
+    // the SCM open + status + does-not-exist mapping against live Win32 — and,
+    // unlike querying "Crossover", it holds even on a machine where the real
+    // service happens to be installed (e.g. a dev box mid-soak).
     #[test]
-    fn status_of_uninstalled_service_is_not_installed() {
-        let manager =
-            WindowsServiceManager::new(PathBuf::from(r"C:\nonexistent\crossover-svc.exe"));
-        assert_eq!(manager.status().unwrap(), ServiceStatus::NotInstalled);
+    fn status_of_an_absent_service_is_not_installed() {
+        let status = super::query_status("Crossover-Absent-Service-For-Tests-9f3c1a").unwrap();
+        assert_eq!(status, ServiceStatus::NotInstalled);
     }
 
     // The missing-binary guard fires before any SCM call, so this never mutates
