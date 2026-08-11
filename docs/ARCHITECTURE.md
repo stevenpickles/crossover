@@ -175,6 +175,48 @@ Each observed OS clipboard change becomes an immutable `ClipboardItem`
 (id, origin peer, sequence, timestamp, content type, length, hash, content).
 Contents are never logged; metadata is (FR-7.4).
 
+**Content is typed and opaque.** Since
+[ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md) an item is a
+`ContentType` plus bytes — text is one type, a raster image another — and
+nothing above the platform boundary transcodes, compresses, or parses image
+bytes. The hash and the length are the only things ever computed over them.
+
+**The state machine, both directions.** At most one transaction is in
+flight per direction; a newer one supersedes the older, which is the rule
+that keeps every buffer singular.
+
+| Direction | States | Retains |
+|-----------|--------|---------|
+| Outbound | `AwaitingAccept` → (`Streaming` for chunked types) → `AwaitingApplied` | the item buffer, until the last chunk is out |
+| Inbound | accepted offer → (`ChunkReassembly` for chunked types) → pending write | the reassembly buffer, until it verifies |
+
+Chunks are emitted **one at a time**, sliced out of the retained buffer, so
+the sender never materializes the whole split; each becomes its own command
+and its own frame, which is what makes a chunk the preemption unit §5.4
+depends on. On the receiving side the item's `content_hash` is verified over
+the complete reassembly before the OS clipboard is touched, so a torn
+transfer installs nothing (FR-3.2) — and `ClipboardApplied` is still emitted
+only from the write result, never on receipt of the last chunk.
+
+**The memory commitment is deliberate, singular, and time-bounded.** One
+retained outbound item and one inbound reassembly, each up to
+`MAX_CLIPBOARD_IMAGE_BYTES` (64 MiB), each sized only after the declared
+length was validated against its type's maximum (NFR-1). Session-scoped
+cleanup is not a bound on its own — a session can live for days — so every
+transaction that retains content also carries a deadline
+(`ClipboardConfig::transfer_timeout`). Expiry releases the buffers,
+tells the origin of an inbound transfer that nothing was installed so its
+transaction closes rather than stalling (NFR-3), and leaves the machine
+able to start the next transfer immediately.
+
+**The platform boundary is typed with it.** `ClipboardProvider` reads and
+writes a `ClipboardContent` (text or image-with-format); every raster
+format concern — `CF_DIB` and the rest — lives behind it in
+`crossover-platform-*`, and core names no OS clipboard format (NFR-4). The
+platform crate keeps its no-dependency rule, so its image-format tag is a
+deliberate mirror of the protocol's, reconciled by one wildcard-free
+mapping in `crossover-core::clipboard`.
+
 ### 5.3 Connection lifecycle
 
 ```
