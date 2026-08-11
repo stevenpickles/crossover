@@ -716,9 +716,20 @@ mod tests {
         assert_eq!(client_session.info().peer_device_id, b.identity.device_id());
 
         // Capability negotiation is the intersection of the two Hellos
-        // (docs/PROTOCOL.md §3). Empty while this build advertises
-        // nothing; this is the assertion that starts carrying a feature
-        // the day `FeatureFlags::ADVERTISED` gains one.
+        // (docs/PROTOCOL.md §3), and both sides here are this build, so
+        // the intersection is what it advertises — CHUNKED_CLIPBOARD
+        // since ADR 0014's platform slice.
+        //
+        // Note what this does and does not prove: written this way it is
+        // tautological in the value (negotiating a set with itself), so
+        // it pins the *plumbing* — that each side's advertisement reaches
+        // the other and lands on `SessionInfo::features` — and nothing
+        // about which bits are advertised. The value itself is pinned by
+        // the golden Hello snapshot's `0x01`
+        // (`crossover-protocol::hello`), and the asymmetric case that
+        // actually matters is
+        // `unnegotiated_content_is_refused_before_it_reaches_the_wire`
+        // below, where the peer advertises nothing.
         let expected = crossover_protocol::hello::FeatureFlags::negotiate(
             crossover_protocol::hello::FeatureFlags::ADVERTISED,
             crossover_protocol::hello::FeatureFlags::ADVERTISED,
