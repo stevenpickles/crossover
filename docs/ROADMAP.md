@@ -18,6 +18,13 @@
 > continuous unattended operation between two Windows workstations — which gates
 > closing the phase.
 >
+> **Sequencing (2026-08-11):** after Phase 6, **rich clipboard (images and
+> files) is scheduled before cross-platform validation** — maintainer decision.
+> The hard part of rich clipboard is platform-neutral (prioritization, chunked
+> protocol, transaction engine), so it is hardened once on Windows, where the
+> real issues surface, then carried to macOS and Linux. The phases below are
+> renumbered: 7 Rich Clipboard, 8 Cross-Platform Validation, 9 Productization.
+>
 > Phase 5 (Seamless Crossover) closed 2026-08-09: the two-machine seamless
 > soak ran on real hardware — a two-monitor, mixed-DPI machine paired with a
 > single-monitor one. The cursor crosses a screen edge and control *and*
@@ -288,7 +295,59 @@ workstations without manual intervention; transient network loss and peer
 restarts recover automatically; clipboard reliability requirements still
 hold under soak; security review findings resolved or accepted by ADR.
 
-## Phase 7 — Cross-Platform Validation
+## Phase 7 — Rich Clipboard (images and files)
+
+**Goal:** extend the reliable clipboard from text to **images and files** —
+built and hardened on **Windows first**, so the platform-neutral protocol and
+engine work is settled where the real issues surface, before the cross-platform
+port (Phase 8) carries it to macOS and Linux. Re-sequenced ahead of
+cross-platform by maintainer decision (2026-08-11): the hard part is neutral
+(prioritization, chunked protocol, transaction engine), so hardening it once on
+Windows turns the later port into "implement the clipboard trait for formats
+already designed" rather than designing rich clipboard three times.
+
+Design captured 2026-08-11 (Proposed [ADR 0013](adr/0013-interactive-over-bulk-prioritization.md),
+[ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md)). Three linked pieces,
+in dependency order:
+
+1. **Interactive-over-bulk frame prioritization** (ADR 0013). Split the
+   session's single FIFO send path into High (input, control, keepalive) and
+   Background (bulk) classes; input always preempts bulk *between chunks*.
+   Foundational — makes "background transfer never interferes with live input"
+   (priority #5 / NFR-5) real, and forces bulk to be chunked (a big frame is
+   unpreemptable).
+2. **Chunked rich-clipboard transfer, images first** (ADR 0014). The chunking
+   ADR 0005 predicted. Images (screenshots/snips, a few MB) are the value:
+   native raster format shipped **verbatim** (no transcode, no codec, no
+   compression on a 2.5 GbE LAN), eager chunked sync consistent with text,
+   chunks sized to ADR 0013's latency budget, before-allocation bounds (NFR-1),
+   hash-dedup so a re-paste moves zero bytes. Plus the Windows platform
+   clipboard read/write for the raster format.
+3. **Files/folders — deliberately minimal, gated on its own ADR.** A
+   drop-folder model (not Explorer-paste fidelity), folders zipped to a single
+   blob, with a configured destination, per-peer permission, name sanitization
+   (no paths/`..`/drive letters), and size/count caps. Adds a filesystem-write
+   surface, so it needs its own ADR **and** SECURITY.md threat additions before
+   implementation (tracked in adr/README.md "Known decisions awaiting an ADR").
+
+Exit criteria:
+
+- Images copy/paste **both directions, byte-identical**, reliably through a
+  soak; re-pasting the same image transfers zero payload bytes (hash-dedup).
+- **Live input stays responsive during a concurrent bulk transfer** — measured:
+  input latency bounded under a saturating background transfer (the ADR 0013
+  guarantee), not merely subjectively smooth.
+- Files land only in the configured drop folder with every guardrail enforced;
+  oversized or path-dubious inputs are rejected **observably** (FR-3.6), never a
+  traversal write or a silent drop.
+- No regression in text-clipboard reliability (the Phase 2 stress gate still
+  passes) or in input latency/correctness.
+
+The hermetic stress and fault-injection suites extend to cover chunked transfers
+and the priority guarantee. Files/folders may run as a second sub-milestone
+after images, given the added security surface.
+
+## Phase 8 — Cross-Platform Validation
 
 **Goal:** prove the architecture is genuinely portable.
 
@@ -297,42 +356,20 @@ Deliverables: `crossover-platform-macos` and `crossover-platform-linux`
 risk catalogue per platform written before implementation (macOS:
 accessibility permissions, event taps, pasteboard, Keychain; Linux:
 X11/Wayland split, clipboard ownership semantics, injection permissions,
-secret-service).
+secret-service). Rich-clipboard image/file support (Phase 7) carries over here
+as new implementations of the clipboard trait, not new protocol design.
 
 Exit criteria: core feature set works Windows↔Windows, Windows↔macOS,
 Windows↔Linux, macOS↔macOS, Linux↔Linux — and macOS↔Linux requires no
 protocol changes.
 
-## Phase 8 — Productization
+## Phase 9 — Productization
 
 Potential work, each item gated on preserving the security and clipboard
 reliability requirements: tray application, graphical configuration and
-topology editor, peer discovery, >2 peers, rich clipboard formats (HTML,
-images, files), drag-and-drop, software updates, diagnostics UI, optional
+topology editor, peer discovery, >2 peers, further rich clipboard formats
+(e.g. HTML), drag-and-drop, software updates, diagnostics UI, optional
 secure WAN operation.
-
-### Rich clipboard — design captured 2026-08-11 (Proposed ADRs 0013–0014)
-
-Design worked through with the maintainer ahead of scheduling, so it is ready to
-pick up cleanly. Three linked pieces, in dependency order:
-
-1. **Interactive-over-bulk frame prioritization** ([ADR 0013](adr/0013-interactive-over-bulk-prioritization.md),
-   Proposed). Split the session's single FIFO send path into High (input,
-   control, keepalive) and Background (bulk) classes; input always preempts bulk
-   *between chunks*. Foundational — makes "background transfer never interferes
-   with live input" (priority #5 / NFR-5) real, and requires bulk to be chunked
-   (a big frame is unpreemptable).
-2. **Chunked rich-clipboard transfer, images first** ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md),
-   Proposed). The chunking ADR 0005 predicted. Images (screenshots/snips, a few
-   MB) are the value: native raster format shipped **verbatim** (no transcode, no
-   codec, no compression — the LAN is 2.5 GbE), eager chunked sync consistent
-   with text, chunk size set by ADR 0013's latency budget. Rests on existing
-   machinery (Offer/Accept, hash-dedup, bounds, loop prevention).
-3. **Files/folders — later, deliberately minimal.** Rare use → a drop-folder
-   model (not Explorer-paste fidelity), folders zipped to a single blob, with
-   destination + per-peer permission + name sanitization + size/count caps. Adds
-   a filesystem-write surface, so it needs its own ADR and SECURITY.md threat
-   additions (tracked in adr/README.md "Known decisions awaiting an ADR").
 
 ---
 

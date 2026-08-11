@@ -281,7 +281,8 @@ that touch them:
 
 macOS (accessibility permissions, pasteboard semantics) and Linux
 (X11/Wayland split, clipboard ownership model) risks are catalogued when
-those phases begin ([ROADMAP.md](ROADMAP.md) Phase 7).
+those phases begin ([ROADMAP.md](ROADMAP.md) Phase 8 — Cross-Platform
+Validation).
 
 ## 7. Process requirements
 

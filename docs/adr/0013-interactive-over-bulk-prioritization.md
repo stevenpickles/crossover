@@ -1,6 +1,6 @@
 # 0013. Interactive input takes wire priority over bulk transfers
 
-Status: Proposed (Phase 8 — design captured 2026-08-11, not yet scheduled)
+Status: Proposed (Phase 7 — design captured 2026-08-11, not yet scheduled)
 Date: 2026-08-11
 
 ## Context
@@ -11,7 +11,7 @@ order in `run_session` (`crossover-core/src/supervision.rs`), with input
 batches, control, and clipboard all writing to the one writer through it. That
 is fine while every payload is small.
 
-Phase 8 rich-clipboard transfers (images, files — [ADR 0014](0014-chunked-rich-clipboard-transfer.md))
+Phase 7 rich-clipboard transfers (images, files — [ADR 0014](0014-chunked-rich-clipboard-transfer.md))
 introduce multi-MB, occasionally much larger, payloads on that same stream. A
 large payload queued ahead of an input batch would **head-of-line block** the
 pointer and keyboard — directly violating priority #5 (low input latency) and

@@ -1,6 +1,6 @@
 # 0014. Chunked rich-clipboard transfer: images first, native format verbatim
 
-Status: Proposed (Phase 8 — design captured 2026-08-11, not yet scheduled)
+Status: Proposed (Phase 7 — design captured 2026-08-11, not yet scheduled)
 Date: 2026-08-11
 
 ## Context
