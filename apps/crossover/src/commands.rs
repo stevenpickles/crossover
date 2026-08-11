@@ -640,6 +640,12 @@ impl SessionFanout {
     ///
     /// `join!` polls both in this task, so neither can gate the other. A full
     /// channel still delays *its own* driver, as it must.
+    ///
+    /// **Not cancel-safe**: cancelled mid-`join!` this can leave one driver
+    /// notified and the other not. Every caller either runs to completion or
+    /// is cancelled only at process shutdown, where both drivers are going
+    /// away regardless and the asymmetry is unobservable. Do not put it in a
+    /// `select!` branch without revisiting that.
     async fn fan_out(&self, sync: SyncEvent, control: InputControlEvent) {
         let (sync_sent, control_sent) =
             tokio::join!(self.sync.send(sync), self.control.send(control));

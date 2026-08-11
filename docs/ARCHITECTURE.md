@@ -239,11 +239,24 @@ in transit.** One honest limit remains, upstream of the path: a driver is a
 serial event loop, and a driver parked on Background backpressure is not
 emitting *anything* until it drains — its own High commands included. That
 is correct backpressure — it is how the wire tells the clipboard engine to
-stop producing — and it is bounded: a peer that will not consume ends the
-session by the write bounds below, and teardown then retires the path, which
-is what actually unparks the driver. Both halves are needed; the ordering
-that makes the second one work is spelled out below, because getting it
-wrong deadlocks the application.
+stop producing. For an **accepted (listening) session** it is also bounded: a
+peer that will not consume ends the session by the write bounds below, and
+teardown then retires the path, which is what actually unparks the driver.
+Both halves are needed; the ordering that makes the second one work is
+spelled out below, because getting it wrong deadlocks the application.
+
+**Known limitation — the outbound (supervised) role.** There the send path
+belongs to the supervisor, which holds it across reconnects, so a wedge
+clears only when the *next* session establishes. The honest bound:
+self-healing on reconnect, but **unbounded if the peer never returns**, and
+in that window local input suppression is possible — a control driver whose
+own High path is also full stops emitting. Two things limit the damage and
+neither removes it: the outbound path removes the session from the registry
+before fanning the loss out, and the remote peer releases the input it holds
+on its own (FR-4.4). It is deliberate rather than overlooked: clearing the
+wedge means discarding queued frames on disconnect, which contradicts
+`SupervisorHandle::send`'s documented flush-on-reconnect contract, so
+changing it is an ADR-level decision, not a bug fix.
 
 **Drain policy: strict High-first, no aging.** The writer takes everything
 queued High before a *single* Background frame, then re-checks High. Because
@@ -301,6 +314,13 @@ held (FR-4.4). Two bounds, both fail-closed, make that state terminal:
 The polite TLS shutdown on the way out is bounded too, for the same reason:
 it has to flush, and the commonest reason to be closing is a peer that
 stopped reading.
+
+Bound 2 catches *continuous* stalling, and a peer that alternates one brisk
+write with one slow one evades it, since the brisk write clears the run —
+per-frame input delay stays inside bound 1's keepalive timeout, which is what
+this section claims, but such a peer is not disconnected; closing that needs
+a duty-cycle measure rather than a continuity one, and it matters less once
+ADR 0014's chunking caps how large a bulk frame can be.
 
 What these bounds do **not** do is keep the session loop responsive *during*
 a write. While one is pending the loop still polls nothing else, so a slow

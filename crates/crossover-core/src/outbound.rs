@@ -607,6 +607,12 @@ impl CommandReceiver {
     /// that needs the two lanes separately — to forward each with its own
     /// task — takes them apart with [`Self::into_lanes`] instead, and the
     /// bound means the same thing there.
+    ///
+    /// A consequence worth stating plainly: because the in-hand command
+    /// holds budget, **a consumer must not send into the same lane while
+    /// holding one**. On a full lane that is a self-deadlock — it would be
+    /// waiting for budget only it can release. Consumers here forward
+    /// *onward*, into a different lane, which is why it does not arise.
     pub async fn recv(&mut self) -> Option<SessionCommand> {
         // The previous command is finished with by definition: the caller is
         // asking for another one.
