@@ -301,6 +301,16 @@ fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
 /// synchronized, so copying it out of the OS clipboard — with the
 /// machine-global lock held — would be an allocation spike bought for
 /// nothing.
+///
+/// Note what that compares: `GlobalSize` is the *allocation*, which may be
+/// rounded up past the bitmap inside it, so an image whose logical length
+/// is a hair under the ceiling can be refused for its allocation being
+/// over it. Deliberate, and the right direction to err — the check has to
+/// happen before anything is copied, and the logical length is only
+/// knowable after. The headroom absorbs it: the ceiling is 64 MiB and the
+/// worst realistic capture, a dual-4K span, is 63.3 MiB
+/// (docs/PROTOCOL.md §8), so roughly 0.7 MiB of rounding is tolerated
+/// before the distinction could ever matter.
 fn read_dib(max_bytes: usize) -> Result<Option<Vec<u8>>, ClipboardError> {
     // SAFETY: no arguments; checks format availability only. Synthesized
     // formats count as available, which is exactly what makes this one
