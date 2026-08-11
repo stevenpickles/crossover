@@ -14,7 +14,9 @@ pub mod input;
 pub mod secure_storage;
 pub mod service;
 
-pub use clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
+pub use clipboard::{
+    ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
+};
 pub use cursor::{CursorMask, CursorMaskError, NoopCursorMask};
 pub use display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
 pub use input::{

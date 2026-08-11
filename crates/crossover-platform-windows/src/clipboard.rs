@@ -24,10 +24,21 @@
 //!
 //! Text is `CF_UNICODETEXT` (Windows synthesizes it from `CF_TEXT`
 //! automatically), converted UTF-16 ↔ UTF-8 at this boundary.
+//!
+//! **Scope, deliberately: text only.** [`ClipboardProvider`] is typed
+//! since ADR 0014, but the raster half of it belongs to that ADR's
+//! *platform* slice: `CF_DIB` reading and writing, format selection, and
+//! the DIB header handling all land there, behind this same trait. Until
+//! then this backend reports an image clipboard as absent on read and
+//! refuses an image on write with a permanent, non-retryable error — the
+//! honest answers, and the reason `FeatureFlags::ADVERTISED` stays empty
+//! (docs/PROTOCOL.md §3.1).
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crossover_platform::{ClipboardError, ClipboardListener, ClipboardProvider};
+use crossover_platform::{
+    ClipboardContent, ClipboardError, ClipboardListener, ClipboardProvider,
+};
 use windows::Win32::Foundation::GlobalFree;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::{
@@ -112,7 +123,48 @@ impl Drop for WindowsClipboard {
 }
 
 impl ClipboardProvider for WindowsClipboard {
-    fn read_text(&self) -> Result<Option<String>, ClipboardError> {
+    /// Reads `CF_UNICODETEXT` only.
+    ///
+    /// **ADR 0014 platform slice**: raster formats (`CF_DIB` first) are
+    /// not read yet, so a clipboard holding only an image reads as
+    /// *absent* — which is the trait's documented meaning for "nothing
+    /// this backend represents", not a failure. The engine above is
+    /// already chunk-capable; `FeatureFlags::ADVERTISED` stays empty
+    /// until this function can genuinely return an image, so a peer is
+    /// never told this build can do what it cannot.
+    fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+        Ok(self.read_unicode_text()?.map(ClipboardContent::Text))
+    }
+
+    /// Writes `CF_UNICODETEXT` only.
+    ///
+    /// **ADR 0014 platform slice**: an image cannot be installed yet, and
+    /// says so — a permanent, non-retryable refusal that closes the
+    /// origin's transaction with an honest verdict rather than a silent
+    /// stall or a pretended success (FR-3.2, NFR-3).
+    fn write(&self, content: &ClipboardContent) -> Result<(), ClipboardError> {
+        match content {
+            ClipboardContent::Text(text) => self.write_unicode_text(text),
+            ClipboardContent::Image { format, .. } => Err(ClipboardError::Unavailable {
+                reason: format!(
+                    "this build cannot install {format:?} clipboard images \
+                     (ADR 0014 platform slice not yet implemented)"
+                ),
+            }),
+        }
+    }
+
+    fn set_change_listener(
+        &self,
+        listener: Option<ClipboardListener>,
+    ) -> Result<(), ClipboardError> {
+        *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = listener;
+        Ok(())
+    }
+}
+
+impl WindowsClipboard {
+    fn read_unicode_text(&self) -> Result<Option<String>, ClipboardError> {
         // SAFETY: no arguments; checks format availability only.
         if unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)) }.is_err() {
             return Ok(None); // empty clipboard or no text representation
@@ -168,7 +220,7 @@ impl ClipboardProvider for WindowsClipboard {
         Ok(Some(String::from_utf16_lossy(&units)))
     }
 
-    fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
+    fn write_unicode_text(&self, text: &str) -> Result<(), ClipboardError> {
         let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let byte_len = utf16.len() * 2;
 
@@ -236,14 +288,6 @@ impl ClipboardProvider for WindowsClipboard {
                 reason: format!("SetClipboardData failed (ownership churn?): {e}"),
             });
         }
-        Ok(())
-    }
-
-    fn set_change_listener(
-        &self,
-        listener: Option<ClipboardListener>,
-    ) -> Result<(), ClipboardError> {
-        *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = listener;
         Ok(())
     }
 }
@@ -379,6 +423,33 @@ mod tests {
         Err(last.unwrap_or(ClipboardError::Busy {
             reason: "clipboard stayed busy".to_owned(),
         }))
+    }
+
+    /// The typed boundary's honest state in this slice (ADR 0014): an
+    /// image write is refused permanently, not retried and not silently
+    /// swallowed, so the origin gets a real verdict. Touches no clipboard
+    /// lock at all — the refusal happens before any Win32 call — so this
+    /// case is immune to the contention the others live with.
+    #[test]
+    fn image_writes_are_refused_until_the_platform_slice_lands() {
+        use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+
+        let clipboard = WindowsClipboard::new().unwrap();
+        let refusal = clipboard.write(&ClipboardContent::Image {
+            format: ClipboardImageFormat::Dib,
+            bytes: vec![0u8; 64],
+        });
+        match refusal {
+            // Unavailable, not Busy: retrying will not make this build
+            // grow a DIB writer (FR-3.4's split is load-bearing).
+            Err(ClipboardError::Unavailable { reason }) => {
+                assert!(
+                    reason.contains("ADR 0014"),
+                    "the diagnostic must name why: {reason}"
+                );
+            }
+            other => panic!("expected a permanent refusal, got {other:?}"),
+        }
     }
 
     /// The Windows clipboard is machine-global: serialize every test that
