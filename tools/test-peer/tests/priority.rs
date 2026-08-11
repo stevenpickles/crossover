@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
-use crossover_core::supervision::{DisconnectReason, KeepaliveConfig, run_session};
+use crossover_core::supervision::{DisconnectReason, KeepaliveConfig, SessionEvent, run_session};
 use crossover_core::{
     LocalNode, MAX_BACKGROUND_QUEUE_FRAMES, OutboundSender, SessionListener, SessionOptions,
 };
@@ -56,12 +56,14 @@ fn patient_keepalive() -> KeepaliveConfig {
 }
 
 async fn connected_pair() -> (AppSide, TestConnection) {
-    connected_pair_with(
+    let (app, conn, events) = connected_pair_with(
         patient_keepalive(),
         FeatureFlags::ADVERTISED,
         FeatureFlags::NONE,
     )
-    .await
+    .await;
+    spawn_event_consumer(events);
+    (app, conn)
 }
 
 /// A pair that has negotiated chunked clipboard, so `ClipboardChunk`
@@ -69,14 +71,23 @@ async fn connected_pair() -> (AppSide, TestConnection) {
 /// because `FeatureFlags::ADVERTISED` is still empty — ADR 0014's platform
 /// slice is what flips it — and the lane property has to be provable now.
 async fn chunk_capable_pair() -> (AppSide, TestConnection) {
-    connected_pair_with(patient_keepalive(), FeatureFlags::ALL, FeatureFlags::ALL).await
+    let (app, conn, events) =
+        connected_pair_with(patient_keepalive(), FeatureFlags::ALL, FeatureFlags::ALL).await;
+    spawn_event_consumer(events);
+    (app, conn)
 }
 
+/// The pair, with the session's event stream handed back **undrained**.
+///
+/// Who consumes those events is the variable this suite cares about: every
+/// test but one spawns a consumer immediately, and
+/// `an_event_consumer_that_stops_consuming_fails_the_session_closed` keeps
+/// the receiver parked to model an application whose chain has wedged.
 async fn connected_pair_with(
     keepalive: KeepaliveConfig,
     app_features: FeatureFlags,
     peer_features: FeatureFlags,
-) -> (AppSide, TestConnection) {
+) -> (AppSide, TestConnection, mpsc::Receiver<SessionEvent>) {
     let mut app = TestNode::generate("app").unwrap();
     let mut peer = TestNode::generate("scripted-peer").unwrap();
     app.trust(&peer).unwrap();
@@ -86,10 +97,9 @@ async fn connected_pair_with(
     let addr = listener.local_addr().unwrap();
 
     let (outbound_tx, mut outbound_rx) = crossover_core::outbound_channel();
-    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let (events_tx, events_rx) = mpsc::channel(64);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
-    tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
     let session = tokio::spawn(async move {
         let (identity, certified, trust) = (app.identity, app.certified, app.trust);
         let local = LocalNode {
@@ -124,7 +134,14 @@ async fn connected_pair_with(
             _shutdown: shutdown_tx,
         },
         conn,
+        events_rx,
     )
+}
+
+/// Spawn the consumer the application normally provides, so a test that
+/// does not care about event delivery gets the healthy behaviour.
+fn spawn_event_consumer(mut events: mpsc::Receiver<SessionEvent>) {
+    tokio::spawn(async move { while events.recv().await.is_some() {} });
 }
 
 /// Push bulk clipboard frames until the send path refuses them — every
@@ -181,6 +198,115 @@ async fn drain_frames(conn: &mut TestConnection, expected: usize) -> Vec<u16> {
     seen
 }
 
+/// The inbound half of the same rule: a session whose *event consumer* has
+/// stopped must not be able to hold the session loop open forever either.
+///
+/// This reconstructs the whole cycle rather than just its last hop. High is
+/// kept saturated, so `drain_high_first` never reaches Background — ADR
+/// 0013's deliberate starvation — which parks a bulk producer exactly where
+/// the clipboard driver parks. A parked driver stops draining its own
+/// events, the fanout parks behind it, the session's event drain stops, and
+/// an inbound clipboard burst then fills the last queue and parks
+/// `dispatch_frame` *inside* the one `select!` that drains outbound, answers
+/// `Ping`, and runs the keepalive tick.
+///
+/// Before the deadline nothing could break that: the write bounds only
+/// cover a write already in progress, and the keepalive check lives in the
+/// loop that stopped turning. Measured on a faithful reconstruction, High
+/// writes stopped entirely and nothing ever timed out.
+///
+/// Two assertions, because the fix has two halves: the session must fail
+/// closed *and* the failure must release the chain — the parked producer
+/// unwinds when teardown drops the receiver and closes the byte budget.
+///
+/// The peer here keeps reading throughout, deliberately. It is the *app*
+/// side that is broken, and a peer that stopped reading would trip the write
+/// bound instead — a correct disconnect, but the wrong one, and the two
+/// deadlines share the keepalive timeout, so racing them would make this
+/// test decide by coin toss which fix it exercised. The links earlier in the
+/// cycle (High starvation parking a bulk producer) are pinned by the
+/// neighbouring tests in this file; what had no bound at all, and what this
+/// pins, is the hop where dispatch parks inside the session loop.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_consumer_that_stops_consuming_fails_the_session_closed() {
+    // Short, so the deadline is reached quickly; the assertion is on the
+    // reason, not the duration.
+    let (app, mut conn, held_events) = connected_pair_with(
+        KeepaliveConfig::new(Duration::from_millis(200), Duration::from_secs(1)).unwrap(),
+        FeatureFlags::ADVERTISED,
+        FeatureFlags::NONE,
+    )
+    .await;
+
+    // The inbound burst: more than the event channel holds, and small
+    // enough that every frame fits in socket buffers whether or not the app
+    // is still reading. Nothing consumes these — `held_events` is the
+    // stalled consumer — so the channel fills and frame dispatch parks.
+    for id in 0..200u64 {
+        if conn
+            .send_frame(MessageType::ClipboardData.wire(), id, b"burst")
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    // From here the peer is a healthy reader, so no write can stall and the
+    // write bounds are out of the picture.
+    let peer = tokio::spawn(async move { while conn.recv_frame().await.is_ok() {} });
+
+    // With the loop frozen nothing drains either lane, so live input queues
+    // and bulk parks — the state the cycle ends in, and the state a parked
+    // clipboard driver would be in.
+    let high = {
+        let outbound = app.outbound.clone();
+        tokio::spawn(async move {
+            while outbound
+                .send(MessageType::InputBatch.wire(), b"move".to_vec())
+                .await
+                .is_ok()
+            {}
+        })
+    };
+    let bulk = {
+        let outbound = app.outbound.clone();
+        tokio::spawn(async move {
+            while outbound
+                .send(
+                    MessageType::ClipboardData.wire(),
+                    vec![0xBB; BULK_FRAME_BYTES],
+                )
+                .await
+                .is_ok()
+            {}
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !bulk.is_finished(),
+        "the bulk producer never parked, so nothing is queued behind the \
+         frozen loop and the unparking half proves nothing"
+    );
+
+    let reason = timeout(Duration::from_secs(30), app.session)
+        .await
+        .expect("the session froze: a stalled event consumer held the loop open")
+        .expect("the session task panicked");
+    assert!(
+        matches!(reason, DisconnectReason::EventConsumerStalled { .. }),
+        "expected a fail-closed end to a stalled event consumer, got {reason:?}"
+    );
+
+    // The other half: ending the session released everything behind it.
+    timeout(Duration::from_secs(5), bulk)
+        .await
+        .expect("the parked bulk producer was never released by teardown")
+        .expect("the bulk producer panicked");
+    high.abort();
+    peer.abort();
+    drop(held_events);
+}
+
 /// A peer that simply stops reading must not be able to hold the session
 /// open forever.
 ///
@@ -195,12 +321,13 @@ async fn drain_frames(conn: &mut TestConnection, expected: usize) -> Vec<u16> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_that_stops_reading_cannot_suppress_disconnect_detection() {
     // Short enough that the test is quick, long enough to be a real stall.
-    let (app, _conn) = connected_pair_with(
+    let (app, _conn, events) = connected_pair_with(
         KeepaliveConfig::new(Duration::from_millis(200), Duration::from_secs(1)).unwrap(),
         FeatureFlags::ADVERTISED,
         FeatureFlags::NONE,
     )
     .await;
+    spawn_event_consumer(events);
 
     // The peer never reads a byte from here on; push until the writer is
     // stuck mid-frame with a full socket behind it.
