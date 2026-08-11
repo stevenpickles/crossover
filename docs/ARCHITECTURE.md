@@ -375,6 +375,33 @@ The polite TLS shutdown on the way out is bounded too, for the same reason:
 it has to flush, and the commonest reason to be closing is a peer that
 stopped reading.
 
+**And so is the one hop that pushes back the other way.** Everything above
+describes backpressure heading *out*; the session's event channel is the
+only place it points *in*, because `run_session` hands each inbound frame to
+the application and waits for it to be accepted. That wait sits in the same
+`select!` as the outbound drain, the `Pong` answer, and the keepalive tick,
+so an application that stops consuming freezes all of them — and the write
+bounds above cannot help, because they only cover a write already in
+progress, and the keepalive check lives in the loop that stopped turning.
+The state is reachable without any local bug: sustained High traffic starves
+the Background lane by design, which parks the clipboard driver, which stops
+it draining its own events, which parks the fanout, which stops the session's
+event drain, which fills this channel. Every hop is legitimate backpressure;
+the cycle is not. So the hand-off carries the same keepalive-timeout deadline
+as the writes, and expiry ends the session as `EventConsumerStalled` — a
+*local* fault, kept distinct from a transport one so a soak report does not
+go hunting the network. Teardown then retires the send path and unparks the
+whole chain: a wedged event chain costs the session, not the process.
+
+A peer cannot use this against a healthy session. All it controls is how
+fast frames arrive, and a consumer that is running accepts each one in
+microseconds however hard it is pushed — a flood meets backpressure, which
+slows the peer down, and never approaches a multi-second wait for a single
+hand-off. Reaching the deadline requires the consumer chain to have stopped.
+A peer *can* stop it, by driving the cycle above, and killing the session is
+then exactly right: one whose frames are neither dispatched nor answered is
+doing nothing but holding the chain hostage.
+
 Bound 2 catches *continuous* stalling, and a peer that alternates one brisk
 write with one slow one evades it, since the brisk write clears the run —
 per-frame input delay stays inside bound 1's keepalive timeout, which is what
