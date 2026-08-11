@@ -311,6 +311,29 @@ topology editor, peer discovery, >2 peers, rich clipboard formats (HTML,
 images, files), drag-and-drop, software updates, diagnostics UI, optional
 secure WAN operation.
 
+### Rich clipboard — design captured 2026-08-11 (Proposed ADRs 0013–0014)
+
+Design worked through with the maintainer ahead of scheduling, so it is ready to
+pick up cleanly. Three linked pieces, in dependency order:
+
+1. **Interactive-over-bulk frame prioritization** ([ADR 0013](adr/0013-interactive-over-bulk-prioritization.md),
+   Proposed). Split the session's single FIFO send path into High (input,
+   control, keepalive) and Background (bulk) classes; input always preempts bulk
+   *between chunks*. Foundational — makes "background transfer never interferes
+   with live input" (priority #5 / NFR-5) real, and requires bulk to be chunked
+   (a big frame is unpreemptable).
+2. **Chunked rich-clipboard transfer, images first** ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md),
+   Proposed). The chunking ADR 0005 predicted. Images (screenshots/snips, a few
+   MB) are the value: native raster format shipped **verbatim** (no transcode, no
+   codec, no compression — the LAN is 2.5 GbE), eager chunked sync consistent
+   with text, chunk size set by ADR 0013's latency budget. Rests on existing
+   machinery (Offer/Accept, hash-dedup, bounds, loop prevention).
+3. **Files/folders — later, deliberately minimal.** Rare use → a drop-folder
+   model (not Explorer-paste fidelity), folders zipped to a single blob, with
+   destination + per-peer permission + name sanitization + size/count caps. Adds
+   a filesystem-write surface, so it needs its own ADR and SECURITY.md threat
+   additions (tracked in adr/README.md "Known decisions awaiting an ADR").
+
 ---
 
 ## Working practices
