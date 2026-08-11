@@ -108,6 +108,33 @@ Some of these need real interactive sessions and run on dedicated Windows
 runners or manually per release, not in every headless CI job — but they
 exist as automated tests, not checklists.
 
+**Two exceptions, and they are honest ones.** Clipboard images (ADR 0014)
+have a part no automation can reach: what a *third-party* application
+publishes, and whether one accepts what Crossover installs. Automation
+covers everything either side of that — a fabricated DIB round-trips
+through Win32 verbatim, canonicalizes to a stable length, and is refused
+above the ceiling — so these two are `#[ignore]`d and run deliberately:
+
+```
+cargo test -p crossover-platform-windows -- --ignored manual_a_real_snip
+cargo test -p crossover-platform-windows -- --ignored manual_an_installed_image
+```
+
+| Test | What the human does |
+|------|---------------------|
+| `clipboard::tests::manual_a_real_snip_is_read_as_a_stable_image` | Take a snip (`Win+Shift+S`) **before** running; the test asserts the Snipping Tool's own DIB reads as an image, sits inside the ceiling, and yields identical bytes on consecutive reads |
+| `clipboard::tests::manual_an_installed_image_pastes_into_other_applications` | Run it, then paste (`Ctrl+V`) into Paint, Word, and a browser compose box, and confirm the gradient appears in each |
+
+Both are also on the two-machine list in [SOAK.md](SOAK.md), where the
+interesting version is the same paste after the image crossed the wire.
+
+Note that every test in this file that drives the real clipboard is
+serialized behind one process-wide lock and tolerates `Busy`, because the
+clipboard is a machine-global lock any application may hold. A failure
+that reports `OpenClipboard ... Access is denied` on *every* such test —
+including ones this change did not touch — is the desktop, not the code;
+reproduce it on a clean checkout before debugging it.
+
 ## 2. CI
 
 GitHub Actions builds and tests on **Windows, Linux, and macOS from

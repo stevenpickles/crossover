@@ -57,9 +57,9 @@ reason" — it kills that peer's session.
 
 Therefore: **every payload-enum extension must be feature-gated by the
 sender** (§3.1), which is why the gate lives on the send path where no
-caller can skip it, and why `FeatureFlags::ADVERTISED` stays empty until a
-build can genuinely honour the capability. This applies to every future
-addition of the kind, `ContentType::Files` among them.
+caller can skip it, and why a bit joins `FeatureFlags::ADVERTISED` only
+once a build can genuinely honour the capability end to end. This applies
+to every future addition of the kind, `ContentType::Files` among them.
 
 ## 3. Session establishment and versioning
 
@@ -112,21 +112,29 @@ Rules, all of them deliberate:
 | 0 | `CHUNKED_CLIPBOARD` | The peer can receive `ContentType::Image` items offered and streamed as `ClipboardChunk` messages, reassemble them, and install the result (ADR 0014) |
 
 `FeatureFlags::ADVERTISED` is what this build actually sends, and it is
-**empty today** — now for exactly one remaining reason. The wire layer
-carries chunked items and the clipboard engine offers, streams,
-reassembles, verifies and installs them (ADR 0014's protocol and engine
-slices), but no platform backend can yet put a raster format on a real
-clipboard: `crossover-platform-windows` reports an image clipboard as
-absent on read and refuses an image on write. Advertising is a promise to
-**handle**, so promising it here would mean accepting a transfer this build
-must then fail at the last step, after the peer moved every byte.
-ADR 0014's platform slice sets it to `ALL`; that flip is what switches
-image transfer on, on both sides at once.
+`ALL` — bit 0 set — since ADR 0014's platform slice. Every layer of the
+promise is real: the wire carries chunked items, the clipboard engine
+offers, streams, reassembles, verifies and installs them, and
+`crossover-platform-windows` reads and writes `CF_DIB` on the actual OS
+clipboard. Advertising is a promise to **handle**, and the last step that
+could not be honoured is implemented, so the promise is honest.
 
-Tests that need the negotiated path before then override the advertisement
-per session (`SessionOptions::advertised_features`) with a fake provider
-behind it, rather than weakening the constant — the negotiated flow over
-real TLS is proven now, and the promise stays honest.
+The flip is **wire-visible**: the `Hello` a peer receives now carries
+`supported_features = 1` where it carried `0`. That is why the golden
+`Hello` snapshot pins the byte — a change to the advertisement has to be a
+deliberate edit rather than something a peer discovers first. It is also
+safe by the rules above and by nothing else: a feature activates only on
+the *intersection*, so a peer that predates the bit negotiates it away and
+receives nothing new, and no base-protocol layout changed, so text keeps
+synchronizing with such a peer exactly as before. `crossover-core::net`'s
+`unnegotiated_content_is_refused_before_it_reaches_the_wire` and the
+test-peer suite's
+`an_un_negotiated_image_never_reaches_the_wire_and_text_still_flows` are
+that compatibility case, run against an advertising build.
+
+Tests that need a *specific* negotiation still set it per session
+(`SessionOptions::advertised_features`) rather than inheriting the
+constant, so each suite states the negotiation it depends on.
 
 This is the route chosen over another hard version-floor bump (the v1 → v2
 option ADR 0014 weighed): the base-protocol wire layouts are unchanged, so
