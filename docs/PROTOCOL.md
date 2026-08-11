@@ -42,6 +42,25 @@ Requirements:
 - Unknown *message types* within a known-valid frame are skippable when the
   version negotiation permits it (§3), enabling forward compatibility.
 
+**Forward compatibility is asymmetric, and the asymmetry is load-bearing:**
+
+| Extension | A peer that predates it |
+|-----------|-------------------------|
+| A new **message type** | Skips the frame (§7): survivable, though the sender gets no answer |
+| A new **feature bit** | Ignores it (§3.1): the feature simply never activates |
+| A new **variant of an enum inside a payload** (`ContentType`, `DeclineReason`, `ApplyResult`, …) | **Cannot decode the payload at all.** Its decoder rejects the unknown discriminant, and a malformed payload is fatal (§7) — the session terminates |
+
+The third row is the trap: appending an enum variant looks like the same
+kind of additive change as the first two, and is not. A `ClipboardDecline`
+carrying a reason an older peer does not know does not degrade to "unknown
+reason" — it kills that peer's session.
+
+Therefore: **every payload-enum extension must be feature-gated by the
+sender** (§3.1), which is why the gate lives on the send path where no
+caller can skip it, and why `FeatureFlags::ADVERTISED` stays empty until a
+build can genuinely honour the capability. This applies to every future
+addition of the kind, `ContentType::Files` among them.
+
 ## 3. Session establishment and versioning
 
 After TLS establishment and peer authorization, each side sends `Hello`:
@@ -59,11 +78,49 @@ Hello
 - The session runs at the highest mutually supported version; if the ranges
   don't intersect, the session terminates with a diagnostic. No silent
   downgrade below either side's minimum.
-- Capabilities beyond the base protocol (future clipboard types, multiple
+- Capabilities beyond the base protocol (optional clipboard types, multiple
   displays, …) are negotiated via `supported_features`, never assumed.
 - Behavior for unknown fields and unknown messages at each version is part
   of the version's definition. Breaking changes require an ADR,
   compatibility tests, and documentation updates.
+
+### 3.1 Feature flags
+
+`supported_features` is a bitmask, `FeatureFlags` in `crossover-protocol`.
+Rules, all of them deliberate:
+
+- **A feature is active only if both sides advertise it.** The session's
+  capability set is the *intersection* of the two `Hello`s
+  (`FeatureFlags::negotiate`), carried on `SessionInfo::features`.
+- **Unknown bits are ignored, never an error.** A future peer advertising
+  bits this build does not know simply never activates them — the
+  intersection drops them.
+- **Advertising is a promise to handle, not a statement of intent to
+  send.** A build sets a bit only when it can receive that traffic and
+  complete the transaction.
+- **Senders gate on the negotiated set before anything travels**, at the
+  send path itself (`gate_outbound` in `crossover-core::net`), so the
+  check cannot be forgotten by a caller. This is not an optimization. Per
+  §2 an unknown *message type* is skipped, so an un-negotiated chunk would
+  be answered by nothing at all — a silently stalled transaction, which
+  NFR-3 forbids. Worse, an un-negotiated *content type* is not skipped at
+  all: it fails the peer's payload decode and terminates its session. The
+  gate is what turns both outcomes into a local refusal.
+
+| Bit | Name | Meaning |
+|-----|------|---------|
+| 0 | `CHUNKED_CLIPBOARD` | The peer can receive `ContentType::Image` items offered and streamed as `ClipboardChunk` messages, reassemble them, and install the result (ADR 0014) |
+
+`FeatureFlags::ADVERTISED` is what this build actually sends, and it is
+**empty today**: the wire layer below is implemented, but the clipboard
+engine cannot yet reassemble a chunked item and the platform layer cannot
+yet read or write a raster format. ADR 0014's engine and platform slices
+set it to `ALL`; that flip is what switches image transfer on, on both
+sides at once.
+
+This is the route chosen over another hard version-floor bump (the v1 → v2
+option ADR 0014 weighed): the base-protocol wire layouts are unchanged, so
+a peer without the bit keeps synchronizing text with one that has it.
 
 ## 4. Message classes
 
@@ -85,9 +142,11 @@ block the pointer and keyboard on the single connection
 on:
 
 - Messages **within** a class arrive in the order the sender produced them.
-  In particular a clipboard transaction — `Offer`, `Accept`, `Data`,
-  `Applied` — is never reordered against itself, which is what §5's state
-  machine depends on.
+  In particular a clipboard transaction — `Offer`, `Accept`, `Data` or the
+  `Chunk` sequence, `Applied` — is never reordered against itself, which is
+  what §5's state machine depends on, and what lets the receiver treat a
+  chunk index that is not the next one as a protocol violation rather than
+  a delivery artefact.
 - Messages of **different** classes may arrive in a different relative order
   than they were produced. A receiver must not infer causality across
   classes from arrival order.
@@ -124,8 +183,10 @@ B        validates length + hash, writes OS clipboard (bounded retries)
 B -> A   ClipboardApplied   { id, result }        // success or typed failure
 ```
 
-Offered flow (larger items, up to `MAX_CLIPBOARD_TEXT_BYTES` = 4 MiB;
-oversized items are rejected gracefully — no chunking, per ADR 0005):
+Offered flow (text above the inline threshold, up to
+`MAX_CLIPBOARD_TEXT_BYTES` = 4 MiB; oversized items are rejected
+gracefully — text is never chunked, per ADR 0005, because it always fits
+one frame):
 
 ```
 A -> B   ClipboardOffer     { id, content_type, content_length, content_hash }
@@ -135,6 +196,55 @@ B -> A   ClipboardAccept | ClipboardDecline   // decline carries a typed
 A -> B   ClipboardData
 B -> A   ClipboardApplied
 ```
+
+Offered **and chunked** flow (ADR 0014), for content types that cannot
+ride a single frame — `ContentType::Image` today, up to
+`MAX_CLIPBOARD_IMAGE_BYTES` = 64 MiB:
+
+```
+A -> B   ClipboardOffer     { id, content_type, content_length, content_hash }
+B -> A   ClipboardAccept | ClipboardDecline   // AlreadyHave here is why a
+                                              // re-pasted snip moves zero
+                                              // payload bytes
+A -> B   ClipboardChunk     { id, index: 0, payload }
+A -> B   ClipboardChunk     { id, index: 1, payload }   // interleaved with
+...                                                     // live input (§4)
+A -> B   ClipboardChunk     { id, index: n-1, payload }
+B        reassembles, verifies content_hash, writes OS clipboard
+B -> A   ClipboardApplied
+```
+
+Rules specific to the chunked flow:
+
+- **A chunk is its own message type, not a `ClipboardData`.**
+  `ClipboardData` validates that its declared length equals the bytes it
+  carries and that its hash covers all of them — which a fragment cannot
+  satisfy. A chunk carries only what a fragment can prove about itself:
+  item id, index, payload.
+- **Chunked types are always offered, at any size.** The inline threshold
+  is a text rule. The offer round is where hash dedup short-circuits a
+  re-paste and where the receiver bounds its memory, so it is never
+  skipped. Correspondingly, a `ClipboardData` carrying a chunked type is
+  malformed, and a `ClipboardChunk` with no accepted offer behind it is a
+  protocol violation.
+- **The split is derived, not declared.** The receiver computes the chunk
+  count and each chunk's exact length from the offered `content_length`
+  and the size of chunk 0. There is no second declaration on the wire to
+  contradict the first; a split that does not reconcile exactly with the
+  offered length — or that needs more than `MAX_CHUNK_COUNT` chunks — is
+  rejected before any chunk is kept.
+- **Indices are strictly sequential from 0.** A gap, a repeat, an index
+  past the end, a chunk for a different item, or a chunk whose length is
+  not exactly what its position requires is a protocol violation (§7). The
+  running total therefore cannot drift past the declared length.
+- **The hash is verified over the reassembled bytes**, before the OS
+  clipboard is touched — the bounds invariant below, unchanged, now
+  spanning a reassembly rather than a single frame.
+- **Sender-gated by negotiation** (§3.1): chunked content is offered only
+  to a peer advertising `CHUNKED_CLIPBOARD`.
+- Image bytes are the source clipboard's own raster format, verbatim: no
+  transcode, no compression (ADR 0014). The format tag travels with the
+  item; no component parses the pixels.
 
 Invariants (enforced by the core clipboard engine, wire-visible here):
 
@@ -146,9 +256,10 @@ Invariants (enforced by the core clipboard engine, wire-visible here):
 - **Conflict policy**: latest observed item wins, decided by (sequence,
   origin) deterministically; documented and tested (FR-3.5). Logical clocks
   only if a real defect demands them.
-- **Bounds**: `content_length` is validated against the negotiated maximum
-  before any allocation, and `content_hash` is verified before the OS
-  clipboard is touched (FR-3.6).
+- **Bounds**: `content_length` is validated against the maximum **for its
+  content type** before any allocation — including the reassembly buffer,
+  which is sized from the offered length only after that check — and
+  `content_hash` is verified before the OS clipboard is touched (FR-3.6).
 
 ## 6. Input events
 
@@ -241,6 +352,37 @@ Rules, all fail-closed:
 |----------|-------|
 | Serialization format | postcard (ADR 0001) |
 | Default TCP port | 27677 (ADR 0004), `DEFAULT_PORT` in `crossover-protocol` |
-| Frame body maximum | 4 MiB + 64 KiB (ADR 0005): one maximum clipboard item plus envelope per frame |
+| Frame body maximum | 4 MiB + 64 KiB (ADR 0005): one maximum *text* item plus envelope per frame. Unchanged by chunking (ADR 0014) — larger content is split, never carried whole, because one giant frame is exactly what cannot be preempted (ADR 0013) |
 | Max clipboard text / inline threshold | 4 MiB / 64 KiB (ADR 0005), named constants in `crossover-protocol` |
+| Max clipboard image | 64 MiB, `MAX_CLIPBOARD_IMAGE_BYTES` (ADR 0014) — see below |
+| Chunk payload maximum | 64 KiB, `MAX_CHUNK_BYTES` (ADR 0014) — see below |
+| Chunk count maximum | 1024, `MAX_CHUNK_COUNT` = `MAX_CLIPBOARD_IMAGE_BYTES` ÷ `MAX_CHUNK_BYTES`. Derived, and compile-time asserted against the two constants it comes from |
 | Keepalive interval / timeout | 5 s / 15 s defaults in `crossover-core::supervision` |
+
+**Why 64 MiB for images.** Images travel as the source's native raster
+bytes, verbatim and uncompressed (ADR 0014), so the ceiling has to cover a
+full-screen grab in that form rather than a codec's idea of one. At 32 bits
+per pixel: a 4K screenshot is 3840 × 2160 × 4 = 31.6 MiB, and a dual-4K
+span is 7680 × 2160 × 4 = 63.3 MiB. 64 MiB admits the worst realistic
+screenshot with margin, while the everyday case — snips of a few MB — sits
+two orders of magnitude below it. It is also the receiver's worst-case
+memory commitment, since the reassembly buffer is sized from the offered
+length after that length is checked against this bound.
+
+**Why 64 KiB chunks.** A chunk is the *preemption unit*: the writer emits
+at most one background chunk before re-checking the interactive lane
+(ADR 0013), so the worst-case delay a keystroke can suffer behind a bulk
+transfer is about one chunk's transmit time.
+
+| Link | Bytes/ms | 64 KiB chunk |
+|------|----------|--------------|
+| 2.5 GbE | 312 500 | 0.21 ms |
+| 1 GbE | 125 000 | 0.52 ms |
+
+Both are sub-millisecond, which is ADR 0013's budget, and the same size
+keeps overhead negligible: a maximum image is 1024 chunks whose envelopes
+(frame header plus postcard fields, well under 64 bytes each) total under
+0.1 % of the payload. Smaller chunks would buy latency nobody can perceive
+at the cost of more messages; larger ones eat straight into the
+input-latency budget. This settles ADR 0013's open "exact chunk size"
+question.

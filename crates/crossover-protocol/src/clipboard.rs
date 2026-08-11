@@ -1,16 +1,28 @@
-//! Clipboard transaction messages (ADR 0005, docs/PROTOCOL.md §5).
+//! Clipboard transaction messages (ADR 0005, ADR 0014, docs/PROTOCOL.md §5).
 //!
-//! Two flows share these messages: inline (`Data` → `Applied`) for
-//! content at or below [`CLIPBOARD_INLINE_MAX_BYTES`], and offered
-//! (`Offer` → `Accept`/`Decline` → `Data` → `Applied`) above it. The
-//! non-negotiable semantic lives in `Applied`: a sync succeeded only if
-//! the destination OS clipboard was updated (FR-3.2).
+//! Three flows share these messages:
+//!
+//! - **inline** (`Data` → `Applied`) for text at or below
+//!   [`CLIPBOARD_INLINE_MAX_BYTES`];
+//! - **offered** (`Offer` → `Accept`/`Decline` → `Data` → `Applied`) for
+//!   text above it;
+//! - **offered and chunked** (`Offer` → `Accept`/`Decline` →
+//!   `Chunk`×N → `Applied`) for the types [`ContentType::is_chunked`]
+//!   marks — images today (ADR 0014), files later (ADR 0015).
+//!
+//! The non-negotiable semantic lives in `Applied`: a sync succeeded only
+//! if the destination OS clipboard was updated (FR-3.2).
 //!
 //! Wire-level validation is deliberately strong: a `ClipboardData` whose
 //! declared length, hash, or UTF-8 validity disagrees with its content is
 //! rejected at decode — corrupt items are unrepresentable past the
 //! parser, so the engine's dedup and loop prevention can trust every item
-//! identity they see.
+//! identity they see. Chunked items keep that guarantee by *construction*
+//! rather than per-message: a chunk is only ever a fragment, so
+//! [`ChunkReassembly`] is the sole way to obtain the bytes and it hands
+//! them out only after the item's `content_hash` verifies over the whole
+//! reassembly (ADR 0014 — nothing partially-verified reaches the OS
+//! clipboard).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +30,7 @@ use uuid::Uuid;
 
 use crate::ProtocolError;
 use crate::decode_strict;
+use crate::hello::{FeatureFlags, MessageType};
 
 /// SHA-256 of clipboard content — the identity that dedup and loop
 /// prevention key on. Exposed so the engine hashes local observations
@@ -27,19 +40,160 @@ pub fn content_hash(content: &[u8]) -> [u8; 32] {
     Sha256::digest(content).into()
 }
 
-/// Content at or below this rides the inline flow; above it, the offered
-/// flow (ADR 0005).
+/// Text at or below this rides the inline flow; above it, the offered
+/// flow (ADR 0005). Chunked types ignore this threshold entirely — see
+/// [`ClipboardOffer::validate`].
 pub const CLIPBOARD_INLINE_MAX_BYTES: usize = 64 * 1024;
 
-/// Hard cap on clipboard item content. Larger items are rejected
+/// Hard cap on text clipboard content. Larger items are rejected
 /// gracefully on both send and receive (FR-3.6) — never truncated.
 pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
-/// Clipboard content types defined by protocol version 1.
+/// Hard cap on image clipboard content (ADR 0014, FR-3.6).
+///
+/// Images travel as the source's native raster bytes, verbatim and
+/// uncompressed, so the ceiling has to cover a full-screen grab in that
+/// form rather than a codec's idea of one. At 32 bits per pixel a 4K
+/// screenshot is 3840 × 2160 × 4 = 31.6 MiB, and a dual-4K span
+/// (7680 × 2160 × 4) is 63.3 MiB — so 64 MiB admits the worst realistic
+/// screenshot with margin, while the maintainer's actual case (snips of a
+/// few MB, ADR 0014) sits two orders of magnitude below it.
+///
+/// It is also the receiver's memory commitment: the reassembly buffer is
+/// sized from the *offered* length, which is validated against this bound
+/// **before** the allocation happens (NFR-1), and the engine holds one
+/// reassembly at a time.
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum payload bytes in one [`ClipboardChunk`].
+///
+/// A chunk is the *preemption unit* (ADR 0013): the writer emits at most
+/// one background chunk before re-checking the interactive lane, so the
+/// worst-case delay a live keystroke can suffer behind a bulk transfer is
+/// roughly one chunk's transmit time. The arithmetic that fixes the value:
+///
+/// | Link | Bytes/ms | 64 KiB chunk |
+/// |------|----------|--------------|
+/// | 2.5 `GbE` | 312 500 | 0.21 ms |
+/// | 1 `GbE` | 125 000 | 0.52 ms |
+///
+/// Both are sub-millisecond, which is ADR 0013's budget, and the same
+/// chunk keeps per-message overhead negligible: a 64 MiB image is 1024
+/// chunks whose envelopes (frame header plus postcard fields, well under
+/// 64 bytes each) total under 0.1 % of the payload. Smaller chunks would
+/// buy latency nobody can perceive at the cost of more messages; larger
+/// ones eat directly into the input-latency budget.
+///
+/// Far below [`crate::framing::MAX_FRAME_BODY_BYTES`], which does **not**
+/// grow for chunking (ADR 0014).
+pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
+
+/// [`MAX_CHUNK_BYTES`] as the `u32` the chunk arithmetic works in, so the
+/// bound is stated once and the two forms cannot drift.
+const MAX_CHUNK_BYTES_U32: u32 = 64 * 1024;
+const _: () = assert!(MAX_CHUNK_BYTES_U32 as usize == MAX_CHUNK_BYTES);
+
+/// Maximum number of chunks one item may be split into.
+///
+/// Derived, not chosen: the largest chunked item divided by the largest
+/// chunk. It is what stops a peer from declaring a legal-looking transfer
+/// made of millions of tiny chunks — a sender that picks a smaller chunk
+/// size simply has to keep the *count* inside this bound, which
+/// [`ChunkPlan::derive`] enforces before a single byte is buffered.
+pub const MAX_CHUNK_COUNT: u32 = 1024;
+
+/// Keep [`MAX_CHUNK_COUNT`] tied to the two constants it is derived from:
+/// if either moves, the build fails here rather than silently admitting a
+/// maximum item that cannot be split inside the count bound.
+const _: () = assert!(
+    (MAX_CHUNK_COUNT as usize) * MAX_CHUNK_BYTES >= MAX_CLIPBOARD_IMAGE_BYTES,
+    "MAX_CHUNK_COUNT chunks of MAX_CHUNK_BYTES must cover MAX_CLIPBOARD_IMAGE_BYTES"
+);
+
+/// Raster formats an image item may carry (ADR 0014).
+///
+/// The bytes are whatever the source clipboard held, verbatim: Crossover
+/// neither transcodes nor compresses, so the wire is *format-tagged*
+/// rather than format-normalized. `Dib` is the default because it is the
+/// format Windows applications near-universally both provide and accept;
+/// the compressed tags exist for sources that offer nothing else.
+///
+/// The tag is descriptive metadata, not a promise about the bytes: no
+/// component parses image data, and validation is length and hash only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageFormat {
+    /// Windows device-independent bitmap (`CF_DIB`).
+    Dib,
+    /// PNG, verbatim.
+    Png,
+    /// JPEG, verbatim.
+    Jpeg,
+}
+
+/// Clipboard content types.
+///
+/// Variants are **appended, never renumbered** — the postcard
+/// discriminant is the wire value (ADR 0001), and `Utf8Text` must stay 0
+/// for the golden snapshots below to keep meaning what they mean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentType {
-    /// UTF-8 text (FR-3.7) — the only type in version 1.
+    /// UTF-8 text (FR-3.7) — the base protocol's only type.
     Utf8Text,
+    /// A raster image in the source's own format (ADR 0014). Gated by
+    /// [`FeatureFlags::CHUNKED_CLIPBOARD`]; always offered, always
+    /// chunked.
+    Image(ImageFormat),
+}
+
+impl ContentType {
+    /// The size ceiling for this type (FR-3.6). Per-type since ADR 0014:
+    /// a 64 MiB image bound would be absurd for text, and a 4 MiB text
+    /// bound would reject ordinary screenshots.
+    #[must_use]
+    pub const fn max_content_bytes(self) -> u64 {
+        match self {
+            Self::Utf8Text => MAX_CLIPBOARD_TEXT_BYTES as u64,
+            Self::Image(_) => MAX_CLIPBOARD_IMAGE_BYTES as u64,
+        }
+    }
+
+    /// Whether items of this type travel as [`ClipboardChunk`]s after an
+    /// accepted offer, rather than in a single [`ClipboardData`].
+    ///
+    /// Chunked types are **always** offered — at any size, the inline
+    /// threshold notwithstanding — because the offer round is where the
+    /// receiver's `AlreadyHave` decline short-circuits a re-paste to zero
+    /// payload bytes, and where it bounds its memory before megabytes
+    /// arrive (ADR 0014).
+    #[must_use]
+    pub const fn is_chunked(self) -> bool {
+        matches!(self, Self::Image(_))
+    }
+
+    /// The capability a peer must advertise in its `Hello` before this
+    /// type may be sent to it (docs/PROTOCOL.md §3).
+    ///
+    /// [`FeatureFlags::NONE`] for the base protocol's types, which every
+    /// peer at the negotiated version understands.
+    #[must_use]
+    pub const fn required_feature(self) -> FeatureFlags {
+        match self {
+            Self::Utf8Text => FeatureFlags::NONE,
+            Self::Image(_) => FeatureFlags::CHUNKED_CLIPBOARD,
+        }
+    }
+
+    /// Whether a peer advertising `features` can receive this type.
+    ///
+    /// The sender-side gate. Unknown message types are *ignored* rather
+    /// than fatal (docs/PROTOCOL.md §2), so offering chunked content to a
+    /// peer that does not understand it would produce no answer at all —
+    /// a silent stall, which NFR-3 forbids. Nothing is sent that the peer
+    /// has not said it can take.
+    #[must_use]
+    pub const fn negotiated_by(self, features: FeatureFlags) -> bool {
+        features.contains(self.required_feature())
+    }
 }
 
 /// The identity and description of one clipboard item, shared by
@@ -63,13 +217,29 @@ pub struct ClipboardMeta {
 }
 
 impl ClipboardMeta {
-    fn validate(&self) -> Result<(), ProtocolError> {
-        if self.content_length > MAX_CLIPBOARD_TEXT_BYTES as u64 {
+    /// Per-type bounds (ADR 0014): the declared length is checked against
+    /// *this type's* maximum, and it is checked before anything is sized
+    /// from it (NFR-1).
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] for an out-of-range declared length,
+    /// or an empty item of a chunked type (a zero-byte image is not an
+    /// image, and it would leave the chunk arithmetic with nothing to
+    /// reconcile).
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        let max = self.content_type.max_content_bytes();
+        if self.content_length > max {
             return Err(ProtocolError::Malformed {
                 reason: format!(
-                    "clipboard content length {} exceeds maximum {MAX_CLIPBOARD_TEXT_BYTES}",
-                    self.content_length
+                    "clipboard content length {} exceeds the maximum {max} for {:?}",
+                    self.content_length, self.content_type
                 ),
+            });
+        }
+        if self.content_type.is_chunked() && self.content_length == 0 {
+            return Err(ProtocolError::Malformed {
+                reason: format!("empty {:?} clipboard item", self.content_type),
             });
         }
         Ok(())
@@ -85,15 +255,21 @@ pub struct ClipboardOffer {
 }
 
 impl ClipboardOffer {
-    /// Semantic validation: offers exist only above the inline threshold
-    /// (ADR 0005) — a conforming peer never offers what it should send.
+    /// Semantic validation: for the types that have an inline flow, offers
+    /// exist only above the inline threshold (ADR 0005) — a conforming
+    /// peer never offers what it should send. The rule is type-aware since
+    /// ADR 0014: a chunked type has no inline flow at all and is
+    /// legitimately offered at any size.
     ///
     /// # Errors
     ///
-    /// [`ProtocolError::Malformed`] for out-of-range lengths.
+    /// [`ProtocolError::Malformed`] for out-of-range lengths, and for a
+    /// non-chunked offer at or below the inline threshold.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.meta.validate()?;
-        if self.meta.content_length <= CLIPBOARD_INLINE_MAX_BYTES as u64 {
+        if !self.meta.content_type.is_chunked()
+            && self.meta.content_length <= CLIPBOARD_INLINE_MAX_BYTES as u64
+        {
             return Err(ProtocolError::Malformed {
                 reason: format!(
                     "offer for {} bytes at or below the {CLIPBOARD_INLINE_MAX_BYTES}-byte \
@@ -103,6 +279,18 @@ impl ClipboardOffer {
             });
         }
         Ok(())
+    }
+
+    /// Whether this offer may be sent to a peer advertising `features`
+    /// (docs/PROTOCOL.md §3).
+    ///
+    /// The sender's gate, checked before the offer travels: an
+    /// un-negotiated content type would be answered by silence, because
+    /// unknown types are skipped rather than fatal — and a transaction
+    /// that never gets an answer is the silent failure NFR-3 forbids.
+    #[must_use]
+    pub const fn negotiated_by(&self, features: FeatureFlags) -> bool {
+        self.meta.content_type.negotiated_by(features)
     }
 
     /// Encode the payload, validating first.
@@ -149,6 +337,12 @@ pub enum DeclineReason {
     /// superseded this one; synchronization converges on the newer item.
     /// A success-shaped outcome, not a failure.
     Superseded,
+    /// The receiver does not handle this [`ContentType`]. A *permanent*
+    /// answer, unlike [`DeclineReason::NotReady`]: the origin learns not
+    /// to expect this type to travel, instead of waiting on an offer that
+    /// will never be accepted (NFR-3). Appended after `Superseded` —
+    /// discriminants are wire values and are never renumbered.
+    UnsupportedType,
 }
 
 /// Decline an offered item.
@@ -196,8 +390,10 @@ impl ClipboardData {
     }
 
     /// Full consistency validation: bounds, declared length == actual,
-    /// hash matches content, and (for [`ContentType::Utf8Text`]) valid
-    /// UTF-8.
+    /// hash matches content, and per-type rules — valid UTF-8 for
+    /// [`ContentType::Utf8Text`], and *no* `ClipboardData` at all for a
+    /// chunked type (ADR 0014: those travel as [`ClipboardChunk`]s, and
+    /// one path per type means no ambiguity about which validation ran).
     ///
     /// # Errors
     ///
@@ -227,6 +423,16 @@ impl ClipboardData {
                     });
                 }
             }
+            // No UTF-8 rule for binary types — and no ClipboardData
+            // either: a chunked item is only ever assembled from chunks.
+            ContentType::Image(_) => {
+                return Err(ProtocolError::Malformed {
+                    reason: format!(
+                        "{:?} content travels as chunks, not as ClipboardData",
+                        self.meta.content_type
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -253,6 +459,500 @@ impl ClipboardData {
         message.validate()?;
         Ok(message)
     }
+}
+
+/// One fragment of a chunked item (ADR 0014).
+///
+/// Deliberately **not** a [`ClipboardData`]: that message validates at
+/// decode that its declared length equals the bytes it carries and that
+/// the hash covers all of them, which a fragment can never satisfy. A
+/// chunk therefore carries only what a fragment can prove about itself —
+/// which item it belongs to, where it sits in the sequence, and its own
+/// bounded payload. Everything cross-chunk (sizes reconciling with the
+/// offered length, strictly sequential indices, and finally the item
+/// hash) is [`ChunkReassembly`]'s to enforce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardChunk {
+    /// The offered item this fragment belongs to. Chunks are
+    /// offer-scoped: an id with no accepted offer behind it is a protocol
+    /// violation, not an implicit new transfer.
+    pub id: Uuid,
+    /// Position in the sequence, from 0. Strictly sequential: a gap, a
+    /// repeat, or an index past the item's chunk count is a protocol
+    /// violation (fail closed, docs/PROTOCOL.md §7).
+    pub index: u32,
+    /// The fragment itself, at most [`MAX_CHUNK_BYTES`].
+    pub payload: Vec<u8>,
+}
+
+impl ClipboardChunk {
+    /// Validation a chunk can do alone: a non-empty payload inside
+    /// [`MAX_CHUNK_BYTES`] and an index inside [`MAX_CHUNK_COUNT`].
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] for an empty or oversized payload, or
+    /// an out-of-range index.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.payload.is_empty() {
+            return Err(ProtocolError::Malformed {
+                reason: format!("empty clipboard chunk at index {}", self.index),
+            });
+        }
+        if self.payload.len() > MAX_CHUNK_BYTES {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "clipboard chunk of {} bytes exceeds the {MAX_CHUNK_BYTES}-byte maximum",
+                    self.payload.len()
+                ),
+            });
+        }
+        if self.index >= MAX_CHUNK_COUNT {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "clipboard chunk index {} is past the {MAX_CHUNK_COUNT}-chunk maximum",
+                    self.index
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Encode the payload, validating first.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] from validation;
+    /// [`ProtocolError::Encode`] on serialization failure.
+    pub fn encode_payload(&self) -> Result<Vec<u8>, ProtocolError> {
+        self.validate()?;
+        encode(self)
+    }
+
+    /// Decode and validate a payload (strict: no trailing bytes).
+    ///
+    /// The frame layer has already bounded the bytes handed in here
+    /// (`MAX_FRAME_BODY_BYTES`, validated from the length prefix before
+    /// any payload is buffered), so nothing in this path sizes an
+    /// allocation from an unvalidated declaration.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] for undecodable or invalid payloads.
+    pub fn decode_payload(payload: &[u8]) -> Result<Self, ProtocolError> {
+        let message: Self = decode_strict(payload, "ClipboardChunk")?;
+        message.validate()?;
+        Ok(message)
+    }
+}
+
+/// How a chunked item is split.
+///
+/// **Derived, never declared.** The receiver computes the plan from the
+/// offered `content_length` and the size of chunk 0, so there is no
+/// second declaration on the wire that could disagree with the first —
+/// the class of bug where a peer's stated chunk count and stated length
+/// describe different transfers simply cannot be expressed. What the
+/// sender does declare implicitly (its chunk size) is reconciled against
+/// the offered length exactly, once, before any chunk is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkPlan {
+    total_bytes: u64,
+    chunk_bytes: u32,
+    chunk_count: u32,
+}
+
+impl ChunkPlan {
+    /// The plan a sender should use for `total_bytes`: full
+    /// [`MAX_CHUNK_BYTES`] chunks and a remainder.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] if `total_bytes` is zero or cannot be
+    /// split inside [`MAX_CHUNK_COUNT`].
+    pub fn for_length(total_bytes: u64) -> Result<Self, ProtocolError> {
+        Self::derive(total_bytes, MAX_CHUNK_BYTES_U32)
+    }
+
+    /// The plan implied by an item of `total_bytes` split into chunks of
+    /// `chunk_bytes` (the last one shorter).
+    ///
+    /// All arithmetic is checked or saturating: no input combination
+    /// overflows, and every failure is a value (NFR-1).
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] when `chunk_bytes` is zero or over
+    /// [`MAX_CHUNK_BYTES`], when `total_bytes` is zero, when the implied
+    /// count exceeds [`MAX_CHUNK_COUNT`], or when the three quantities do
+    /// not reconcile exactly.
+    pub fn derive(total_bytes: u64, chunk_bytes: u32) -> Result<Self, ProtocolError> {
+        if chunk_bytes == 0 || chunk_bytes > MAX_CHUNK_BYTES_U32 {
+            return Err(ProtocolError::Malformed {
+                reason: format!("chunk size {chunk_bytes} outside 1..={MAX_CHUNK_BYTES}"),
+            });
+        }
+        if total_bytes == 0 {
+            return Err(ProtocolError::Malformed {
+                reason: "chunked transfer of zero bytes".to_owned(),
+            });
+        }
+        let chunk_bytes_u64 = u64::from(chunk_bytes);
+        let count = total_bytes.div_ceil(chunk_bytes_u64);
+        let Ok(chunk_count) = u32::try_from(count) else {
+            return Err(ProtocolError::Malformed {
+                reason: format!("chunk count {count} exceeds the {MAX_CHUNK_COUNT}-chunk maximum"),
+            });
+        };
+        if chunk_count > MAX_CHUNK_COUNT {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "{total_bytes} bytes in {chunk_bytes}-byte chunks needs {chunk_count} chunks, \
+                     over the {MAX_CHUNK_COUNT}-chunk maximum"
+                ),
+            });
+        }
+        // The three quantities must reconcile exactly: the full chunks
+        // plus a final chunk of 1..=chunk_bytes account for every declared
+        // byte and no more. Guaranteed by div_ceil, but stated as a check
+        // rather than trusted, because it is the invariant every later
+        // per-chunk length check derives from.
+        let full_chunks = u64::from(chunk_count.saturating_sub(1));
+        let Some(final_bytes) = full_chunks
+            .checked_mul(chunk_bytes_u64)
+            .and_then(|before_final| total_bytes.checked_sub(before_final))
+        else {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk plan arithmetic does not close for {total_bytes} bytes in \
+                     {chunk_bytes}-byte chunks"
+                ),
+            });
+        };
+        if final_bytes == 0 || final_bytes > chunk_bytes_u64 {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "{chunk_count} chunks of {chunk_bytes} bytes do not reconcile with a declared \
+                     length of {total_bytes}"
+                ),
+            });
+        }
+        Ok(Self {
+            total_bytes,
+            chunk_bytes,
+            chunk_count,
+        })
+    }
+
+    /// Total declared item length.
+    #[must_use]
+    pub const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Size of every chunk but the last.
+    #[must_use]
+    pub const fn chunk_bytes(self) -> u32 {
+        self.chunk_bytes
+    }
+
+    /// How many chunks the item is split into.
+    #[must_use]
+    pub const fn chunk_count(self) -> u32 {
+        self.chunk_count
+    }
+
+    /// The exact length chunk `index` must carry, or `None` if `index` is
+    /// past the end of the transfer.
+    #[must_use]
+    pub fn chunk_len(self, index: u32) -> Option<u32> {
+        if index >= self.chunk_count {
+            return None;
+        }
+        if index.saturating_add(1) < self.chunk_count {
+            return Some(self.chunk_bytes);
+        }
+        // The final chunk: whatever the full ones left over, which
+        // `derive` already proved is 1..=chunk_bytes.
+        let consumed = u64::from(index) * u64::from(self.chunk_bytes);
+        u32::try_from(self.total_bytes.saturating_sub(consumed)).ok()
+    }
+}
+
+/// What a chunk did to a reassembly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkOutcome {
+    /// Accepted; more chunks are expected.
+    More,
+    /// The final chunk landed and the item's `content_hash` verified over
+    /// the whole reassembly: these bytes are the item, and this is the
+    /// only way they leave the protocol layer.
+    Complete(Vec<u8>),
+}
+
+/// Accumulates an offered item's chunks and proves the result is the item
+/// that was offered (ADR 0014).
+///
+/// Pure accounting — no I/O, no platform, no clock — so every rejection
+/// path is reachable in a unit test (docs/ARCHITECTURE.md §3). The
+/// receiver's whole memory commitment is this buffer, sized from the
+/// offered length *after* that length was validated against the type's
+/// maximum (NFR-1).
+#[derive(Debug)]
+pub struct ChunkReassembly {
+    meta: ClipboardMeta,
+    plan: Option<ChunkPlan>,
+    buffer: Vec<u8>,
+    next_index: u32,
+    complete: bool,
+}
+
+impl ChunkReassembly {
+    /// Begin reassembling the offered item.
+    ///
+    /// Validates `meta` — crucially the declared length against the
+    /// per-type maximum — **before** sizing the buffer from it.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] if the meta is invalid, if the type
+    /// does not travel as chunks, or if the declared length cannot be
+    /// represented as a buffer on this target;
+    /// [`ProtocolError::ResourceExhausted`] if the (bounded, validated)
+    /// buffer cannot be reserved — the caller declines the transfer
+    /// rather than the process dying.
+    pub fn begin(meta: ClipboardMeta) -> Result<Self, ProtocolError> {
+        meta.validate()?;
+        if !meta.content_type.is_chunked() {
+            return Err(ProtocolError::Malformed {
+                reason: format!("{:?} items do not travel as chunks", meta.content_type),
+            });
+        }
+        // Bounded by the check inside `validate` above; `try_from` covers
+        // the 32-bit target where the bound alone would not.
+        let Ok(capacity) = usize::try_from(meta.content_length) else {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "declared length {} cannot be buffered on this target",
+                    meta.content_length
+                ),
+            });
+        };
+        // `try_reserve`, not `with_capacity`: the length is legal and
+        // bounded, but a legal 64 MiB is still 64 MiB, and infallible
+        // allocation turns a memory-pressured machine into an aborted
+        // process at a peer's choosing. The ordering NFR-1 cares about is
+        // unchanged — validate, *then* allocate.
+        let mut buffer = Vec::new();
+        if buffer.try_reserve_exact(capacity).is_err() {
+            return Err(ProtocolError::ResourceExhausted {
+                what: "a clipboard reassembly buffer",
+                requested: meta.content_length,
+            });
+        }
+        Ok(Self {
+            meta,
+            plan: None,
+            buffer,
+            next_index: 0,
+            complete: false,
+        })
+    }
+
+    /// The item being reassembled.
+    #[must_use]
+    pub const fn meta(&self) -> ClipboardMeta {
+        self.meta
+    }
+
+    /// Bytes accumulated so far.
+    #[must_use]
+    pub fn received_bytes(&self) -> u64 {
+        self.buffer.len() as u64
+    }
+
+    /// The plan, once chunk 0 has fixed the sender's chunk size.
+    #[must_use]
+    pub const fn plan(&self) -> Option<ChunkPlan> {
+        self.plan
+    }
+
+    /// Take one chunk.
+    ///
+    /// The reject list, all fail-closed: a chunk for a different item; an
+    /// index that is not exactly the next one (a gap, a repeat, or
+    /// backwards); a chunk after the transfer completed; a first chunk
+    /// whose size implies a plan that does not reconcile with the offered
+    /// length or exceeds [`MAX_CHUNK_COUNT`]; any chunk whose length is
+    /// not the exact length its position requires — which is also what
+    /// makes the running total incapable of passing the declared length.
+    /// Completion additionally requires the item's `content_hash` to
+    /// verify over the reassembled bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] for every case above.
+    pub fn accept(&mut self, chunk: &ClipboardChunk) -> Result<ChunkOutcome, ProtocolError> {
+        chunk.validate()?;
+        if self.complete {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk {} for item {} arrived after the transfer completed",
+                    chunk.index, self.meta.id
+                ),
+            });
+        }
+        if chunk.id != self.meta.id {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk for item {} during reassembly of {}",
+                    chunk.id, self.meta.id
+                ),
+            });
+        }
+        if chunk.index != self.next_index {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk index {} out of sequence; expected {}",
+                    chunk.index, self.next_index
+                ),
+            });
+        }
+
+        // Chunk 0 fixes the sender's chunk size, and with it the whole
+        // plan — reconciled against the offered length before a byte of it
+        // is kept. Computed here but **not stored yet**: a rejection must
+        // leave no trace in a fail-closed parser, and storing before the
+        // checks below would let a refused chunk decide how the rest of
+        // the transfer is measured.
+        let plan = if let Some(plan) = self.plan {
+            plan
+        } else {
+            let Ok(chunk_bytes) = u32::try_from(chunk.payload.len()) else {
+                return Err(ProtocolError::Malformed {
+                    reason: "chunk payload length is not representable".to_owned(),
+                });
+            };
+            ChunkPlan::derive(self.meta.content_length, chunk_bytes)?
+        };
+
+        let Some(expected) = plan.chunk_len(chunk.index) else {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk index {} is past the {}-chunk transfer",
+                    chunk.index,
+                    plan.chunk_count()
+                ),
+            });
+        };
+        if chunk.payload.len() as u64 != u64::from(expected) {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk {} carries {} bytes; the plan requires exactly {expected}",
+                    chunk.index,
+                    chunk.payload.len()
+                ),
+            });
+        }
+
+        // Accepted: only now does any of it become state.
+        self.plan = Some(plan);
+        self.buffer.extend_from_slice(&chunk.payload);
+        self.next_index = self.next_index.saturating_add(1);
+        if self.next_index < plan.chunk_count() {
+            return Ok(ChunkOutcome::More);
+        }
+
+        // Every declared byte is here. Verify the item's identity before
+        // anything downstream is allowed to touch the OS clipboard.
+        if self.buffer.len() as u64 != self.meta.content_length {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "reassembled {} bytes for a declared length of {}",
+                    self.buffer.len(),
+                    self.meta.content_length
+                ),
+            });
+        }
+        let digest: [u8; 32] = Sha256::digest(&self.buffer).into();
+        if digest != self.meta.content_hash {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "reassembled content hash mismatch for item {}",
+                    self.meta.id
+                ),
+            });
+        }
+        self.complete = true;
+        Ok(ChunkOutcome::Complete(std::mem::take(&mut self.buffer)))
+    }
+}
+
+/// The capability a peer must have advertised before this frame may be
+/// sent to it (docs/PROTOCOL.md §3.1), from the frame alone.
+///
+/// This is the shape the **send-path gate** needs: a chokepoint that sees
+/// every outbound frame sees `(message_type, payload)` and nothing else,
+/// so the rule has to be answerable from exactly that. Gating there
+/// rather than at each call site is what makes the guarantee
+/// unbypassable — no future caller can forget it.
+///
+/// Cheap by construction: `ClipboardMeta` is the first field of both
+/// [`ClipboardOffer`] and [`ClipboardData`], and postcard is sequential,
+/// so only that prefix is decoded — never the content.
+///
+/// **A payload whose meta prefix does not decode claims no capability**,
+/// and that is sound rather than lenient: decoding is deterministic and
+/// schema-identical on both ends, so bytes this side cannot read as a
+/// `ClipboardMeta` are bytes the peer cannot read as a typed item either.
+/// They can therefore neither carry an un-negotiated content type nor
+/// kill a session by discriminant. Classifying a capability and
+/// validating a payload are separate jobs; `encode_payload` owns the
+/// second one, at the point the message is built.
+#[must_use]
+pub fn required_feature_for_frame(message_type: u16, payload: &[u8]) -> FeatureFlags {
+    match MessageType::from_wire(message_type) {
+        // The message type *is* the capability: a peer without the bit
+        // has no decoder for it, whatever it carries.
+        Some(MessageType::ClipboardChunk) => FeatureFlags::CHUNKED_CLIPBOARD,
+        // These two carry a content type, and a content type a peer
+        // cannot decode is fatal to it, not skippable (§2).
+        Some(MessageType::ClipboardOffer | MessageType::ClipboardData) => {
+            crate::decode_prefix::<ClipboardMeta>(payload, "ClipboardMeta")
+                .map_or(FeatureFlags::NONE, |meta| {
+                    meta.content_type.required_feature()
+                })
+        }
+        // Everything else is base protocol.
+        _ => FeatureFlags::NONE,
+    }
+}
+
+/// Split `content` into the chunks that carry it (ADR 0014).
+///
+/// The sender's counterpart to [`ChunkReassembly`], here so both sides of
+/// the arithmetic live together and are tested against each other.
+///
+/// # Errors
+///
+/// [`ProtocolError::Malformed`] if `content` is empty or does not fit
+/// inside [`MAX_CHUNK_COUNT`] chunks.
+pub fn chunk_content(id: Uuid, content: &[u8]) -> Result<Vec<ClipboardChunk>, ProtocolError> {
+    let plan = ChunkPlan::for_length(content.len() as u64)?;
+    let mut chunks = Vec::with_capacity(plan.chunk_count() as usize);
+    for (index, payload) in content.chunks(MAX_CHUNK_BYTES).enumerate() {
+        let Ok(index) = u32::try_from(index) else {
+            return Err(ProtocolError::Malformed {
+                reason: "chunk index is not representable".to_owned(),
+            });
+        };
+        chunks.push(ClipboardChunk {
+            id,
+            index,
+            payload: payload.to_vec(),
+        });
+    }
+    Ok(chunks)
 }
 
 /// The transaction verdict from the destination.
@@ -317,14 +1017,21 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use uuid::Uuid;
 
     use super::{
-        ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardAccept, ClipboardApplied, ClipboardData,
-        ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
-        MAX_CLIPBOARD_TEXT_BYTES,
+        ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ChunkOutcome, ChunkPlan, ChunkReassembly,
+        ClipboardAccept, ClipboardApplied, ClipboardChunk, ClipboardData, ClipboardDecline,
+        ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, ImageFormat, MAX_CHUNK_BYTES,
+        MAX_CHUNK_BYTES_U32, MAX_CHUNK_COUNT, MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_TEXT_BYTES,
+        chunk_content, content_hash,
     };
     use crate::ProtocolError;
+    use crate::hello::FeatureFlags;
+
+    const ITEM: Uuid = Uuid::from_bytes([0x11; 16]);
+    const ORIGIN: Uuid = Uuid::from_bytes([0x22; 16]);
 
     fn data(content: &[u8]) -> ClipboardData {
         ClipboardData::from_content(
@@ -426,6 +1133,7 @@ mod tests {
             DeclineReason::TooLarge,
             DeclineReason::NotReady,
             DeclineReason::Superseded,
+            DeclineReason::UnsupportedType,
         ] {
             let decline = ClipboardDecline {
                 id: Uuid::from_bytes([0x44; 16]),
@@ -495,6 +1203,69 @@ mod tests {
         );
     }
 
+    /// Golden discriminants for every typed enum that crosses the wire
+    /// (ADR 0001).
+    ///
+    /// Round-trip tests cannot catch what this catches: encode and decode
+    /// move together inside one build, so reordering a variant round-trips
+    /// perfectly while silently changing what the *other* build reads —
+    /// an `AlreadyHave` arriving as `TooLarge` turns a synchronization
+    /// success into a refusal, with no error anywhere. Only bytes pin
+    /// that. Variants are appended, never reordered; a failure here is a
+    /// protocol version bump, not a test to update.
+    #[test]
+    fn golden_wire_discriminants_for_typed_enums() {
+        for (reason, discriminant) in [
+            (DeclineReason::AlreadyHave, 0x00),
+            (DeclineReason::TooLarge, 0x01),
+            (DeclineReason::NotReady, 0x02),
+            (DeclineReason::Superseded, 0x03),
+            (DeclineReason::UnsupportedType, 0x04),
+        ] {
+            let mut expected: Vec<u8> = vec![0x10];
+            expected.extend([0x11; 16]);
+            expected.push(discriminant);
+            assert_eq!(
+                ClipboardDecline { id: ITEM, reason }
+                    .encode_payload()
+                    .unwrap(),
+                expected,
+                "{reason:?} changed wire value: bump the protocol version"
+            );
+        }
+
+        for (result, discriminant) in [
+            (ApplyResult::Applied, 0x00),
+            (ApplyResult::ClipboardUnavailable, 0x01),
+            (ApplyResult::ContentRejected, 0x02),
+            (ApplyResult::Superseded, 0x03),
+        ] {
+            let mut expected: Vec<u8> = vec![0x10];
+            expected.extend([0x11; 16]);
+            expected.push(discriminant);
+            assert_eq!(
+                ClipboardApplied { id: ITEM, result }
+                    .encode_payload()
+                    .unwrap(),
+                expected,
+                "{result:?} changed wire value: bump the protocol version"
+            );
+        }
+
+        for (content_type, encoded) in [
+            (ContentType::Utf8Text, vec![0x00]),
+            (ContentType::Image(ImageFormat::Dib), vec![0x01, 0x00]),
+            (ContentType::Image(ImageFormat::Png), vec![0x01, 0x01]),
+            (ContentType::Image(ImageFormat::Jpeg), vec![0x01, 0x02]),
+        ] {
+            assert_eq!(
+                super::encode(&content_type).unwrap(),
+                encoded,
+                "{content_type:?} changed wire value: bump the protocol version"
+            );
+        }
+    }
+
     #[test]
     fn garbage_and_padded_payloads_are_malformed() {
         assert!(matches!(
@@ -515,5 +1286,569 @@ mod tests {
         // ClipboardMeta is the engine's working currency; keep it Copy.
         fn assert_copy<T: Copy>() {}
         assert_copy::<ClipboardMeta>();
+    }
+
+    // --- chunked rich clipboard (ADR 0014) ---------------------------------
+
+    fn image_meta(content: &[u8]) -> ClipboardMeta {
+        ClipboardMeta {
+            id: ITEM,
+            origin: ORIGIN,
+            sequence: 3,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: content.len() as u64,
+            content_hash: content_hash(content),
+        }
+    }
+
+    /// Feed every chunk into a reassembly, returning the verified bytes.
+    fn reassemble(
+        meta: ClipboardMeta,
+        chunks: &[ClipboardChunk],
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let mut reassembly = ChunkReassembly::begin(meta)?;
+        let mut last = ChunkOutcome::More;
+        for chunk in chunks {
+            last = reassembly.accept(chunk)?;
+        }
+        match last {
+            ChunkOutcome::Complete(bytes) => Ok(bytes),
+            ChunkOutcome::More => Err(ProtocolError::Malformed {
+                reason: "transfer never completed".to_owned(),
+            }),
+        }
+    }
+
+    #[test]
+    fn chunks_round_trip_through_payload_encoding() {
+        let chunk = ClipboardChunk {
+            id: ITEM,
+            index: 7,
+            payload: vec![0xAB; 1024],
+        };
+        assert_eq!(
+            ClipboardChunk::decode_payload(&chunk.encode_payload().unwrap()).unwrap(),
+            chunk
+        );
+    }
+
+    /// Golden wire snapshot (ADR 0001): a schema change here is a protocol
+    /// version bump, and `ContentType`'s discriminants are wire values —
+    /// `Utf8Text` stays 0 and `Image` was appended as 1.
+    #[test]
+    fn golden_wire_snapshots_for_chunked_transfer() {
+        let chunk = ClipboardChunk {
+            id: ITEM,
+            index: 2,
+            payload: b"px".to_vec(),
+        };
+        let mut expected: Vec<u8> = Vec::new();
+        expected.push(0x10); // id: 16-byte length prefix
+        expected.extend([0x11; 16]);
+        expected.push(0x02); // index varint
+        expected.extend([0x02, b'p', b'x']); // payload: len-prefixed bytes
+        assert_eq!(
+            chunk.encode_payload().unwrap(),
+            expected,
+            "v2 ClipboardChunk wire layout changed: bump the protocol version"
+        );
+
+        let offer = ClipboardOffer {
+            meta: image_meta(b"px"),
+        };
+        let encoded = offer.encode_payload().unwrap();
+        // ContentType sits after id (17), origin (17) and the sequence
+        // varint (1): Image = 1, ImageFormat::Dib = 0.
+        assert_eq!(
+            &encoded[35..37],
+            &[0x01, 0x00],
+            "ContentType discriminants are wire values and are never renumbered"
+        );
+        assert_eq!(ClipboardOffer::decode_payload(&encoded).unwrap(), offer);
+    }
+
+    /// The inline-threshold rule is a *text* rule: an image is always
+    /// offered, at any size, because the offer round is where the
+    /// already-have-this-hash decline makes a re-paste move zero bytes.
+    #[test]
+    fn images_are_offered_at_any_size_while_text_keeps_the_inline_threshold() {
+        let tiny_image = ClipboardOffer {
+            meta: image_meta(b"a tiny snip"),
+        };
+        assert!(tiny_image.encode_payload().is_ok());
+
+        let mut tiny_text = tiny_image.meta;
+        tiny_text.content_type = ContentType::Utf8Text;
+        assert!(matches!(
+            ClipboardOffer { meta: tiny_text }.encode_payload(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// One path per type: a chunked type never travels as `ClipboardData`,
+    /// so there is no ambiguity about which validation ran over it.
+    #[test]
+    fn image_content_is_rejected_as_clipboard_data() {
+        let content = vec![0xFFu8; 128];
+        let item = ClipboardData {
+            meta: image_meta(&content),
+            content,
+        };
+        assert!(matches!(
+            item.encode_payload(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        let bytes = super::encode(&item).unwrap();
+        assert!(matches!(
+            ClipboardData::decode_payload(&bytes),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Per-type maxima: an image may be far larger than any text item, and
+    /// each type's own ceiling is what its declared length is checked
+    /// against — before anything is sized from it.
+    #[test]
+    fn each_content_type_is_bounded_by_its_own_maximum() {
+        let at_limit = ClipboardMeta {
+            content_length: MAX_CLIPBOARD_IMAGE_BYTES as u64,
+            ..image_meta(b"unused")
+        };
+        assert!(ClipboardOffer { meta: at_limit }.validate().is_ok());
+
+        let over = ClipboardMeta {
+            content_length: (MAX_CLIPBOARD_IMAGE_BYTES as u64) + 1,
+            ..at_limit
+        };
+        assert!(matches!(
+            ClipboardOffer { meta: over }.validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // An image-sized *text* item is still refused at the text bound.
+        let text = ClipboardMeta {
+            content_type: ContentType::Utf8Text,
+            content_length: (MAX_CLIPBOARD_TEXT_BYTES as u64) + 1,
+            ..at_limit
+        };
+        assert!(matches!(
+            ClipboardOffer { meta: text }.validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // A zero-byte image is not an image.
+        let empty = ClipboardMeta {
+            content_length: 0,
+            ..at_limit
+        };
+        assert!(matches!(
+            ChunkReassembly::begin(empty),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Image bytes are arbitrary binary; the UTF-8 rule belongs to text
+    /// alone, and it must not follow the bytes into reassembly.
+    #[test]
+    fn image_bytes_need_not_be_utf8() {
+        let content: Vec<u8> = (0..=255u8).cycle().take(3000).collect();
+        let meta = image_meta(&content);
+        let chunks = chunk_content(meta.id, &content).unwrap();
+        assert_eq!(reassemble(meta, &chunks).unwrap(), content);
+    }
+
+    #[test]
+    fn chunk_validation_rejects_empty_oversized_and_out_of_range() {
+        let empty = ClipboardChunk {
+            id: ITEM,
+            index: 0,
+            payload: Vec::new(),
+        };
+        assert!(matches!(
+            empty.validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        let oversized = ClipboardChunk {
+            id: ITEM,
+            index: 0,
+            payload: vec![0u8; MAX_CHUNK_BYTES + 1],
+        };
+        assert!(matches!(
+            oversized.validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // The boundary itself is fine.
+        assert!(
+            ClipboardChunk {
+                id: ITEM,
+                index: 0,
+                payload: vec![0u8; MAX_CHUNK_BYTES],
+            }
+            .validate()
+            .is_ok()
+        );
+
+        let far_index = ClipboardChunk {
+            id: ITEM,
+            index: MAX_CHUNK_COUNT,
+            payload: vec![1u8],
+        };
+        assert!(matches!(
+            far_index.validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // Encode refuses what decode would refuse.
+        assert!(matches!(
+            far_index.encode_payload(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Length, chunk size and chunk count must reconcile *exactly*.
+    #[test]
+    fn chunk_plans_reconcile_length_size_and_count() {
+        // An exact multiple: every chunk full, none left over.
+        let plan = ChunkPlan::derive(1024, 256).unwrap();
+        assert_eq!((plan.chunk_count(), plan.chunk_bytes()), (4, 256));
+        assert_eq!(plan.chunk_len(3), Some(256));
+        assert_eq!(plan.chunk_len(4), None);
+
+        // A remainder: the final chunk is short, and only the final one.
+        let plan = ChunkPlan::derive(1025, 256).unwrap();
+        assert_eq!(plan.chunk_count(), 5);
+        assert_eq!(plan.chunk_len(3), Some(256));
+        assert_eq!(plan.chunk_len(4), Some(1));
+
+        // Smaller than one chunk: a single, short chunk.
+        let plan = ChunkPlan::derive(10, 256).unwrap();
+        assert_eq!((plan.chunk_count(), plan.chunk_len(0)), (1, Some(10)));
+
+        // The sender's default plan uses full chunks.
+        let plan = ChunkPlan::for_length((MAX_CHUNK_BYTES as u64) + 1).unwrap();
+        assert_eq!(plan.chunk_count(), 2);
+        assert_eq!(plan.chunk_bytes(), MAX_CHUNK_BYTES_U32);
+    }
+
+    #[test]
+    fn inconsistent_chunk_declarations_are_rejected() {
+        // Zero-sized chunks would never terminate.
+        assert!(matches!(
+            ChunkPlan::derive(1024, 0),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // A chunk larger than the preemption unit defeats ADR 0013.
+        assert!(matches!(
+            ChunkPlan::derive(1024, MAX_CHUNK_BYTES_U32 + 1),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // Nothing to transfer.
+        assert!(matches!(
+            ChunkPlan::derive(0, 256),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // A legal-looking transfer of millions of tiny chunks: the count
+        // bound refuses it before anything is buffered.
+        assert!(matches!(
+            ChunkPlan::derive(MAX_CLIPBOARD_IMAGE_BYTES as u64, 1),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // The largest item still fits, at the largest chunk size.
+        let plan =
+            ChunkPlan::derive(MAX_CLIPBOARD_IMAGE_BYTES as u64, MAX_CHUNK_BYTES_U32).unwrap();
+        assert_eq!(plan.chunk_count(), MAX_CHUNK_COUNT);
+        // No length math overflows, however absurd the declaration.
+        assert!(matches!(
+            ChunkPlan::derive(u64::MAX, 1),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn reassembly_completes_only_after_the_hash_verifies() {
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let meta = image_meta(&content);
+        let chunks = chunk_content(meta.id, &content).unwrap();
+        assert_eq!(chunks.len(), 4);
+
+        let mut reassembly = ChunkReassembly::begin(meta).unwrap();
+        for chunk in &chunks[..chunks.len() - 1] {
+            assert_eq!(reassembly.accept(chunk).unwrap(), ChunkOutcome::More);
+        }
+        assert_eq!(reassembly.received_bytes(), 3 * MAX_CHUNK_BYTES as u64);
+        let ChunkOutcome::Complete(bytes) = reassembly.accept(chunks.last().unwrap()).unwrap()
+        else {
+            panic!("the final chunk must complete the item");
+        };
+        assert_eq!(bytes, content);
+    }
+
+    /// The hash is verified over the *reassembled* bytes: a single flipped
+    /// byte in one chunk, with every length still exact, must not reach the
+    /// caller (ADR 0014 — nothing unverified touches the OS clipboard).
+    #[test]
+    fn reassembly_detects_a_hash_mismatch_over_the_whole_item() {
+        let content = vec![0x5Au8; 100_000];
+        let meta = image_meta(&content);
+        let mut chunks = chunk_content(meta.id, &content).unwrap();
+        chunks[0].payload[17] ^= 0xFF;
+        assert!(matches!(
+            reassemble(meta, &chunks),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn reassembly_requires_strictly_sequential_indices() {
+        let content = vec![0x11u8; 3 * MAX_CHUNK_BYTES];
+        let meta = image_meta(&content);
+        let chunks = chunk_content(meta.id, &content).unwrap();
+
+        // A gap.
+        let gapped = [chunks[0].clone(), chunks[2].clone()];
+        assert!(matches!(
+            reassemble(meta, &gapped),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // A repeat.
+        let repeated = [chunks[0].clone(), chunks[0].clone()];
+        assert!(matches!(
+            reassemble(meta, &repeated),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // Backwards.
+        let backwards = [chunks[0].clone(), chunks[1].clone(), chunks[0].clone()];
+        assert!(matches!(
+            reassemble(meta, &backwards),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // Out of range for this transfer: index 3 of a 3-chunk item.
+        let past_end = [
+            chunks[0].clone(),
+            chunks[1].clone(),
+            chunks[2].clone(),
+            ClipboardChunk {
+                id: meta.id,
+                index: 3,
+                payload: vec![0x11; 16],
+            },
+        ];
+        assert!(matches!(
+            reassemble(meta, &past_end),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn reassembly_requires_the_exact_length_each_position_demands() {
+        let content = vec![0x22u8; 2 * MAX_CHUNK_BYTES + 100];
+        let meta = image_meta(&content);
+        let chunks = chunk_content(meta.id, &content).unwrap();
+
+        // A short non-final chunk would make the running total drift.
+        let mut short_first = chunks.clone();
+        short_first[0].payload.truncate(MAX_CHUNK_BYTES - 1);
+        assert!(matches!(
+            reassemble(meta, &short_first),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // A final chunk that overshoots the declared length.
+        let mut long_final = chunks.clone();
+        long_final[2].payload.extend(std::iter::repeat_n(0x22, 8));
+        assert!(matches!(
+            reassemble(meta, &long_final),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // A first chunk whose size implies a plan that cannot reconcile
+        // with the offered length: 1-byte chunks for a 128 KiB item needs
+        // more chunks than the protocol allows.
+        let degenerate = [ClipboardChunk {
+            id: meta.id,
+            index: 0,
+            payload: vec![0x22; 1],
+        }];
+        assert!(matches!(
+            reassemble(meta, &degenerate),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn reassembly_rejects_foreign_ids_and_late_chunks() {
+        let content = vec![0x33u8; 32];
+        let meta = image_meta(&content);
+        let chunks = chunk_content(meta.id, &content).unwrap();
+
+        let foreign = [ClipboardChunk {
+            id: Uuid::from_bytes([0x99; 16]),
+            ..chunks[0].clone()
+        }];
+        assert!(matches!(
+            reassemble(meta, &foreign),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // The item completed on chunk 0; anything after it is a violation.
+        let mut reassembly = ChunkReassembly::begin(meta).unwrap();
+        assert!(matches!(
+            reassembly.accept(&chunks[0]).unwrap(),
+            ChunkOutcome::Complete(_)
+        ));
+        assert!(matches!(
+            reassembly.accept(&chunks[0]),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn reassembly_refuses_non_chunked_types_and_oversized_declarations() {
+        let text = ClipboardMeta {
+            content_type: ContentType::Utf8Text,
+            ..image_meta(b"not an image")
+        };
+        assert!(matches!(
+            ChunkReassembly::begin(text),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // The declared length is checked against the type maximum before
+        // the buffer is sized from it (NFR-1): this must fail without
+        // attempting a 64 MiB + 1 allocation.
+        let oversized = ClipboardMeta {
+            content_length: (MAX_CLIPBOARD_IMAGE_BYTES as u64) + 1,
+            ..image_meta(b"unused")
+        };
+        assert!(matches!(
+            ChunkReassembly::begin(oversized),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// The sender's gate (docs/PROTOCOL.md §3): unknown message types are
+    /// skipped rather than fatal, so an un-negotiated chunked offer would
+    /// simply never be answered. Nothing goes out that the peer has not
+    /// said it can take.
+    #[test]
+    fn chunked_content_is_offered_only_to_a_peer_that_advertised_it() {
+        let image = ClipboardOffer {
+            meta: image_meta(b"a snip"),
+        };
+        let text = ClipboardOffer {
+            meta: ClipboardMeta {
+                content_type: ContentType::Utf8Text,
+                content_length: (CLIPBOARD_INLINE_MAX_BYTES as u64) + 1,
+                ..image.meta
+            },
+        };
+
+        assert!(!image.negotiated_by(FeatureFlags::NONE));
+        assert!(image.negotiated_by(FeatureFlags::CHUNKED_CLIPBOARD));
+        assert!(image.negotiated_by(FeatureFlags::ALL));
+        // The base protocol's types need no bit at all.
+        assert!(text.negotiated_by(FeatureFlags::NONE));
+
+        // A feature is active only when both sides advertise it.
+        assert_eq!(
+            FeatureFlags::negotiate(FeatureFlags::ALL, FeatureFlags::NONE),
+            FeatureFlags::NONE
+        );
+        assert_eq!(
+            FeatureFlags::negotiate(FeatureFlags::ALL, FeatureFlags::ALL),
+            FeatureFlags::CHUNKED_CLIPBOARD
+        );
+        // An unknown bit from a future peer never activates anything.
+        assert_eq!(
+            FeatureFlags::negotiate(FeatureFlags::ALL, FeatureFlags(1 << 63)),
+            FeatureFlags::NONE
+        );
+    }
+
+    #[test]
+    fn garbage_truncated_and_padded_chunk_payloads_are_malformed() {
+        assert!(matches!(
+            ClipboardChunk::decode_payload(&[0xFF; 30]),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        let good = ClipboardChunk {
+            id: ITEM,
+            index: 1,
+            payload: b"bytes".to_vec(),
+        }
+        .encode_payload()
+        .unwrap();
+        assert!(matches!(
+            ClipboardChunk::decode_payload(&good[..good.len() - 1]),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        let mut padded = good;
+        padded.push(0x00);
+        assert!(matches!(
+            ClipboardChunk::decode_payload(&padded),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    proptest! {
+        /// Any content splits and reassembles byte-identically, through
+        /// the same encode/decode every chunk takes on the wire.
+        #[test]
+        fn any_content_survives_chunking_and_reassembly(
+            content in proptest::collection::vec(any::<u8>(), 1..200_000),
+        ) {
+            let meta = image_meta(&content);
+            let chunks = chunk_content(meta.id, &content).unwrap();
+            let mut reassembly = ChunkReassembly::begin(meta).unwrap();
+            let mut assembled = None;
+            for chunk in &chunks {
+                let wire = chunk.encode_payload().unwrap();
+                let decoded = ClipboardChunk::decode_payload(&wire).unwrap();
+                if let ChunkOutcome::Complete(bytes) = reassembly.accept(&decoded).unwrap() {
+                    assembled = Some(bytes);
+                }
+            }
+            prop_assert_eq!(assembled, Some(content));
+        }
+
+        /// Arbitrary chunk sequences never panic: every outcome is bytes,
+        /// "more", or a typed rejection (NFR-1).
+        #[test]
+        fn arbitrary_chunk_sequences_never_panic(
+            declared in 1u64..300_000,
+            chunks in proptest::collection::vec(
+                (0u32..8, proptest::collection::vec(any::<u8>(), 0..70_000)),
+                0..8,
+            ),
+        ) {
+            let meta = ClipboardMeta {
+                content_length: declared,
+                ..image_meta(b"unused")
+            };
+            let Ok(mut reassembly) = ChunkReassembly::begin(meta) else { return Ok(()); };
+            for (index, payload) in chunks {
+                let chunk = ClipboardChunk { id: meta.id, index, payload };
+                let (bytes_before, plan_before) =
+                    (reassembly.received_bytes(), reassembly.plan());
+                if reassembly.accept(&chunk).is_err() {
+                    // A rejection leaves no trace: nothing buffered, and
+                    // no plan fixed by a chunk that was refused.
+                    prop_assert_eq!(reassembly.received_bytes(), bytes_before);
+                    prop_assert_eq!(reassembly.plan(), plan_before);
+                    break; // fail closed: the transfer is over
+                }
+            }
+        }
+
+        /// Arbitrary bytes never panic the chunk decoder, and anything
+        /// that decodes survives a re-encode unchanged.
+        #[test]
+        fn arbitrary_bytes_decode_or_reject_without_panicking(
+            bytes in proptest::collection::vec(any::<u8>(), 0..512),
+        ) {
+            if let Ok(chunk) = ClipboardChunk::decode_payload(&bytes) {
+                let again = ClipboardChunk::decode_payload(&chunk.encode_payload().unwrap())
+                    .unwrap();
+                prop_assert_eq!(chunk, again);
+            }
+        }
     }
 }

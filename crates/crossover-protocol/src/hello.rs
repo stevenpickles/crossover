@@ -55,6 +55,10 @@ pub enum MessageType {
     ControlResponse = 14,
     /// Control: end the control relationship (hand-back or revocation).
     ControlRelease = 15,
+    /// Clipboard: one fragment of a chunked item (ADR 0014). Gated by
+    /// [`FeatureFlags::CHUNKED_CLIPBOARD`] — a peer that has not
+    /// advertised it is never sent one.
+    ClipboardChunk = 16,
 }
 
 impl MessageType {
@@ -79,6 +83,7 @@ impl MessageType {
             13 => Some(Self::ControlRequest),
             14 => Some(Self::ControlResponse),
             15 => Some(Self::ControlRelease),
+            16 => Some(Self::ClipboardChunk),
             _ => None,
         }
     }
@@ -106,16 +111,60 @@ pub enum OsFamily {
 
 /// Feature bitmask for capability negotiation beyond the base protocol.
 ///
-/// Bit assignments are defined per protocol version; version 1 defines no
-/// bits, so the only valid value is empty. Unknown bits from a peer are
-/// ignored, not an error: a feature is active only when *both* sides
-/// advertise it, so an unknown bit simply never activates.
+/// Bit assignments are defined per protocol version. Unknown bits from a
+/// peer are ignored, not an error: a feature is active only when *both*
+/// sides advertise it ([`FeatureFlags::negotiate`]), so an unknown bit
+/// simply never activates.
+///
+/// This is the route PROTOCOL.md §3 fixes for capabilities beyond the base
+/// protocol, and ADR 0014's answer to its own interop question. It matters
+/// because unknown *message types* are skipped rather than fatal (§2): a
+/// peer sent content it does not understand would answer nothing at all,
+/// and a transaction that never gets an answer is exactly the silent
+/// failure NFR-3 forbids. So the sender asks first, via these bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FeatureFlags(pub u64);
 
 impl FeatureFlags {
-    /// No features — the only value version 1 emits.
+    /// No features.
     pub const NONE: Self = Self(0);
+
+    /// Bit 0 — chunked rich-clipboard transfer (ADR 0014): the sender may
+    /// offer `ContentType::Image` items and stream them as
+    /// [`MessageType::ClipboardChunk`] messages. Advertising it means "I
+    /// can reassemble a chunked item and install it", so a build only sets
+    /// it once it genuinely can.
+    pub const CHUNKED_CLIPBOARD: Self = Self(1 << 0);
+
+    /// Every bit this protocol version defines.
+    pub const ALL: Self = Self(Self::CHUNKED_CLIPBOARD.0);
+
+    /// What **this build** advertises in its `Hello`.
+    ///
+    /// Empty today, deliberately: the wire layer for chunked images is
+    /// implemented (this crate), but the clipboard engine cannot yet
+    /// reassemble one and the platform layer cannot yet read or write a
+    /// raster format. Advertising a capability we would then decline is a
+    /// lie in negotiation, and the peer would spend real work preparing an
+    /// item that goes nowhere. **The engine/platform slices of ADR 0014
+    /// set this to [`FeatureFlags::ALL`]** — that flip is what switches
+    /// image transfer on, on both sides at once, and nothing else needs to
+    /// change.
+    pub const ADVERTISED: Self = Self::NONE;
+
+    /// Whether every bit in `feature` is set. `NONE` is contained by
+    /// everything, so base-protocol capabilities never need a bit.
+    #[must_use]
+    pub const fn contains(self, feature: Self) -> bool {
+        self.0 & feature.0 == feature.0
+    }
+
+    /// The features active on a session: the intersection, because a
+    /// capability is usable only if both sides have it.
+    #[must_use]
+    pub const fn negotiate(local: Self, peer: Self) -> Self {
+        Self(local.0 & peer.0)
+    }
 }
 
 /// Session-establishment message (docs/PROTOCOL.md §3).

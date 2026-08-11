@@ -14,8 +14,9 @@ pub mod pairing;
 pub mod version;
 
 pub use clipboard::{
-    ApplyResult, ClipboardAccept, ClipboardApplied, ClipboardData, ClipboardDecline, ClipboardMeta,
-    ClipboardOffer, ContentType, DeclineReason,
+    ApplyResult, ChunkOutcome, ChunkPlan, ChunkReassembly, ClipboardAccept, ClipboardApplied,
+    ClipboardChunk, ClipboardData, ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType,
+    DeclineReason, ImageFormat,
 };
 pub use control::{ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason};
 pub use framing::{FrameDecoder, RawFrame, encode_frame};
@@ -40,6 +41,22 @@ pub(crate) fn decode_strict<'a, T: serde::Deserialize<'a>>(
             reason: format!("{} trailing bytes after {what} payload", rest.len()),
         });
     }
+    Ok(value)
+}
+
+/// Decode the leading value of a payload and **ignore what follows** —
+/// the deliberate opposite of [`decode_strict`], for the one case that
+/// wants a prefix: reading a message's fixed-size header without touching
+/// (or copying) the variable-length content behind it. postcard is
+/// sequential, so a struct's first field is a decodable prefix of it.
+pub(crate) fn decode_prefix<'a, T: serde::Deserialize<'a>>(
+    payload: &'a [u8],
+    what: &str,
+) -> Result<T, ProtocolError> {
+    let (value, _rest): (T, &[u8]) =
+        postcard::take_from_bytes(payload).map_err(|e| ProtocolError::Malformed {
+            reason: format!("undecodable {what} prefix: {e}"),
+        })?;
     Ok(value)
 }
 
@@ -97,6 +114,22 @@ pub enum ProtocolError {
     /// diagnostics never blame a peer for our own encoding failure.
     #[error("encoding outbound message failed: {reason}")]
     Encode { reason: String },
+
+    /// A bounded, already-validated allocation could not be made.
+    ///
+    /// Distinct from [`ProtocolError::Malformed`] because the peer did
+    /// nothing wrong: the length was inside its limit, and this machine
+    /// could not honour it anyway. It exists so that path returns a value
+    /// the caller can decline with, instead of the process aborting —
+    /// Rust's default on allocation failure is `abort`, and a remote peer
+    /// must never be able to reach it (NFR-1).
+    #[error("cannot reserve {requested} bytes for {what}")]
+    ResourceExhausted {
+        /// What the memory was for, for the diagnostic.
+        what: &'static str,
+        /// How many bytes were asked for.
+        requested: u64,
+    },
 }
 
 #[cfg(test)]

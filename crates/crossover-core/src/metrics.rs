@@ -97,6 +97,7 @@ impl FrameClass {
                 | MessageType::ClipboardAccept
                 | MessageType::ClipboardDecline
                 | MessageType::ClipboardData
+                | MessageType::ClipboardChunk
                 | MessageType::ClipboardApplied,
             ) => Self::Clipboard,
             Some(MessageType::InputBatch | MessageType::ReleaseAllInput) => Self::Input,

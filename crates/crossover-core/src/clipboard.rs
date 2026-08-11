@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crossover_protocol::clipboard::{
-    ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardAccept, ClipboardApplied, ClipboardData,
-    ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
+    ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardAccept, ClipboardApplied, ClipboardChunk,
+    ClipboardData, ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
     MAX_CLIPBOARD_TEXT_BYTES, content_hash,
 };
 use crossover_protocol::hello::MessageType;
@@ -40,6 +40,19 @@ use crate::metrics::Metrics;
 /// prevention. Notifications coalesce, so a small window suffices; the
 /// bound keeps memory fixed (NFR-1).
 const APPLIED_HASH_MEMORY: usize = 8;
+
+/// How many clipboard protocol violations a peer may commit on one
+/// session before it is terminated (docs/PROTOCOL.md §7: a violation is
+/// rejected and counted; repeated violations end the session).
+///
+/// Small, but not one. A conforming peer commits zero, yet a *benign*
+/// race can produce a few — chunks already in flight for a transfer this
+/// side abandoned on supersession or session loss arrive with nothing to
+/// belong to, and killing a healthy session over an in-flight tail would
+/// be its own defect. A handful absorbs that; nothing absorbs a peer
+/// streaming violations, which is the point: without a cap, unanswered
+/// junk is free for the sender and unbounded log volume for us.
+const MAX_CLIPBOARD_VIOLATIONS: u32 = 8;
 
 /// Clipboard engine tuning. Grouped because both knobs are timing
 /// policy, and tests need to shrink them without pretending the
@@ -175,6 +188,13 @@ pub enum Action {
         /// How long the clipboard must stay quiet.
         delay: Duration,
     },
+    /// End the session: the peer's clipboard traffic committed repeated
+    /// protocol violations (docs/PROTOCOL.md §7 — a single violation is
+    /// rejected and counted, repetition is fatal).
+    TerminateSession {
+        /// Operator-facing diagnostic naming what the peer did.
+        reason: String,
+    },
 }
 
 /// An inbound clipboard message, decoded by the driver.
@@ -188,6 +208,8 @@ pub enum InboundMessage {
     Decline(ClipboardDecline),
     /// Peer sends item content.
     Data(ClipboardData),
+    /// Peer sends one fragment of a chunked item (ADR 0014).
+    Chunk(ClipboardChunk),
     /// Peer reports the verdict on our item.
     Applied(ClipboardApplied),
 }
@@ -217,6 +239,9 @@ impl InboundMessage {
             }
             Some(MessageType::ClipboardData) => {
                 Some(Self::Data(ClipboardData::decode_payload(payload)?))
+            }
+            Some(MessageType::ClipboardChunk) => {
+                Some(Self::Chunk(ClipboardChunk::decode_payload(payload)?))
             }
             Some(MessageType::ClipboardApplied) => {
                 Some(Self::Applied(ClipboardApplied::decode_payload(payload)?))
@@ -291,6 +316,11 @@ pub struct ClipboardEngine {
     expecting_data: Option<ClipboardMeta>,
     /// The write (with retries) currently underway.
     pending_write: Option<PendingWrite>,
+    /// Clipboard protocol violations this peer has committed since the
+    /// session was established (docs/PROTOCOL.md §7). Reset by
+    /// [`ClipboardEngine::on_session_established`], so the budget is per
+    /// session rather than per process.
+    violations: u32,
     /// Optional metrics sink. Recorded alongside the `tracing` side
     /// effects the engine already emits at each decision point, so the
     /// semantic outcomes only this engine can see — sent, applied,
@@ -323,6 +353,7 @@ impl ClipboardEngine {
             outbound: None,
             expecting_data: None,
             pending_write: None,
+            violations: 0,
             metrics,
         }
     }
@@ -403,6 +434,7 @@ impl ClipboardEngine {
             InboundMessage::Accept(accept) => self.on_peer_accept(accept.id),
             InboundMessage::Decline(decline) => self.on_peer_decline(&decline),
             InboundMessage::Data(data) => self.on_peer_data(data),
+            InboundMessage::Chunk(chunk) => self.on_peer_chunk(&chunk),
             InboundMessage::Applied(applied) => self.on_peer_applied(&applied),
         }
     }
@@ -487,6 +519,10 @@ impl ClipboardEngine {
     pub fn on_session_established(&mut self) -> Vec<Action> {
         self.outbound = None;
         self.expecting_data = None;
+        // A fresh session gets a fresh violation budget: the counter
+        // bounds one peer's misbehaviour on one connection, not a
+        // process-lifetime grudge.
+        self.violations = 0;
         // Ask the driver to re-read: the clipboard may have changed while
         // disconnected, and re-reading routes through the normal dedup
         // (and then through the debounce, like any other observation).
@@ -496,6 +532,19 @@ impl ClipboardEngine {
 
     /// The session dropped: in-flight transaction state is meaningless
     /// now. Pending local writes finish (the content is already here).
+    ///
+    /// TODO(ADR 0014 engine slice): two things must join this cleanup
+    /// when reassembly lands here, because both would otherwise pin up to
+    /// `MAX_CLIPBOARD_IMAGE_BYTES` indefinitely —
+    ///
+    /// 1. the in-flight `ChunkReassembly` must be dropped here, exactly as
+    ///    `outbound` and `expecting_data` are; and
+    /// 2. `expecting_data` (and the reassembly it will gate) has **no
+    ///    timeout**. Today that is harmless: an accepted offer whose Data
+    ///    never arrives costs one `ClipboardMeta`. With images it costs
+    ///    the whole buffer, held until the session happens to end — so an
+    ///    accepted-but-never-fulfilled transfer needs a bounded lifetime,
+    ///    not just a session-scoped one.
     pub fn on_session_lost(&mut self) -> Vec<Action> {
         if let Some(outbound) = self.outbound.take() {
             tracing::debug!(
@@ -531,6 +580,29 @@ impl ClipboardEngine {
     }
 
     fn on_peer_offer(&mut self, offer: ClipboardOffer) -> Vec<Action> {
+        // ---- ADR 0014 placeholder: replaced by the engine slice --------
+        // The wire layer can carry chunked items (images) and prove them
+        // correct; this engine cannot yet reassemble one or hand it to a
+        // typed clipboard write, and the platform layer cannot yet read or
+        // write a raster format. Until those land, refuse *honestly*: a
+        // typed, permanent decline closes the origin's transaction at once
+        // (NFR-3), where silence would strand it. Nothing should reach
+        // here in practice — `FeatureFlags::ADVERTISED` does not offer the
+        // capability, so a conforming peer never offers such an item — so
+        // this is the answer for a peer that ignores negotiation.
+        if offer.meta.content_type.is_chunked() {
+            tracing::info!(
+                clipboard_id = %offer.meta.id,
+                content_type = ?offer.meta.content_type,
+                result = "unsupported_type",
+                "declining an offer of a type this build cannot install"
+            );
+            return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
+                id: offer.meta.id,
+                reason: DeclineReason::UnsupportedType,
+            }))];
+        }
+        // ---------------------------------------------------------------
         if let Some(reason) = self.conflict_verdict(offer.meta) {
             return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
                 id: offer.meta.id,
@@ -575,7 +647,9 @@ impl ClipboardEngine {
                     // Success-shaped: the peer already has the content, or
                     // a newer item won the race.
                     DeclineReason::AlreadyHave | DeclineReason::Superseded => "converged",
-                    DeclineReason::TooLarge | DeclineReason::NotReady => "declined",
+                    DeclineReason::TooLarge
+                    | DeclineReason::NotReady
+                    | DeclineReason::UnsupportedType => "declined",
                 };
                 tracing::info!(
                     clipboard_id = %decline.id,
@@ -650,6 +724,50 @@ impl ClipboardEngine {
         vec![Action::WriteClipboard {
             id: data.meta.id,
             text,
+        }]
+    }
+
+    /// A chunk arrived (ADR 0014).
+    ///
+    /// A chunk with no accepted offer behind it is a protocol violation
+    /// (docs/PROTOCOL.md §5), so it takes §7's handling exactly: rejected,
+    /// counted, logged at **debug** — the level matters, because the log
+    /// volume is otherwise the peer's to choose, and a saturated 2.5 `GbE`
+    /// link is thousands of chunks per second into an uncapped rolling
+    /// file — and fatal once the peer makes a habit of it.
+    ///
+    /// **ADR 0014 placeholder: the engine slice replaces the ignoring**
+    /// with a `ChunkReassembly` for chunks that *do* belong to an accepted
+    /// offer. The violation accounting below stays: it is what makes an
+    /// unsolicited chunk fail closed either way.
+    fn on_peer_chunk(&mut self, chunk: &ClipboardChunk) -> Vec<Action> {
+        tracing::debug!(
+            clipboard_id = %chunk.id,
+            chunk_index = chunk.index,
+            byte_count = chunk.payload.len(),
+            "clipboard chunk with no accepted offer; rejecting"
+        );
+        self.record_violation("clipboard chunk with no accepted offer")
+    }
+
+    /// Count one clipboard protocol violation, terminating the session
+    /// once the peer passes [`MAX_CLIPBOARD_VIOLATIONS`]
+    /// (docs/PROTOCOL.md §7).
+    fn record_violation(&mut self, what: &str) -> Vec<Action> {
+        self.violations = self.violations.saturating_add(1);
+        if self.violations < MAX_CLIPBOARD_VIOLATIONS {
+            return Vec::new();
+        }
+        tracing::warn!(
+            violation_count = self.violations,
+            violation = what,
+            "terminating the session: repeated clipboard protocol violations"
+        );
+        vec![Action::TerminateSession {
+            reason: format!(
+                "{self_violations} clipboard protocol violations ({what})",
+                self_violations = self.violations
+            ),
         }]
     }
 
@@ -988,6 +1106,9 @@ mod tests {
                             self.drive(read, outbox);
                         }
                         Action::ReadClipboard | Action::ScheduleRetry { .. } => {}
+                        Action::TerminateSession { reason } => {
+                            panic!("conforming engines must not terminate: {reason}")
+                        }
                     }
                 }
                 // Complete writes instantly (fake clipboard, no
@@ -1217,6 +1338,78 @@ mod tests {
         );
         e.on_peer_message(InboundMessage::Data(inbound));
         assert_eq!(metrics.snapshot().clipboard_conflicts, 1);
+    }
+
+    /// ADR 0014 placeholder behaviour, asserted so the engine slice
+    /// deliberately replaces it rather than quietly inheriting it: a type
+    /// this build cannot install is refused with a typed, permanent
+    /// decline — never left unanswered (NFR-3), never a panic.
+    #[test]
+    fn a_chunked_offer_is_declined_as_an_unsupported_type() {
+        use crossover_protocol::clipboard::ImageFormat;
+
+        let mut e = engine(0xBB);
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xAA; 16]),
+            sequence: 1,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: 4096,
+            content_hash: content_hash(b"a snip"),
+        };
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        match sent(&actions).as_slice() {
+            [OutboundMessage::Decline(decline)] => {
+                assert_eq!(decline.id, meta.id);
+                assert_eq!(decline.reason, DeclineReason::UnsupportedType);
+            }
+            other => panic!("expected an UnsupportedType decline, got {other:?}"),
+        }
+    }
+
+    /// A chunk with no accepted offer behind it is a protocol violation
+    /// (docs/PROTOCOL.md §5), so it gets §7's handling: rejected and
+    /// counted, survivable once, fatal when the peer makes a habit of it.
+    /// Without the cap, unanswered junk is free for the sender.
+    #[test]
+    fn unsolicited_chunks_are_rejected_and_terminate_the_session_when_repeated() {
+        use crossover_protocol::clipboard::ClipboardChunk;
+
+        use super::MAX_CLIPBOARD_VIOLATIONS;
+
+        let mut e = engine(0xBB);
+        let chunk = |i: u32| {
+            InboundMessage::Chunk(ClipboardChunk {
+                id: Uuid::new_v4(),
+                index: i,
+                payload: vec![0xAB; 32],
+            })
+        };
+
+        // Every violation below the budget is absorbed silently: nothing
+        // applied, nothing acknowledged, the session lives.
+        for i in 0..MAX_CLIPBOARD_VIOLATIONS - 1 {
+            let actions = e.on_peer_message(chunk(i));
+            assert!(actions.is_empty(), "violation {i} acted on: {actions:?}");
+        }
+
+        // The one that reaches the budget ends the session.
+        match e
+            .on_peer_message(chunk(MAX_CLIPBOARD_VIOLATIONS - 1))
+            .as_slice()
+        {
+            [Action::TerminateSession { reason }] => {
+                assert!(
+                    reason.contains("violation"),
+                    "the diagnostic must name what the peer did: {reason}"
+                );
+            }
+            other => panic!("repeated violations must terminate, got {other:?}"),
+        }
+
+        // A new session starts the peer on a clean budget.
+        e.on_session_established();
+        assert!(e.on_peer_message(chunk(0)).is_empty());
     }
 
     #[test]

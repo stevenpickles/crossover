@@ -114,9 +114,11 @@ The decision above is fixed. These were the loose ends; where implementation
 has since settled one, the resolution is noted inline — bookkeeping, not a
 change of decision.
 
-- Exact chunk size (latency budget vs per-frame overhead). **Still open**,
-  and belongs with [ADR 0014](0014-chunked-rich-clipboard-transfer.md)'s
-  chunking work.
+- Exact chunk size (latency budget vs per-frame overhead). **Settled with
+  [ADR 0014](0014-chunked-rich-clipboard-transfer.md)'s chunking work:
+  64 KiB** (`MAX_CHUNK_BYTES`) — 0.21 ms of 2.5 GbE, so one chunk of
+  worst-case input delay stays sub-millisecond, at under 0.1 % envelope
+  overhead. Arithmetic in [PROTOCOL.md](../PROTOCOL.md) §8.
 - Whether small clipboard *text* rides High or Background (it is tiny either
   way). **Settled: Background, along with every other clipboard message.**
   Splitting a transaction across classes would let its acknowledgement

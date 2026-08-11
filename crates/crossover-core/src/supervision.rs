@@ -613,6 +613,20 @@ async fn write_bounded(
     let started = Instant::now();
     match tokio::time::timeout(keepalive.timeout(), writer.send(message_type, payload)).await {
         Ok(Ok(_)) => {}
+        // The send-path gate refused this frame *locally* — nothing
+        // reached the socket, and the session is healthy. Dropping one
+        // frame is the correct outcome and killing the session over it
+        // would be a self-inflicted outage; the loud diagnostic is what
+        // makes the local bug visible (NFR-3).
+        Ok(Err(error @ SessionError::FeatureNotNegotiated { .. })) => {
+            tracing::warn!(
+                message_type,
+                byte_count = payload.len(),
+                error = %error,
+                "outbound frame refused before the wire"
+            );
+            return Ok(());
+        }
         Ok(Err(error)) => return Err(transport_reason(&error)),
         Err(_) => {
             return Err(DisconnectReason::Transport {
@@ -676,6 +690,7 @@ async fn dispatch_frame(
             | MessageType::ClipboardAccept
             | MessageType::ClipboardDecline
             | MessageType::ClipboardData
+            | MessageType::ClipboardChunk
             | MessageType::ClipboardApplied
             | MessageType::InputBatch
             | MessageType::ReleaseAllInput

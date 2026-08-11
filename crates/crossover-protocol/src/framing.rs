@@ -27,11 +27,20 @@ pub const LENGTH_PREFIX_BYTES: usize = 4;
 /// Fixed body header: `message_type` (2) + `message_id` (8).
 pub const BODY_HEADER_BYTES: usize = 10;
 
-/// Maximum accepted frame body (header + payload): one maximum clipboard
-/// item (4 MiB, ADR 0005) plus envelope headroom, so a full item always
-/// fits a single frame and no chunking/reassembly state exists. Safe
-/// against NFR-1 because the declared length is validated before
-/// allocation and the decode buffer is capped.
+/// Maximum accepted frame body (header + payload): one maximum *text*
+/// clipboard item (4 MiB, ADR 0005) plus envelope headroom, so a full text
+/// item always fits a single frame. Safe against NFR-1 because the
+/// declared length is validated before allocation and the decode buffer is
+/// capped.
+///
+/// This bound deliberately does **not** grow for rich clipboard content
+/// (ADR 0014): larger items are split into
+/// [`crate::clipboard::MAX_CHUNK_BYTES`] chunks, which are two orders of
+/// magnitude *below* this ceiling — a chunk is the preemption unit that
+/// keeps live input ahead of a bulk transfer (ADR 0013), and one giant
+/// frame is precisely what cannot be preempted. Reassembly state
+/// therefore does exist, in `ChunkReassembly`, bounded by the offered
+/// length rather than by this constant.
 pub const MAX_FRAME_BODY_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
 
 /// Maximum payload bytes a single frame can carry.
