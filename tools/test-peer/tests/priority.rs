@@ -52,10 +52,7 @@ struct AppSide {
 /// and a deliberate stall must not be mistaken for a dead peer. The one test
 /// that *wants* the stall detected passes its own short config.
 fn patient_keepalive() -> KeepaliveConfig {
-    KeepaliveConfig {
-        interval: Duration::from_secs(30),
-        timeout: Duration::from_mins(2),
-    }
+    KeepaliveConfig::new(Duration::from_secs(30), Duration::from_mins(2)).unwrap()
 }
 
 async fn connected_pair() -> (AppSide, TestConnection) {
@@ -179,10 +176,9 @@ async fn drain_frames(conn: &mut TestConnection, expected: usize) -> Vec<u16> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_that_stops_reading_cannot_suppress_disconnect_detection() {
     // Short enough that the test is quick, long enough to be a real stall.
-    let (app, _conn) = connected_pair_with(KeepaliveConfig {
-        interval: Duration::from_millis(200),
-        timeout: Duration::from_secs(1),
-    })
+    let (app, _conn) = connected_pair_with(
+        KeepaliveConfig::new(Duration::from_millis(200), Duration::from_secs(1)).unwrap(),
+    )
     .await;
 
     // The peer never reads a byte from here on; push until the writer is

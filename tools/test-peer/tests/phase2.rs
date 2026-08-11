@@ -55,10 +55,7 @@ fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     // Session task: accept once, run the shared session loop.
-    let keepalive = KeepaliveConfig {
-        interval: Duration::from_secs(2),
-        timeout: Duration::from_secs(30),
-    };
+    let keepalive = KeepaliveConfig::new(Duration::from_secs(2), Duration::from_secs(30)).unwrap();
     tokio::spawn(async move {
         let (local_identity, certified, trust) = (node.identity, node.certified, node.trust);
         let local = LocalNode {

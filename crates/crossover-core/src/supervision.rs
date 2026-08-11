@@ -81,14 +81,40 @@ impl ReconnectPolicy {
 /// correctness, and must never hold a task open (NFR-1).
 const GRACEFUL_CLOSE_BUDGET: Duration = Duration::from_secs(1);
 
+/// `interval` was not shorter than `timeout`, so the configuration is not
+/// merely odd — it is inoperative (see [`KeepaliveConfig`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "keepalive interval ({interval:?}) must be shorter than the timeout ({timeout:?}): \
+     the peer needs a chance to answer a Ping, and the write-stall bound needs room \
+     between the two to detect anything"
+)]
+pub struct InvalidKeepalive {
+    /// The rejected interval.
+    pub interval: Duration,
+    /// The rejected timeout.
+    pub timeout: Duration,
+}
+
 /// Keepalive tuning for an established session.
+///
+/// The fields are private because the relationship between them is load
+/// bearing twice over, and `interval >= timeout` breaks both silently rather
+/// than loudly:
+///
+/// - the peer would never get a chance to answer a `Ping` before the idle
+///   timeout declared it dead;
+/// - the write-stall bound (`WriteHealth`) would be **inert**, because any
+///   write slow enough to count as stalling already exceeds the per-write
+///   deadline and is killed by that first.
+///
+/// A silently-disabled safety bound is worse than a rejected config, so the
+/// only ways to build one are [`Self::new`], which validates, and
+/// [`Default`], which is valid by construction.
 #[derive(Debug, Clone)]
 pub struct KeepaliveConfig {
-    /// Idle time after which a `Ping` is sent.
-    pub interval: Duration,
-    /// Idle time after which the session is declared dead. Must exceed
-    /// `interval` to give the peer a chance to answer.
-    pub timeout: Duration,
+    interval: Duration,
+    timeout: Duration,
 }
 
 impl Default for KeepaliveConfig {
@@ -97,6 +123,34 @@ impl Default for KeepaliveConfig {
             interval: Duration::from_secs(5),
             timeout: Duration::from_secs(15),
         }
+    }
+}
+
+impl KeepaliveConfig {
+    /// Build a keepalive configuration.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidKeepalive`] if `interval` is not strictly shorter than
+    /// `timeout`. Returned, never panicked: this is reachable from a config
+    /// file, and a bad file must produce a diagnostic (NFR-1, NFR-3).
+    pub fn new(interval: Duration, timeout: Duration) -> Result<Self, InvalidKeepalive> {
+        if interval >= timeout {
+            return Err(InvalidKeepalive { interval, timeout });
+        }
+        Ok(Self { interval, timeout })
+    }
+
+    /// Idle time after which a `Ping` is sent.
+    #[must_use]
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Idle time after which the session is declared dead.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 
@@ -365,7 +419,7 @@ pub async fn run_session(
     let (mut reader, mut writer) = session.split();
     let mut last_rx = Instant::now();
     let mut write_health = WriteHealth::default();
-    let mut tick = tokio::time::interval(keepalive.interval);
+    let mut tick = tokio::time::interval(keepalive.interval());
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let reason = loop {
@@ -419,10 +473,10 @@ pub async fn run_session(
             }
             _ = tick.tick() => {
                 let idle = last_rx.elapsed();
-                if idle >= keepalive.timeout {
+                if idle >= keepalive.timeout() {
                     break DisconnectReason::KeepaliveTimeout;
                 }
-                if idle >= keepalive.interval
+                if idle >= keepalive.interval()
                     && let Err(reason) =
                         write_bounded(&mut writer, MessageType::Ping.wire(), &[], keepalive, None)
                             .await
@@ -484,21 +538,27 @@ impl WriteHealth {
     ) -> Result<(), DisconnectReason> {
         // A quiet spell is not a stall: with nothing queued there was nothing
         // to be held up, so an older stall record is stale evidence.
+        //
+        // The gap is measured to this write's *start*, not its end. Measuring
+        // to the end would fold the write's own duration into the "idle" gap,
+        // so a slow write would clear the very stall run it belongs to — and
+        // a peer stalling every write with a token pause between them would
+        // reset the bound forever.
         if self
             .last_write_end
-            .is_some_and(|end| finished.duration_since(end) >= keepalive.timeout)
+            .is_some_and(|end| started.duration_since(end) >= keepalive.timeout())
         {
             self.stalling_since = None;
         }
         self.last_write_end = Some(finished);
 
-        if finished.duration_since(started) < keepalive.interval {
+        if finished.duration_since(started) < keepalive.interval() {
             self.stalling_since = None;
             return Ok(());
         }
         let stalling_since = *self.stalling_since.get_or_insert(started);
         let stalling_for = finished.duration_since(stalling_since);
-        if stalling_for < keepalive.timeout {
+        if stalling_for < keepalive.timeout() {
             return Ok(());
         }
         Err(DisconnectReason::Transport {
@@ -507,7 +567,7 @@ impl WriteHealth {
                  slower than the {}s keepalive interval); the peer is consuming too \
                  slowly for the session to be usable",
                 stalling_for.as_secs_f32(),
-                keepalive.interval.as_secs_f32()
+                keepalive.interval().as_secs_f32()
             ),
         })
     }
@@ -551,7 +611,7 @@ async fn write_bounded(
     health: Option<&mut WriteHealth>,
 ) -> Result<(), DisconnectReason> {
     let started = Instant::now();
-    match tokio::time::timeout(keepalive.timeout, writer.send(message_type, payload)).await {
+    match tokio::time::timeout(keepalive.timeout(), writer.send(message_type, payload)).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => return Err(transport_reason(&error)),
         Err(_) => {
@@ -560,7 +620,7 @@ async fn write_bounded(
                     "a single {}-byte frame did not finish sending within {}s; the peer is \
                      not consuming this connection",
                     payload.len(),
-                    keepalive.timeout.as_secs_f32()
+                    keepalive.timeout().as_secs_f32()
                 ),
             });
         }
@@ -659,6 +719,43 @@ mod tests {
     use crate::net::{LocalNode, SessionListener, SessionOptions};
     use crate::outbound::outbound_channel;
 
+    // --- keepalive configuration ---
+
+    /// `interval >= timeout` does not just read oddly, it disables things:
+    /// the peer never gets to answer a `Ping`, and the write-stall bound
+    /// becomes inert because any write slow enough to count as stalling has
+    /// already blown the per-write deadline. Rejected at construction, with
+    /// an error rather than a panic — this is reachable from a config file.
+    #[test]
+    fn a_keepalive_whose_interval_swallows_its_timeout_is_rejected() {
+        use super::{InvalidKeepalive, KeepaliveConfig};
+
+        let equal = KeepaliveConfig::new(Duration::from_secs(5), Duration::from_secs(5));
+        assert_eq!(
+            equal.unwrap_err(),
+            InvalidKeepalive {
+                interval: Duration::from_secs(5),
+                timeout: Duration::from_secs(5),
+            }
+        );
+        assert!(KeepaliveConfig::new(Duration::from_secs(30), Duration::from_secs(15)).is_err());
+        assert!(KeepaliveConfig::new(Duration::ZERO, Duration::ZERO).is_err());
+
+        // The message names both values, so a bad config file is actionable.
+        let message = KeepaliveConfig::new(Duration::from_secs(9), Duration::from_secs(3))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("9s"), "{message}");
+        assert!(message.contains("3s"), "{message}");
+
+        // A sane pair is accepted, and the default is one.
+        let ok = KeepaliveConfig::new(Duration::from_secs(1), Duration::from_secs(2)).unwrap();
+        assert_eq!(ok.interval(), Duration::from_secs(1));
+        assert_eq!(ok.timeout(), Duration::from_secs(2));
+        let default = KeepaliveConfig::default();
+        assert!(default.interval() < default.timeout());
+    }
+
     // --- write health (pure) ---
 
     /// 5 s interval / 15 s timeout, the shipped defaults.
@@ -739,6 +836,43 @@ mod tests {
         assert!(
             health.record(at, finished, &keepalive()).is_ok(),
             "an idle gap was charged as continuous stalling"
+        );
+    }
+
+    /// The gap that clears a stall run is measured from one write's end to
+    /// the *next one's start*. Folding the write's own duration into the gap
+    /// would let a slow write clear the run it belongs to — and then a peer
+    /// pausing briefly between stalls resets the bound for ever.
+    #[test]
+    fn a_token_pause_between_stalls_does_not_clear_the_run() {
+        let mut health = super::WriteHealth::default();
+        let mut at = tokio::time::Instant::now();
+
+        // 14.9 s writes with a 200 ms breather: each write on its own is
+        // inside the per-write bound, and the pause is nowhere near the
+        // 15 s idle threshold, so the run must keep accumulating.
+        let mut verdicts = Vec::new();
+        for _ in 0..4 {
+            let finished = at + Duration::from_millis(14_900);
+            verdicts.push(health.record(at, finished, &keepalive()));
+            at = finished + Duration::from_millis(200);
+        }
+        assert!(
+            verdicts.iter().any(Result::is_err),
+            "a token pause between stalling writes cleared the run for ever"
+        );
+
+        // The boundary from the other side: a gap measured from the previous
+        // end to this start that does reach the timeout clears the run.
+        let mut health = super::WriteHealth::default();
+        let at = tokio::time::Instant::now();
+        let finished = at + Duration::from_millis(14_900);
+        assert!(health.record(at, finished, &keepalive()).is_ok());
+        let at = finished + KeepaliveConfig::default().timeout;
+        let finished = at + Duration::from_millis(14_900);
+        assert!(
+            health.record(at, finished, &keepalive()).is_ok(),
+            "a genuine idle gap of the full timeout failed to clear the run"
         );
     }
 
@@ -845,10 +979,8 @@ mod tests {
                 // the backoff), matching the pre-flap-protection behavior.
                 reset_after: Duration::from_millis(1),
             },
-            keepalive: KeepaliveConfig {
-                interval: Duration::from_millis(500),
-                timeout: Duration::from_secs(5),
-            },
+            keepalive: KeepaliveConfig::new(Duration::from_millis(500), Duration::from_secs(5))
+                .unwrap(),
             session: SessionOptions {
                 establish_timeout: Duration::from_secs(5),
                 metrics: None,
@@ -931,10 +1063,8 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
 
         let mut config = fast_config();
-        config.keepalive = KeepaliveConfig {
-            interval: Duration::from_millis(100),
-            timeout: Duration::from_millis(400),
-        };
+        config.keepalive =
+            KeepaliveConfig::new(Duration::from_millis(100), Duration::from_millis(400)).unwrap();
         let (handle, mut events) = supervise_outbound(
             addr,
             a.identity,
@@ -973,10 +1103,8 @@ mod tests {
         // Aggressive client keepalive: several ping cycles fit in the
         // observation window below.
         let mut config = fast_config();
-        config.keepalive = KeepaliveConfig {
-            interval: Duration::from_millis(100),
-            timeout: Duration::from_millis(600),
-        };
+        config.keepalive =
+            KeepaliveConfig::new(Duration::from_millis(100), Duration::from_millis(600)).unwrap();
         let (handle, mut events) = supervise_outbound(
             addr,
             a.identity,
@@ -992,10 +1120,8 @@ mod tests {
         let (server_events_tx, mut server_events_rx) = mpsc::channel(16);
         let (_server_out_tx, mut server_out_rx) = outbound_channel();
         let (_server_shutdown_tx, mut server_shutdown_rx) = watch::channel(false);
-        let server_keepalive = KeepaliveConfig {
-            interval: Duration::from_secs(2),
-            timeout: Duration::from_secs(30),
-        };
+        let server_keepalive =
+            KeepaliveConfig::new(Duration::from_secs(2), Duration::from_secs(30)).unwrap();
         let server_task = tokio::spawn(async move {
             run_session(
                 server_session,
