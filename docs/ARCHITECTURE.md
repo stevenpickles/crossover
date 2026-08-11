@@ -198,16 +198,34 @@ the complete reassembly before the OS clipboard is touched, so a torn
 transfer installs nothing (FR-3.2) — and `ClipboardApplied` is still emitted
 only from the write result, never on receipt of the last chunk.
 
-**The memory commitment is deliberate, singular, and time-bounded.** One
-retained outbound item and one inbound reassembly, each up to
-`MAX_CLIPBOARD_IMAGE_BYTES` (64 MiB), each sized only after the declared
-length was validated against its type's maximum (NFR-1). Session-scoped
-cleanup is not a bound on its own — a session can live for days — so every
-transaction that retains content also carries a deadline
-(`ClipboardConfig::transfer_timeout`). Expiry releases the buffers,
-tells the origin of an inbound transfer that nothing was installed so its
-transaction closes rather than stalling (NFR-3), and leaves the machine
-able to start the next transfer immediately.
+**The memory commitment is deliberate, bounded, and time-bounded — and
+larger than "one buffer".** Each individual slot is singular, but the slots
+are independent, so the honest worst case is their sum. Three item buffers
+of up to `MAX_CLIPBOARD_IMAGE_BYTES` (64 MiB) are simultaneously reachable:
+
+| Slot | Held while |
+|------|-----------|
+| `pending_write` | an item is being installed, including across the bounded `Busy` retry schedule |
+| the inbound reassembly | a *newer* offer, accepted while that write is still retrying, streams in |
+| the retained outbound item | a concurrent local copy is offered and awaiting its answer |
+
+That is **192 MiB**, plus the Background lane's 8 MiB byte budget — about
+**200 MiB** steady-state — and transiently ~264 MiB during a supersession,
+where the buffer being replaced is alive alongside its replacement. Every
+one of those is sized only after the declared length was validated against
+its type's maximum (NFR-1), and none is unbounded; the number is simply
+larger than the count of slots suggests, which is why it is written down
+rather than left to be inferred.
+
+Session-scoped cleanup is not a bound on its own — a session can live for
+days — so every transaction carries a deadline
+(`ClipboardConfig::transfer_timeout`). Expiry releases the buffers, tells
+the origin of an inbound transfer that nothing was installed so its
+transaction closes rather than stalling (NFR-3), counts the abandonment
+(FR-7.3), and leaves the machine able to start the next transfer
+immediately. The deadline covers `AwaitingApplied` too, where almost no
+memory is at stake but the single outbound slot is: an unanswered
+transaction left there would go on deciding conflict races (FR-3.5).
 
 **The platform boundary is typed with it.** `ClipboardProvider` reads and
 writes a `ClipboardContent` (text or image-with-format); every raster

@@ -406,12 +406,18 @@ impl InboundMessage {
 /// transaction latency is computed entirely on the originating machine's
 /// clock — no cross-machine skew enters the measurement.
 ///
-/// `content` is **the** outbound memory commitment, and it is deliberate:
-/// exactly one item is retained at a time (a newer local copy supersedes
-/// and replaces it), for at most [`ClipboardConfig::transfer_timeout`],
-/// bounded by the content type's maximum — 64 MiB for an image
-/// (ADR 0014). Chunks are sliced out of it on demand rather than
-/// pre-rendered, so the peak is that one buffer plus one chunk.
+/// `content` is the outbound memory commitment, and it is deliberate:
+/// exactly one item is retained *in this slot* at a time (a newer local
+/// copy supersedes and replaces it), for at most
+/// [`ClipboardConfig::transfer_timeout`], bounded by the content type's
+/// maximum — 64 MiB for an image (ADR 0014). Chunks are sliced out of it
+/// on demand rather than pre-rendered, so this slot's peak is one buffer
+/// plus one chunk.
+///
+/// It is not the engine's *only* buffer: an inbound reassembly and a
+/// `PendingWrite` under retry are independent slots of the same size, so
+/// the honest whole-engine worst case is their sum — see
+/// docs/ARCHITECTURE.md §5.2, which states it.
 #[derive(Debug)]
 enum Outbound {
     /// Offer sent; awaiting Accept/Decline. Holds the content, because
