@@ -24,7 +24,7 @@ use crossover_core::supervision::{DisconnectReason, KeepaliveConfig, run_session
 use crossover_core::{
     LocalNode, MAX_BACKGROUND_QUEUE_FRAMES, OutboundSender, SessionListener, SessionOptions,
 };
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::hello::{FeatureFlags, MessageType};
 use crossover_test_peer::{TestConnection, TestNode};
 
 /// One bulk frame. Sized so the Background lane's *message* bound binds
@@ -56,10 +56,27 @@ fn patient_keepalive() -> KeepaliveConfig {
 }
 
 async fn connected_pair() -> (AppSide, TestConnection) {
-    connected_pair_with(patient_keepalive()).await
+    connected_pair_with(
+        patient_keepalive(),
+        FeatureFlags::ADVERTISED,
+        FeatureFlags::NONE,
+    )
+    .await
 }
 
-async fn connected_pair_with(keepalive: KeepaliveConfig) -> (AppSide, TestConnection) {
+/// A pair that has negotiated chunked clipboard, so `ClipboardChunk`
+/// frames pass the send gate (docs/PROTOCOL.md §3.1). Explicit here
+/// because `FeatureFlags::ADVERTISED` is still empty — ADR 0014's platform
+/// slice is what flips it — and the lane property has to be provable now.
+async fn chunk_capable_pair() -> (AppSide, TestConnection) {
+    connected_pair_with(patient_keepalive(), FeatureFlags::ALL, FeatureFlags::ALL).await
+}
+
+async fn connected_pair_with(
+    keepalive: KeepaliveConfig,
+    app_features: FeatureFlags,
+    peer_features: FeatureFlags,
+) -> (AppSide, TestConnection) {
     let mut app = TestNode::generate("app").unwrap();
     let mut peer = TestNode::generate("scripted-peer").unwrap();
     app.trust(&peer).unwrap();
@@ -80,10 +97,11 @@ async fn connected_pair_with(keepalive: KeepaliveConfig) -> (AppSide, TestConnec
             certified: &certified,
             trust: &trust,
         };
-        let session = listener
-            .accept(&local, &SessionOptions::default())
-            .await
-            .expect("accept");
+        let options = SessionOptions {
+            advertised_features: app_features,
+            ..SessionOptions::default()
+        };
+        let session = listener.accept(&local, &options).await.expect("accept");
         run_session(
             session,
             &events_tx,
@@ -94,7 +112,8 @@ async fn connected_pair_with(keepalive: KeepaliveConfig) -> (AppSide, TestConnec
         .await
     });
 
-    let peer_hello = peer.hello();
+    let mut peer_hello = peer.hello();
+    peer_hello.supported_features = peer_features;
     let mut conn = TestConnection::connect(addr, &peer).await.unwrap();
     conn.send_hello(&peer_hello).await.unwrap();
     let _app_hello = conn.expect_hello().await.unwrap();
@@ -178,6 +197,8 @@ async fn a_peer_that_stops_reading_cannot_suppress_disconnect_detection() {
     // Short enough that the test is quick, long enough to be a real stall.
     let (app, _conn) = connected_pair_with(
         KeepaliveConfig::new(Duration::from_millis(200), Duration::from_secs(1)).unwrap(),
+        FeatureFlags::ADVERTISED,
+        FeatureFlags::NONE,
     )
     .await;
 
@@ -398,5 +419,79 @@ async fn a_clipboard_transaction_keeps_its_order_under_input_pressure() {
     assert_eq!(
         clipboard, expected,
         "the clipboard transaction was reordered against itself"
+    );
+}
+
+/// ADR 0014's reason for chunking, proved on a real session: a whole
+/// image transfer — every chunk of it — must not delay live input.
+///
+/// A single frame carrying a multi-megabyte image would be unpreemptable
+/// by construction, which is the thing ADR 0013 forbids. Chunks make it
+/// preemptable, and this is what that buys: with a full image's worth of
+/// chunks queued and the socket stalled, a keystroke handed over
+/// afterwards still overtakes essentially all of them.
+///
+/// Structural, not timed: the assertion is on arrival *order*, so a loaded
+/// runner cannot turn the guarantee into a flake.
+#[tokio::test(flavor = "multi_thread")]
+async fn input_preempts_a_streaming_image_transfer() {
+    use crossover_protocol::clipboard::{ClipboardChunk, MAX_CHUNK_BYTES};
+
+    let (app, mut conn) = chunk_capable_pair().await;
+
+    // Chunks exactly as the engine emits them: one per frame, maximum
+    // size, sequential — the shape a real 4 MiB-plus snip takes.
+    let id = uuid::Uuid::from_bytes([0x77; 16]);
+    let mut queued = 0u32;
+    loop {
+        let chunk = ClipboardChunk {
+            id,
+            index: queued,
+            payload: vec![0xBB; MAX_CHUNK_BYTES],
+        };
+        let payload = chunk.encode_payload().unwrap();
+        if app
+            .outbound
+            .try_send(MessageType::ClipboardChunk.wire(), payload)
+            .is_err()
+        {
+            break;
+        }
+        queued += 1;
+        assert!(queued < 512, "the background lane never filled");
+    }
+    let queued = queued as usize;
+    assert!(
+        queued >= MAX_BACKGROUND_QUEUE_FRAMES,
+        "expected a full backlog of chunks, got {queued}"
+    );
+
+    // A keystroke, handed over after the whole backlog.
+    timeout(
+        Duration::from_secs(5),
+        app.outbound
+            .send(MessageType::InputBatch.wire(), b"keystroke".to_vec()),
+    )
+    .await
+    .expect("a streaming image blocked the interactive lane")
+    .expect("the session ended");
+
+    let seen = drain_frames(&mut conn, queued + 1).await;
+    let position = seen
+        .iter()
+        .position(|&ty| ty == MessageType::InputBatch.wire())
+        .expect("the input batch never arrived behind the transfer");
+    let chunks_after = seen.len() - position - 1;
+    assert_eq!(
+        position + chunks_after,
+        queued,
+        "chunks were dropped, not deferred"
+    );
+    // `- 1`: the chunk already committed to the socket legitimately
+    // precedes the input; every chunk still queued must follow it.
+    assert!(
+        chunks_after >= MAX_BACKGROUND_QUEUE_FRAMES - 1,
+        "input waited behind {position} of {queued} chunks — a transfer \
+         delayed live input"
     );
 }

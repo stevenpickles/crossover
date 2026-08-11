@@ -20,8 +20,12 @@ use crossover_core::{
 };
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::{ClipboardFailure, ClipboardOp, InMemoryClipboard};
-use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied, ClipboardData, ContentType};
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::clipboard::{
+    ApplyResult, ChunkOutcome, ChunkReassembly, ClipboardAccept, ClipboardApplied, ClipboardChunk,
+    ClipboardData, ClipboardMeta, ClipboardOffer, ContentType, ImageFormat, MAX_CHUNK_BYTES,
+    chunk_content, content_hash,
+};
+use crossover_protocol::hello::{FeatureFlags, MessageType};
 use crossover_test_peer::{TestConnection, TestNode};
 
 /// One fully wired "app side": session loop + clipboard driver + fake
@@ -33,7 +37,7 @@ struct AppSide {
     _shutdown: watch::Sender<bool>,
 }
 
-fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
+fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFlags) -> AppSide {
     let clipboard = Arc::new(InMemoryClipboard::new());
     let (driver, sync_events, mut sync_commands) = clipboard_sync(
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
@@ -64,10 +68,15 @@ fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
             certified: &certified,
             trust: &trust,
         };
-        let session = listener
-            .accept(&local, &SessionOptions::default())
-            .await
-            .expect("accept");
+        let options = SessionOptions {
+            // What this side promises the peer. Production reads
+            // `FeatureFlags::ADVERTISED`; the image suites below negotiate
+            // explicitly because ADR 0014's platform slice has not landed,
+            // so the constant is honestly still empty (PROTOCOL.md §3.1).
+            advertised_features: features,
+            ..SessionOptions::default()
+        };
+        let session = listener.accept(&local, &options).await.expect("accept");
         run_session(
             session,
             &session_events_tx,
@@ -114,6 +123,14 @@ fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
 }
 
 async fn connected_pair() -> (AppSide, TestConnection) {
+    connected_pair_with(FeatureFlags::ADVERTISED, FeatureFlags::NONE).await
+}
+
+/// A connected pair where each side advertises exactly what it is given.
+async fn connected_pair_with(
+    app_features: FeatureFlags,
+    peer_features: FeatureFlags,
+) -> (AppSide, TestConnection) {
     let mut app = TestNode::generate("app").unwrap();
     let mut peer = TestNode::generate("scripted-peer").unwrap();
     app.trust(&peer).unwrap();
@@ -122,8 +139,9 @@ async fn connected_pair() -> (AppSide, TestConnection) {
     let listener = SessionListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let peer_hello = peer.hello();
-    let side = spawn_app_side(listener, app);
+    let mut peer_hello = peer.hello();
+    peer_hello.supported_features = peer_features;
+    let side = spawn_app_side(listener, app, app_features);
     let mut conn = TestConnection::connect(addr, &peer).await.unwrap();
     conn.send_hello(&peer_hello).await.unwrap();
     let _app_hello = conn.expect_hello().await.unwrap();
@@ -298,4 +316,168 @@ async fn transient_contention_recovers_and_applies() {
         side.clipboard.peek().as_deref(),
         Some("lands on attempt three")
     );
+}
+
+// --- chunked rich clipboard over a real session (ADR 0014) -----------------
+
+/// Deliberately hostile bytes for anything that assumes text: non-UTF-8
+/// lead bytes, embedded NULs, runs of 0xFF. An image is opaque, and the
+/// only thing computed over it anywhere is its hash and its length.
+fn snip_bytes(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| match i % 4 {
+            0 => 0xFF,
+            1 => 0x00,
+            2 => 0xFE,
+            _ => u8::try_from(i % 251).unwrap_or(0),
+        })
+        .collect()
+}
+
+fn image_meta(origin: u8, sequence: u64, bytes: &[u8]) -> ClipboardMeta {
+    ClipboardMeta {
+        id: Uuid::new_v4(),
+        origin: Uuid::from_bytes([origin; 16]),
+        sequence,
+        content_type: ContentType::Image(ImageFormat::Dib),
+        content_length: bytes.len() as u64,
+        content_hash: content_hash(bytes),
+    }
+}
+
+/// Peer→app over real TLS: an offered image is accepted, streamed as
+/// chunks, reassembled, verified, installed, and only then acknowledged
+/// (FR-3.2). The bytes on the destination clipboard must be byte-identical
+/// to the source's — that is the whole promise of verbatim transfer.
+#[tokio::test]
+async fn an_offered_image_round_trips_over_a_real_session() {
+    use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+
+    let (side, mut conn) =
+        connected_pair_with(FeatureFlags::ALL, FeatureFlags::CHUNKED_CLIPBOARD).await;
+
+    let bytes = snip_bytes(MAX_CHUNK_BYTES * 3 + 17);
+    let meta = image_meta(0xBB, 0, &bytes);
+    conn.send_frame(
+        MessageType::ClipboardOffer.wire(),
+        2,
+        &ClipboardOffer { meta }.encode_payload().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let accept = recv_typed(&mut conn, MessageType::ClipboardAccept).await;
+    assert_eq!(
+        ClipboardAccept::decode_payload(&accept).unwrap().id,
+        meta.id
+    );
+
+    let chunks = chunk_content(meta.id, &bytes).unwrap();
+    assert_eq!(chunks.len(), 4);
+    for (id, chunk) in chunks.iter().enumerate() {
+        conn.send_frame(
+            MessageType::ClipboardChunk.wire(),
+            10 + id as u64,
+            &chunk.encode_payload().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let ack = recv_typed(&mut conn, MessageType::ClipboardApplied).await;
+    let applied = ClipboardApplied::decode_payload(&ack).unwrap();
+    assert_eq!(applied.id, meta.id);
+    assert_eq!(applied.result, ApplyResult::Applied);
+    assert_eq!(
+        side.clipboard.peek_content(),
+        Some(ClipboardContent::Image {
+            format: ClipboardImageFormat::Dib,
+            bytes,
+        }),
+        "the installed image is not byte-identical to the source"
+    );
+}
+
+/// App→peer over real TLS: a local snip is offered (never inline), and on
+/// acceptance streams as one chunk per frame, in order, reassembling to
+/// exactly what was copied.
+#[tokio::test]
+async fn a_local_image_is_offered_and_streamed_to_the_peer() {
+    use crossover_platform::ClipboardImageFormat;
+
+    let (side, mut conn) =
+        connected_pair_with(FeatureFlags::ALL, FeatureFlags::CHUNKED_CLIPBOARD).await;
+
+    let bytes = snip_bytes(MAX_CHUNK_BYTES * 2 + 5);
+    side.clipboard
+        .set_image_locally(ClipboardImageFormat::Dib, bytes.clone());
+
+    let payload = recv_typed(&mut conn, MessageType::ClipboardOffer).await;
+    let offer = ClipboardOffer::decode_payload(&payload).unwrap();
+    assert_eq!(
+        offer.meta.content_type,
+        ContentType::Image(ImageFormat::Dib)
+    );
+    assert_eq!(offer.meta.content_length, bytes.len() as u64);
+
+    conn.send_frame(
+        MessageType::ClipboardAccept.wire(),
+        3,
+        &ClipboardAccept { id: offer.meta.id }
+            .encode_payload()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Reassemble with the receiver's own machinery: it enforces the
+    // sequence, the per-chunk lengths, and finally the item hash, so a
+    // successful completion *is* the assertion that the stream was well
+    // formed and complete.
+    let mut reassembly = ChunkReassembly::begin(offer.meta).unwrap();
+    let received = loop {
+        let payload = recv_typed(&mut conn, MessageType::ClipboardChunk).await;
+        let chunk = ClipboardChunk::decode_payload(&payload).unwrap();
+        match reassembly.accept(&chunk).unwrap() {
+            ChunkOutcome::More => {}
+            ChunkOutcome::Complete(bytes) => break bytes,
+        }
+    };
+    assert_eq!(received, bytes, "the streamed image was not verbatim");
+
+    // Closing the transaction produces no further traffic.
+    conn.send_frame(
+        MessageType::ClipboardApplied.wire(),
+        4,
+        &ClipboardApplied {
+            id: offer.meta.id,
+            result: ApplyResult::Applied,
+        }
+        .encode_payload()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+}
+
+/// The honesty rule, end to end (docs/PROTOCOL.md §3.1 — and this build's
+/// actual configuration, since `FeatureFlags::ADVERTISED` is empty). With
+/// the capability un-negotiated, an image copy must not reach the wire and
+/// must not wedge the pipeline: text keeps synchronizing immediately after.
+#[tokio::test]
+async fn an_un_negotiated_image_never_reaches_the_wire_and_text_still_flows() {
+    use crossover_platform::ClipboardImageFormat;
+
+    let (side, mut conn) = connected_pair().await; // both sides: no features
+    side.clipboard
+        .set_image_locally(ClipboardImageFormat::Dib, snip_bytes(MAX_CHUNK_BYTES * 2));
+
+    // Whatever the engine produced was refused at the send gate; the very
+    // next thing the peer sees is the text copied after it.
+    side.clipboard
+        .set_text_locally("text after a refused image");
+    let payload = recv_typed(&mut conn, MessageType::ClipboardData).await;
+    let data = ClipboardData::decode_payload(&payload).unwrap();
+    assert_eq!(data.content, b"text after a refused image");
+    assert_eq!(data.meta.content_type, ContentType::Utf8Text);
 }

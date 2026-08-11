@@ -998,7 +998,7 @@ mod tests {
                 .unwrap(),
             session: SessionOptions {
                 establish_timeout: Duration::from_secs(5),
-                metrics: None,
+                ..SessionOptions::default()
             },
         }
     }

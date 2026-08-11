@@ -141,15 +141,21 @@ impl FeatureFlags {
 
     /// What **this build** advertises in its `Hello`.
     ///
-    /// Empty today, deliberately: the wire layer for chunked images is
-    /// implemented (this crate), but the clipboard engine cannot yet
-    /// reassemble one and the platform layer cannot yet read or write a
-    /// raster format. Advertising a capability we would then decline is a
-    /// lie in negotiation, and the peer would spend real work preparing an
-    /// item that goes nowhere. **The engine/platform slices of ADR 0014
-    /// set this to [`FeatureFlags::ALL`]** — that flip is what switches
-    /// image transfer on, on both sides at once, and nothing else needs to
-    /// change.
+    /// Empty today, deliberately, and now for exactly one reason: the wire
+    /// layer carries chunked images and the clipboard engine reassembles,
+    /// verifies and installs them (ADR 0014's protocol and engine slices),
+    /// but no platform backend can yet put a raster format on a real
+    /// clipboard — `crossover-platform-windows` reads an image as absent
+    /// and refuses to write one. Advertising is a promise to *handle*, so
+    /// promising it here would mean accepting a transfer this build must
+    /// then fail at the last step, after the peer moved every byte.
+    ///
+    /// **The ADR 0014 platform slice sets this to [`FeatureFlags::ALL`]**
+    /// — one line, and image transfer switches on for both sides at once,
+    /// with nothing else to change. Tests that need the negotiated path
+    /// before then override the advertisement per session
+    /// (`SessionOptions::advertised_features`) rather than weakening this
+    /// constant.
     pub const ADVERTISED: Self = Self::NONE;
 
     /// Whether every bit in `feature` is set. `NONE` is contained by

@@ -312,3 +312,163 @@ async fn next_command(commands: &mut crossover_core::outbound::CommandReceiver) 
         .expect("timed out waiting for a sync command")
         .expect("sync command channel closed")
 }
+
+/// Take the next frame `from` produces, assert its type, and hand it to
+/// `to`. Returns the payload, so the caller can decode what crossed.
+async fn forward(
+    from: &mut Side,
+    to: &mut Side,
+    expected: MessageType,
+    message_id: u64,
+) -> Vec<u8> {
+    let (message_type, payload) = next_frame(&mut from.commands).await;
+    assert_eq!(
+        message_type,
+        expected.wire(),
+        "expected {expected:?} on the wire"
+    );
+    to.events
+        .send(SyncEvent::Frame(RawFrame {
+            message_type,
+            message_id,
+            payload: payload.clone(),
+        }))
+        .await
+        .unwrap();
+    payload
+}
+
+/// Fault injection for the chunked path (ADR 0014): a session that dies
+/// **mid-stream** must leave nothing behind — no half-image on the
+/// destination clipboard, no pinned reassembly buffer, no stuck
+/// transaction — and the same item must transfer cleanly after reconnect.
+///
+/// A torn transfer installing anything would break FR-3.2 outright: the
+/// content hash is verified over the *whole* reassembly, so partial bytes
+/// can never be the item that was offered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disconnect_mid_stream_installs_nothing_and_the_retry_succeeds() {
+    use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+    use crossover_protocol::clipboard::{
+        ClipboardAccept, ClipboardChunk, ClipboardOffer, MAX_CHUNK_BYTES, content_hash,
+    };
+
+    let mut a = side(0x01);
+    let mut b = side(0x02);
+    a.events.send(SyncEvent::SessionEstablished).await.unwrap();
+    b.events.send(SyncEvent::SessionEstablished).await.unwrap();
+
+    let bytes: Vec<u8> = (0..MAX_CHUNK_BYTES * 4 + 3)
+        .map(|i| match i % 3 {
+            0 => 0xFF,
+            1 => 0x00,
+            _ => u8::try_from(i % 251).unwrap_or(0),
+        })
+        .collect();
+
+    // First attempt: A copies the snip, B accepts, two chunks cross.
+    a.clipboard
+        .set_image_locally(ClipboardImageFormat::Dib, bytes.clone());
+    let payload = forward(&mut a, &mut b, MessageType::ClipboardOffer, 1).await;
+    let offer = ClipboardOffer::decode_payload(&payload).unwrap();
+    let payload = forward(&mut b, &mut a, MessageType::ClipboardAccept, 2).await;
+    assert_eq!(
+        ClipboardAccept::decode_payload(&payload).unwrap().id,
+        offer.meta.id
+    );
+    for message_id in 3..5u64 {
+        forward(&mut a, &mut b, MessageType::ClipboardChunk, message_id).await;
+    }
+
+    // Kill the session on both sides: the stream is torn mid-flight.
+    a.events.send(SyncEvent::SessionLost).await.unwrap();
+    b.events.send(SyncEvent::SessionLost).await.unwrap();
+
+    // Nothing partial was installed. The hash covers the whole item, so a
+    // torn transfer can never produce the item that was offered.
+    assert_eq!(
+        b.clipboard.peek_content(),
+        None,
+        "a torn transfer installed something"
+    );
+
+    // Reconnect: A re-announces (its clipboard still holds the snip).
+    a.events.send(SyncEvent::SessionEstablished).await.unwrap();
+    b.events.send(SyncEvent::SessionEstablished).await.unwrap();
+
+    // Chunks the driver had already handed to the send path before the
+    // loss are still queued: they belong to a session that no longer
+    // exists, and the app drops them with it. Skip them here, asserting
+    // they are only ever the *old* transfer's — no new chunk may be
+    // produced for an abandoned transaction.
+    let payload = loop {
+        let (message_type, payload) = next_frame(&mut a.commands).await;
+        if message_type == MessageType::ClipboardOffer.wire() {
+            break payload;
+        }
+        assert_eq!(
+            message_type,
+            MessageType::ClipboardChunk.wire(),
+            "unexpected traffic after a session loss"
+        );
+        assert_eq!(
+            ClipboardChunk::decode_payload(&payload).unwrap().id,
+            offer.meta.id,
+            "a chunk was produced for a transfer the session loss abandoned"
+        );
+    };
+    let reoffer = ClipboardOffer::decode_payload(&payload).unwrap();
+    assert_eq!(reoffer.meta.content_hash, content_hash(&bytes));
+    assert_ne!(
+        reoffer.meta.id, offer.meta.id,
+        "the retry must be a fresh transaction, not a resumed one"
+    );
+    b.events
+        .send(SyncEvent::Frame(RawFrame {
+            message_type: MessageType::ClipboardOffer.wire(),
+            message_id: 20,
+            payload,
+        }))
+        .await
+        .unwrap();
+    forward(&mut b, &mut a, MessageType::ClipboardAccept, 21).await;
+
+    // The retried stream runs to completion, and only then is there a
+    // verdict — which is what makes it an acknowledged install (FR-3.2).
+    let mut message_id = 30u64;
+    let applied = loop {
+        forward(&mut a, &mut b, MessageType::ClipboardChunk, message_id).await;
+        message_id += 1;
+        if let Ok(Some(SessionCommand::SendFrame { payload, .. })) =
+            timeout(Duration::from_millis(50), b.commands.recv()).await
+        {
+            break ClipboardApplied::decode_payload(&payload).unwrap();
+        }
+        assert!(message_id < 100, "the retried transfer never completed");
+    };
+
+    assert_eq!(applied.id, reoffer.meta.id);
+    assert_eq!(applied.result, ApplyResult::Applied);
+    assert_eq!(
+        b.clipboard.peek_content(),
+        Some(ClipboardContent::Image {
+            format: ClipboardImageFormat::Dib,
+            bytes,
+        }),
+        "the retried transfer did not deliver the image verbatim"
+    );
+}
+
+/// The next `SendFrame` a side produces; a termination is a test failure.
+async fn next_frame(commands: &mut crossover_core::outbound::CommandReceiver) -> (u16, Vec<u8>) {
+    match next_command(commands).await {
+        SessionCommand::SendFrame {
+            message_type,
+            payload,
+            ..
+        } => (message_type, payload),
+        SessionCommand::TerminateSession { reason, .. } => {
+            panic!("unexpected session termination: {reason}")
+        }
+    }
+}
