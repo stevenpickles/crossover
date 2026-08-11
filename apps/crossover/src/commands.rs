@@ -1448,7 +1448,7 @@ mod tests {
 
     use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore, TrustedPeer};
 
-    use super::{age, revoked_session_ids};
+    use super::{age, command_priority, revoked_session_ids};
 
     #[test]
     fn revoked_sessions_are_those_whose_peer_left_the_trust_store() {
@@ -1483,6 +1483,137 @@ mod tests {
             )
             .unwrap();
         assert!(revoked_session_ids(&live, &trust).is_empty());
+    }
+
+    /// A fail-closed termination is a security action, so it rides High
+    /// even though it comes off the clipboard driver's otherwise-bulk
+    /// stream (docs/PROTOCOL.md §7).
+    #[test]
+    fn terminations_ride_the_interactive_lane_and_bulk_frames_do_not() {
+        use crossover_core::{FrameTarget, SendPriority, SessionCommand};
+        use crossover_protocol::hello::MessageType;
+
+        let target = FrameTarget::Broadcast;
+        let frame = |message_type: MessageType| SessionCommand::SendFrame {
+            target,
+            message_type: message_type.wire(),
+            payload: Vec::new(),
+        };
+        assert_eq!(
+            command_priority(&SessionCommand::TerminateSession {
+                target,
+                reason: "invalid payload".to_owned(),
+            }),
+            SendPriority::High
+        );
+        assert_eq!(
+            command_priority(&frame(MessageType::InputBatch)),
+            SendPriority::High
+        );
+        assert_eq!(
+            command_priority(&frame(MessageType::ClipboardData)),
+            SendPriority::Background
+        );
+    }
+
+    /// The hop the ADR 0013 drift-check singled out: the command mux
+    /// *awaits* delivery into each session's queue, so a single task
+    /// draining both classes would let one wedged Background path stall
+    /// input for every session.
+    ///
+    /// Structural, not timed: saturate the entire Background path until it
+    /// stops accepting work at all, then prove an input batch still reaches
+    /// the session's writer — and reaches it *first*, ahead of the bulk
+    /// already queued there. On a current-thread runtime `yield_now` steps
+    /// the mux tasks deterministically, so there is no wall clock in the
+    /// assertion.
+    #[tokio::test]
+    async fn a_wedged_background_path_never_delays_a_high_frame_through_the_mux() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        use tokio::sync::mpsc;
+        use tokio::task::yield_now;
+
+        use crossover_core::{
+            FrameTarget, MAX_BACKGROUND_QUEUE_FRAMES, SendPriority, SessionCommand,
+            outbound_channel,
+        };
+        use crossover_protocol::hello::MessageType;
+
+        use super::{
+            FrameSink, SessionRegistry, SessionRoute, classify_command_streams, spawn_command_mux,
+        };
+
+        let identity = DeviceIdentity::generate("wedged-peer").unwrap();
+        let certified = CertifiedIdentity::from_identity(&identity).unwrap();
+        let session = Uuid::from_bytes([0x55; 16]);
+
+        // One live session whose writer never runs: nothing drains it.
+        let (sink, mut outbound) = outbound_channel();
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::from([(
+            session,
+            SessionRoute {
+                sink: FrameSink::Inbound(sink),
+                kill: None,
+                peer_fingerprint: certified.fingerprint(),
+            },
+        )])));
+
+        let (clipboard_tx, clipboard_rx) = mpsc::channel(64);
+        let (control_tx, control_rx) = mpsc::channel(64);
+        spawn_command_mux(
+            registry,
+            classify_command_streams(clipboard_rx, control_rx),
+            None,
+        );
+
+        // Saturate every Background queue on the path: the driver's own
+        // channel, the mux's bulk lane, and the session's bulk lane.
+        let mut queued = 0usize;
+        let mut refusals = 0usize;
+        while refusals < 32 {
+            let bulk = SessionCommand::SendFrame {
+                target: FrameTarget::Session(session),
+                message_type: MessageType::ClipboardData.wire(),
+                payload: vec![0xBB; 128 * 1024],
+            };
+            if clipboard_tx.try_send(bulk).is_ok() {
+                queued += 1;
+                refusals = 0;
+            } else {
+                refusals += 1;
+            }
+            yield_now().await;
+            assert!(queued < 4096, "the background path never saturated");
+        }
+        assert!(
+            queued >= MAX_BACKGROUND_QUEUE_FRAMES,
+            "expected a full bulk lane before the input frame, got {queued} frames"
+        );
+
+        // With bulk wedged solid, an input batch still crosses the mux…
+        control_tx
+            .send(SessionCommand::SendFrame {
+                target: FrameTarget::Session(session),
+                message_type: MessageType::InputBatch.wire(),
+                payload: b"pointer moved".to_vec(),
+            })
+            .await
+            .unwrap();
+        for _ in 0..64 {
+            yield_now().await;
+        }
+
+        // …and is the very next frame the writer would put on the wire.
+        let frame = outbound.recv().await.expect("a frame for the writer");
+        assert_eq!(
+            frame.message_type,
+            MessageType::InputBatch.wire(),
+            "input queued behind {queued} bulk frames"
+        );
+        assert_eq!(frame.priority, SendPriority::High);
+        assert_eq!(frame.payload, b"pointer moved");
     }
 
     #[test]
