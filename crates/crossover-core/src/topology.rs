@@ -72,30 +72,7 @@ impl Edge {
             Self::Right => x >= self.outer_x(monitor),
         }
     }
-
-    /// The column `inset` pixels *inside* this edge — off the extreme column,
-    /// so a cursor placed here does **not** read as [`touched_by`] this edge.
-    /// An arriving cursor lands just inside the linked edge (not on it) so the
-    /// edge detector re-primes `at_edge = false`; otherwise it would prime as
-    /// already-at-the-edge and swallow the first crossing back out — the
-    /// reversal-stall the soak found (feature/90). Clamped to the monitor's own
-    /// columns so a degenerate (very narrow) monitor never produces an
-    /// off-monitor coordinate.
-    fn inset_x(self, monitor: MonitorRect, inset: i32) -> i32 {
-        let insetted = match self {
-            Self::Left => self.outer_x(monitor).saturating_add(inset),
-            Self::Right => self.outer_x(monitor).saturating_sub(inset),
-        };
-        let lo = Self::Left.outer_x(monitor);
-        let hi = Self::Right.outer_x(monitor).max(lo);
-        insetted.clamp(lo, hi)
-    }
 }
-
-/// How far inside the linked edge an arriving cursor is placed (see
-/// [`Edge::inset_x`]). A couple of pixels: enough to clear the edge latch so
-/// the next real crossing fires, small enough to be visually on the edge.
-const EDGE_ENTRY_INSET: i32 = 2;
 
 // The display geometry vocabulary — the monitor layout and a cursor
 // position — lives in `crossover-platform`, because the display HAL trait
@@ -258,18 +235,13 @@ impl Topology {
     /// that crossed at `fraction`: on this machine's edge monitor, at that
     /// fraction of the monitor's height. The inverse direction of
     /// [`leaving`](Self::leaving), and the same edge in reverse.
-    ///
-    /// Placed a couple of pixels *inside* the linked edge, not on it
-    /// ([`EDGE_ENTRY_INSET`]): a cursor sitting exactly on the edge reads as
-    /// already-crossing, so the detector would latch and drop the first
-    /// crossing back — the reversal stall (feature/90).
     #[must_use]
     pub fn entering(self, fraction: EdgeFraction, monitors: &[MonitorRect]) -> CursorPoint {
         let Some(monitor) = self.edge_monitor(monitors) else {
             return CursorPoint { x: 0, y: 0 };
         };
         CursorPoint {
-            x: self.linked_edge().inset_x(monitor, EDGE_ENTRY_INSET),
+            x: self.linked_edge().outer_x(monitor),
             y: monitor.top + fraction.to_pixel(monitor.height),
         }
     }
@@ -279,9 +251,7 @@ impl Topology {
 mod tests {
     use proptest::prelude::*;
 
-    use super::{
-        CursorPoint, EDGE_ENTRY_INSET, Edge, EdgeFraction, LinkSide, MonitorRect, Topology,
-    };
+    use super::{CursorPoint, Edge, EdgeFraction, LinkSide, MonitorRect, Topology};
 
     /// A single monitor `width`×`height` at the desktop origin.
     fn one(width: u32, height: u32) -> Vec<MonitorRect> {
@@ -345,61 +315,28 @@ mod tests {
     }
 
     #[test]
-    fn entering_lands_just_inside_the_linked_edge_at_the_fraction() {
-        // Right member: enters on its left edge, a couple pixels inside it.
-        let inside_left = EDGE_ENTRY_INSET; // 0 + inset
+    fn entering_lands_on_the_linked_edge_at_the_fraction() {
+        // Right member: cursor enters on its left edge (x == 0).
         let right = Topology::new(LinkSide::Right);
         assert_eq!(
             right.entering(EdgeFraction::new(0.0), &hd()),
-            CursorPoint {
-                x: inside_left,
-                y: 0
-            }
+            CursorPoint { x: 0, y: 0 }
         );
         assert_eq!(
             right.entering(EdgeFraction::new(1.0), &hd()),
-            CursorPoint {
-                x: inside_left,
-                y: 1079
-            }
+            CursorPoint { x: 0, y: 1079 }
         );
         assert_eq!(
             right.entering(EdgeFraction::new(0.5), &hd()),
-            CursorPoint {
-                x: inside_left,
-                y: 540
-            } // round(0.5 * 1079) = 540
+            CursorPoint { x: 0, y: 540 } // round(0.5 * 1079) = 540
         );
 
-        // Left member: enters on its right edge, a couple pixels inside it.
-        let inside_right = 1919 - EDGE_ENTRY_INSET;
+        // Left member: cursor enters on its right edge (x == width − 1).
         let left = Topology::new(LinkSide::Left);
         assert_eq!(
             left.entering(EdgeFraction::new(0.0), &hd()),
-            CursorPoint {
-                x: inside_right,
-                y: 0
-            }
+            CursorPoint { x: 1919, y: 0 }
         );
-    }
-
-    #[test]
-    fn a_placed_cursor_does_not_immediately_read_as_leaving() {
-        // feature/90 (the reversal-stall fix): a cursor placed by entering()
-        // must NOT read as leaving, so the edge detector primes at_edge=false
-        // and the first crossing back out fires instead of being swallowed by
-        // the rising-edge latch.
-        for side in [LinkSide::Left, LinkSide::Right] {
-            let topology = Topology::new(side);
-            for frac in [0.0_f64, 0.5, 1.0] {
-                let placed = topology.entering(EdgeFraction::new(frac), &hd());
-                assert_eq!(
-                    topology.leaving(placed, &hd()),
-                    None,
-                    "{side:?}: placed cursor {placed:?} must not read as leaving"
-                );
-            }
-        }
     }
 
     #[test]
@@ -412,7 +349,7 @@ mod tests {
 
         let frac = a.leaving(CursorPoint { x: 1919, y: 540 }, &hd()).unwrap(); // half-ish
         let entry = b.entering(frac, &b_monitors);
-        assert_eq!(entry.x, EDGE_ENTRY_INSET); // just inside B's left edge
+        assert_eq!(entry.x, 0); // B's left edge
         // 540/1079 of B's 1439-tall edge ≈ 720; proportional, not equal.
         assert!((entry.y - 720).abs() <= 1, "got {}", entry.y);
     }
@@ -453,7 +390,7 @@ mod tests {
         // B is a single 3840×2160 display: the fraction lands mid-screen.
         let b = Topology::new(LinkSide::Right);
         let entry = b.entering(frac, &one(3840, 2160));
-        assert_eq!(entry.x, EDGE_ENTRY_INSET);
+        assert_eq!(entry.x, 0);
         assert!((entry.y - 1080).abs() <= 2, "got {}", entry.y);
     }
 
@@ -466,25 +403,12 @@ mod tests {
 
         let out = a.leaving(CursorPoint { x: 1919, y: 333 }, &hd()).unwrap();
         let b_entry = b.entering(out, &hd());
-        assert_eq!(
-            b_entry,
-            CursorPoint {
-                x: EDGE_ENTRY_INSET,
-                y: 333
-            }
-        );
+        assert_eq!(b_entry, CursorPoint { x: 0, y: 333 });
 
-        // B returns from its left edge (the user pushes back to x == 0) at the
-        // same row; A receives just inside its own right edge.
+        // B returns from its left edge at the same row.
         let back = b.leaving(CursorPoint { x: 0, y: 333 }, &hd()).unwrap();
         let a_entry = a.entering(back, &hd());
-        assert_eq!(
-            a_entry,
-            CursorPoint {
-                x: 1919 - EDGE_ENTRY_INSET,
-                y: 333
-            }
-        );
+        assert_eq!(a_entry, CursorPoint { x: 1919, y: 333 });
     }
 
     #[test]
