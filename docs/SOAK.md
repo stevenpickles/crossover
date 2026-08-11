@@ -543,11 +543,11 @@ If a soak ever needs to separate cursor behavior from control transfer, add
   on the machine you are not on (`SetSystemCursor`). It is applied off the
   control loop and restored on quit, on lost connection, and on the next
   launch; and, whatever happens, local input on a machine that is not
-  driving the peer shows its cursor again. **Known latent item:** a brief
-  cross-machine state disagreement during a crossing can momentarily leave
-  a machine "controlling" with no visible cursor; the local-input fail-safe
-  recovers it within a health tick (~200 ms), so it is a tidy-up to revisit,
-  not a blocker. `--no-cursor-mask` turns masking off entirely.
+  driving the peer shows its cursor again. The previously-noted latent item
+  — a brief cursor/keyboard-target mismatch right after a crossing — was the
+  visibility cue racing ahead of the capture/placement it stood for; it is
+  fixed (feature/95, see Phase 6 Findings). `--no-cursor-mask` turns masking
+  off entirely.
 - The Phase 4 keyboard caveat still applies: a native editor with its own
   Home/End handling may treat forwarded shifted-navigation its own way.
   (The separate Right-Shift-drops-symbols defect the seamless soak found —
@@ -681,6 +681,40 @@ Then use the machines normally. Over the soak window (target: multiple days):
   both-Control escape on the controller. A controller-side liveness ack (for the
   case where the controlled side's notification is itself lost) remains a
   possible follow-up.
+- **Reversal stall (fixed, feature/93).** Reversing the control direction — be
+  driven by the peer, then take it over yourself — stalled: the first edge
+  crossing did nothing, the second worked. The linked edge does double duty
+  (leave while local, return while controlled) and right after a transfer the
+  cursor rests *on* it, so a rising-edge detector primed latched and swallowed
+  the next crossing. Position/time fixes both failed on hardware (a few-pixel
+  entry inset became a hair-trigger that broke the forward crossing; a firing
+  dwell added palpable latency). Fix: genuine local input on the controlled
+  machine reclaims control to **neutral** (neither side controlling), told apart
+  from the peer's own injection by the system input tick re-baselined on each
+  injection. From neutral the cursor is free in the interior, so the next
+  crossing is an ordinary rising edge — reversing is "touch this machine, then
+  cross," with no dwell and no re-cross (ADR 0009).
+- **Elevated / higher-integrity windows (fixed, feature/94, ADR 0012).** With an
+  elevated window focused on the *controller*, crossing to the peer hid the
+  local cursor but captured and forwarded nothing, and the capture watchdog —
+  which only fails closed when raw input flows while the hook is silent — was
+  starved of that evidence and left the cursor wedged hidden. Cause: Windows
+  UIPI skips a medium-integrity process's low-level hooks over a higher-integrity
+  foreground window, and drops injection into one (R-1). The worker ran at the
+  user's UAC-filtered (medium) token. Fix: the service now launches it with the
+  user's full (elevated) linked token, so it runs high-integrity and its hooks
+  and injection reach elevated windows; standard-user sessions have no split
+  token and are unaffected. The worker still runs as the user, never SYSTEM (ADR
+  0011 invariant intact); the escalation is recorded as SECURITY threat T11.
+- **Transfer cue ordering (fixed, feature/95).** Right after a crossing the
+  window-focus/keyboard target felt briefly mismatched: the cursor-visibility
+  cue was emitted during the engine step, before the transition's capture
+  start/stop and cursor placement ran — so the cursor could hide before local
+  input was really suppressed (first keystrokes leaking locally), or be shown and
+  jump before the return placement landed. Fix: the cue is held and applied only
+  *after* those actions complete, so "cursor gone → driving the peer" / "cursor
+  back → local" tracks the real capture state. This resolves the Phase 5
+  "known latent item" above.
 
 Record the outcome in the Phase 6 exit-criteria notes (docs/ROADMAP.md): the
 soak duration, reboots and network interruptions survived, any manual
