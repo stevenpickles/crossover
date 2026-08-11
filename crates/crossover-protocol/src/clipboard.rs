@@ -1185,6 +1185,69 @@ mod tests {
         );
     }
 
+    /// Golden discriminants for every typed enum that crosses the wire
+    /// (ADR 0001).
+    ///
+    /// Round-trip tests cannot catch what this catches: encode and decode
+    /// move together inside one build, so reordering a variant round-trips
+    /// perfectly while silently changing what the *other* build reads —
+    /// an `AlreadyHave` arriving as `TooLarge` turns a synchronization
+    /// success into a refusal, with no error anywhere. Only bytes pin
+    /// that. Variants are appended, never reordered; a failure here is a
+    /// protocol version bump, not a test to update.
+    #[test]
+    fn golden_wire_discriminants_for_typed_enums() {
+        for (reason, discriminant) in [
+            (DeclineReason::AlreadyHave, 0x00),
+            (DeclineReason::TooLarge, 0x01),
+            (DeclineReason::NotReady, 0x02),
+            (DeclineReason::Superseded, 0x03),
+            (DeclineReason::UnsupportedType, 0x04),
+        ] {
+            let mut expected: Vec<u8> = vec![0x10];
+            expected.extend([0x11; 16]);
+            expected.push(discriminant);
+            assert_eq!(
+                ClipboardDecline { id: ITEM, reason }
+                    .encode_payload()
+                    .unwrap(),
+                expected,
+                "{reason:?} changed wire value: bump the protocol version"
+            );
+        }
+
+        for (result, discriminant) in [
+            (ApplyResult::Applied, 0x00),
+            (ApplyResult::ClipboardUnavailable, 0x01),
+            (ApplyResult::ContentRejected, 0x02),
+            (ApplyResult::Superseded, 0x03),
+        ] {
+            let mut expected: Vec<u8> = vec![0x10];
+            expected.extend([0x11; 16]);
+            expected.push(discriminant);
+            assert_eq!(
+                ClipboardApplied { id: ITEM, result }
+                    .encode_payload()
+                    .unwrap(),
+                expected,
+                "{result:?} changed wire value: bump the protocol version"
+            );
+        }
+
+        for (content_type, encoded) in [
+            (ContentType::Utf8Text, vec![0x00]),
+            (ContentType::Image(ImageFormat::Dib), vec![0x01, 0x00]),
+            (ContentType::Image(ImageFormat::Png), vec![0x01, 0x01]),
+            (ContentType::Image(ImageFormat::Jpeg), vec![0x01, 0x02]),
+        ] {
+            assert_eq!(
+                super::encode(&content_type).unwrap(),
+                encoded,
+                "{content_type:?} changed wire value: bump the protocol version"
+            );
+        }
+    }
+
     #[test]
     fn garbage_and_padded_payloads_are_malformed() {
         assert!(matches!(
