@@ -1089,10 +1089,11 @@ mod tests {
 
         use crate::outbound::MAX_BACKGROUND_QUEUE_FRAMES;
 
-        let mut rig = rig();
         // Far more chunks than the Background lane's 64-frame bound, so
         // the driver is genuinely parked partway through.
         const CHUNKS: usize = 200;
+
+        let mut rig = rig();
         rig.clipboard.set_image_locally(
             ClipboardImageFormat::Dib,
             vec![0xAB; MAX_CHUNK_BYTES * CHUNKS],

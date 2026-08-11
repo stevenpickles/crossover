@@ -80,7 +80,15 @@ const RECENT_TRANSFER_MEMORY: usize = 4;
 /// Clipboard engine tuning. Grouped because all three knobs are timing
 /// policy, and tests need to shrink them without pretending the
 /// production defaults are different.
-#[derive(Debug, Clone, Default)]
+///
+/// [`Default`] is [`ClipboardConfig::new`], not a derive, and the
+/// difference is not cosmetic: a derived `Default` gives every `Duration`
+/// field zero, which here means "abandon each transfer the instant it
+/// starts" and "disable the transmit debounce ADR 0006 exists for". A
+/// caller writing `..Default::default()` would get that silently, with
+/// nothing to review — the same trap `KeepaliveConfig` avoids the same
+/// way.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardConfig {
     /// Bounded retry for `Busy` clipboard writes (FR-3.4).
     pub retry: RetryPolicy,
@@ -88,6 +96,12 @@ pub struct ClipboardConfig {
     pub transmit_debounce: Duration,
     /// Deadline on a transfer that retains content (ADR 0014).
     pub transfer_timeout: Duration,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClipboardConfig {
@@ -142,7 +156,7 @@ pub const TRANSFER_TIMEOUT: Duration = Duration::from_mins(1);
 /// Retry policy for `Busy` clipboard writes (FR-3.4): centrally defined,
 /// bounded attempts, bounded total time (ADR 0005 requires exactly this
 /// shape).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
     /// Total write attempts before giving up (first try included).
     pub max_attempts: u32,
@@ -1553,6 +1567,25 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// `Default` must be the production configuration, not a field-wise
+    /// zero. A derived one would hand `..Default::default()` a
+    /// `transfer_timeout` of zero — every transfer abandoned at birth —
+    /// and a `transmit_debounce` of zero, silently undoing ADR 0006. Both
+    /// would compile, and neither would look wrong at the call site.
+    #[test]
+    fn the_default_configuration_is_the_production_one() {
+        assert_eq!(ClipboardConfig::default(), ClipboardConfig::new());
+        assert_eq!(
+            ClipboardConfig::default().transfer_timeout,
+            super::TRANSFER_TIMEOUT
+        );
+        assert_eq!(
+            ClipboardConfig::default().transmit_debounce,
+            super::TRANSMIT_DEBOUNCE
+        );
+        assert!(!ClipboardConfig::default().transfer_timeout.is_zero());
     }
 
     #[test]
