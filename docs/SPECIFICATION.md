@@ -94,6 +94,14 @@ with arbitrary topology; background/tray operation; peer discovery; rich
 clipboard types (HTML, images, file lists); drag-and-drop; auto-update;
 secure WAN operation; diagnostics UI.
 
+> **Re-scoped:** clipboard **images** left this list on 2026-08-11 and are
+> being built in Phase 7 ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md));
+> file lists are sketched for a later, deliberately minimal drop-folder
+> capability ([ADR 0015](adr/0015-drop-folder-file-transfer.md)). §3.1's
+> "UTF-8 **text**" remains an accurate description of what a *shipped*
+> build synchronizes until ADR 0014's platform slice lands — the feature is
+> negotiated, and this build advertises nothing (PROTOCOL.md §3.1).
+
 Long-term capabilities must not complicate the initial implementation except
 where required to preserve a clean architecture (chiefly: the protocol and
 platform abstractions must not hard-code two-peer, one-display, Windows-only

@@ -154,6 +154,23 @@ these, the resolution is noted inline — bookkeeping, not a change of decision.
   no inline flow and are always offered, at any size
   ([PROTOCOL.md](../PROTOCOL.md) §5).
 - Which clipboard formats to capture and restore, and whether to advertise more
-  than one format on the far side for maximum paste compatibility.
+  than one format on the far side for maximum paste compatibility. **Still
+  open**: it belongs to the platform slice, where `CF_DIB` handling lands.
 - Interaction with clipboard citizenship (FR-3.1a) — how long the far side owns
-  the clipboard while reassembling.
+  the clipboard while reassembling. **Settled: not at all.** Reassembly is
+  pure accounting in `crossover-protocol` and never touches the OS clipboard;
+  the far side takes the machine-global lock exactly once, for the single
+  write of the completed, hash-verified item — the same one write a text item
+  costs. A transfer is therefore invisible to other applications' copy and
+  paste no matter how long it runs, which is the strongest form of FR-3.1a
+  citizenship available.
+- Not previously listed, and settled by the engine slice: **how long an
+  unfinished transfer may hold its buffers.** Session-scoped cleanup alone is
+  not a bound — a session can live for days, and an offer accepted by a peer
+  that then dies would pin up to `MAX_CLIPBOARD_IMAGE_BYTES` for all of it.
+  Every transaction that retains content now carries a deadline
+  (`ClipboardConfig::transfer_timeout`, 60 s by default): expiry releases the
+  buffers, answers the origin so its transaction closes instead of stalling
+  (NFR-3), and leaves the machine ready for the next transfer. The same
+  mechanism closes the pre-existing gap where an accepted **text** offer whose
+  `ClipboardData` never arrived had no timeout at all.

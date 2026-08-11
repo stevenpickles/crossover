@@ -175,6 +175,66 @@ Each observed OS clipboard change becomes an immutable `ClipboardItem`
 (id, origin peer, sequence, timestamp, content type, length, hash, content).
 Contents are never logged; metadata is (FR-7.4).
 
+**Content is typed and opaque.** Since
+[ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md) an item is a
+`ContentType` plus bytes — text is one type, a raster image another — and
+nothing above the platform boundary transcodes, compresses, or parses image
+bytes. The hash and the length are the only things ever computed over them.
+
+**The state machine, both directions.** At most one transaction is in
+flight per direction; a newer one supersedes the older, which is the rule
+that keeps every buffer singular.
+
+| Direction | States | Retains |
+|-----------|--------|---------|
+| Outbound | `AwaitingAccept` → (`Streaming` for chunked types) → `AwaitingApplied` | the item buffer, until the last chunk is out |
+| Inbound | accepted offer → (`ChunkReassembly` for chunked types) → pending write | the reassembly buffer, until it verifies |
+
+Chunks are emitted **one at a time**, sliced out of the retained buffer, so
+the sender never materializes the whole split; each becomes its own command
+and its own frame, which is what makes a chunk the preemption unit §5.4
+depends on. On the receiving side the item's `content_hash` is verified over
+the complete reassembly before the OS clipboard is touched, so a torn
+transfer installs nothing (FR-3.2) — and `ClipboardApplied` is still emitted
+only from the write result, never on receipt of the last chunk.
+
+**The memory commitment is deliberate, bounded, and time-bounded — and
+larger than "one buffer".** Each individual slot is singular, but the slots
+are independent, so the honest worst case is their sum. Three item buffers
+of up to `MAX_CLIPBOARD_IMAGE_BYTES` (64 MiB) are simultaneously reachable:
+
+| Slot | Held while |
+|------|-----------|
+| `pending_write` | an item is being installed, including across the bounded `Busy` retry schedule |
+| the inbound reassembly | a *newer* offer, accepted while that write is still retrying, streams in |
+| the retained outbound item | a concurrent local copy is offered and awaiting its answer |
+
+That is **192 MiB**, plus the Background lane's 8 MiB byte budget — about
+**200 MiB** steady-state — and transiently ~264 MiB during a supersession,
+where the buffer being replaced is alive alongside its replacement. Every
+one of those is sized only after the declared length was validated against
+its type's maximum (NFR-1), and none is unbounded; the number is simply
+larger than the count of slots suggests, which is why it is written down
+rather than left to be inferred.
+
+Session-scoped cleanup is not a bound on its own — a session can live for
+days — so every transaction carries a deadline
+(`ClipboardConfig::transfer_timeout`). Expiry releases the buffers, tells
+the origin of an inbound transfer that nothing was installed so its
+transaction closes rather than stalling (NFR-3), counts the abandonment
+(FR-7.3), and leaves the machine able to start the next transfer
+immediately. The deadline covers `AwaitingApplied` too, where almost no
+memory is at stake but the single outbound slot is: an unanswered
+transaction left there would go on deciding conflict races (FR-3.5).
+
+**The platform boundary is typed with it.** `ClipboardProvider` reads and
+writes a `ClipboardContent` (text or image-with-format); every raster
+format concern — `CF_DIB` and the rest — lives behind it in
+`crossover-platform-*`, and core names no OS clipboard format (NFR-4). The
+platform crate keeps its no-dependency rule, so its image-format tag is a
+deliberate mirror of the protocol's, reconciled by one wildcard-free
+mapping in `crossover-core::clipboard`.
+
 ### 5.3 Connection lifecycle
 
 ```

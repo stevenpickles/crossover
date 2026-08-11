@@ -2,9 +2,16 @@
 //! docs/SPECIFICATION.md §6).
 //!
 //! Crossover observes the real OS clipboard — never keyboard shortcuts —
-//! through this trait. Phase 2 scope is UTF-8 text; the trait reads and
-//! writes text and reports non-text content as absent, leaving richer
-//! types to a later revision (FR-3.7 keeps the protocol ready for them).
+//! through this trait. The boundary is **typed** since ADR 0014: a
+//! provider reads and writes a [`ClipboardContent`], of which UTF-8 text
+//! is one variant and a raster image is another. Everything raster —
+//! `CF_DIB` and friends — lives *behind* this trait in the platform
+//! crates; nothing above it names an OS clipboard format (NFR-4).
+//!
+//! Image bytes are **opaque here and everywhere above**: no component
+//! transcodes, compresses, or parses them (ADR 0014). The format tag is
+//! descriptive metadata that travels with the bytes, not a promise the
+//! bytes were inspected.
 
 use thiserror::Error;
 
@@ -28,6 +35,78 @@ pub enum ClipboardError {
     /// contain clipboard contents (FR-7.4).
     #[error("clipboard unavailable: {reason}")]
     Unavailable { reason: String },
+
+    /// The backend does not handle this content *type* at all.
+    ///
+    /// Split from [`ClipboardError::Unavailable`] because the two mean
+    /// different things to the peer that sent the item: a clipboard that
+    /// is unavailable might work in a second, while a type this build
+    /// cannot represent will never work, and the origin deserves to be
+    /// told which it met (NFR-3). It is what a backend returns for a
+    /// raster image before ADR 0014's platform slice lands.
+    #[error("clipboard content type unsupported: {reason}")]
+    Unsupported { reason: String },
+}
+
+/// Raster formats a [`ClipboardContent::Image`] may carry (ADR 0014).
+///
+/// A deliberate mirror of `crossover_protocol::clipboard::ImageFormat`:
+/// this crate is trait definitions with **no dependencies** by design
+/// (docs/ARCHITECTURE.md §4), so the platform boundary cannot name a
+/// protocol type. The two are kept in step by an exhaustive, wildcard-free
+/// mapping in `crossover-core` and a test that walks every variant, so a
+/// new format fails to compile rather than silently losing its tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardImageFormat {
+    /// Windows device-independent bitmap (`CF_DIB`), the default.
+    Dib,
+    /// PNG, verbatim.
+    Png,
+    /// JPEG, verbatim.
+    Jpeg,
+}
+
+/// What the OS clipboard holds, typed (ADR 0014).
+///
+/// `Text` keeps a `String` rather than bytes so the UTF-8 guarantee is
+/// carried by the type across the boundary — every provider would
+/// otherwise have to re-establish it, and one that forgot would put
+/// invalid UTF-8 into a channel whose consumers assume otherwise. Image
+/// bytes are a plain `Vec<u8>` precisely because nothing may assume
+/// anything about them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardContent {
+    /// UTF-8 text (`CF_UNICODETEXT` on Windows).
+    Text(String),
+    /// A raster image in the source clipboard's own format, verbatim.
+    Image {
+        /// What the bytes are said to be; never verified by parsing them.
+        format: ClipboardImageFormat,
+        /// The image bytes, opaque.
+        bytes: Vec<u8>,
+    },
+}
+
+impl ClipboardContent {
+    /// The text, if this is text — the shape most callers of the old
+    /// text-only boundary want.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Image { .. } => None,
+        }
+    }
+
+    /// Content byte length, for bounds checks and diagnostics. Never the
+    /// content itself — contents are never logged (FR-7.4).
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::Image { bytes, .. } => bytes.len(),
+        }
+    }
 }
 
 /// A change-notification callback.
@@ -43,9 +122,12 @@ pub type ClipboardListener = Box<dyn Fn() + Send + Sync>;
 ///
 /// Semantics implementations must uphold:
 ///
-/// - `read_text` returns `Ok(None)` when the clipboard is empty or holds
-///   no text representation — absence is not an error.
-/// - `write_text` replaces the clipboard contents.
+/// - `read` returns `Ok(None)` when the clipboard is empty or holds no
+///   representation this build handles — absence is not an error, and a
+///   format the backend cannot yet read is absence, not failure.
+/// - `write` replaces the clipboard contents. A content *type* the
+///   backend cannot install is [`ClipboardError::Unavailable`] (a
+///   permanent, non-retryable refusal), never a silent success.
 /// - The listener is invoked on an arbitrary thread and must return
 ///   quickly without blocking (on Windows it descends from the clipboard
 ///   listener message on the message-pump thread).
@@ -59,21 +141,51 @@ pub type ClipboardListener = Box<dyn Fn() + Send + Sync>;
 /// - At most one listener is active; setting a new one replaces the old,
 ///   and `None` unsubscribes.
 pub trait ClipboardProvider: Send + Sync {
-    /// Read the current text content, or `Ok(None)` if empty/non-text.
+    /// Read the current content, or `Ok(None)` if the clipboard is empty
+    /// or holds nothing this backend represents.
     ///
     /// # Errors
     ///
     /// [`ClipboardError::Busy`] under contention (retryable);
     /// [`ClipboardError::Unavailable`] on real failure.
-    fn read_text(&self) -> Result<Option<String>, ClipboardError>;
+    fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError>;
+
+    /// Replace the clipboard contents with `content`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClipboardError::Busy`] under contention (retryable);
+    /// [`ClipboardError::Unavailable`] on real failure, **including a
+    /// content type this backend cannot install** — the caller must be
+    /// able to tell the origin the truth (FR-3.2, NFR-3).
+    fn write(&self, content: &ClipboardContent) -> Result<(), ClipboardError>;
+
+    /// Read the current text content, or `Ok(None)` if the clipboard is
+    /// empty or holds no text.
+    ///
+    /// A convenience over [`ClipboardProvider::read`], not a second
+    /// contract: implementations override [`ClipboardProvider::read`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ClipboardProvider::read`].
+    fn read_text(&self) -> Result<Option<String>, ClipboardError> {
+        Ok(match self.read()? {
+            Some(ClipboardContent::Text(text)) => Some(text),
+            Some(ClipboardContent::Image { .. }) | None => None,
+        })
+    }
 
     /// Replace the clipboard contents with `text`.
     ///
+    /// A convenience over [`ClipboardProvider::write`].
+    ///
     /// # Errors
     ///
-    /// [`ClipboardError::Busy`] under contention (retryable);
-    /// [`ClipboardError::Unavailable`] on real failure.
-    fn write_text(&self, text: &str) -> Result<(), ClipboardError>;
+    /// As [`ClipboardProvider::write`].
+    fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
+        self.write(&ClipboardContent::Text(text.to_owned()))
+    }
 
     /// Install (or with `None`, remove) the change listener.
     ///

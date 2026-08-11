@@ -57,6 +57,17 @@ pub struct SessionOptions {
     /// (FR-7.3); when `None`, sessions are uninstrumented, which is what
     /// most tests want.
     pub metrics: Option<Arc<Metrics>>,
+    /// What this side advertises in its `Hello` (docs/PROTOCOL.md §3.1).
+    ///
+    /// Defaults to [`FeatureFlags::ADVERTISED`] — what the build can
+    /// genuinely honour — and production never sets anything else.
+    /// Overriding it exists so a test can negotiate a capability whose
+    /// *upper* layers are complete while a lower one is not: ADR 0014's
+    /// engine handles chunked images before its platform slice can put one
+    /// on a real clipboard, and the full path over TLS has to be provable
+    /// in between, with a fake provider. Advertising is a promise to
+    /// handle, so the constant stays honest and the override is explicit.
+    pub advertised_features: FeatureFlags,
 }
 
 impl Default for SessionOptions {
@@ -64,6 +75,7 @@ impl Default for SessionOptions {
         Self {
             establish_timeout: Duration::from_secs(10),
             metrics: None,
+            advertised_features: FeatureFlags::ADVERTISED,
         }
     }
 }
@@ -409,7 +421,7 @@ impl SessionListener {
                 peer_fingerprint,
                 local,
                 session_id,
-                options.metrics.clone(),
+                options,
             )
             .await
         })
@@ -456,7 +468,7 @@ pub async fn connect(
             peer_fingerprint,
             local,
             session_id,
-            options.metrics.clone(),
+            options,
         )
         .await
     })
@@ -484,16 +496,20 @@ async fn establish(
     peer_fingerprint: SpkiFingerprint,
     local: &LocalNode<'_>,
     session_id: Uuid,
-    metrics: Option<Arc<Metrics>>,
+    options: &SessionOptions,
 ) -> Result<EstablishedSession, SessionError> {
-    // Send our Hello (message id 1).
+    let metrics = options.metrics.clone();
+    // Send our Hello (message id 1). What it advertises is a promise to
+    // handle, so it comes from the build's own constant unless a caller
+    // deliberately says otherwise (docs/PROTOCOL.md §3.1).
+    let advertised = options.advertised_features;
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
         min_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
         device_id: local.identity.device_id(),
         device_name: local.identity.device_name().to_owned(),
         operating_system: local_os_family(),
-        supported_features: FeatureFlags::ADVERTISED,
+        supported_features: advertised,
     };
     let payload = hello.encode_payload()?;
     let frame = encode_frame(MessageType::Hello.wire(), 1, &payload)?;
@@ -543,10 +559,7 @@ async fn establish(
             peer_device_name: peer_hello.device_name,
             peer_os: peer_hello.operating_system,
             protocol_version,
-            features: FeatureFlags::negotiate(
-                FeatureFlags::ADVERTISED,
-                peer_hello.supported_features,
-            ),
+            features: FeatureFlags::negotiate(advertised, peer_hello.supported_features),
         },
         metrics,
     })
@@ -665,7 +678,7 @@ mod tests {
     fn options() -> SessionOptions {
         SessionOptions {
             establish_timeout: Duration::from_secs(5),
-            metrics: None,
+            ..SessionOptions::default()
         }
     }
 
@@ -747,6 +760,7 @@ mod tests {
         let opts = SessionOptions {
             establish_timeout: Duration::from_secs(5),
             metrics: Some(Arc::clone(&metrics)),
+            ..SessionOptions::default()
         };
 
         let listener = SessionListener::bind("127.0.0.1:0").await.unwrap();
@@ -999,7 +1013,7 @@ mod tests {
 
         let short = SessionOptions {
             establish_timeout: Duration::from_millis(200),
-            metrics: None,
+            ..SessionOptions::default()
         };
         let server_local = server.local();
         let (inbound, ()) = tokio::join!(listener.accept(&server_local, &short), async {

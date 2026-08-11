@@ -20,6 +20,17 @@
 //!   `Superseded`. The order is deterministic, not wall-clock-fair — a
 //!   freshly restarted peer (sequence reset) loses ties until it catches
 //!   up, which only matters during genuinely simultaneous copies.
+//! - **Bounded transfer lifetime** (ADR 0014, NFR-1): every transaction
+//!   that retains content — an offer awaiting an answer, a chunk stream,
+//!   an accepted offer awaiting its bytes — carries a deadline, so an
+//!   answer that never comes costs a bounded amount of memory for a
+//!   bounded time instead of pinning up to `MAX_CLIPBOARD_IMAGE_BYTES`
+//!   until the session happens to end.
+//!
+//! Content is **typed and opaque** since ADR 0014: items carry a
+//! [`ContentType`] and bytes, text is one type and a raster image another,
+//! and nothing here transcodes, parses or even looks at image bytes — the
+//! hash and the length are the only things ever computed over them.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -27,10 +38,11 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
+use crossover_platform::{ClipboardContent, ClipboardImageFormat};
 use crossover_protocol::clipboard::{
-    ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardAccept, ClipboardApplied, ClipboardChunk,
-    ClipboardData, ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
-    MAX_CLIPBOARD_TEXT_BYTES, content_hash,
+    ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ChunkOutcome, ChunkPlan, ChunkReassembly,
+    ClipboardAccept, ClipboardApplied, ClipboardChunk, ClipboardData, ClipboardDecline,
+    ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, ImageFormat, content_hash,
 };
 use crossover_protocol::hello::MessageType;
 
@@ -54,15 +66,57 @@ const APPLIED_HASH_MEMORY: usize = 8;
 /// junk is free for the sender and unbounded log volume for us.
 const MAX_CLIPBOARD_VIOLATIONS: u32 = 8;
 
-/// Clipboard engine tuning. Grouped because both knobs are timing
+/// How many recently finished chunked transfers are remembered by id.
+///
+/// Small on purpose: it exists only to recognize the *tail* of a transfer
+/// this side stopped caring about — chunks already in flight when the
+/// transfer was superseded, abandoned, or completed. Recognizing them
+/// keeps a benign race off the violation budget, which matters at image
+/// scale: a superseded transfer can leave a whole background lane's worth
+/// of chunks in flight, far past [`MAX_CLIPBOARD_VIOLATIONS`], and killing
+/// a healthy session over that would be its own defect.
+///
+/// **What this concedes, stated plainly.** An id in this ring is a
+/// permanently free channel for the rest of the session: a peer may send
+/// chunks bearing it forever and be charged nothing. That is deliberate,
+/// and the reasoning is economic rather than structural. To obtain such an
+/// id a peer must first have had a transfer complete or be abandoned —
+/// and having got one, the traffic buys it nothing: no state is created,
+/// no memory is committed, no answer is sent, and the frames are logged at
+/// **debug**, so at default levels the cost to this side is a decode and a
+/// comparison per frame. That is strictly less than the peer spends
+/// sending them, and it is no better than what any unknown message type
+/// already costs (docs/PROTOCOL.md §7 — skipped, counted, debug). The one
+/// caveat worth knowing when diagnosing: under `RUST_LOG=debug` the
+/// *volume* of that logging is the peer's to choose, so a machine left in
+/// debug logging can have its log growth driven from the far end.
+const RECENT_TRANSFER_MEMORY: usize = 4;
+
+/// Clipboard engine tuning. Grouped because all three knobs are timing
 /// policy, and tests need to shrink them without pretending the
 /// production defaults are different.
-#[derive(Debug, Clone, Default)]
+///
+/// [`Default`] is [`ClipboardConfig::new`], not a derive, and the
+/// difference is not cosmetic: a derived `Default` gives every `Duration`
+/// field zero, which here means "abandon each transfer the instant it
+/// starts" and "disable the transmit debounce ADR 0006 exists for". A
+/// caller writing `..Default::default()` would get that silently, with
+/// nothing to review — the same trap `KeepaliveConfig` avoids the same
+/// way.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardConfig {
     /// Bounded retry for `Busy` clipboard writes (FR-3.4).
     pub retry: RetryPolicy,
     /// Quiet period before staged content is transmitted (ADR 0006).
     pub transmit_debounce: Duration,
+    /// Deadline on a transfer that retains content (ADR 0014).
+    pub transfer_timeout: Duration,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClipboardConfig {
@@ -72,6 +126,7 @@ impl ClipboardConfig {
         Self {
             retry: RetryPolicy::default(),
             transmit_debounce: TRANSMIT_DEBOUNCE,
+            transfer_timeout: TRANSFER_TIMEOUT,
         }
     }
 }
@@ -91,10 +146,44 @@ impl ClipboardConfig {
 /// debounce carries Phase 2 and remains the fallback afterwards.
 pub const TRANSMIT_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// How long a content-retaining transfer may stay unfinished before it is
+/// abandoned (ADR 0014).
+///
+/// The bound exists because of what a transfer *holds*. An offered item
+/// keeps its content until the answer arrives, and an accepted offer keeps
+/// a reassembly buffer sized from the offered length — up to
+/// `MAX_CLIPBOARD_IMAGE_BYTES`, 64 MiB. Session-scoped cleanup alone is
+/// not a bound: a session can live for days, and a peer that offers and
+/// then goes quiet would pin that memory for all of it. Nothing about
+/// that needs malice; a peer killed between `Accept` and its first chunk
+/// produces it.
+///
+/// Sixty seconds is chosen to be *far* longer than any honest transfer and
+/// still short enough to be a bound. The transfer itself is milliseconds
+/// (a 64 MiB image is 0.2 s on 2.5 `GbE`, 0.5 s on 1 `GbE`), and the margin is
+/// for the deliberate starvation ADR 0013 allows: clipboard bulk yields to
+/// live input with no aging, so a transfer *should* be able to wait out a
+/// long burst of typing. A transfer that loses even a minute to that is
+/// better abandoned observably than kept forever — the content is still on
+/// the origin's clipboard, and re-copying re-sends it.
+///
+/// **Known coarseness.** One case reaches this deadline having never had a
+/// chance: an offer the session's send gate refuses locally, because the
+/// peer never advertised the content type (docs/PROTOCOL.md §3.1). The
+/// engine is sans-io and holds no session knowledge — it cannot know a
+/// capability was missing — so it waits out the full minute holding the
+/// item, then abandons it like any other unanswered offer. The wait is
+/// bounded and the outcome is *counted*
+/// ([`Metrics::record_clipboard_abandoned`]) rather than merely logged, so
+/// the case is diagnosable instead of silent; teaching the engine the
+/// negotiated feature set would fix it properly, and would mean handing
+/// the state machine session state it otherwise has no reason to know.
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_mins(1);
+
 /// Retry policy for `Busy` clipboard writes (FR-3.4): centrally defined,
 /// bounded attempts, bounded total time (ADR 0005 requires exactly this
 /// shape).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
     /// Total write attempts before giving up (first try included).
     pub max_attempts: u32,
@@ -120,8 +209,13 @@ pub enum OutboundMessage {
     Accept(ClipboardAccept),
     /// Decline an offered item.
     Decline(ClipboardDecline),
-    /// The item content.
+    /// The item content, whole (text).
     Data(ClipboardData),
+    /// One fragment of a chunked item (ADR 0014). Each chunk is its own
+    /// frame and its own command, because a chunk is the preemption unit:
+    /// the writer takes exactly one between checks of the interactive lane
+    /// (ADR 0013), which is what keeps live input ahead of a transfer.
+    Chunk(ClipboardChunk),
     /// The destination verdict.
     Applied(ClipboardApplied),
 }
@@ -135,6 +229,7 @@ impl OutboundMessage {
             Self::Accept(_) => MessageType::ClipboardAccept,
             Self::Decline(_) => MessageType::ClipboardDecline,
             Self::Data(_) => MessageType::ClipboardData,
+            Self::Chunk(_) => MessageType::ClipboardChunk,
             Self::Applied(_) => MessageType::ClipboardApplied,
         }
     }
@@ -152,27 +247,69 @@ impl OutboundMessage {
             Self::Accept(m) => m.encode_payload()?,
             Self::Decline(m) => m.encode_payload()?,
             Self::Data(m) => m.encode_payload()?,
+            Self::Chunk(m) => m.encode_payload()?,
             Self::Applied(m) => m.encode_payload()?,
         };
         Ok((self.message_type().wire(), payload))
     }
 }
 
+/// Which half of the transaction machine a deadline belongs to.
+///
+/// Two independent timers rather than one: an outbound offer and an
+/// inbound reassembly can be in flight at the same moment, and a single
+/// shared deadline would let the later one keep resetting the earlier
+/// one's clock — which is not a bound at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferScope {
+    /// Our own item, offered or streaming (the retained content buffer).
+    Outbound,
+    /// A peer item we accepted (the reassembly buffer, or an accepted
+    /// text offer whose `Data` has not arrived).
+    Inbound,
+}
+
+/// Why a clipboard write did not succeed.
+///
+/// Three outcomes rather than a retryable/not-retryable flag, because the
+/// third one is a different *kind* of answer: a content type this
+/// destination cannot represent is a permanent statement about the item,
+/// where an unavailable clipboard is a transient statement about the
+/// machine. Collapsing them would tell the origin "clipboard
+/// unavailable" for an image that will never install here, whatever it
+/// tries (NFR-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteFailure {
+    /// Transient contention (FR-3.4): the only failure that is retried.
+    Busy,
+    /// The clipboard could not be written and retrying will not help.
+    Unavailable,
+    /// The backend does not handle this content type at all.
+    UnsupportedType,
+}
+
 /// What the driver must do next.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// Read the current clipboard text and report it back via
+    /// Read the current clipboard content and report it back via
     /// [`ClipboardEngine::on_local_read`].
     ReadClipboard,
-    /// Write `text` to the local clipboard and report the result via
+    /// Write `content` to the local clipboard and report the result via
     /// [`ClipboardEngine::on_write_result`].
     WriteClipboard {
         /// Transaction id the result must reference.
         id: Uuid,
-        /// The content to install.
-        text: String,
+        /// The content to install. Shared rather than owned so a retry
+        /// (FR-3.4) re-issues the write without copying what may be a
+        /// 64 MiB image each time.
+        content: Arc<ClipboardContent>,
     },
-    /// Send a message to the peer.
+    /// Send a message to the peer. After a [`OutboundMessage::Chunk`] has
+    /// been handed to the send path, call
+    /// [`ClipboardEngine::on_chunk_sent`] for the next one — the engine
+    /// emits chunks one at a time, straight out of the retained item
+    /// buffer, so neither it nor the driver ever holds a second copy of
+    /// the image (ADR 0014, NFR-1).
     Send(OutboundMessage),
     /// Call [`ClipboardEngine::on_retry_due`] with `id` after `delay`.
     ScheduleRetry {
@@ -186,6 +323,18 @@ pub enum Action {
     /// expected: the driver keeps only the latest.
     ScheduleSettle {
         /// How long the clipboard must stay quiet.
+        delay: Duration,
+    },
+    /// Call [`ClipboardEngine::on_transfer_timeout`] with `scope` and
+    /// `generation` after `delay` (ADR 0014). Generation-tagged like
+    /// [`Action::ScheduleSettle`]: a timer for a superseded transfer
+    /// fires into a no-op, so nothing has to be cancelled.
+    ScheduleTransferTimeout {
+        /// Which half of the machine the deadline covers.
+        scope: TransferScope,
+        /// Which transfer the deadline belongs to.
+        generation: u64,
+        /// How long the transfer may take.
         delay: Duration,
     },
     /// End the session: the peer's clipboard traffic committed repeated
@@ -256,14 +405,38 @@ impl InboundMessage {
 /// `started` stamps when the local observation entered the pipeline, so
 /// transaction latency is computed entirely on the originating machine's
 /// clock — no cross-machine skew enters the measurement.
+///
+/// `content` is the outbound memory commitment, and it is deliberate:
+/// exactly one item is retained *in this slot* at a time (a newer local
+/// copy supersedes and replaces it), for at most
+/// [`ClipboardConfig::transfer_timeout`], bounded by the content type's
+/// maximum — 64 MiB for an image (ADR 0014). Chunks are sliced out of it
+/// on demand rather than pre-rendered, so this slot's peak is one buffer
+/// plus one chunk.
+///
+/// It is not the engine's *only* buffer: an inbound reassembly and a
+/// `PendingWrite` under retry are independent slots of the same size, so
+/// the honest whole-engine worst case is their sum — see
+/// docs/ARCHITECTURE.md §5.2, which states it.
 #[derive(Debug)]
 enum Outbound {
-    /// Offer sent; awaiting Accept/Decline.
+    /// Offer sent; awaiting Accept/Decline. Holds the content, because
+    /// an Accept means "send it now".
     AwaitingAccept {
-        data: ClipboardData,
+        meta: ClipboardMeta,
+        content: Vec<u8>,
         started: Instant,
     },
-    /// Data sent; awaiting Applied.
+    /// Accepted and streaming chunks (ADR 0014). `next_index` is the
+    /// chunk to emit when the driver comes back for another.
+    Streaming {
+        meta: ClipboardMeta,
+        content: Vec<u8>,
+        plan: ChunkPlan,
+        next_index: u32,
+        started: Instant,
+    },
+    /// Everything sent; awaiting Applied. Content released.
     AwaitingApplied {
         meta: ClipboardMeta,
         started: Instant,
@@ -273,17 +446,23 @@ enum Outbound {
 impl Outbound {
     fn meta(&self) -> ClipboardMeta {
         match self {
-            Self::AwaitingAccept { data, .. } => data.meta,
-            Self::AwaitingApplied { meta, .. } => *meta,
+            Self::AwaitingAccept { meta, .. }
+            | Self::Streaming { meta, .. }
+            | Self::AwaitingApplied { meta, .. } => *meta,
         }
     }
 
     fn started(&self) -> Instant {
         match self {
-            Self::AwaitingAccept { started, .. } | Self::AwaitingApplied { started, .. } => {
-                *started
-            }
+            Self::AwaitingAccept { started, .. }
+            | Self::Streaming { started, .. }
+            | Self::AwaitingApplied { started, .. } => *started,
         }
+    }
+
+    /// Whether this state retains an item buffer, and so needs a deadline.
+    const fn retains_content(&self) -> bool {
+        matches!(self, Self::AwaitingAccept { .. } | Self::Streaming { .. })
     }
 }
 
@@ -291,7 +470,7 @@ impl Outbound {
 #[derive(Debug)]
 struct PendingWrite {
     meta: ClipboardMeta,
-    text: String,
+    content: Arc<ClipboardContent>,
     attempts_made: u32,
 }
 
@@ -312,8 +491,24 @@ pub struct ClipboardEngine {
     /// At most one outbound transaction in flight; newer local copies
     /// supersede it.
     outbound: Option<Outbound>,
-    /// An accepted inbound offer whose Data we await.
+    /// An accepted inbound offer whose Data we await (text).
     expecting_data: Option<ClipboardMeta>,
+    /// The accepted inbound *chunked* offer being reassembled (ADR 0014).
+    ///
+    /// At most one, ever: it is the receiver's whole memory commitment,
+    /// and a second concurrent one would double a bound the protocol
+    /// states as singular. A newer accepted offer replaces it, which is
+    /// the same supersession rule `expecting_data` has always had.
+    reassembly: Option<ChunkReassembly>,
+    /// Ids of chunked transfers recently finished or abandoned, so their
+    /// in-flight tail is recognized as the benign race it is rather than
+    /// charged to the violation budget.
+    recent_transfers: VecDeque<Uuid>,
+    /// Deadline generations (ADR 0014). Bumped when a transfer that
+    /// retains content starts; a timeout for an older generation is a
+    /// no-op, so superseded timers need no cancellation.
+    outbound_generation: u64,
+    inbound_generation: u64,
     /// The write (with retries) currently underway.
     pending_write: Option<PendingWrite>,
     /// Clipboard protocol violations this peer has committed since the
@@ -352,6 +547,10 @@ impl ClipboardEngine {
             applied_hashes: VecDeque::new(),
             outbound: None,
             expecting_data: None,
+            reassembly: None,
+            recent_transfers: VecDeque::new(),
+            outbound_generation: 0,
+            inbound_generation: 0,
             pending_write: None,
             violations: 0,
             metrics,
@@ -386,19 +585,32 @@ impl ClipboardEngine {
     }
 
     /// The driver read the clipboard. Decide whether anything travels.
-    pub fn on_local_read(&mut self, content: Option<String>) -> Vec<Action> {
-        let Some(text) = content else {
-            return Vec::new(); // empty or non-text: nothing to sync
+    ///
+    /// Typed since ADR 0014: the same rules apply to every content type —
+    /// only the bound and the flow differ, and both come from the type.
+    pub fn on_local_read(&mut self, content: Option<ClipboardContent>) -> Vec<Action> {
+        let Some(content) = content else {
+            return Vec::new(); // empty, or a format this build cannot read
         };
-        if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+        let (content_type, bytes) = into_wire(content);
+        let max = content_type.max_content_bytes();
+        if bytes.len() as u64 > max {
             tracing::warn!(
-                byte_count = text.len(),
-                max = MAX_CLIPBOARD_TEXT_BYTES,
+                byte_count = bytes.len(),
+                max,
+                content_type = ?content_type,
                 "local clipboard item exceeds the protocol maximum; not synchronized"
             );
             return Vec::new(); // graceful rejection (FR-3.6)
         }
-        let hash = content_hash(text.as_bytes());
+        if content_type.is_chunked() && bytes.is_empty() {
+            // A zero-byte image is not an image, and the chunk arithmetic
+            // has nothing to reconcile: refuse locally rather than mint an
+            // item the wire would reject (docs/PROTOCOL.md §5).
+            tracing::warn!(content_type = ?content_type, "empty local clipboard item; not synchronized");
+            return Vec::new();
+        }
+        let hash = content_hash(&bytes);
 
         // Loop prevention: this is content we ourselves applied.
         if self.applied_hashes.contains(&hash) {
@@ -414,17 +626,18 @@ impl ClipboardEngine {
 
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        let data = ClipboardData::from_content(
-            Uuid::new_v4(),
-            self.origin,
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: self.origin,
             sequence,
-            ContentType::Utf8Text,
-            text.into_bytes(),
-        );
+            content_type,
+            content_length: bytes.len() as u64,
+            content_hash: hash,
+        };
         // The read only happens after the clipboard has settled, so
         // whatever we just read is the content worth sending: transmit
         // it directly.
-        self.start_outbound(data)
+        self.start_outbound(meta, bytes)
     }
 
     /// A decoded clipboard message arrived from the peer.
@@ -440,10 +653,7 @@ impl ClipboardEngine {
     }
 
     /// The driver finished (or failed) a clipboard write.
-    ///
-    /// `retryable` distinguishes `Busy` (true) from `Unavailable`
-    /// (false).
-    pub fn on_write_result(&mut self, id: Uuid, result: Result<(), bool>) -> Vec<Action> {
+    pub fn on_write_result(&mut self, id: Uuid, result: Result<(), WriteFailure>) -> Vec<Action> {
         // Take-then-restore: no panic path exists (NFR-1 discipline).
         let Some(pending) = self.pending_write.take() else {
             tracing::debug!(clipboard_id = %id, "write result for no pending write; ignoring");
@@ -456,6 +666,7 @@ impl ClipboardEngine {
         }
         match result {
             Ok(()) => {
+                drop(pending.content); // release the item buffer promptly
                 self.remember_applied(pending.meta.content_hash);
                 self.current_local_hash = Some(pending.meta.content_hash);
                 self.record(Metrics::record_clipboard_applied);
@@ -472,8 +683,10 @@ impl ClipboardEngine {
                     result: ApplyResult::Applied,
                 }))]
             }
-            Err(retryable) => {
-                if retryable && pending.attempts_made < self.config.retry.max_attempts {
+            Err(failure) => {
+                if failure == WriteFailure::Busy
+                    && pending.attempts_made < self.config.retry.max_attempts
+                {
                     let delay = self.config.retry.delay;
                     tracing::debug!(
                         clipboard_id = %id,
@@ -483,16 +696,28 @@ impl ClipboardEngine {
                     self.pending_write = Some(pending);
                     return vec![Action::ScheduleRetry { id, delay }];
                 }
+                // A type this destination cannot represent is a statement
+                // about the *content*, not about the clipboard's
+                // availability, and the origin acts on the two
+                // differently: one will never work here, the other might
+                // work on the next copy (NFR-3).
+                let verdict = match failure {
+                    WriteFailure::UnsupportedType => ApplyResult::ContentRejected,
+                    WriteFailure::Busy | WriteFailure::Unavailable => {
+                        ApplyResult::ClipboardUnavailable
+                    }
+                };
                 tracing::warn!(
                     clipboard_id = %pending.meta.id,
                     origin_peer = %pending.meta.origin,
+                    content_type = ?pending.meta.content_type,
                     attempt_count = pending.attempts_made,
-                    result = "clipboard_unavailable",
+                    result = ?verdict,
                     "clipboard item could not be installed"
                 );
                 vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
                     id,
-                    result: ApplyResult::ClipboardUnavailable,
+                    result: verdict,
                 }))]
             }
         }
@@ -509,7 +734,7 @@ impl ClipboardEngine {
         pending.attempts_made += 1;
         vec![Action::WriteClipboard {
             id,
-            text: pending.text.clone(),
+            content: Arc::clone(&pending.content),
         }]
     }
 
@@ -519,6 +744,8 @@ impl ClipboardEngine {
     pub fn on_session_established(&mut self) -> Vec<Action> {
         self.outbound = None;
         self.expecting_data = None;
+        self.reassembly = None;
+        self.recent_transfers.clear();
         // A fresh session gets a fresh violation budget: the counter
         // bounds one peer's misbehaviour on one connection, not a
         // process-lifetime grudge.
@@ -533,18 +760,11 @@ impl ClipboardEngine {
     /// The session dropped: in-flight transaction state is meaningless
     /// now. Pending local writes finish (the content is already here).
     ///
-    /// TODO(ADR 0014 engine slice): two things must join this cleanup
-    /// when reassembly lands here, because both would otherwise pin up to
-    /// `MAX_CLIPBOARD_IMAGE_BYTES` indefinitely —
-    ///
-    /// 1. the in-flight `ChunkReassembly` must be dropped here, exactly as
-    ///    `outbound` and `expecting_data` are; and
-    /// 2. `expecting_data` (and the reassembly it will gate) has **no
-    ///    timeout**. Today that is harmless: an accepted offer whose Data
-    ///    never arrives costs one `ClipboardMeta`. With images it costs
-    ///    the whole buffer, held until the session happens to end — so an
-    ///    accepted-but-never-fulfilled transfer needs a bounded lifetime,
-    ///    not just a session-scoped one.
+    /// Every buffer the transaction machine can hold is released here —
+    /// the retained outbound item and the inbound reassembly both, either
+    /// of which can be `MAX_CLIPBOARD_IMAGE_BYTES` (ADR 0014). Nothing is
+    /// sent: the peer is gone, and the deadline that would have answered
+    /// it becomes moot with the session.
     pub fn on_session_lost(&mut self) -> Vec<Action> {
         if let Some(outbound) = self.outbound.take() {
             tracing::debug!(
@@ -552,13 +772,144 @@ impl ClipboardEngine {
                 "outbound clipboard transaction abandoned: session lost"
             );
         }
-        self.expecting_data = None;
+        if let Some(meta) = self.expecting_data.take() {
+            tracing::debug!(
+                clipboard_id = %meta.id,
+                "accepted inbound offer abandoned: session lost"
+            );
+        }
+        if let Some(reassembly) = self.reassembly.take() {
+            tracing::debug!(
+                clipboard_id = %reassembly.meta().id,
+                byte_count = reassembly.received_bytes(),
+                "inbound chunked transfer abandoned: session lost"
+            );
+        }
         Vec::new()
+    }
+
+    /// A transfer deadline came due (ADR 0014).
+    ///
+    /// Abandoning is observable and never fatal: the state is released,
+    /// the origin of an inbound transfer is told the truth so its
+    /// transaction closes instead of stalling (NFR-3), and the machine is
+    /// left clean — the very next offer or copy works normally.
+    pub fn on_transfer_timeout(&mut self, scope: TransferScope, generation: u64) -> Vec<Action> {
+        match scope {
+            TransferScope::Outbound => {
+                if generation != self.outbound_generation {
+                    return Vec::new(); // a newer transfer restarted the clock
+                }
+                let Some(outbound) = self.outbound.take() else {
+                    return Vec::new();
+                };
+                // Every outbound state expires, not only the ones holding
+                // an item buffer. `AwaitingApplied` costs almost no
+                // memory, but a peer that never answers would occupy the
+                // single outbound slot forever — and that slot is an input
+                // to the conflict rule, so a zombie transaction would keep
+                // deciding races against items minted long after it
+                // (FR-3.5).
+                self.record(Metrics::record_clipboard_abandoned);
+                tracing::warn!(
+                    clipboard_id = %outbound.meta().id,
+                    byte_count = outbound.meta().content_length,
+                    retained_content = outbound.retains_content(),
+                    result = "abandoned",
+                    "outbound clipboard transaction abandoned: no answer within the deadline"
+                );
+                Vec::new()
+            }
+            TransferScope::Inbound => {
+                if generation != self.inbound_generation {
+                    return Vec::new();
+                }
+                let mut actions = Vec::new();
+                if let Some(meta) = self.expecting_data.take() {
+                    self.record(Metrics::record_clipboard_abandoned);
+                    tracing::warn!(
+                        clipboard_id = %meta.id,
+                        result = "abandoned",
+                        "accepted inbound offer abandoned: content never arrived"
+                    );
+                    actions.push(Action::Send(OutboundMessage::Applied(ClipboardApplied {
+                        id: meta.id,
+                        // Nothing was installed and nothing will be. The
+                        // origin needs *an* answer far more than it needs a
+                        // bespoke variant, and a new `ApplyResult` would be
+                        // a wire change fatal to peers that predate it
+                        // (docs/PROTOCOL.md §2).
+                        result: ApplyResult::ContentRejected,
+                    })));
+                }
+                if let Some(reassembly) = self.abandon_reassembly("deadline") {
+                    self.record(Metrics::record_clipboard_abandoned);
+                    actions.push(Action::Send(OutboundMessage::Applied(ClipboardApplied {
+                        id: reassembly,
+                        result: ApplyResult::ContentRejected,
+                    })));
+                }
+                actions
+            }
+        }
+    }
+
+    /// One chunk has been handed to the send path; emit the next.
+    ///
+    /// The stream is driven one chunk at a time, on purpose: a chunk is
+    /// ADR 0013's preemption unit, so each one becomes its own command and
+    /// its own frame, and the sender never materializes the whole split
+    /// (a 64 MiB image would otherwise be 128 MiB in flight).
+    pub fn on_chunk_sent(&mut self, id: Uuid) -> Vec<Action> {
+        let Some(Outbound::Streaming {
+            meta,
+            content,
+            plan,
+            next_index,
+            started,
+        }) = self.outbound.take()
+        else {
+            return Vec::new(); // superseded, abandoned, or not streaming
+        };
+        if meta.id != id {
+            // A late confirmation for a transfer that has been replaced.
+            self.outbound = Some(Outbound::Streaming {
+                meta,
+                content,
+                plan,
+                next_index,
+                started,
+            });
+            return Vec::new();
+        }
+        if next_index >= plan.chunk_count() {
+            // Every chunk is out; the content buffer is released here and
+            // only the verdict remains outstanding.
+            self.outbound = Some(Outbound::AwaitingApplied { meta, started });
+            return Vec::new();
+        }
+        let Some(chunk) = chunk_at(meta.id, &content, plan, next_index) else {
+            // Unreachable: the plan was derived from this buffer's length.
+            tracing::error!(
+                clipboard_id = %meta.id,
+                chunk_index = next_index,
+                "clipboard chunk slice out of range; abandoning the transfer"
+            );
+            return Vec::new();
+        };
+        self.outbound = Some(Outbound::Streaming {
+            meta,
+            content,
+            plan,
+            next_index: next_index.saturating_add(1),
+            started,
+        });
+        vec![Action::Send(OutboundMessage::Chunk(chunk))]
     }
 
     // --- internals ---
 
-    fn start_outbound(&mut self, data: ClipboardData) -> Vec<Action> {
+    fn start_outbound(&mut self, meta: ClipboardMeta, content: Vec<u8>) -> Vec<Action> {
         if let Some(previous) = self.outbound.take() {
             tracing::debug!(
                 clipboard_id = %previous.meta().id,
@@ -566,43 +917,96 @@ impl ClipboardEngine {
             );
         }
         self.record(Metrics::record_clipboard_sent);
-        let meta = data.meta;
         let started = Instant::now();
-        if meta.content_length <= CLIPBOARD_INLINE_MAX_BYTES as u64 {
+        // Chunked types have no inline flow and are offered at any size:
+        // the offer round is where the receiver's already-have decline
+        // makes a re-paste move zero bytes, and where it bounds its own
+        // memory before megabytes arrive (ADR 0014).
+        let offered = meta.content_type.is_chunked()
+            || meta.content_length > CLIPBOARD_INLINE_MAX_BYTES as u64;
+        // Armed for *every* outbound transaction, inline text included.
+        // The buffer is only half the reason: the other half is that
+        // `outbound` is the single slot the conflict rule reads, so a
+        // transaction nobody ever answers would go on deciding races it
+        // has no business in (FR-3.5). One deadline covers the whole
+        // transaction — offer, stream and verdict — so accepting does not
+        // restart the clock.
+        let deadline = self.arm_timeout(TransferScope::Outbound);
+        if !offered {
             self.outbound = Some(Outbound::AwaitingApplied { meta, started });
-            vec![Action::Send(OutboundMessage::Data(data))]
-        } else {
-            self.outbound = Some(Outbound::AwaitingAccept { data, started });
-            vec![Action::Send(OutboundMessage::Offer(ClipboardOffer {
-                meta,
-            }))]
+            return vec![
+                Action::Send(OutboundMessage::Data(ClipboardData { meta, content })),
+                deadline,
+            ];
+        }
+        self.outbound = Some(Outbound::AwaitingAccept {
+            meta,
+            content,
+            started,
+        });
+        vec![
+            Action::Send(OutboundMessage::Offer(ClipboardOffer { meta })),
+            deadline,
+        ]
+    }
+
+    /// Start (or restart) a scope's deadline, returning the action that
+    /// asks the driver for the timer.
+    fn arm_timeout(&mut self, scope: TransferScope) -> Action {
+        let generation = match scope {
+            TransferScope::Outbound => {
+                self.outbound_generation = self.outbound_generation.wrapping_add(1);
+                self.outbound_generation
+            }
+            TransferScope::Inbound => {
+                self.inbound_generation = self.inbound_generation.wrapping_add(1);
+                self.inbound_generation
+            }
+        };
+        Action::ScheduleTransferTimeout {
+            scope,
+            generation,
+            delay: self.config.transfer_timeout,
         }
     }
 
-    fn on_peer_offer(&mut self, offer: ClipboardOffer) -> Vec<Action> {
-        // ---- ADR 0014 placeholder: replaced by the engine slice --------
-        // The wire layer can carry chunked items (images) and prove them
-        // correct; this engine cannot yet reassemble one or hand it to a
-        // typed clipboard write, and the platform layer cannot yet read or
-        // write a raster format. Until those land, refuse *honestly*: a
-        // typed, permanent decline closes the origin's transaction at once
-        // (NFR-3), where silence would strand it. Nothing should reach
-        // here in practice — `FeatureFlags::ADVERTISED` does not offer the
-        // capability, so a conforming peer never offers such an item — so
-        // this is the answer for a peer that ignores negotiation.
-        if offer.meta.content_type.is_chunked() {
-            tracing::info!(
-                clipboard_id = %offer.meta.id,
-                content_type = ?offer.meta.content_type,
-                result = "unsupported_type",
-                "declining an offer of a type this build cannot install"
-            );
-            return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
-                id: offer.meta.id,
-                reason: DeclineReason::UnsupportedType,
-            }))];
+    /// Drop any in-flight reassembly, remembering its id so the chunks
+    /// still on the wire for it are recognized rather than punished.
+    /// Returns the abandoned item id.
+    fn abandon_reassembly(&mut self, why: &str) -> Option<Uuid> {
+        let reassembly = self.reassembly.take()?;
+        let id = reassembly.meta().id;
+        tracing::debug!(
+            clipboard_id = %id,
+            byte_count = reassembly.received_bytes(),
+            reason = why,
+            "inbound chunked transfer abandoned"
+        );
+        self.remember_transfer(id);
+        Some(id)
+    }
+
+    /// Remember a finished or abandoned transfer, at most once.
+    ///
+    /// The de-duplication is not tidiness. The same id can arrive here
+    /// twice — a transfer abandoned and then re-offered under its original
+    /// id, say — and without the check those repeats would evict the ring
+    /// with copies of one value. A ring holding four of the same id
+    /// remembers exactly one transfer, so the tail of a *different*
+    /// superseded transfer would suddenly be chargeable as unsolicited:
+    /// the peer's repetition, not its misbehaviour, would decide whether a
+    /// benign race costs it violations.
+    fn remember_transfer(&mut self, id: Uuid) {
+        if self.recent_transfers.contains(&id) {
+            return;
         }
-        // ---------------------------------------------------------------
+        if self.recent_transfers.len() >= RECENT_TRANSFER_MEMORY {
+            self.recent_transfers.pop_front();
+        }
+        self.recent_transfers.push_back(id);
+    }
+
+    fn on_peer_offer(&mut self, offer: ClipboardOffer) -> Vec<Action> {
         if let Some(reason) = self.conflict_verdict(offer.meta) {
             return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
                 id: offer.meta.id,
@@ -611,24 +1015,113 @@ impl ClipboardEngine {
         }
         if self.current_local_hash == Some(offer.meta.content_hash) {
             // Already holding identical content: a sync success with zero
-            // payload bytes moved (ADR 0005).
+            // payload bytes moved (ADR 0005) — and for a chunked item that
+            // is the whole point of offering it, since a re-pasted snip
+            // then costs one offer and one decline instead of megabytes.
             return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
                 id: offer.meta.id,
                 reason: DeclineReason::AlreadyHave,
             }))];
         }
+
+        // Accepting supersedes whatever inbound transfer was in flight:
+        // the peer holds at most one outbound transaction of its own, so a
+        // second offer means it already abandoned the first, and there is
+        // no answer owed for a transaction its origin has dropped.
+        if let Some(previous) = self.expecting_data.take() {
+            tracing::debug!(
+                clipboard_id = %previous.id,
+                "accepted inbound offer superseded by a newer one"
+            );
+        }
+        self.abandon_reassembly("superseded by a newer offer");
+
+        if offer.meta.content_type.is_chunked() {
+            // The receiver's memory commitment is decided here and nowhere
+            // else: `begin` validates the offered length against the
+            // type's maximum *before* sizing the buffer from it (NFR-1),
+            // and reports an allocation it cannot make rather than dying.
+            match ChunkReassembly::begin(offer.meta) {
+                Ok(reassembly) => {
+                    self.reassembly = Some(reassembly);
+                    return vec![
+                        Action::Send(OutboundMessage::Accept(ClipboardAccept {
+                            id: offer.meta.id,
+                        })),
+                        self.arm_timeout(TransferScope::Inbound),
+                    ];
+                }
+                Err(error) => {
+                    // Declined, not dropped: a typed answer closes the
+                    // origin's transaction (NFR-3). `NotReady` because a
+                    // memory refusal is about *now*, unlike a length the
+                    // protocol will never admit.
+                    tracing::warn!(
+                        clipboard_id = %offer.meta.id,
+                        byte_count = offer.meta.content_length,
+                        error = %error,
+                        "declining a chunked offer this side cannot buffer"
+                    );
+                    return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
+                        id: offer.meta.id,
+                        reason: DeclineReason::NotReady,
+                    }))];
+                }
+            }
+        }
+
         self.expecting_data = Some(offer.meta);
-        vec![Action::Send(OutboundMessage::Accept(ClipboardAccept {
-            id: offer.meta.id,
-        }))]
+        vec![
+            Action::Send(OutboundMessage::Accept(ClipboardAccept {
+                id: offer.meta.id,
+            })),
+            self.arm_timeout(TransferScope::Inbound),
+        ]
     }
 
     fn on_peer_accept(&mut self, id: Uuid) -> Vec<Action> {
         match self.outbound.take() {
-            Some(Outbound::AwaitingAccept { data, started }) if data.meta.id == id => {
-                let meta = data.meta;
-                self.outbound = Some(Outbound::AwaitingApplied { meta, started });
-                vec![Action::Send(OutboundMessage::Data(data))]
+            Some(Outbound::AwaitingAccept {
+                meta,
+                content,
+                started,
+            }) if meta.id == id => {
+                if !meta.content_type.is_chunked() {
+                    self.outbound = Some(Outbound::AwaitingApplied { meta, started });
+                    return vec![Action::Send(OutboundMessage::Data(ClipboardData {
+                        meta,
+                        content,
+                    }))];
+                }
+                // The split is the same arithmetic the receiver derives
+                // from the offered length and chunk 0 — one implementation,
+                // both sides (ADR 0014).
+                let Ok(plan) = ChunkPlan::for_length(meta.content_length) else {
+                    tracing::error!(
+                        clipboard_id = %meta.id,
+                        byte_count = meta.content_length,
+                        "clipboard item cannot be split into chunks; abandoning"
+                    );
+                    return Vec::new();
+                };
+                let Some(first) = chunk_at(meta.id, &content, plan, 0) else {
+                    tracing::error!(clipboard_id = %meta.id, "empty clipboard chunk plan; abandoning");
+                    return Vec::new();
+                };
+                tracing::debug!(
+                    clipboard_id = %meta.id,
+                    byte_count = meta.content_length,
+                    chunk_count = plan.chunk_count(),
+                    "streaming an accepted chunked clipboard item"
+                );
+                self.outbound = Some(Outbound::Streaming {
+                    meta,
+                    content,
+                    plan,
+                    next_index: 1,
+                    started,
+                });
+                vec![Action::Send(OutboundMessage::Chunk(first))]
             }
             other => {
                 self.outbound = other; // restore whatever it was
@@ -638,9 +1131,30 @@ impl ClipboardEngine {
         }
     }
 
+    /// A decline closes an offer that is still **awaiting an answer** —
+    /// and only that.
+    ///
+    /// The asymmetry with [`Self::on_peer_applied`], which does stop a
+    /// stream in flight, is deliberate and worth stating because the race
+    /// that raises the question is legal: chunk 0 leaves as soon as the
+    /// accept arrives, so a decline the peer sent for some *other* reason
+    /// can cross it on the wire (docs/PROTOCOL.md §4 orders messages
+    /// within a class, not between the two directions of one).
+    ///
+    /// A decline reaching a live stream therefore means the peer answered
+    /// the same offer twice. Stopping the stream on it would let one
+    /// stray or duplicated frame cancel a transfer the peer has already
+    /// accepted and is actively reassembling — trading a real transfer for
+    /// a message that contradicts the peer's own earlier answer. Ignoring
+    /// it costs at most the rest of one bounded stream, which the receiver
+    /// either completes (and acknowledges) or refuses per §7. `Applied` is
+    /// different in kind: it is the *verdict*, the only message that ends
+    /// a transaction, and a receiver that has rendered one has genuinely
+    /// stopped reassembling — continuing to push chunks at it would be
+    /// spending the wire on nobody.
     fn on_peer_decline(&mut self, decline: &ClipboardDecline) -> Vec<Action> {
         match self.outbound.take() {
-            Some(Outbound::AwaitingAccept { data, started }) if data.meta.id == decline.id => {
+            Some(Outbound::AwaitingAccept { meta, started, .. }) if meta.id == decline.id => {
                 let latency_ms = elapsed_ms(started);
                 self.record(|m| m.record_clipboard_latency(clamp_ms(latency_ms)));
                 let outcome = match decline.reason {
@@ -684,28 +1198,133 @@ impl ClipboardEngine {
                 result: ApplyResult::ContentRejected,
             }))];
         }
+        // A whole item from the peer supersedes any chunked transfer it
+        // was midway through — same rule, other direction.
+        if self
+            .reassembly
+            .as_ref()
+            .is_some_and(|r| r.meta().id != data.meta.id)
+        {
+            self.abandon_reassembly("superseded by a newer inbound item");
+        }
+        self.install_inbound(data.meta, data.content)
+    }
 
-        if let Some(reason) = self.conflict_verdict(data.meta) {
+    /// A chunk arrived (ADR 0014).
+    ///
+    /// Three outcomes, in order of how much the chunk is owed:
+    ///
+    /// 1. it belongs to the transfer being reassembled — routed there,
+    ///    and the reassembly is the only thing that decides whether it is
+    ///    admissible;
+    /// 2. it belongs to a transfer this side recently finished or
+    ///    abandoned — the benign tail of an in-flight stream, ignored
+    ///    without penalty (see [`RECENT_TRANSFER_MEMORY`]);
+    /// 3. anything else has no accepted offer behind it, which is a
+    ///    protocol violation (docs/PROTOCOL.md §5) and takes §7's handling
+    ///    exactly: rejected, counted, logged at **debug** — the level
+    ///    matters, because the log volume is otherwise the peer's to
+    ///    choose, and a saturated 2.5 `GbE` link is thousands of chunks per
+    ///    second into an uncapped rolling file — and fatal once the peer
+    ///    makes a habit of it.
+    fn on_peer_chunk(&mut self, chunk: &ClipboardChunk) -> Vec<Action> {
+        if self
+            .reassembly
+            .as_ref()
+            .is_some_and(|r| r.meta().id == chunk.id)
+        {
+            return self.accept_chunk(chunk);
+        }
+        if self.recent_transfers.contains(&chunk.id) {
+            tracing::debug!(
+                clipboard_id = %chunk.id,
+                chunk_index = chunk.index,
+                "chunk for a finished or abandoned transfer; ignoring"
+            );
+            return Vec::new();
+        }
+        tracing::debug!(
+            clipboard_id = %chunk.id,
+            chunk_index = chunk.index,
+            byte_count = chunk.payload.len(),
+            "clipboard chunk with no accepted offer; rejecting"
+        );
+        self.record_violation("clipboard chunk with no accepted offer")
+    }
+
+    /// Route a chunk into the live reassembly.
+    ///
+    /// A rejected chunk ends the transfer: the sequence is strictly
+    /// ordered and derived, so a chunk the plan cannot admit means the
+    /// stream is no longer the item that was offered, and continuing to
+    /// buffer it would be assembling something else. One violation per
+    /// *transfer*, not per chunk — the rest of a doomed stream is charged
+    /// nothing, which keeps a single bad transfer from spending the whole
+    /// session budget in one burst.
+    fn accept_chunk(&mut self, chunk: &ClipboardChunk) -> Vec<Action> {
+        let Some(reassembly) = self.reassembly.as_mut() else {
+            return Vec::new();
+        };
+        let meta = reassembly.meta();
+        match reassembly.accept(chunk) {
+            Ok(ChunkOutcome::More) => Vec::new(),
+            Ok(ChunkOutcome::Complete(bytes)) => {
+                // The reassembly verified the item's hash over these bytes
+                // before handing them out: this is the offered item, whole,
+                // and nothing partially-verified can reach here.
+                self.reassembly = None;
+                self.remember_transfer(meta.id);
+                tracing::debug!(
+                    clipboard_id = %meta.id,
+                    byte_count = meta.content_length,
+                    "chunked clipboard item reassembled and verified"
+                );
+                self.install_inbound(meta, bytes)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    clipboard_id = %chunk.id,
+                    chunk_index = chunk.index,
+                    error = %error,
+                    "malformed clipboard chunk; abandoning the transfer"
+                );
+                self.abandon_reassembly("malformed chunk");
+                let mut actions = vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
+                    id: meta.id,
+                    result: ApplyResult::ContentRejected,
+                }))];
+                actions.extend(self.record_violation("malformed clipboard chunk"));
+                actions
+            }
+        }
+    }
+
+    /// The shared tail of every inbound item, whole or reassembled: the
+    /// conflict rule, the loop guard, then an acknowledged install
+    /// (FR-3.2 — `Applied` is sent only by [`Self::on_write_result`],
+    /// after the destination clipboard actually took the content).
+    fn install_inbound(&mut self, meta: ClipboardMeta, bytes: Vec<u8>) -> Vec<Action> {
+        if let Some(reason) = self.conflict_verdict(meta) {
             debug_assert_eq!(reason, DeclineReason::Superseded);
             self.record(Metrics::record_clipboard_superseded);
             return vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
-                id: data.meta.id,
+                id: meta.id,
                 result: ApplyResult::Superseded,
             }))];
         }
 
         // Loop/echo guard: identical content is a success without a write.
-        if self.current_local_hash == Some(data.meta.content_hash) {
+        if self.current_local_hash == Some(meta.content_hash) {
             return vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
-                id: data.meta.id,
+                id: meta.id,
                 result: ApplyResult::Applied,
             }))];
         }
 
         // Wire validation guarantees UTF-8 for Utf8Text; defensive here.
-        let Ok(text) = String::from_utf8(data.content) else {
+        let Some(content) = from_wire(meta.content_type, bytes) else {
             return vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
-                id: data.meta.id,
+                id: meta.id,
                 result: ApplyResult::ContentRejected,
             }))];
         };
@@ -716,38 +1335,16 @@ impl ClipboardEngine {
                 "pending write superseded by newer inbound item"
             );
         }
+        let content = Arc::new(content);
         self.pending_write = Some(PendingWrite {
-            meta: data.meta,
-            text: text.clone(),
+            meta,
+            content: Arc::clone(&content),
             attempts_made: 1,
         });
         vec![Action::WriteClipboard {
-            id: data.meta.id,
-            text,
+            id: meta.id,
+            content,
         }]
-    }
-
-    /// A chunk arrived (ADR 0014).
-    ///
-    /// A chunk with no accepted offer behind it is a protocol violation
-    /// (docs/PROTOCOL.md §5), so it takes §7's handling exactly: rejected,
-    /// counted, logged at **debug** — the level matters, because the log
-    /// volume is otherwise the peer's to choose, and a saturated 2.5 `GbE`
-    /// link is thousands of chunks per second into an uncapped rolling
-    /// file — and fatal once the peer makes a habit of it.
-    ///
-    /// **ADR 0014 placeholder: the engine slice replaces the ignoring**
-    /// with a `ChunkReassembly` for chunks that *do* belong to an accepted
-    /// offer. The violation accounting below stays: it is what makes an
-    /// unsolicited chunk fail closed either way.
-    fn on_peer_chunk(&mut self, chunk: &ClipboardChunk) -> Vec<Action> {
-        tracing::debug!(
-            clipboard_id = %chunk.id,
-            chunk_index = chunk.index,
-            byte_count = chunk.payload.len(),
-            "clipboard chunk with no accepted offer; rejecting"
-        );
-        self.record_violation("clipboard chunk with no accepted offer")
     }
 
     /// Count one clipboard protocol violation, terminating the session
@@ -771,9 +1368,18 @@ impl ClipboardEngine {
         }]
     }
 
+    /// The destination's verdict closes our transaction.
+    ///
+    /// A verdict is accepted while we are still *streaming* as well, and
+    /// deliberately: a receiver that rejects a chunk answers immediately,
+    /// and a sender that kept pushing chunks at it would be spending the
+    /// wire on an item nobody is assembling any more.
     fn on_peer_applied(&mut self, applied: &ClipboardApplied) -> Vec<Action> {
         match self.outbound.take() {
-            Some(Outbound::AwaitingApplied { meta, started }) if meta.id == applied.id => {
+            Some(
+                Outbound::AwaitingApplied { meta, started }
+                | Outbound::Streaming { meta, started, .. },
+            ) if meta.id == applied.id => {
                 let outcome = match applied.result {
                     ApplyResult::Applied => "applied",
                     ApplyResult::Superseded => "superseded",
@@ -845,6 +1451,73 @@ impl ClipboardEngine {
     }
 }
 
+/// The chunk at `index`, sliced straight out of the retained item buffer.
+///
+/// `None` when the index is past the transfer or the buffer does not
+/// reach — both unreachable for a plan derived from this buffer's own
+/// length, and both a returned value rather than a panic (NFR-1).
+fn chunk_at(id: Uuid, content: &[u8], plan: ChunkPlan, index: u32) -> Option<ClipboardChunk> {
+    let len = usize::try_from(plan.chunk_len(index)?).ok()?;
+    let start = usize::try_from(u64::from(index) * u64::from(plan.chunk_bytes())).ok()?;
+    let end = start.checked_add(len)?;
+    let payload = content.get(start..end)?.to_vec();
+    Some(ClipboardChunk { id, index, payload })
+}
+
+/// Platform image tag → protocol image tag.
+///
+/// Wildcard-free on purpose. The two enums are deliberate mirrors — the
+/// platform crate carries no dependencies (docs/ARCHITECTURE.md §4) — so
+/// this match is the single place they are reconciled, and a new format
+/// added to either one fails the build here instead of silently losing
+/// its tag somewhere on the way to the wire.
+const fn wire_format(format: ClipboardImageFormat) -> ImageFormat {
+    match format {
+        ClipboardImageFormat::Dib => ImageFormat::Dib,
+        ClipboardImageFormat::Png => ImageFormat::Png,
+        ClipboardImageFormat::Jpeg => ImageFormat::Jpeg,
+    }
+}
+
+/// Protocol image tag → platform image tag. See [`wire_format`].
+const fn platform_format(format: ImageFormat) -> ClipboardImageFormat {
+    match format {
+        ImageFormat::Dib => ClipboardImageFormat::Dib,
+        ImageFormat::Png => ClipboardImageFormat::Png,
+        ImageFormat::Jpeg => ClipboardImageFormat::Jpeg,
+    }
+}
+
+/// Typed platform content → the wire's `(type, bytes)` pair.
+///
+/// Image bytes move by value and untouched: no transcode, no compression,
+/// no inspection — the hash and the length are all that is ever computed
+/// over them (ADR 0014).
+fn into_wire(content: ClipboardContent) -> (ContentType, Vec<u8>) {
+    match content {
+        ClipboardContent::Text(text) => (ContentType::Utf8Text, text.into_bytes()),
+        ClipboardContent::Image { format, bytes } => {
+            (ContentType::Image(wire_format(format)), bytes)
+        }
+    }
+}
+
+/// Verified wire bytes → typed platform content.
+///
+/// `None` only for text bytes that are not UTF-8, which the decoder
+/// already makes unrepresentable — kept as a value-returning check rather
+/// than an assumption, because it is the last gate before content reaches
+/// the OS.
+fn from_wire(content_type: ContentType, bytes: Vec<u8>) -> Option<ClipboardContent> {
+    Some(match content_type {
+        ContentType::Utf8Text => ClipboardContent::Text(String::from_utf8(bytes).ok()?),
+        ContentType::Image(format) => ClipboardContent::Image {
+            format: platform_format(format),
+            bytes,
+        },
+    })
+}
+
 /// Milliseconds since `started`, saturating into `u64` for logging.
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -861,19 +1534,106 @@ fn clamp_ms(ms: u64) -> u32 {
 mod tests {
     use uuid::Uuid;
 
+    use crossover_platform::{ClipboardContent, ClipboardImageFormat};
     use crossover_protocol::clipboard::{
-        ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardApplied, ClipboardData, ClipboardMeta,
-        ClipboardOffer, ContentType, DeclineReason, content_hash,
+        ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardAccept, ClipboardApplied, ClipboardChunk,
+        ClipboardData, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, ImageFormat,
+        MAX_CHUNK_BYTES, chunk_content, content_hash,
     };
 
     use std::time::Duration;
 
     use super::{
         Action, ClipboardConfig, ClipboardEngine, InboundMessage, OutboundMessage, RetryPolicy,
+        TransferScope, WriteFailure,
     };
 
     fn engine(origin_fill: u8) -> ClipboardEngine {
         ClipboardEngine::new(Uuid::from_bytes([origin_fill; 16]), ClipboardConfig::new())
+    }
+
+    /// Image bytes that no text path could survive: non-UTF-8 lead bytes,
+    /// embedded NULs, and a run of 0xFF. Everything about a chunked
+    /// transfer must carry them verbatim (ADR 0014).
+    fn image_bytes(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| match i % 4 {
+                0 => 0xFF,
+                1 => 0x00,
+                2 => 0xFE,
+                _ => u8::try_from(i % 251).unwrap_or(0),
+            })
+            .collect()
+    }
+
+    fn snip(bytes: Vec<u8>) -> ClipboardContent {
+        ClipboardContent::Image {
+            format: ClipboardImageFormat::Dib,
+            bytes,
+        }
+    }
+
+    /// Copy an image locally and return the actions.
+    fn copy_image(engine: &mut ClipboardEngine, bytes: Vec<u8>) -> Vec<Action> {
+        engine.on_local_change();
+        engine.on_settle_due();
+        engine.on_local_read(Some(snip(bytes)))
+    }
+
+    fn offer_of(actions: &[Action]) -> ClipboardOffer {
+        match sent(actions).as_slice() {
+            [OutboundMessage::Offer(offer)] => *offer,
+            other => panic!("expected exactly one offer, got {other:?}"),
+        }
+    }
+
+    fn chunk_of(actions: &[Action]) -> ClipboardChunk {
+        match sent(actions).as_slice() {
+            [OutboundMessage::Chunk(chunk)] => (*chunk).clone(),
+            other => panic!("expected exactly one chunk, got {other:?}"),
+        }
+    }
+
+    /// Drive an accepted outbound transfer to completion, collecting every
+    /// chunk the engine emits — the driver's loop, in miniature.
+    fn drain_chunks(engine: &mut ClipboardEngine, first: ClipboardChunk) -> Vec<ClipboardChunk> {
+        let id = first.id;
+        let mut chunks = vec![first];
+        loop {
+            let actions = engine.on_chunk_sent(id);
+            if actions.is_empty() {
+                return chunks;
+            }
+            chunks.push(chunk_of(&actions));
+            assert!(
+                chunks.len() <= 2048,
+                "the chunk stream never terminated ({} chunks)",
+                chunks.len()
+            );
+        }
+    }
+
+    /// An inbound image transfer, from the peer's offer to the last chunk.
+    /// Returns the actions produced by each step, flattened.
+    fn inbound_image(
+        engine: &mut ClipboardEngine,
+        origin: u8,
+        sequence: u64,
+        bytes: &[u8],
+    ) -> (ClipboardMeta, Vec<Action>) {
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([origin; 16]),
+            sequence,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: bytes.len() as u64,
+            content_hash: content_hash(bytes),
+        };
+        let mut actions = engine.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        for chunk in chunk_content(meta.id, bytes).unwrap() {
+            actions.extend(engine.on_peer_message(InboundMessage::Chunk(chunk)));
+        }
+        (meta, actions)
     }
 
     /// Copy locally and fire the transmit trigger, since these tests are
@@ -888,7 +1648,25 @@ mod tests {
             "a change should schedule a settle, not read now: {scheduled:?}"
         );
         assert_eq!(engine.on_settle_due(), vec![Action::ReadClipboard]);
-        engine.on_local_read(Some(text.to_owned()))
+        engine.on_local_read(Some(ClipboardContent::Text(text.to_owned())))
+    }
+
+    /// The text the engine asked to be written, whatever the action shape.
+    fn written_text(actions: &[Action]) -> Option<String> {
+        actions.iter().find_map(|a| match a {
+            Action::WriteClipboard { content, .. } => {
+                content.as_text().map(std::borrow::ToOwned::to_owned)
+            }
+            _ => None,
+        })
+    }
+
+    /// The content the engine asked to be written.
+    fn written(actions: &[Action]) -> Option<ClipboardContent> {
+        actions.iter().find_map(|a| match a {
+            Action::WriteClipboard { content, .. } => Some((**content).clone()),
+            _ => None,
+        })
     }
 
     fn sent(actions: &[Action]) -> Vec<&OutboundMessage> {
@@ -899,6 +1677,25 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// `Default` must be the production configuration, not a field-wise
+    /// zero. A derived one would hand `..Default::default()` a
+    /// `transfer_timeout` of zero — every transfer abandoned at birth —
+    /// and a `transmit_debounce` of zero, silently undoing ADR 0006. Both
+    /// would compile, and neither would look wrong at the call site.
+    #[test]
+    fn the_default_configuration_is_the_production_one() {
+        assert_eq!(ClipboardConfig::default(), ClipboardConfig::new());
+        assert_eq!(
+            ClipboardConfig::default().transfer_timeout,
+            super::TRANSFER_TIMEOUT
+        );
+        assert_eq!(
+            ClipboardConfig::default().transmit_debounce,
+            super::TRANSMIT_DEBOUNCE
+        );
+        assert!(!ClipboardConfig::default().transfer_timeout.is_zero());
     }
 
     #[test]
@@ -932,7 +1729,16 @@ mod tests {
         let mut e = engine(0xAA);
         assert!(e.on_local_read(None).is_empty());
         let huge = "x".repeat(4 * 1024 * 1024 + 1);
-        assert!(e.on_local_read(Some(huge)).is_empty());
+        assert!(
+            e.on_local_read(Some(ClipboardContent::Text(huge)))
+                .is_empty()
+        );
+        // Per-type bounds since ADR 0014: an image past its own (much
+        // larger) ceiling is refused by the same rule, not by the text one.
+        let huge_image = vec![0u8; 64 * 1024 * 1024 + 1];
+        assert!(e.on_local_read(Some(snip(huge_image))).is_empty());
+        // And an empty image is not an image.
+        assert!(e.on_local_read(Some(snip(Vec::new()))).is_empty());
     }
 
     /// The full loop-prevention cycle: receive, write, own-write
@@ -973,7 +1779,7 @@ mod tests {
             [Action::ScheduleSettle { .. }]
         ));
         assert_eq!(receiver.on_settle_due(), vec![Action::ReadClipboard]);
-        let actions = receiver.on_local_read(Some("from peer".to_owned()));
+        let actions = receiver.on_local_read(Some(ClipboardContent::Text("from peer".to_owned())));
         assert!(
             actions.is_empty(),
             "echoed an applied item back: {actions:?}"
@@ -1007,7 +1813,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            e.on_write_result(id, Err(true)).as_slice(),
+            e.on_write_result(id, Err(WriteFailure::Busy)).as_slice(),
             [Action::ScheduleRetry { .. }]
         ));
         assert!(matches!(
@@ -1015,7 +1821,7 @@ mod tests {
             [Action::WriteClipboard { .. }]
         ));
         assert!(matches!(
-            e.on_write_result(id, Err(true)).as_slice(),
+            e.on_write_result(id, Err(WriteFailure::Busy)).as_slice(),
             [Action::ScheduleRetry { .. }]
         ));
         assert!(matches!(
@@ -1023,7 +1829,7 @@ mod tests {
             [Action::WriteClipboard { .. }]
         ));
         // Third attempt fails: the cap closes the transaction honestly.
-        let actions = e.on_write_result(id, Err(true));
+        let actions = e.on_write_result(id, Err(WriteFailure::Busy));
         assert!(matches!(
             sent(&actions).as_slice(),
             [OutboundMessage::Applied(ClipboardApplied {
@@ -1042,7 +1848,7 @@ mod tests {
         );
         let id2 = item2.meta.id;
         e.on_peer_message(InboundMessage::Data(item2));
-        let actions = e.on_write_result(id2, Err(false));
+        let actions = e.on_write_result(id2, Err(WriteFailure::Unavailable));
         assert!(matches!(
             sent(&actions).as_slice(),
             [OutboundMessage::Applied(ClipboardApplied {
@@ -1096,16 +1902,20 @@ mod tests {
                             OutboundMessage::Accept(x) => InboundMessage::Accept(x),
                             OutboundMessage::Decline(x) => InboundMessage::Decline(x),
                             OutboundMessage::Data(x) => InboundMessage::Data(x),
+                            OutboundMessage::Chunk(x) => InboundMessage::Chunk(x),
                             OutboundMessage::Applied(x) => InboundMessage::Applied(x),
                         }),
-                        Action::WriteClipboard { id, text } => {
+                        Action::WriteClipboard { id, content } => {
+                            let text = content.as_text().unwrap_or_default().to_owned();
                             self.pending_write = Some((id, text));
                         }
                         Action::ScheduleSettle { .. } => {
                             let read = self.engine.on_settle_due();
                             self.drive(read, outbox);
                         }
-                        Action::ReadClipboard | Action::ScheduleRetry { .. } => {}
+                        Action::ReadClipboard
+                        | Action::ScheduleRetry { .. }
+                        | Action::ScheduleTransferTimeout { .. } => {}
                         Action::TerminateSession { reason } => {
                             panic!("conforming engines must not terminate: {reason}")
                         }
@@ -1118,7 +1928,10 @@ mod tests {
                     let more = self.engine.on_write_result(id, Ok(()));
                     self.drive(more, outbox);
                     let mut cycle = self.engine.on_local_change();
-                    cycle.extend(self.engine.on_local_read(Some(text)));
+                    cycle.extend(
+                        self.engine
+                            .on_local_read(Some(ClipboardContent::Text(text))),
+                    );
                     self.drive(cycle, outbox);
                 }
             }
@@ -1213,7 +2026,7 @@ mod tests {
         // The established reset cleared the dedup hash, so the same
         // content travels again for post-gap convergence.
         assert_eq!(
-            sent(&e.on_local_read(Some("persistent".to_owned()))).len(),
+            sent(&e.on_local_read(Some(ClipboardContent::Text("persistent".to_owned())))).len(),
             1
         );
     }
@@ -1237,7 +2050,7 @@ mod tests {
         // The window elapses once: one read, then one send of whatever
         // the clipboard settled on.
         assert_eq!(e.on_settle_due(), vec![Action::ReadClipboard]);
-        let actions = e.on_local_read(Some("settled content".to_owned()));
+        let actions = e.on_local_read(Some(ClipboardContent::Text("settled content".to_owned())));
         let msgs = sent(&actions);
         assert_eq!(msgs.len(), 1);
         let OutboundMessage::Data(data) = msgs[0] else {
@@ -1257,7 +2070,10 @@ mod tests {
         );
         // The escape hatch for callers who want no wait at all.
         assert_eq!(e.on_local_change(), vec![Action::ReadClipboard]);
-        assert_eq!(sent(&e.on_local_read(Some("eager".to_owned()))).len(), 1);
+        assert_eq!(
+            sent(&e.on_local_read(Some(ClipboardContent::Text("eager".to_owned())))).len(),
+            1
+        );
     }
 
     #[test]
@@ -1305,7 +2121,7 @@ mod tests {
         // The provider's own-write notification is suppressed, not resent.
         e.on_local_change();
         e.on_settle_due();
-        e.on_local_read(Some("from peer".to_owned()));
+        e.on_local_read(Some(ClipboardContent::Text("from peer".to_owned())));
         let snap = metrics.snapshot();
         assert_eq!(snap.clipboard_loop_suppressed, 1);
         // No race occurred in this sequence.
@@ -1338,33 +2154,6 @@ mod tests {
         );
         e.on_peer_message(InboundMessage::Data(inbound));
         assert_eq!(metrics.snapshot().clipboard_conflicts, 1);
-    }
-
-    /// ADR 0014 placeholder behaviour, asserted so the engine slice
-    /// deliberately replaces it rather than quietly inheriting it: a type
-    /// this build cannot install is refused with a typed, permanent
-    /// decline — never left unanswered (NFR-3), never a panic.
-    #[test]
-    fn a_chunked_offer_is_declined_as_an_unsupported_type() {
-        use crossover_protocol::clipboard::ImageFormat;
-
-        let mut e = engine(0xBB);
-        let meta = ClipboardMeta {
-            id: Uuid::new_v4(),
-            origin: Uuid::from_bytes([0xAA; 16]),
-            sequence: 1,
-            content_type: ContentType::Image(ImageFormat::Dib),
-            content_length: 4096,
-            content_hash: content_hash(b"a snip"),
-        };
-        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
-        match sent(&actions).as_slice() {
-            [OutboundMessage::Decline(decline)] => {
-                assert_eq!(decline.id, meta.id);
-                assert_eq!(decline.reason, DeclineReason::UnsupportedType);
-            }
-            other => panic!("expected an UnsupportedType decline, got {other:?}"),
-        }
     }
 
     /// A chunk with no accepted offer behind it is a protocol violation
@@ -1431,5 +2220,661 @@ mod tests {
                 ..
             })]
         ));
+    }
+
+    // --- chunked image transfer (ADR 0014) ---------------------------------
+
+    /// The whole outbound transaction: a local snip is offered (never
+    /// inline, whatever its size), accepted, streamed chunk by chunk, and
+    /// closed by the destination's verdict. The bytes that come out of the
+    /// stream must be the bytes that went in, verbatim.
+    #[test]
+    fn a_local_image_is_offered_streamed_and_closed_by_the_verdict() {
+        let mut e = engine(0xAA);
+        let bytes = image_bytes(MAX_CHUNK_BYTES * 2 + 7);
+
+        let actions = copy_image(&mut e, bytes.clone());
+        let offer = offer_of(&actions);
+        assert_eq!(
+            offer.meta.content_type,
+            ContentType::Image(ImageFormat::Dib)
+        );
+        assert_eq!(offer.meta.content_length, bytes.len() as u64);
+        assert_eq!(offer.meta.content_hash, content_hash(&bytes));
+        // A retained transfer arms a deadline; nothing else does.
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::ScheduleTransferTimeout {
+                    scope: TransferScope::Outbound,
+                    ..
+                }
+            )),
+            "an offer that retains its content must be bounded in time"
+        );
+
+        let accepted = e.on_peer_message(InboundMessage::Accept(ClipboardAccept {
+            id: offer.meta.id,
+        }));
+        let chunks = drain_chunks(&mut e, chunk_of(&accepted));
+
+        // Exactly the split the shared arithmetic produces — the sender
+        // slices out of its retained buffer rather than pre-rendering, so
+        // this equality is what ties the two paths together.
+        assert_eq!(chunks, chunk_content(offer.meta.id, &bytes).unwrap());
+        let streamed: Vec<u8> = chunks.iter().flat_map(|c| c.payload.clone()).collect();
+        assert_eq!(streamed, bytes, "image bytes were not transferred verbatim");
+        assert_eq!(chunks.len(), 3);
+
+        // The verdict closes it; nothing further is emitted.
+        let closed = e.on_peer_message(InboundMessage::Applied(ClipboardApplied {
+            id: offer.meta.id,
+            result: ApplyResult::Applied,
+        }));
+        assert!(closed.is_empty());
+        assert!(e.on_chunk_sent(offer.meta.id).is_empty());
+    }
+
+    /// A tiny image is *still* offered: the inline threshold is a text
+    /// rule (ADR 0014), and the offer round is what makes a re-paste free.
+    #[test]
+    fn even_a_tiny_image_is_offered_rather_than_sent_inline() {
+        let mut e = engine(0xAA);
+        let actions = copy_image(&mut e, image_bytes(64));
+        let offer = offer_of(&actions);
+        assert_eq!(offer.meta.content_length, 64);
+
+        let accepted = e.on_peer_message(InboundMessage::Accept(ClipboardAccept {
+            id: offer.meta.id,
+        }));
+        let chunks = drain_chunks(&mut e, chunk_of(&accepted));
+        assert_eq!(chunks.len(), 1, "one chunk under the chunk size");
+        assert_eq!(chunks[0].index, 0);
+    }
+
+    /// Re-pasting a snip the peer already holds moves **zero** content
+    /// bytes: the offer is declined as already-have and the transaction is
+    /// over. This is the payoff the offer round exists for (ADR 0014).
+    #[test]
+    fn an_already_held_image_is_declined_before_any_bytes_travel() {
+        let mut e = engine(0xBB);
+        let bytes = image_bytes(MAX_CHUNK_BYTES * 4);
+        // This side holds the snip already (it copied it locally).
+        copy_image(&mut e, bytes.clone());
+        // Its own transfer closes, so nothing is in flight to conflict.
+        let mine = e.current_local_hash;
+        assert_eq!(mine, Some(content_hash(&bytes)));
+        e.on_session_lost();
+
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xAA; 16]),
+            sequence: 99,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: bytes.len() as u64,
+            content_hash: content_hash(&bytes),
+        };
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        match sent(&actions).as_slice() {
+            [OutboundMessage::Decline(decline)] => {
+                assert_eq!(decline.id, meta.id);
+                assert_eq!(decline.reason, DeclineReason::AlreadyHave);
+            }
+            other => panic!("expected an AlreadyHave decline, got {other:?}"),
+        }
+        // No reassembly was begun, so no buffer was committed either.
+        assert!(e.reassembly.is_none());
+    }
+
+    /// The whole inbound transaction: accept, reassemble, verify, install,
+    /// acknowledge. `Applied` is sent only after the destination clipboard
+    /// took the content (FR-3.2), never on receipt of the last chunk.
+    #[test]
+    fn an_inbound_image_is_reassembled_installed_then_acknowledged() {
+        let mut e = engine(0xBB);
+        let bytes = image_bytes(MAX_CHUNK_BYTES * 3 + 11);
+        let (meta, actions) = inbound_image(&mut e, 0xAA, 1, &bytes);
+
+        // Accept first, deadline armed, and no verdict yet.
+        assert!(matches!(
+            sent(&actions).as_slice(),
+            [OutboundMessage::Accept(_)]
+        ));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::ScheduleTransferTimeout {
+                scope: TransferScope::Inbound,
+                ..
+            }
+        )));
+
+        // The completed transfer asks for an install of the exact bytes.
+        assert_eq!(written(&actions), Some(snip(bytes.clone())));
+
+        // Only the successful write produces the verdict.
+        let closed = e.on_write_result(meta.id, Ok(()));
+        match sent(&closed).as_slice() {
+            [OutboundMessage::Applied(applied)] => {
+                assert_eq!(applied.id, meta.id);
+                assert_eq!(applied.result, ApplyResult::Applied);
+            }
+            other => panic!("expected an Applied verdict, got {other:?}"),
+        }
+        assert!(e.reassembly.is_none(), "the buffer must be released");
+    }
+
+    /// A destination that cannot install the content — which is exactly
+    /// this build's Windows backend for an image — says so, and says it
+    /// after the bytes arrived rather than pretending success (FR-3.2).
+    ///
+    /// *Which* failure it reports matters. A type this destination cannot
+    /// represent is `ContentRejected`: permanent, about the item. A
+    /// clipboard that would not take it is `ClipboardUnavailable`:
+    /// transient, about the machine. An origin that cannot tell those
+    /// apart cannot tell "never send me images" from "try again".
+    #[test]
+    fn an_image_the_platform_cannot_install_reports_the_failure() {
+        for (failure, verdict) in [
+            (WriteFailure::UnsupportedType, ApplyResult::ContentRejected),
+            (WriteFailure::Unavailable, ApplyResult::ClipboardUnavailable),
+        ] {
+            let mut e = engine(0xBB);
+            let bytes = image_bytes(4096);
+            let (meta, _) = inbound_image(&mut e, 0xAA, 1, &bytes);
+
+            let closed = e.on_write_result(meta.id, Err(failure));
+            match sent(&closed).as_slice() {
+                [OutboundMessage::Applied(applied)] => {
+                    assert_eq!(applied.result, verdict, "for {failure:?}");
+                }
+                other => panic!("expected a typed failure verdict, got {other:?}"),
+            }
+        }
+    }
+
+    /// An unsupported type is never retried: the retry budget exists for
+    /// contention (FR-3.4), and no number of attempts will teach this
+    /// build a raster format.
+    #[test]
+    fn an_unsupported_content_type_is_answered_without_burning_retries() {
+        let mut e = engine(0xBB);
+        let bytes = image_bytes(4096);
+        let (meta, _) = inbound_image(&mut e, 0xAA, 1, &bytes);
+
+        let closed = e.on_write_result(meta.id, Err(WriteFailure::UnsupportedType));
+        assert!(
+            !closed
+                .iter()
+                .any(|a| matches!(a, Action::ScheduleRetry { .. })),
+            "an unsupported type was retried: {closed:?}"
+        );
+        assert!(matches!(
+            sent(&closed).as_slice(),
+            [OutboundMessage::Applied(ClipboardApplied {
+                result: ApplyResult::ContentRejected,
+                ..
+            })]
+        ));
+        assert_eq!(meta.content_type, ContentType::Image(ImageFormat::Dib));
+    }
+
+    /// A newer local copy supersedes a chunk stream in flight: the old
+    /// item's buffer goes with it, and the new item travels normally.
+    #[test]
+    fn a_newer_local_copy_supersedes_a_stream_in_flight() {
+        let mut e = engine(0xAA);
+        let first = image_bytes(MAX_CHUNK_BYTES * 3);
+        let actions = copy_image(&mut e, first);
+        let offer = offer_of(&actions);
+        let accepted = e.on_peer_message(InboundMessage::Accept(ClipboardAccept {
+            id: offer.meta.id,
+        }));
+        let chunk0 = chunk_of(&accepted);
+        assert_eq!(chunk0.index, 0);
+
+        // A new copy lands mid-stream.
+        let actions = copy(&mut e, "text beats a half-sent image");
+        assert!(matches!(
+            sent(&actions).as_slice(),
+            [OutboundMessage::Data(_)]
+        ));
+        // The abandoned stream produces nothing more, ever.
+        assert!(e.on_chunk_sent(offer.meta.id).is_empty());
+        assert!(
+            e.on_peer_message(InboundMessage::Accept(ClipboardAccept {
+                id: offer.meta.id
+            }))
+            .is_empty()
+        );
+    }
+
+    /// A newer inbound offer supersedes a reassembly in flight, and the
+    /// tail of the abandoned stream is recognized as the benign race it is
+    /// rather than charged to the violation budget — which matters at
+    /// image scale, where a lane's worth of chunks can already be in
+    /// flight.
+    #[test]
+    fn a_newer_inbound_offer_supersedes_a_reassembly_without_punishing_its_tail() {
+        let mut e = engine(0xBB);
+        let first_bytes = image_bytes(MAX_CHUNK_BYTES * 4);
+        let first = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xAA; 16]),
+            sequence: 1,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: first_bytes.len() as u64,
+            content_hash: content_hash(&first_bytes),
+        };
+        let first_chunks = chunk_content(first.id, &first_bytes).unwrap();
+        e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta: first }));
+        e.on_peer_message(InboundMessage::Chunk(first_chunks[0].clone()));
+
+        // The peer changes its mind and offers something newer.
+        let second_bytes = image_bytes(MAX_CHUNK_BYTES + 3);
+        let (second, actions) = inbound_image(&mut e, 0xAA, 2, &second_bytes);
+        assert_eq!(written(&actions), Some(snip(second_bytes)));
+        e.on_write_result(second.id, Ok(())).len();
+
+        // The first transfer's remaining chunks arrive late. Ignored, not
+        // fatal: the session must survive its own supersession.
+        for chunk in &first_chunks[1..] {
+            let actions = e.on_peer_message(InboundMessage::Chunk(chunk.clone()));
+            assert!(
+                actions.is_empty(),
+                "the tail of a superseded transfer must be absorbed: {actions:?}"
+            );
+        }
+        assert_eq!(e.violations, 0, "a benign race spent the violation budget");
+    }
+
+    /// Session loss releases every buffer the machine can hold — in both
+    /// directions — and leaves it able to do the whole thing again.
+    #[test]
+    fn session_loss_mid_transfer_clears_state_and_a_fresh_transfer_works() {
+        let mut e = engine(0xBB);
+
+        // Inbound: an accepted offer, half streamed.
+        let bytes = image_bytes(MAX_CHUNK_BYTES * 3);
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xAA; 16]),
+            sequence: 1,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: bytes.len() as u64,
+            content_hash: content_hash(&bytes),
+        };
+        let chunks = chunk_content(meta.id, &bytes).unwrap();
+        e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        e.on_peer_message(InboundMessage::Chunk(chunks[0].clone()));
+        assert!(e.reassembly.is_some());
+
+        // Outbound: our own image, offered.
+        let mine = image_bytes(MAX_CHUNK_BYTES * 2);
+        let offer = offer_of(&copy_image(&mut e, mine));
+
+        assert!(e.on_session_lost().is_empty());
+        assert!(e.reassembly.is_none(), "a reassembly buffer survived");
+        assert!(e.outbound.is_none(), "a retained item survived");
+        assert!(e.expecting_data.is_none());
+        // The abandoned outbound transfer is inert.
+        assert!(
+            e.on_peer_message(InboundMessage::Accept(ClipboardAccept {
+                id: offer.meta.id
+            }))
+            .is_empty()
+        );
+
+        // A fresh session, and the whole thing works again.
+        e.on_session_established();
+        let fresh = image_bytes(MAX_CHUNK_BYTES + 5);
+        let (fresh_meta, actions) = inbound_image(&mut e, 0xAA, 9, &fresh);
+        assert_eq!(written(&actions), Some(snip(fresh)));
+        assert!(!sent(&e.on_write_result(fresh_meta.id, Ok(()))).is_empty());
+    }
+
+    /// The lifetime bound (ADR 0014): a transfer that stalls is abandoned,
+    /// observably and non-fatally, with the origin told so its own
+    /// transaction closes (NFR-3) — and the machine still works after.
+    #[test]
+    fn a_stalled_transfer_is_abandoned_and_a_fresh_one_still_works() {
+        let mut e = engine(0xBB);
+
+        // Inbound image: accepted, then the peer goes quiet.
+        let bytes = image_bytes(MAX_CHUNK_BYTES * 8);
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xAA; 16]),
+            sequence: 1,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: bytes.len() as u64,
+            content_hash: content_hash(&bytes),
+        };
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        let Some(Action::ScheduleTransferTimeout { generation, .. }) = actions.iter().find(|a| {
+            matches!(
+                a,
+                Action::ScheduleTransferTimeout {
+                    scope: TransferScope::Inbound,
+                    ..
+                }
+            )
+        }) else {
+            panic!("an accepted offer must be bounded in time: {actions:?}");
+        };
+        let generation = *generation;
+        e.on_peer_message(InboundMessage::Chunk(
+            chunk_content(meta.id, &bytes).unwrap()[0].clone(),
+        ));
+
+        // A stale deadline is a no-op...
+        assert!(
+            e.on_transfer_timeout(TransferScope::Inbound, generation - 1)
+                .is_empty()
+        );
+        assert!(e.reassembly.is_some());
+        // ...and the live one abandons the transfer and answers the origin.
+        let abandoned = e.on_transfer_timeout(TransferScope::Inbound, generation);
+        match sent(&abandoned).as_slice() {
+            [OutboundMessage::Applied(applied)] => {
+                assert_eq!(applied.id, meta.id);
+                assert_eq!(applied.result, ApplyResult::ContentRejected);
+            }
+            other => panic!("an abandoned transfer must answer its origin, got {other:?}"),
+        }
+        assert!(e.reassembly.is_none(), "the buffer was not released");
+
+        // Stuck nowhere: the next offer is accepted and completes.
+        let fresh = image_bytes(MAX_CHUNK_BYTES + 1);
+        let (fresh_meta, actions) = inbound_image(&mut e, 0xAA, 2, &fresh);
+        assert_eq!(written(&actions), Some(snip(fresh)));
+        assert!(!sent(&e.on_write_result(fresh_meta.id, Ok(()))).is_empty());
+    }
+
+    /// The pre-existing gap ADR 0014 named: an accepted **text** offer
+    /// whose `ClipboardData` never arrives had no timeout at all. It does
+    /// now, on the same mechanism.
+    #[test]
+    fn an_accepted_text_offer_that_is_never_fulfilled_is_abandoned() {
+        let mut e = engine(0xBB);
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xAA; 16]),
+            sequence: 1,
+            content_type: ContentType::Utf8Text,
+            content_length: (CLIPBOARD_INLINE_MAX_BYTES + 1) as u64,
+            content_hash: content_hash(b"never sent"),
+        };
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        assert!(matches!(
+            sent(&actions).as_slice(),
+            [OutboundMessage::Accept(_)]
+        ));
+        assert!(e.expecting_data.is_some());
+
+        let abandoned = e.on_transfer_timeout(TransferScope::Inbound, e.inbound_generation);
+        match sent(&abandoned).as_slice() {
+            [OutboundMessage::Applied(applied)] => {
+                assert_eq!(applied.id, meta.id);
+                assert_eq!(applied.result, ApplyResult::ContentRejected);
+            }
+            other => panic!("expected the origin to be told, got {other:?}"),
+        }
+        assert!(e.expecting_data.is_none());
+    }
+
+    /// An unanswered transaction must not occupy the single outbound slot
+    /// forever — not for its memory (an `AwaitingApplied` holds almost
+    /// none) but because that slot decides conflicts: a peer that never
+    /// acknowledges would otherwise leave a zombie item winning races
+    /// against everything minted after it (FR-3.5).
+    #[test]
+    fn an_unacknowledged_inline_item_expires_instead_of_skewing_conflicts() {
+        use std::sync::Arc;
+
+        use crate::metrics::Metrics;
+
+        let metrics = Arc::new(Metrics::new());
+        let mut e = ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig::new(),
+            Some(Arc::clone(&metrics)),
+        );
+        let actions = copy(&mut e, "sent into silence");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::ScheduleTransferTimeout {
+                    scope: TransferScope::Outbound,
+                    ..
+                }
+            )),
+            "even an inline item must be bounded in time: {actions:?}"
+        );
+
+        assert!(e.outbound.is_some());
+        assert!(
+            e.on_transfer_timeout(TransferScope::Outbound, e.outbound_generation)
+                .is_empty()
+        );
+        assert!(e.outbound.is_none(), "the zombie transaction survived");
+        assert_eq!(metrics.snapshot().clipboard_abandoned, 1);
+
+        // With the slot free, a later inbound item is judged on its own
+        // merits rather than raced against one nobody is waiting for.
+        let inbound = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0x01; 16]), // lower origin: would have lost
+            0,
+            ContentType::Utf8Text,
+            b"theirs".to_vec(),
+        );
+        let actions = e.on_peer_message(InboundMessage::Data(inbound));
+        assert_eq!(written_text(&actions).as_deref(), Some("theirs"));
+        assert_eq!(metrics.snapshot().clipboard_conflicts, 0);
+    }
+
+    /// An outbound offer nobody answers releases its item — the retained
+    /// buffer is up to 64 MiB, and a session can live for days.
+    #[test]
+    fn an_unanswered_outbound_offer_releases_its_retained_item() {
+        let mut e = engine(0xAA);
+        let actions = copy_image(&mut e, image_bytes(MAX_CHUNK_BYTES * 2));
+        let offer = offer_of(&actions);
+
+        assert!(
+            e.on_transfer_timeout(TransferScope::Outbound, e.outbound_generation - 1)
+                .is_empty()
+        );
+        assert!(
+            e.outbound.is_some(),
+            "a stale deadline abandoned a transfer"
+        );
+        assert!(
+            e.on_transfer_timeout(TransferScope::Outbound, e.outbound_generation)
+                .is_empty()
+        );
+        assert!(e.outbound.is_none(), "the retained item was not released");
+        // A late accept for the abandoned item does nothing at all.
+        assert!(
+            e.on_peer_message(InboundMessage::Accept(ClipboardAccept {
+                id: offer.meta.id
+            }))
+            .is_empty()
+        );
+    }
+
+    /// Every way a chunk can be wrong, each one fail-closed: the transfer
+    /// ends, the origin is told, and the peer is charged **one** violation
+    /// per doomed transfer rather than one per chunk.
+    #[test]
+    fn malformed_chunk_sequences_end_the_transfer_and_count_once() {
+        use super::MAX_CLIPBOARD_VIOLATIONS;
+
+        /// One way to break a chunk, applied to an otherwise valid one.
+        type Corruption = fn(&mut ClipboardChunk);
+
+        let bytes = image_bytes(MAX_CHUNK_BYTES * 3);
+        let corruptions: [(&str, Corruption); 3] = [
+            ("out of sequence", |c| c.index = 2),
+            ("wrong length", |c| c.payload.truncate(16)),
+            ("foreign item id", |c| c.id = Uuid::from_bytes([0xEE; 16])),
+        ];
+
+        for (label, corrupt) in corruptions {
+            let mut e = engine(0xBB);
+            let meta = ClipboardMeta {
+                id: Uuid::new_v4(),
+                origin: Uuid::from_bytes([0xAA; 16]),
+                sequence: 1,
+                content_type: ContentType::Image(ImageFormat::Dib),
+                content_length: bytes.len() as u64,
+                content_hash: content_hash(&bytes),
+            };
+            let chunks = chunk_content(meta.id, &bytes).unwrap();
+            e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+            e.on_peer_message(InboundMessage::Chunk(chunks[0].clone()));
+
+            let mut bad = chunks[1].clone();
+            corrupt(&mut bad);
+            let actions = e.on_peer_message(InboundMessage::Chunk(bad));
+            // A foreign id is not this transfer's problem: it is an
+            // unsolicited chunk, counted as one, and the live reassembly
+            // is untouched.
+            if label == "foreign item id" {
+                assert!(actions.is_empty(), "{label}: {actions:?}");
+                assert!(
+                    e.reassembly.is_some(),
+                    "{label}: a foreign chunk tore down a healthy transfer"
+                );
+                assert_eq!(e.violations, 1, "{label}");
+                continue;
+            }
+            match sent(&actions).as_slice() {
+                [OutboundMessage::Applied(applied)] => {
+                    assert_eq!(applied.id, meta.id, "{label}");
+                    assert_eq!(applied.result, ApplyResult::ContentRejected, "{label}");
+                }
+                other => panic!("{label}: expected the origin to be told, got {other:?}"),
+            }
+            assert!(e.reassembly.is_none(), "{label}: the buffer survived");
+            assert_eq!(e.violations, 1, "{label}: violations are per transfer");
+
+            // The rest of the doomed stream costs nothing more, so one bad
+            // transfer cannot spend the whole session budget in a burst.
+            for chunk in &chunks[2..] {
+                assert!(
+                    e.on_peer_message(InboundMessage::Chunk(chunk.clone()))
+                        .is_empty(),
+                    "{label}: the tail of an abandoned transfer was punished"
+                );
+            }
+            assert_eq!(e.violations, 1, "{label}");
+            assert!(e.violations < MAX_CLIPBOARD_VIOLATIONS);
+
+            // And the peer can still transfer something correctly after.
+            let fresh = image_bytes(64);
+            let (fresh_meta, actions) = inbound_image(&mut e, 0xAA, 2, &fresh);
+            assert_eq!(written(&actions), Some(snip(fresh)), "{label}");
+            assert!(!sent(&e.on_write_result(fresh_meta.id, Ok(()))).is_empty());
+        }
+    }
+
+    /// The recent-transfer ring must remember four *distinct* transfers,
+    /// not four copies of one. If a repeated id could evict the others,
+    /// the tail of a genuinely different superseded transfer would become
+    /// chargeable — the peer's repetition deciding whether a benign race
+    /// costs it violations.
+    #[test]
+    fn the_recent_transfer_ring_remembers_distinct_transfers() {
+        use super::RECENT_TRANSFER_MEMORY;
+
+        let mut e = engine(0xBB);
+        let bytes = image_bytes(64);
+
+        // The oldest of RECENT_TRANSFER_MEMORY transfers, whose tail must
+        // still be recognized at the end.
+        let (oldest, _) = inbound_image(&mut e, 0xAA, 0, &bytes);
+        e.on_write_result(oldest.id, Ok(()));
+
+        // A second transfer, completed repeatedly — its trailing chunks
+        // arrive again and again, each one re-remembering the same id.
+        let (repeated, _) = inbound_image(&mut e, 0xAA, 1, &image_bytes(96));
+        e.on_write_result(repeated.id, Ok(()));
+        let tail = chunk_content(repeated.id, &image_bytes(96)).unwrap();
+        for _ in 0..RECENT_TRANSFER_MEMORY * 3 {
+            assert!(
+                e.on_peer_message(InboundMessage::Chunk(tail[0].clone()))
+                    .is_empty()
+            );
+        }
+
+        // The oldest transfer's tail is still absorbed, not charged.
+        let old_tail = chunk_content(oldest.id, &bytes).unwrap();
+        let actions = e.on_peer_message(InboundMessage::Chunk(old_tail[0].clone()));
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(
+            e.violations, 0,
+            "a repeated id crowded the ring and made a benign tail chargeable"
+        );
+        // A genuinely unknown id is still a violation: the ring absorbs
+        // races, not everything.
+        e.on_peer_message(InboundMessage::Chunk(ClipboardChunk {
+            id: Uuid::from_bytes([0x5A; 16]),
+            index: 0,
+            payload: vec![0x11; 32],
+        }));
+        assert_eq!(e.violations, 1);
+    }
+
+    /// A conflict decided *before* the transfer starts: an image offer
+    /// that loses the deterministic race is declined, so its megabytes
+    /// never travel at all.
+    #[test]
+    fn an_inbound_image_offer_that_loses_the_conflict_race_is_declined() {
+        let mut e = engine(0xFF); // high origin: ours wins ties
+        copy(&mut e, "ours, in flight");
+
+        let bytes = image_bytes(MAX_CHUNK_BYTES);
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0x01; 16]),
+            sequence: 0,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: bytes.len() as u64,
+            content_hash: content_hash(&bytes),
+        };
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        match sent(&actions).as_slice() {
+            [OutboundMessage::Decline(decline)] => {
+                assert_eq!(decline.reason, DeclineReason::Superseded);
+            }
+            other => panic!("expected a Superseded decline, got {other:?}"),
+        }
+        assert!(e.reassembly.is_none(), "a losing offer committed memory");
+    }
+
+    /// Text keeps every one of its rules while sharing the machine: a
+    /// 4 MiB item is offered (not chunked), sent whole, and installed.
+    #[test]
+    fn the_text_offered_flow_is_unchanged_by_chunking() {
+        let mut e = engine(0xBB);
+        let big = "t".repeat(CLIPBOARD_INLINE_MAX_BYTES + 1);
+        let data = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xAA; 16]),
+            0,
+            ContentType::Utf8Text,
+            big.clone().into_bytes(),
+        );
+        let meta = data.meta;
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        assert!(matches!(
+            sent(&actions).as_slice(),
+            [OutboundMessage::Accept(_)]
+        ));
+        assert!(e.reassembly.is_none(), "text must never build a reassembly");
+
+        let actions = e.on_peer_message(InboundMessage::Data(data));
+        assert_eq!(written_text(&actions).as_deref(), Some(big.as_str()));
     }
 }

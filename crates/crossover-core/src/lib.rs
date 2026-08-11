@@ -20,7 +20,10 @@ pub mod pairing;
 pub mod supervision;
 pub mod topology;
 
-pub use clipboard::{ClipboardConfig, ClipboardEngine, RetryPolicy as ClipboardRetryPolicy};
+pub use clipboard::{
+    ClipboardConfig, ClipboardEngine, RetryPolicy as ClipboardRetryPolicy, TransferScope,
+    WriteFailure,
+};
 pub use clipboard_driver::{ClipboardSyncDriver, SyncEvent, clipboard_sync};
 pub use command::{FrameTarget, SessionCommand};
 pub use control::{

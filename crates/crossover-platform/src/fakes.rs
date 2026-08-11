@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
-use crate::clipboard::{ClipboardError, ClipboardListener, ClipboardProvider};
+use crate::clipboard::{
+    ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
+};
 use crate::cursor::{CursorMask, CursorMaskError};
 use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
 use crate::input::{
@@ -70,9 +72,9 @@ impl SecureStorage for InMemorySecureStorage {
 /// Which fake-clipboard operation an injected failure applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardOp {
-    /// Fail upcoming `read_text` calls.
+    /// Fail upcoming `read` calls.
     Read,
-    /// Fail upcoming `write_text` calls.
+    /// Fail upcoming `write` calls.
     Write,
 }
 
@@ -87,7 +89,7 @@ pub enum ClipboardFailure {
 
 #[derive(Default)]
 struct ClipboardState {
-    content: Option<String>,
+    content: Option<ClipboardContent>,
     listener: Option<ClipboardListener>,
     fail_reads: (usize, Option<ClipboardFailure>),
     fail_writes: (usize, Option<ClipboardFailure>),
@@ -96,8 +98,12 @@ struct ClipboardState {
 /// In-memory [`ClipboardProvider`] with scriptable contention.
 ///
 /// Mirrors the documented contract, including the part that matters most
-/// for loop prevention: `write_text` triggers the change listener, just
-/// as the Windows clipboard notifies for programmatic writes.
+/// for loop prevention: `write` triggers the change listener, just as the
+/// Windows clipboard notifies for programmatic writes. Typed since
+/// ADR 0014: it holds text or image content, and image bytes are stored
+/// and returned verbatim — this fake is what stands in for the OS
+/// clipboard in every hermetic image test, so it must not normalize
+/// anything.
 #[derive(Default)]
 pub struct InMemoryClipboard {
     state: Mutex<ClipboardState>,
@@ -113,9 +119,19 @@ impl InMemoryClipboard {
     /// Simulate a local user copy: set content and notify the listener,
     /// as the OS would for a change made by another application.
     pub fn set_text_locally(&self, text: &str) {
+        self.set_locally(ClipboardContent::Text(text.to_owned()));
+    }
+
+    /// Simulate a local snip: set image content and notify (ADR 0014).
+    pub fn set_image_locally(&self, format: ClipboardImageFormat, bytes: Vec<u8>) {
+        self.set_locally(ClipboardContent::Image { format, bytes });
+    }
+
+    /// Simulate any local copy: set content and notify the listener.
+    pub fn set_locally(&self, content: ClipboardContent) {
         let listener = {
             let mut state = lock(&self.state);
-            state.content = Some(text.to_owned());
+            state.content = Some(content);
             state.listener.take()
         };
         self.notify_and_restore(listener);
@@ -132,9 +148,20 @@ impl InMemoryClipboard {
         }
     }
 
-    /// Current content, bypassing failure injection (test assertions).
+    /// Current text content, bypassing failure injection (test
+    /// assertions). `None` when the clipboard is empty *or* holds an
+    /// image — the shape the text suites have always asserted on.
     #[must_use]
     pub fn peek(&self) -> Option<String> {
+        lock(&self.state)
+            .content
+            .as_ref()
+            .and_then(|content| content.as_text().map(str::to_owned))
+    }
+
+    /// Current typed content, bypassing failure injection.
+    #[must_use]
+    pub fn peek_content(&self) -> Option<ClipboardContent> {
         lock(&self.state).content.clone()
     }
 
@@ -176,7 +203,7 @@ impl InMemoryClipboard {
 }
 
 impl ClipboardProvider for InMemoryClipboard {
-    fn read_text(&self) -> Result<Option<String>, ClipboardError> {
+    fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
         let mut state = lock(&self.state);
         if let Some(kind) = Self::take_failure(&mut state.fail_reads) {
             return Err(Self::failure_error(kind));
@@ -184,13 +211,13 @@ impl ClipboardProvider for InMemoryClipboard {
         Ok(state.content.clone())
     }
 
-    fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
+    fn write(&self, content: &ClipboardContent) -> Result<(), ClipboardError> {
         let listener = {
             let mut state = lock(&self.state);
             if let Some(kind) = Self::take_failure(&mut state.fail_writes) {
                 return Err(Self::failure_error(kind));
             }
-            state.content = Some(text.to_owned());
+            state.content = Some(content.clone());
             state.listener.take()
         };
         // Contract term under test everywhere: our own writes notify too.
@@ -858,6 +885,46 @@ mod clipboard_tests {
     fn empty_clipboard_reads_none_not_error() {
         let clipboard = InMemoryClipboard::new();
         assert_eq!(clipboard.read_text().unwrap(), None);
+    }
+
+    /// Image bytes are opaque (ADR 0014): whatever goes in comes back
+    /// byte-identical, including sequences no text path could survive.
+    #[test]
+    fn image_content_round_trips_verbatim_and_is_not_text() {
+        use crate::clipboard::{ClipboardContent, ClipboardImageFormat};
+
+        let clipboard = InMemoryClipboard::new();
+        let notifications = counting_listener(&clipboard);
+        let bytes = vec![0xFF, 0x00, 0xFE, 0x00, 0x80, 0xC0, 0xFF];
+
+        clipboard.set_image_locally(ClipboardImageFormat::Dib, bytes.clone());
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            clipboard.read().unwrap(),
+            Some(ClipboardContent::Image {
+                format: ClipboardImageFormat::Dib,
+                bytes: bytes.clone(),
+            })
+        );
+        // The text convenience reports an image as absence, never as
+        // lossily-decoded text.
+        assert_eq!(clipboard.read_text().unwrap(), None);
+        assert_eq!(clipboard.peek(), None);
+
+        clipboard
+            .write(&ClipboardContent::Image {
+                format: ClipboardImageFormat::Png,
+                bytes: vec![0x89, b'P', b'N', b'G', 0x00, 0xFF],
+            })
+            .unwrap();
+        assert_eq!(notifications.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            clipboard.peek_content(),
+            Some(ClipboardContent::Image {
+                format: ClipboardImageFormat::Png,
+                bytes: vec![0x89, b'P', b'N', b'G', 0x00, 0xFF],
+            })
+        );
     }
 }
 

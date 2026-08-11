@@ -73,6 +73,19 @@ and a **saturating background transfer** — every send queue full and the
 socket stalled behind a peer that will not read — with live input injected
 into the middle of it (ADR 0013; `tools/test-peer/tests/priority.rs`).
 
+Chunked transfers (ADR 0014) add their own faults, because a transfer with
+many messages has failure modes a single frame does not: a session **torn
+mid-stream** (nothing partially installed, no buffer left pinned, and the
+same item transferring cleanly on reconnect as a fresh transaction —
+`tools/test-peer/tests/stress.rs`); a transfer **accepted and then
+abandoned** by a silent peer, which must expire rather than pin its
+reassembly buffer for the life of the session; and **malformed chunk
+sequences** — gaps, repeats, wrong lengths, foreign item ids — each
+fail-closed, counted once per doomed transfer, and fatal only on
+repetition (PROTOCOL.md §7). A streaming image is also run through the
+saturation case above, since a chunk being preemptable is the whole reason
+ADR 0014 chunks at all.
+
 That last one asserts *structurally*: arrival positions and frame counts,
 never elapsed time. A wall-clock latency bound on a loaded CI runner
 measures the runner, so the guarantee is stated as "everything still queued

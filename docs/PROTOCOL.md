@@ -112,11 +112,21 @@ Rules, all of them deliberate:
 | 0 | `CHUNKED_CLIPBOARD` | The peer can receive `ContentType::Image` items offered and streamed as `ClipboardChunk` messages, reassemble them, and install the result (ADR 0014) |
 
 `FeatureFlags::ADVERTISED` is what this build actually sends, and it is
-**empty today**: the wire layer below is implemented, but the clipboard
-engine cannot yet reassemble a chunked item and the platform layer cannot
-yet read or write a raster format. ADR 0014's engine and platform slices
-set it to `ALL`; that flip is what switches image transfer on, on both
-sides at once.
+**empty today** — now for exactly one remaining reason. The wire layer
+carries chunked items and the clipboard engine offers, streams,
+reassembles, verifies and installs them (ADR 0014's protocol and engine
+slices), but no platform backend can yet put a raster format on a real
+clipboard: `crossover-platform-windows` reports an image clipboard as
+absent on read and refuses an image on write. Advertising is a promise to
+**handle**, so promising it here would mean accepting a transfer this build
+must then fail at the last step, after the peer moved every byte.
+ADR 0014's platform slice sets it to `ALL`; that flip is what switches
+image transfer on, on both sides at once.
+
+Tests that need the negotiated path before then override the advertisement
+per session (`SessionOptions::advertised_features`) with a fake provider
+behind it, rather than weakening the constant — the negotiated flow over
+real TLS is proven now, and the promise stays honest.
 
 This is the route chosen over another hard version-floor bump (the v1 → v2
 option ADR 0014 weighed): the base-protocol wire layouts are unchanged, so
