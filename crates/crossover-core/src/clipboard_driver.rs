@@ -25,6 +25,7 @@ use crossover_protocol::hello::MessageType;
 
 use crate::clipboard::{Action, ClipboardConfig, ClipboardEngine, InboundMessage};
 use crate::metrics::Metrics;
+use crate::outbound::{CommandReceiver, CommandSender, command_lanes};
 
 /// How long after a `Busy` *read* before re-checking the clipboard. Reads
 /// have no transaction to retry inside the engine; the driver simply
@@ -108,7 +109,7 @@ pub struct ClipboardSyncDriver {
     provider: Arc<dyn ClipboardProvider>,
     events_rx: mpsc::Receiver<SyncEvent>,
     events_tx: mpsc::Sender<SyncEvent>,
-    commands_tx: mpsc::Sender<SessionCommand>,
+    commands_tx: CommandSender,
     /// Consecutive `Busy` reads; reset by any successful read.
     busy_reads: u32,
     /// Generation of the newest settle timer; older ones are ignored
@@ -139,12 +140,14 @@ pub fn clipboard_sync(
     (
         ClipboardSyncDriver,
         mpsc::Sender<SyncEvent>,
-        mpsc::Receiver<SessionCommand>,
+        CommandReceiver,
     ),
     ClipboardError,
 > {
     let (events_tx, events_rx) = mpsc::channel(64);
-    let (commands_tx, commands_rx) = mpsc::channel(64);
+    // Two lanes, not one queue: a driver parked on bulk backpressure must
+    // still have a clear path for its fail-closed termination (ADR 0013).
+    let (commands_tx, commands_rx) = command_lanes();
 
     // Bridge the dataless provider callback into the event loop.
     // try_send + drop-on-full IS the documented coalescing: a full queue
@@ -430,7 +433,7 @@ mod tests {
     struct Rig {
         clipboard: Arc<InMemoryClipboard>,
         events: mpsc::Sender<SyncEvent>,
-        commands: mpsc::Receiver<SessionCommand>,
+        commands: crate::outbound::CommandReceiver,
         metrics: Arc<Metrics>,
     }
 

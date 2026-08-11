@@ -12,17 +12,16 @@ use anyhow::Context;
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
-use crossover_core::outbound::{BudgetedReceiver, budgeted_channel};
+use crossover_core::outbound::{BudgetedReceiver, CommandReceiver, command_lanes};
 use crossover_core::pairing::{PairingListener, pair_with};
 use crossover_core::supervision::{
     KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
 };
 use crossover_core::{
     ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
-    FrameTarget, InputControlEvent, LinkSide, LocalNode, MAX_BACKGROUND_QUEUE_BYTES,
-    MAX_BACKGROUND_QUEUE_FRAMES, MAX_HIGH_QUEUE_FRAMES, Metrics, OutboundSender, SeamlessInputs,
-    SendPriority, SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology,
-    clipboard_sync, edge_detect, input_control, outbound_channel,
+    FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics, OutboundSender, SeamlessInputs,
+    SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology, clipboard_sync,
+    edge_detect, input_control, outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
@@ -408,10 +407,7 @@ fn setup_input_control(
     side: Option<LinkSide>,
     metrics: &Arc<Metrics>,
     no_cursor_mask: bool,
-) -> anyhow::Result<(
-    mpsc::Sender<InputControlEvent>,
-    mpsc::Receiver<SessionCommand>,
-)> {
+) -> anyhow::Result<(mpsc::Sender<InputControlEvent>, CommandReceiver)> {
     let (capture, injector) = open_input()?;
     // Diagnostic switch: run without masking to isolate cursor behavior
     // from control transfer (ADR 0009).
@@ -518,7 +514,7 @@ pub async fn run(
 
     // Both drivers emit the same SessionCommands; merge them into the two
     // priority lanes the mux drains independently (ADR 0013).
-    let commands = classify_command_streams(sync_commands, control_commands);
+    let commands = merge_command_lanes(sync_commands, control_commands);
 
     // Outbound role: supervised session with automatic reconnect.
     let (handle, events) =
@@ -694,63 +690,48 @@ struct ClassifiedCommands {
     background: BudgetedReceiver<SessionCommand>,
 }
 
-/// Which lane a driver command rides.
+/// Fold both drivers' already-classified command lanes into one merged pair.
 ///
-/// A fail-closed `TerminateSession` is High: it is a security action
-/// (docs/PROTOCOL.md §7), and putting it behind a bulk transfer would delay
-/// the response to a misbehaving peer.
-fn command_priority(command: &SessionCommand) -> SendPriority {
-    match command {
-        SessionCommand::SendFrame { message_type, .. } => SendPriority::of(*message_type),
-        SessionCommand::TerminateSession { .. } => SendPriority::High,
-    }
-}
-
-/// What a command charges against the Background lane's byte budget.
-fn command_bytes(command: &SessionCommand) -> usize {
-    match command {
-        SessionCommand::SendFrame { payload, .. } => payload.len(),
-        SessionCommand::TerminateSession { .. } => 0,
-    }
-}
-
-/// Fold both drivers' `SessionCommand` streams into one High lane and one
-/// Background lane, classifying each command as it passes. Each forwarder
-/// ends when its driver drops the sender.
+/// **One forwarder task per source lane, never per source.** A task that read
+/// a driver's two lanes together would serialize them: parked handing a bulk
+/// command downstream, it could not pick up that driver's next High command —
+/// so a fail-closed `TerminateSession` emitted during a stalled transfer
+/// would sit behind the very bulk that stalled it. Four single-class tasks
+/// have nothing to serialize; each waits only on its own class.
 ///
-/// A driver blocked here is correct backpressure: the clipboard driver's
-/// output is entirely Background, so it is the one that waits, and the
-/// control driver — whose output is entirely High — never does.
-fn classify_command_streams(
-    a: mpsc::Receiver<SessionCommand>,
-    b: mpsc::Receiver<SessionCommand>,
-) -> ClassifiedCommands {
-    let (high_tx, high_rx) = mpsc::channel(MAX_HIGH_QUEUE_FRAMES);
-    let (background_tx, background_rx) =
-        budgeted_channel(MAX_BACKGROUND_QUEUE_FRAMES, MAX_BACKGROUND_QUEUE_BYTES);
+/// Classification is a pure function of the message type, so re-running it on
+/// the merged sender maps each lane onto the matching lane, never across.
+fn merge_command_lanes(a: CommandReceiver, b: CommandReceiver) -> ClassifiedCommands {
+    let (merged_tx, merged_rx) = command_lanes();
     for source in [a, b] {
-        let high = high_tx.clone();
-        let background = background_tx.clone();
+        let (mut source_high, mut source_background) = source.into_lanes();
+
+        let high_tx = merged_tx.clone();
         tokio::spawn(async move {
-            let mut source = source;
-            while let Some(command) = source.recv().await {
-                let delivered = match command_priority(&command) {
-                    SendPriority::High => high.send(command).await.is_ok(),
-                    SendPriority::Background => {
-                        let bytes = command_bytes(&command);
-                        background.send(command, bytes).await.is_ok()
-                    }
-                };
+            while let Some(command) = source_high.recv().await {
+                if high_tx.send(command).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let background_tx = merged_tx.clone();
+        tokio::spawn(async move {
+            while let Some(command) = source_background.recv().await {
+                // Hold this hop's byte budget until the next hop has taken
+                // the command, so the two bounds cannot both be spent on the
+                // same bytes.
+                let (command, hold) = command.into_parts();
+                let delivered = background_tx.send(command).await.is_ok();
+                drop(hold);
                 if !delivered {
                     break;
                 }
             }
         });
     }
-    ClassifiedCommands {
-        high: high_rx,
-        background: background_rx,
-    }
+    let (high, background) = merged_rx.into_lanes();
+    ClassifiedCommands { high, background }
 }
 
 /// Build the seamless wiring for a `--left`/`--right` run (ADR 0009): the
@@ -1444,11 +1425,19 @@ fn age(unix: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::watch;
     use uuid::Uuid;
 
+    use crossover_core::outbound::{CommandSender, command_lanes};
+    use crossover_core::{
+        FrameTarget, MAX_BACKGROUND_QUEUE_FRAMES, SendPriority, SessionCommand, outbound_channel,
+    };
+    use crossover_protocol::hello::MessageType;
     use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore, TrustedPeer};
 
-    use super::{age, command_priority, revoked_session_ids};
+    use super::{age, revoked_session_ids};
 
     #[test]
     fn revoked_sessions_are_those_whose_peer_left_the_trust_store() {
@@ -1490,6 +1479,7 @@ mod tests {
     /// stream (docs/PROTOCOL.md §7).
     #[test]
     fn terminations_ride_the_interactive_lane_and_bulk_frames_do_not() {
+        use crossover_core::outbound::command_priority;
         use crossover_core::{FrameTarget, SendPriority, SessionCommand};
         use crossover_protocol::hello::MessageType;
 
@@ -1516,104 +1506,173 @@ mod tests {
         );
     }
 
-    /// The hop the ADR 0013 drift-check singled out: the command mux
-    /// *awaits* delivery into each session's queue, so a single task
-    /// draining both classes would let one wedged Background path stall
-    /// input for every session.
-    ///
-    /// Structural, not timed: saturate the entire Background path until it
-    /// stops accepting work at all, then prove an input batch still reaches
-    /// the session's writer — and reaches it *first*, ahead of the bulk
-    /// already queued there. On a current-thread runtime `yield_now` steps
-    /// the mux tasks deterministically, so there is no wall clock in the
-    /// assertion.
-    #[tokio::test]
-    async fn a_wedged_background_path_never_delays_a_high_frame_through_the_mux() {
+    /// One live session whose writer never runs, plus a running mux: the rig
+    /// the two wedged-path tests share.
+    struct WedgeRig {
+        session: Uuid,
+        clipboard: CommandSender,
+        control: CommandSender,
+        outbound: crossover_core::OutboundReceiver,
+        killed: watch::Receiver<bool>,
+    }
+
+    fn wedge_rig() -> WedgeRig {
         use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
-
-        use tokio::sync::mpsc;
-        use tokio::task::yield_now;
-
-        use crossover_core::{
-            FrameTarget, MAX_BACKGROUND_QUEUE_FRAMES, SendPriority, SessionCommand,
-            outbound_channel,
-        };
-        use crossover_protocol::hello::MessageType;
+        use std::sync::Mutex;
 
         use super::{
-            FrameSink, SessionRegistry, SessionRoute, classify_command_streams, spawn_command_mux,
+            FrameSink, SessionRegistry, SessionRoute, merge_command_lanes, spawn_command_mux,
         };
 
         let identity = DeviceIdentity::generate("wedged-peer").unwrap();
         let certified = CertifiedIdentity::from_identity(&identity).unwrap();
         let session = Uuid::from_bytes([0x55; 16]);
 
-        // One live session whose writer never runs: nothing drains it.
-        let (sink, mut outbound) = outbound_channel();
+        let (sink, outbound) = outbound_channel();
+        let (kill_tx, killed) = watch::channel(false);
         let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::from([(
             session,
             SessionRoute {
                 sink: FrameSink::Inbound(sink),
-                kill: None,
+                kill: Some(kill_tx),
                 peer_fingerprint: certified.fingerprint(),
             },
         )])));
 
-        let (clipboard_tx, clipboard_rx) = mpsc::channel(64);
-        let (control_tx, control_rx) = mpsc::channel(64);
+        let (clipboard, clipboard_rx) = command_lanes();
+        let (control, control_rx) = command_lanes();
         spawn_command_mux(
             registry,
-            classify_command_streams(clipboard_rx, control_rx),
+            merge_command_lanes(clipboard_rx, control_rx),
             None,
         );
 
-        // Saturate every Background queue on the path: the driver's own
-        // channel, the mux's bulk lane, and the session's bulk lane.
-        let mut queued = 0usize;
-        let mut refusals = 0usize;
-        while refusals < 32 {
-            let bulk = SessionCommand::SendFrame {
-                target: FrameTarget::Session(session),
-                message_type: MessageType::ClipboardData.wire(),
-                payload: vec![0xBB; 128 * 1024],
-            };
-            if clipboard_tx.try_send(bulk).is_ok() {
-                queued += 1;
-                refusals = 0;
-            } else {
-                refusals += 1;
-            }
-            yield_now().await;
-            assert!(queued < 4096, "the background path never saturated");
+        WedgeRig {
+            session,
+            clipboard,
+            control,
+            outbound,
+            killed,
         }
+    }
+
+    /// Wedge the whole Background path solid — the driver's own lane, the
+    /// mux's, and the session's — and return once the producer is *provably*
+    /// parked, with the number of commands it got in.
+    ///
+    /// Deterministic rather than timed: `#[tokio::test]` gives a
+    /// current-thread runtime, so a sweep of `yield_now` runs every other
+    /// task to its next await point. A producer that has not advanced across
+    /// a whole sweep is parked on backpressure, not merely behind us.
+    async fn wedge_background(sender: &CommandSender, session: Uuid) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sent = Arc::new(AtomicUsize::new(0));
+        let producer = {
+            let sender = sender.clone();
+            let sent = Arc::clone(&sent);
+            tokio::spawn(async move {
+                loop {
+                    let bulk = SessionCommand::SendFrame {
+                        target: FrameTarget::Session(session),
+                        message_type: MessageType::ClipboardData.wire(),
+                        payload: vec![0xBB; 128 * 1024],
+                    };
+                    if sender.send(bulk).await.is_err() {
+                        return;
+                    }
+                    sent.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+
+        let mut previous = usize::MAX;
+        loop {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            let now = sent.load(Ordering::Relaxed);
+            assert!(now < 4096, "the background path never saturated");
+            if now == previous {
+                assert!(!producer.is_finished(), "the producer stopped early");
+                return now;
+            }
+            previous = now;
+        }
+    }
+
+    /// The hop the ADR 0013 drift-check singled out: the command mux
+    /// *awaits* delivery into each session's queue, so a single task
+    /// draining both classes would let one wedged Background path stall
+    /// input for every session.
+    #[tokio::test]
+    async fn a_wedged_background_path_never_delays_a_high_frame_through_the_mux() {
+        let mut rig = wedge_rig();
+        let wedged = wedge_background(&rig.clipboard, rig.session).await;
         assert!(
-            queued >= MAX_BACKGROUND_QUEUE_FRAMES,
-            "expected a full bulk lane before the input frame, got {queued} frames"
+            wedged >= MAX_BACKGROUND_QUEUE_FRAMES,
+            "expected a full bulk backlog, got {wedged} commands"
         );
 
         // With bulk wedged solid, an input batch still crosses the mux…
-        control_tx
+        rig.control
             .send(SessionCommand::SendFrame {
-                target: FrameTarget::Session(session),
+                target: FrameTarget::Session(rig.session),
                 message_type: MessageType::InputBatch.wire(),
                 payload: b"pointer moved".to_vec(),
             })
             .await
             .unwrap();
         for _ in 0..64 {
-            yield_now().await;
+            tokio::task::yield_now().await;
         }
 
         // …and is the very next frame the writer would put on the wire.
-        let frame = outbound.recv().await.expect("a frame for the writer");
+        let frame = rig.outbound.recv().await.expect("a frame for the writer");
         assert_eq!(
             frame.message_type,
             MessageType::InputBatch.wire(),
-            "input queued behind {queued} bulk frames"
+            "input queued behind {wedged} bulk commands"
         );
         assert_eq!(frame.priority, SendPriority::High);
         assert_eq!(frame.payload, b"pointer moved");
+    }
+
+    /// The sharper case, and the one a per-*source* forwarder gets wrong:
+    /// the High command comes from the **same driver** whose bulk wedged the
+    /// path.
+    ///
+    /// A peer that stops reading its socket and then sends a malformed
+    /// clipboard payload must still get its session killed. If the
+    /// termination queues behind the bulk it just stalled, that peer has
+    /// bought immunity from the fail-closed path (docs/PROTOCOL.md §7) by
+    /// doing nothing more than refusing to read.
+    #[tokio::test]
+    async fn a_termination_overtakes_the_bulk_from_its_own_driver() {
+        let mut rig = wedge_rig();
+        let wedged = wedge_background(&rig.clipboard, rig.session).await;
+        assert!(wedged >= MAX_BACKGROUND_QUEUE_FRAMES);
+        assert!(
+            !*rig.killed.borrow_and_update(),
+            "the session died before the test began"
+        );
+
+        rig.clipboard
+            .send(SessionCommand::TerminateSession {
+                target: FrameTarget::Session(rig.session),
+                reason: "malformed clipboard payload".to_owned(),
+            })
+            .await
+            .expect("a wedged bulk lane blocked a fail-closed termination");
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            *rig.killed.borrow_and_update(),
+            "the session was never killed: the termination is stuck behind \
+             {wedged} bulk commands from the same driver"
+        );
     }
 
     #[test]

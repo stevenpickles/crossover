@@ -52,6 +52,7 @@ use crate::control::{
 };
 use crate::edge_driver::EdgeMode;
 use crate::input::InputEvent;
+use crate::outbound::{CommandReceiver, CommandSender, command_lanes};
 use crate::topology::{EdgeFraction, Topology};
 
 /// How often, while controlling, the driver polls the platform for a
@@ -182,7 +183,7 @@ pub struct InputControlDriver {
     last_edge_mode: EdgeMode,
     events_rx: mpsc::Receiver<InputControlEvent>,
     events_tx: mpsc::Sender<InputControlEvent>,
-    commands_tx: mpsc::Sender<SessionCommand>,
+    commands_tx: CommandSender,
     notices_tx: mpsc::Sender<ControlNotice>,
     /// Established sessions in the order they arrived. Used only to pick
     /// which peer a user "take control" command targets (the engine
@@ -204,11 +205,11 @@ pub fn input_control(
 ) -> (
     InputControlDriver,
     mpsc::Sender<InputControlEvent>,
-    mpsc::Receiver<SessionCommand>,
+    CommandReceiver,
     mpsc::Receiver<ControlNotice>,
 ) {
     let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
-    let (commands_tx, commands_rx) = mpsc::channel(64);
+    let (commands_tx, commands_rx) = command_lanes();
     let (notices_tx, notices_rx) = mpsc::channel(64);
 
     // Cursor visibility is applied off this loop (the mask's Win32 calls can
@@ -846,7 +847,7 @@ mod tests {
         injector: Arc<FakeInputInjector>,
         cursor_mask: Arc<FakeCursorMask>,
         events: mpsc::Sender<InputControlEvent>,
-        commands: mpsc::Receiver<SessionCommand>,
+        commands: crate::outbound::CommandReceiver,
         notices: mpsc::Receiver<ControlNotice>,
         edge_modes: mpsc::Receiver<EdgeMode>,
     }

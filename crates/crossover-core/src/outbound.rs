@@ -40,6 +40,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crossover_protocol::hello::MessageType;
 
+use crate::clipboard_driver::SessionCommand;
+
 /// Depth of a High lane, in frames. Interactive frames are small (an input
 /// batch is tens of bytes, a control message a handful), so a message count
 /// is the honest bound here: sixty-four of them is well under a kilobyte of
@@ -419,6 +421,60 @@ impl OutboundSender {
     }
 }
 
+/// One item taken off a two-lane pair, tagged with the lane it came from.
+#[derive(Debug)]
+enum Lane<T> {
+    High(T),
+    Background(Budgeted<T>),
+}
+
+/// The scheduler both two-lane receivers share: **everything queued High
+/// first, then at most one Background item** (ADR 0013).
+///
+/// The High check runs before *every* Background item, so a caller that
+/// consumes one item per call re-checks High between every pair — which is
+/// what keeps a bulk backlog from re-serializing ahead of interactive work.
+/// Never reorders within a lane, never drops.
+///
+/// `None` once both lanes are closed and drained. Cancel-safe: nothing is
+/// taken off a lane without being returned.
+async fn drain_high_first<T>(
+    high: &mut mpsc::Receiver<T>,
+    background: &mut BudgetedReceiver<T>,
+    high_closed: &mut bool,
+    background_closed: &mut bool,
+) -> Option<Lane<T>> {
+    loop {
+        match high.try_recv() {
+            Ok(item) => return Some(Lane::High(item)),
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => *high_closed = true,
+        }
+        match background.try_recv() {
+            Ok(budgeted) => return Some(Lane::Background(budgeted)),
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => *background_closed = true,
+        }
+        if *high_closed && *background_closed {
+            return None;
+        }
+
+        // Both lanes are empty: wait for whichever wakes first, still biased
+        // so a simultaneous arrival resolves to High.
+        tokio::select! {
+            biased;
+            item = high.recv(), if !*high_closed => match item {
+                Some(item) => return Some(Lane::High(item)),
+                None => *high_closed = true,
+            },
+            item = background.recv(), if !*background_closed => match item {
+                Some(budgeted) => return Some(Lane::Background(budgeted)),
+                None => *background_closed = true,
+            },
+        }
+    }
+}
+
 /// The writer's end of a session's send path: the scheduler that makes the
 /// priority real.
 #[derive(Debug)]
@@ -430,53 +486,23 @@ pub struct OutboundReceiver {
 }
 
 impl OutboundReceiver {
-    /// The next frame to write: **everything queued High first, then at most
-    /// one Background frame** (ADR 0013).
+    /// The next frame to write. See [`drain_high_first`] for the policy;
+    /// because [`crate::supervision::run_session`] writes exactly one frame
+    /// per call, the High lane is re-checked between every pair of frames.
     ///
-    /// Because the caller writes one frame per call, the High lane is
-    /// re-checked between every pair of frames — which is what keeps the
-    /// kernel send buffer shallow enough for app-level priority to reach the
-    /// wire. Never reorders within a class, never drops.
-    ///
-    /// `None` once both lanes are closed and drained. Cancel-safe: no frame
-    /// is taken without being returned.
+    /// `None` once both lanes are closed and drained. Cancel-safe.
     pub async fn recv(&mut self) -> Option<OutboundFrame> {
-        loop {
-            // Strict priority. This runs before *every* Background frame, so
-            // an input batch that arrived while the previous frame was on the
-            // wire preempts the rest of the bulk queue.
-            match self.high.try_recv() {
-                Ok((message_type, payload)) => {
-                    return Some(OutboundFrame::high(message_type, payload));
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => self.high_closed = true,
-            }
-            match self.background.try_recv() {
-                Ok(budgeted) => return Some(OutboundFrame::background(budgeted)),
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => self.background_closed = true,
-            }
-            if self.high_closed && self.background_closed {
-                return None;
-            }
-
-            // Both lanes are empty: wait for whichever wakes first, still
-            // biased so a simultaneous arrival resolves to High.
-            tokio::select! {
-                biased;
-                item = self.high.recv(), if !self.high_closed => match item {
-                    Some((message_type, payload)) => {
-                        return Some(OutboundFrame::high(message_type, payload));
-                    }
-                    None => self.high_closed = true,
-                },
-                item = self.background.recv(), if !self.background_closed => match item {
-                    Some(budgeted) => return Some(OutboundFrame::background(budgeted)),
-                    None => self.background_closed = true,
-                },
-            }
-        }
+        let lane = drain_high_first(
+            &mut self.high,
+            &mut self.background,
+            &mut self.high_closed,
+            &mut self.background_closed,
+        )
+        .await?;
+        Some(match lane {
+            Lane::High((message_type, payload)) => OutboundFrame::high(message_type, payload),
+            Lane::Background(budgeted) => OutboundFrame::background(budgeted),
+        })
     }
 }
 
@@ -494,6 +520,127 @@ pub fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
             background: background_tx,
         },
         OutboundReceiver {
+            high: high_rx,
+            background: background_rx,
+            high_closed: false,
+            background_closed: false,
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The drivers' end of the path
+// ---------------------------------------------------------------------------
+
+/// Which lane a driver command rides.
+///
+/// A fail-closed `TerminateSession` is High: it is a security action
+/// (docs/PROTOCOL.md §7), and a peer that has just sent an invalid payload
+/// must not be able to postpone its own termination by keeping the wire
+/// busy.
+#[must_use]
+pub fn command_priority(command: &SessionCommand) -> SendPriority {
+    match command {
+        SessionCommand::SendFrame { message_type, .. } => SendPriority::of(*message_type),
+        SessionCommand::TerminateSession { .. } => SendPriority::High,
+    }
+}
+
+/// What a command charges against the Background lane's byte budget.
+fn command_bytes(command: &SessionCommand) -> usize {
+    match command {
+        SessionCommand::SendFrame { payload, .. } => payload.len(),
+        SessionCommand::TerminateSession { .. } => 0,
+    }
+}
+
+/// A driver's end of its command stream: the same two lanes, classified on
+/// the way in.
+///
+/// A driver emitting into **one** mixed queue would re-create the head-of-line
+/// block this design exists to remove — its High commands would wait behind
+/// its own bulk in that queue, and once the queue filled they would never be
+/// emitted at all. Splitting here means a driver parked on bulk backpressure
+/// still has a clear path for a termination or a control frame.
+#[derive(Debug, Clone)]
+pub struct CommandSender {
+    high: mpsc::Sender<SessionCommand>,
+    background: BudgetedSender<SessionCommand>,
+}
+
+impl CommandSender {
+    /// Queue a command on the lane its class belongs to, waiting for room.
+    ///
+    /// # Errors
+    ///
+    /// [`OutboundClosed`] once the consuming side is gone.
+    pub async fn send(&self, command: SessionCommand) -> Result<(), OutboundClosed> {
+        match command_priority(&command) {
+            SendPriority::High => self.high.send(command).await.map_err(|_| OutboundClosed),
+            SendPriority::Background => {
+                let bytes = command_bytes(&command);
+                self.background.send(command, bytes).await
+            }
+        }
+    }
+}
+
+/// The consuming end of a driver's command stream.
+#[derive(Debug)]
+pub struct CommandReceiver {
+    high: mpsc::Receiver<SessionCommand>,
+    background: BudgetedReceiver<SessionCommand>,
+    high_closed: bool,
+    background_closed: bool,
+}
+
+impl CommandReceiver {
+    /// The next command, High lane first. Cancel-safe.
+    ///
+    /// The Background byte budget is returned as the command leaves the
+    /// queue; a consumer that must hold the budget until it has passed the
+    /// command on should take the lanes apart with [`Self::into_lanes`].
+    pub async fn recv(&mut self) -> Option<SessionCommand> {
+        let lane = drain_high_first(
+            &mut self.high,
+            &mut self.background,
+            &mut self.high_closed,
+            &mut self.background_closed,
+        )
+        .await?;
+        Some(match lane {
+            Lane::High(command) => command,
+            Lane::Background(budgeted) => budgeted.into_parts().0,
+        })
+    }
+
+    /// Take the two lanes apart, so each can be forwarded by its own task.
+    /// This is what keeps a parked Background forwarder from holding up High
+    /// commands from the same driver.
+    #[must_use]
+    pub fn into_lanes(
+        self,
+    ) -> (
+        mpsc::Receiver<SessionCommand>,
+        BudgetedReceiver<SessionCommand>,
+    ) {
+        (self.high, self.background)
+    }
+}
+
+/// Build one driver's command stream: the same High/Background lanes, with
+/// the same bounds, as a session's send path.
+#[must_use]
+pub fn command_lanes() -> (CommandSender, CommandReceiver) {
+    let (high_tx, high_rx) = mpsc::channel(MAX_HIGH_QUEUE_FRAMES);
+    let (background_tx, background_rx) =
+        budgeted_channel(MAX_BACKGROUND_QUEUE_FRAMES, MAX_BACKGROUND_QUEUE_BYTES);
+    (
+        CommandSender {
+            high: high_tx,
+            background: background_tx,
+        },
+        CommandReceiver {
             high: high_rx,
             background: background_rx,
             high_closed: false,
