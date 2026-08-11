@@ -182,6 +182,13 @@ pub enum DisconnectReason {
     /// Transport-level failure.
     #[error("transport failure: {reason}")]
     Transport { reason: String },
+    /// The application stopped taking this session's events, so inbound
+    /// frames could no longer be dispatched. Kept distinct from
+    /// [`Self::Transport`] because it is a *local* fault: blaming the
+    /// network for it would send a soak report hunting the wrong thing
+    /// (docs/ARCHITECTURE.md §9).
+    #[error("session event consumer stalled: {reason}")]
+    EventConsumerStalled { reason: String },
     /// The local side asked the supervisor to stop.
     #[error("shutdown requested locally")]
     ShutdownRequested,
@@ -700,13 +707,57 @@ async fn dispatch_frame(
         )
         // Not a control message: the application owns dispatch (and
         // validity) of everything else.
-        | None => {
-            if events.send(SessionEvent::Frame(frame)).await.is_err() {
-                Some(DisconnectReason::ShutdownRequested)
-            } else {
-                None
-            }
-        }
+        | None => deliver_bounded(events, SessionEvent::Frame(frame), keepalive).await,
+    }
+}
+
+/// Hand one frame to the application, giving up if it cannot be accepted
+/// inside the keepalive timeout.
+///
+/// This is the last unbounded await in [`run_session`], and the one hop
+/// where backpressure points *inwards*. Parking here parks the whole
+/// session loop — the outbound drain, the `Pong` answer, and the keepalive
+/// tick that would otherwise notice — so an application that stops
+/// consuming freezes the session with nothing left running to time it out.
+///
+/// That state is reachable, and not only by local misbehaviour. Under
+/// sustained High-lane saturation the Background lane is deliberately
+/// starved (ADR 0013), so a clipboard driver parked on it stops draining
+/// its own events; the fanout then parks, the session's event drain stops,
+/// this channel fills, and the loop stops turning. Every hop is legitimate
+/// backpressure; the cycle is not.
+///
+/// The budget is `keepalive.timeout()`, matching the write bounds: one knob
+/// for "this session has stopped moving", whichever direction it stopped
+/// in. Expiry is fail-closed, and the disconnect is what breaks the cycle —
+/// teardown retires the send path, which unparks everything queued behind
+/// it (docs/ARCHITECTURE.md §5.4).
+///
+/// **A peer cannot induce this on a healthy session.** All a peer controls
+/// is how fast frames arrive, and a consumer that is *running* accepts each
+/// one in microseconds however hard it is pushed: a flood meets
+/// backpressure, which slows the peer down, and never approaches a
+/// multi-second wait for a single hand-off. Reaching the deadline requires
+/// the consumer chain to have genuinely stopped. A peer *can* stop it, by
+/// driving the wedge above — and killing the session is then exactly right,
+/// because a session whose frames are neither dispatched nor answered is
+/// already doing nothing but holding the chain hostage.
+async fn deliver_bounded(
+    events: &mpsc::Sender<SessionEvent>,
+    event: SessionEvent,
+    keepalive: &KeepaliveConfig,
+) -> Option<DisconnectReason> {
+    match tokio::time::timeout(keepalive.timeout(), events.send(event)).await {
+        Ok(Ok(())) => None,
+        // The application dropped the stream: it is shutting down.
+        Ok(Err(_)) => Some(DisconnectReason::ShutdownRequested),
+        Err(_) => Some(DisconnectReason::EventConsumerStalled {
+            reason: format!(
+                "no inbound frame accepted for {}s; the session's event consumer has \
+                 stopped, so nothing here can be dispatched or answered",
+                keepalive.timeout().as_secs_f32()
+            ),
+        }),
     }
 }
 

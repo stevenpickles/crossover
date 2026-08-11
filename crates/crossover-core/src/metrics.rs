@@ -119,15 +119,17 @@ enum DisconnectKind {
     KeepaliveTimeout,
     ProtocolViolation,
     Transport,
+    EventConsumerStalled,
     ShutdownRequested,
 }
 
 impl DisconnectKind {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::PeerClosed,
         Self::KeepaliveTimeout,
         Self::ProtocolViolation,
         Self::Transport,
+        Self::EventConsumerStalled,
         Self::ShutdownRequested,
     ];
 
@@ -137,7 +139,8 @@ impl DisconnectKind {
             Self::KeepaliveTimeout => 1,
             Self::ProtocolViolation => 2,
             Self::Transport => 3,
-            Self::ShutdownRequested => 4,
+            Self::EventConsumerStalled => 4,
+            Self::ShutdownRequested => 5,
         }
     }
 
@@ -147,6 +150,7 @@ impl DisconnectKind {
             Self::KeepaliveTimeout => "keepalive_timeout",
             Self::ProtocolViolation => "protocol_violation",
             Self::Transport => "transport",
+            Self::EventConsumerStalled => "event_consumer_stalled",
             Self::ShutdownRequested => "shutdown_requested",
         }
     }
@@ -160,6 +164,7 @@ impl DisconnectKind {
             DisconnectReason::KeepaliveTimeout => Self::KeepaliveTimeout,
             DisconnectReason::ProtocolViolation { .. } => Self::ProtocolViolation,
             DisconnectReason::Transport { .. } => Self::Transport,
+            DisconnectReason::EventConsumerStalled { .. } => Self::EventConsumerStalled,
             DisconnectReason::ShutdownRequested => Self::ShutdownRequested,
         }
     }
@@ -186,7 +191,7 @@ pub struct Metrics {
     reconnect_recoveries: AtomicU64,
     reconnect_recovery_total_ms: AtomicU64,
     reconnect_recovery_max_ms: AtomicU64,
-    disconnects: [AtomicU64; 5],
+    disconnects: [AtomicU64; 6],
     total_connected_ms: AtomicU64,
     longest_session_ms: AtomicU64,
 
@@ -494,7 +499,7 @@ pub struct Report {
     /// Worst downtime before a recovery, milliseconds (`None` if none yet).
     pub reconnect_recovery_max_ms: Option<u64>,
     /// Disconnects, per reason in `DisconnectKind::ALL` order.
-    pub disconnects: [u64; 5],
+    pub disconnects: [u64; 6],
     /// Total connected time across all sessions, milliseconds.
     pub total_connected_ms: u64,
     /// Longest single session, milliseconds.

@@ -72,6 +72,13 @@ const MAX_CONSECUTIVE_BUSY_READS: u32 = 5;
 /// of them, so the worst case is unchanged in order of magnitude (NFR-1).
 const MAX_DEFERRED_EVENTS: usize = 64;
 
+/// Depth of the driver's inbound event channel. Named because
+/// [`MAX_DEFERRED_EVENTS`] is deliberately equal to it, and because the two
+/// together are the driver's deafness threshold — the number of events it
+/// can absorb while parked before backpressure starts propagating outwards
+/// (docs/ARCHITECTURE.md §5.4).
+const EVENT_CHANNEL_CAPACITY: usize = 64;
+
 /// What became of a command handed to the send path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendOutcome {
@@ -158,7 +165,7 @@ pub fn clipboard_sync(
     ),
     ClipboardError,
 > {
-    let (events_tx, events_rx) = mpsc::channel(64);
+    let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     // Two lanes, not one queue: a driver parked on bulk backpressure must
     // still have a clear path for its fail-closed termination (ADR 0013).
     let (commands_tx, commands_rx) = command_lanes();
@@ -196,16 +203,22 @@ impl ClipboardSyncDriver {
 
     /// Run until every event sender is dropped. Spawn this.
     ///
-    /// One turn of the loop takes **at most one event and performs at most
-    /// one action**, and that alternation is load-bearing rather than
-    /// stylistic. An action can produce the next action — a chunk send
-    /// asks the engine for the following chunk — so draining actions to
-    /// exhaustion would run an entire image transfer inside one turn, with
-    /// the event channel unread for its whole duration. That is how a
-    /// long transfer turns into a deaf driver, and a deaf driver is one
-    /// hop of the wedge cycle documented on [`Self::send_command`].
-    /// Alternating costs a `try_recv` per action and bounds the delay on
-    /// any event at one action.
+    /// One turn of the loop takes **at most one coalesce batch** (up to
+    /// [`MAX_COALESCE_BATCH`] events, all of them fed to the engine) **and
+    /// performs at most one action**. The action half is the load-bearing
+    /// one, and it is a bound on *monopoly*, not on throughput: an action
+    /// can produce the next action — a chunk send asks the engine for the
+    /// following chunk — so draining actions to exhaustion would run an
+    /// entire image transfer inside one turn, with the event channel unread
+    /// for its whole duration. That is how a long transfer turns into a deaf
+    /// driver, and a deaf driver is one hop of the wedge cycle documented on
+    /// [`Self::send_command`]. Alternating costs a `try_recv` per action and
+    /// bounds the delay on any event at one action.
+    ///
+    /// The event half is deliberately *not* one-at-a-time: coalescing is
+    /// what stops a backlog of clipboard items becoming a burst of writes to
+    /// a machine-global lock, and it consumes a bounded batch without
+    /// performing any action, so it cannot monopolise anything.
     pub async fn run(mut self) {
         loop {
             // An event that is already waiting is taken first; the loop
@@ -631,7 +644,9 @@ mod tests {
     };
     use crossover_protocol::hello::MessageType;
 
-    use super::{SessionCommand, SyncEvent, clipboard_sync};
+    use super::{
+        EVENT_CHANNEL_CAPACITY, MAX_DEFERRED_EVENTS, SessionCommand, SyncEvent, clipboard_sync,
+    };
     use crate::clipboard::{ClipboardConfig, RetryPolicy};
     use crate::metrics::Metrics;
 
@@ -1255,5 +1270,77 @@ mod tests {
         };
         let data = ClipboardData::decode_payload(&payload).unwrap();
         assert_eq!(data.content, b"survives the gap");
+    }
+
+    /// `MAX_DEFERRED_EVENTS` is the *bound* on the deferred queue, and the
+    /// bound is the part nothing else pins. The neighbouring chunk-stream
+    /// test proves a parked driver still consumes — but it delivers a single
+    /// event, so the queue never exceeds one and the constant could read 1
+    /// or a billion without a test noticing.
+    ///
+    /// Here the parked driver is fed until it refuses, which lands on
+    /// channel depth + deferred depth. Deleting the drain halves that;
+    /// unbounding the queue makes it run away. Both are caught.
+    #[tokio::test]
+    async fn a_parked_driver_defers_a_bounded_number_of_events() {
+        /// Events in flight between the channel and the deferred queue.
+        const SLACK: usize = 4;
+
+        use crossover_platform::ClipboardImageFormat;
+        use crossover_protocol::clipboard::{ClipboardAccept, ClipboardOffer, MAX_CHUNK_BYTES};
+
+        // Park the driver the way the app does: a chunk stream far longer
+        // than the Background lane, with nothing draining the lane. It stops
+        // inside `send_command`, the only place deferring happens — and,
+        // crucially, it stops *without* having drained the event channel,
+        // which is what makes the count below mean something.
+        let mut rig = rig();
+        rig.clipboard
+            .set_image_locally(ClipboardImageFormat::Dib, vec![0xAB; MAX_CHUNK_BYTES * 200]);
+        let SessionCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
+            panic!("expected an offer");
+        };
+        let offer = ClipboardOffer::decode_payload(&payload).unwrap();
+        rig.events
+            .send(frame(
+                MessageType::ClipboardAccept,
+                ClipboardAccept { id: offer.meta.id }
+                    .encode_payload()
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now count what a parked driver will still take. `LocalChanged` is
+        // the cheapest event that reaches the deferred queue; the count is
+        // the measurement, not the content.
+        let mut accepted = 0usize;
+        loop {
+            if rig.events.try_send(SyncEvent::LocalChanged).is_err() {
+                // Let the driver move one across before concluding it has
+                // stopped taking them.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if rig.events.try_send(SyncEvent::LocalChanged).is_err() {
+                    break;
+                }
+            }
+            accepted += 1;
+            assert!(
+                accepted < 4096,
+                "a parked driver took {accepted} events: the deferred queue                  is not bounded"
+            );
+        }
+
+        // The channel's own depth plus the deferred queue, and nothing more.
+        let deaf_at = EVENT_CHANNEL_CAPACITY + MAX_DEFERRED_EVENTS;
+        assert!(
+            accepted + SLACK >= deaf_at,
+            "a parked driver went deaf at {accepted} events, expected about              {deaf_at} — is the deferred queue still being drained?"
+        );
+        assert!(
+            accepted <= deaf_at + SLACK,
+            "a parked driver absorbed {accepted} events, past the {deaf_at}              its bounds allow (NFR-1)"
+        );
     }
 }
