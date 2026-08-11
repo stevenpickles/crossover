@@ -62,6 +62,7 @@ fn side(origin: u8) -> Side {
             // any non-zero value would cost a scheduler tick per item —
             // ~15 ms on Windows, which is 150 s across the run.
             transmit_debounce: Duration::ZERO,
+            ..ClipboardConfig::new()
         },
         None,
     )

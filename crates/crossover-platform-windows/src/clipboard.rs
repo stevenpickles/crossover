@@ -36,9 +36,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crossover_platform::{
-    ClipboardContent, ClipboardError, ClipboardListener, ClipboardProvider,
-};
+use crossover_platform::{ClipboardContent, ClipboardError, ClipboardListener, ClipboardProvider};
 use windows::Win32::Foundation::GlobalFree;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::{
@@ -133,7 +131,7 @@ impl ClipboardProvider for WindowsClipboard {
     /// until this function can genuinely return an image, so a peer is
     /// never told this build can do what it cannot.
     fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
-        Ok(self.read_unicode_text()?.map(ClipboardContent::Text))
+        Ok(read_unicode_text()?.map(ClipboardContent::Text))
     }
 
     /// Writes `CF_UNICODETEXT` only.
@@ -144,7 +142,7 @@ impl ClipboardProvider for WindowsClipboard {
     /// stall or a pretended success (FR-3.2, NFR-3).
     fn write(&self, content: &ClipboardContent) -> Result<(), ClipboardError> {
         match content {
-            ClipboardContent::Text(text) => self.write_unicode_text(text),
+            ClipboardContent::Text(text) => write_unicode_text(text),
             ClipboardContent::Image { format, .. } => Err(ClipboardError::Unavailable {
                 reason: format!(
                     "this build cannot install {format:?} clipboard images \
@@ -163,133 +161,132 @@ impl ClipboardProvider for WindowsClipboard {
     }
 }
 
-impl WindowsClipboard {
-    fn read_unicode_text(&self) -> Result<Option<String>, ClipboardError> {
-        // SAFETY: no arguments; checks format availability only.
-        if unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)) }.is_err() {
-            return Ok(None); // empty clipboard or no text representation
-        }
+/// Read `CF_UNICODETEXT`, or `None` when the clipboard holds no text.
+fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
+    // SAFETY: no arguments; checks format availability only.
+    if unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)) }.is_err() {
+        return Ok(None); // empty clipboard or no text representation
+    }
 
-        let open = OpenGuard::open()?;
-        // SAFETY: the clipboard is open (guard); the returned handle is
-        // owned by the clipboard, not by us. Everything between here and
-        // the explicit drop below is the critical section — keep it to
-        // the bytes and nothing else.
-        // Contention-shaped, observed live: clipboard ownership can churn
-        // between our successful open and this call (another process
-        // taking the clipboard), surfacing as ERROR_CLIPBOARD_NOT_OPEN.
-        // Retryable, not fatal (R-5).
-        let handle = unsafe { GetClipboardData(u32::from(CF_UNICODETEXT.0)) }.map_err(|e| {
-            ClipboardError::Busy {
-                reason: format!("GetClipboardData failed (ownership churn?): {e}"),
-            }
-        })?;
-        if handle.is_invalid() {
-            return Ok(None);
+    let open = OpenGuard::open()?;
+    // SAFETY: the clipboard is open (guard); the returned handle is
+    // owned by the clipboard, not by us. Everything between here and
+    // the explicit drop below is the critical section — keep it to
+    // the bytes and nothing else.
+    // Contention-shaped, observed live: clipboard ownership can churn
+    // between our successful open and this call (another process
+    // taking the clipboard), surfacing as ERROR_CLIPBOARD_NOT_OPEN.
+    // Retryable, not fatal (R-5).
+    let handle = unsafe { GetClipboardData(u32::from(CF_UNICODETEXT.0)) }.map_err(|e| {
+        ClipboardError::Busy {
+            reason: format!("GetClipboardData failed (ownership churn?): {e}"),
         }
+    })?;
+    if handle.is_invalid() {
+        return Ok(None);
+    }
 
-        let hglobal = HGLOBAL(handle.0);
-        // SAFETY: `hglobal` came from GetClipboardData while the clipboard
-        // is open; GlobalLock pins it and yields the base pointer.
-        let ptr = unsafe { GlobalLock(hglobal) }.cast::<u16>();
+    let hglobal = HGLOBAL(handle.0);
+    // SAFETY: `hglobal` came from GetClipboardData while the clipboard
+    // is open; GlobalLock pins it and yields the base pointer.
+    let ptr = unsafe { GlobalLock(hglobal) }.cast::<u16>();
+    if ptr.is_null() {
+        // Same churn window as above: the block can vanish with its
+        // owner. Retryable.
+        return Err(ClipboardError::Busy {
+            reason: "GlobalLock on clipboard data failed".to_owned(),
+        });
+    }
+    // SAFETY: CF_UNICODETEXT is null-terminated UTF-16 by contract;
+    // scan for the terminator, then copy the units out. Only the copy
+    // happens under the clipboard lock — the UTF-16 → String
+    // conversion (which allocates, and for a multi-megabyte item is
+    // not cheap) happens after releasing, so Crossover is not the
+    // reason another application's clipboard call fails.
+    let units: Vec<u16> = unsafe {
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        std::slice::from_raw_parts(ptr, len).to_vec()
+    };
+    // SAFETY: balances the successful GlobalLock above. GlobalUnlock
+    // reports "no longer locked" as an error-shaped success; ignore.
+    let _ = unsafe { GlobalUnlock(hglobal) };
+    drop(open);
+
+    Ok(Some(String::from_utf16_lossy(&units)))
+}
+
+/// Replace the clipboard with `text` as `CF_UNICODETEXT`.
+fn write_unicode_text(text: &str) -> Result<(), ClipboardError> {
+    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let byte_len = utf16.len() * 2;
+
+    // Allocate and fill the block BEFORE taking the clipboard. None
+    // of this needs the lock, and for a multi-megabyte item the copy
+    // is long enough that holding it here made other applications'
+    // clipboard calls fail outright (found in the two-machine soak).
+    // SAFETY: allocating a movable global block for the clipboard.
+    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) }.map_err(|e| {
+        ClipboardError::Unavailable {
+            reason: format!("GlobalAlloc failed: {e}"),
+        }
+    })?;
+    // SAFETY: `hglobal` is ours and unlocked; lock, copy the UTF-16
+    // (exactly `utf16.len()` units fit by construction), unlock. On
+    // any failure before the system takes ownership we free it.
+    unsafe {
+        let ptr = GlobalLock(hglobal).cast::<u16>();
         if ptr.is_null() {
-            // Same churn window as above: the block can vanish with its
-            // owner. Retryable.
-            return Err(ClipboardError::Busy {
-                reason: "GlobalLock on clipboard data failed".to_owned(),
+            let _ = GlobalFree(Some(hglobal));
+            return Err(ClipboardError::Unavailable {
+                reason: "GlobalLock on fresh allocation failed".to_owned(),
             });
         }
-        // SAFETY: CF_UNICODETEXT is null-terminated UTF-16 by contract;
-        // scan for the terminator, then copy the units out. Only the copy
-        // happens under the clipboard lock — the UTF-16 → String
-        // conversion (which allocates, and for a multi-megabyte item is
-        // not cheap) happens after releasing, so Crossover is not the
-        // reason another application's clipboard call fails.
-        let units: Vec<u16> = unsafe {
-            let mut len = 0usize;
-            while *ptr.add(len) != 0 {
-                len += 1;
-            }
-            std::slice::from_raw_parts(ptr, len).to_vec()
-        };
-        // SAFETY: balances the successful GlobalLock above. GlobalUnlock
-        // reports "no longer locked" as an error-shaped success; ignore.
-        let _ = unsafe { GlobalUnlock(hglobal) };
-        drop(open);
-
-        Ok(Some(String::from_utf16_lossy(&units)))
+        std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr, utf16.len());
+        let _ = GlobalUnlock(hglobal);
     }
 
-    fn write_unicode_text(&self, text: &str) -> Result<(), ClipboardError> {
-        let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let byte_len = utf16.len() * 2;
-
-        // Allocate and fill the block BEFORE taking the clipboard. None
-        // of this needs the lock, and for a multi-megabyte item the copy
-        // is long enough that holding it here made other applications'
-        // clipboard calls fail outright (found in the two-machine soak).
-        // SAFETY: allocating a movable global block for the clipboard.
-        let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) }.map_err(|e| {
-            ClipboardError::Unavailable {
-                reason: format!("GlobalAlloc failed: {e}"),
+    // The critical section starts here and holds only two calls.
+    let _open = match OpenGuard::open() {
+        Ok(guard) => guard,
+        Err(error) => {
+            // SAFETY: the system never took ownership; the block is
+            // still ours to free.
+            unsafe {
+                let _ = GlobalFree(Some(hglobal));
             }
-        })?;
-        // SAFETY: `hglobal` is ours and unlocked; lock, copy the UTF-16
-        // (exactly `utf16.len()` units fit by construction), unlock. On
-        // any failure before the system takes ownership we free it.
+            return Err(error);
+        }
+    };
+
+    // SAFETY: the clipboard is open (guard).
+    if let Err(e) = unsafe { EmptyClipboard() } {
+        // SAFETY: ownership never transferred; free our block.
         unsafe {
-            let ptr = GlobalLock(hglobal).cast::<u16>();
-            if ptr.is_null() {
-                let _ = GlobalFree(Some(hglobal));
-                return Err(ClipboardError::Unavailable {
-                    reason: "GlobalLock on fresh allocation failed".to_owned(),
-                });
-            }
-            std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr, utf16.len());
-            let _ = GlobalUnlock(hglobal);
+            let _ = GlobalFree(Some(hglobal));
         }
-
-        // The critical section starts here and holds only two calls.
-        let _open = match OpenGuard::open() {
-            Ok(guard) => guard,
-            Err(error) => {
-                // SAFETY: the system never took ownership; the block is
-                // still ours to free.
-                unsafe {
-                    let _ = GlobalFree(Some(hglobal));
-                }
-                return Err(error);
-            }
-        };
-
-        // SAFETY: the clipboard is open (guard).
-        if let Err(e) = unsafe { EmptyClipboard() } {
-            // SAFETY: ownership never transferred; free our block.
-            unsafe {
-                let _ = GlobalFree(Some(hglobal));
-            }
-            return Err(ClipboardError::Busy {
-                reason: format!("EmptyClipboard failed (ownership churn?): {e}"),
-            });
-        }
-        // SAFETY: the clipboard is open (guard). On success the system
-        // takes ownership of `hglobal` and we must never free it; on
-        // failure ownership stays with us, which the error arm handles.
-        let stored =
-            unsafe { SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(hglobal.0))) };
-        if let Err(e) = stored {
-            // SAFETY: on failure the system did NOT take ownership, so
-            // freeing here is correct and avoids the leak the previous
-            // version accepted.
-            unsafe {
-                let _ = GlobalFree(Some(hglobal));
-            }
-            return Err(ClipboardError::Busy {
-                reason: format!("SetClipboardData failed (ownership churn?): {e}"),
-            });
-        }
-        Ok(())
+        return Err(ClipboardError::Busy {
+            reason: format!("EmptyClipboard failed (ownership churn?): {e}"),
+        });
     }
+    // SAFETY: the clipboard is open (guard). On success the system
+    // takes ownership of `hglobal` and we must never free it; on
+    // failure ownership stays with us, which the error arm handles.
+    let stored = unsafe { SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(hglobal.0))) };
+    if let Err(e) = stored {
+        // SAFETY: on failure the system did NOT take ownership, so
+        // freeing here is correct and avoids the leak the previous
+        // version accepted.
+        unsafe {
+            let _ = GlobalFree(Some(hglobal));
+        }
+        return Err(ClipboardError::Busy {
+            reason: format!("SetClipboardData failed (ownership churn?): {e}"),
+        });
+    }
+    Ok(())
 }
 
 /// RAII for `OpenClipboard`/`CloseClipboard`. Open failure is `Busy`:

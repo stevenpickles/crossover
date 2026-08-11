@@ -23,7 +23,9 @@ use crossover_protocol::RawFrame;
 use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
 use crossover_protocol::hello::MessageType;
 
-use crate::clipboard::{Action, ClipboardConfig, ClipboardEngine, InboundMessage};
+use crate::clipboard::{
+    Action, ClipboardConfig, ClipboardEngine, InboundMessage, OutboundMessage, TransferScope,
+};
 use crate::command::{FrameTarget, SessionCommand};
 use crate::metrics::Metrics;
 use crate::outbound::{CommandReceiver, CommandSender, command_lanes};
@@ -66,6 +68,13 @@ pub enum SyncEvent {
     RetryDue(Uuid),
     /// The settle window elapsed (ADR 0006): time to read.
     SettleDue(u64),
+    /// A transfer deadline came due (ADR 0014).
+    TransferTimeout {
+        /// Which half of the transaction machine it covers.
+        scope: TransferScope,
+        /// Which transfer it belongs to; a stale one is a no-op.
+        generation: u64,
+    },
 }
 
 /// The clipboard sync driver. Create with [`clipboard_sync`], then spawn
@@ -161,6 +170,9 @@ impl ClipboardSyncDriver {
                     SyncEvent::SessionLost => self.engine.on_session_lost(),
                     SyncEvent::LocalChanged => self.engine.on_local_change(),
                     SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
+                    SyncEvent::TransferTimeout { scope, generation } => {
+                        self.engine.on_transfer_timeout(scope, generation)
+                    }
                     SyncEvent::SettleDue(generation) => {
                         if generation == self.settle_generation {
                             self.engine.on_settle_due()
@@ -288,49 +300,97 @@ impl ClipboardSyncDriver {
             .is_ok()
     }
 
+    /// Read the provider and feed the result back, absorbing contention
+    /// with the bounded nudge cycle the soak forced (see
+    /// [`MAX_CONSECUTIVE_BUSY_READS`]).
+    fn read_clipboard(&mut self) -> Vec<Action> {
+        match self.provider.read() {
+            Ok(content) => {
+                self.busy_reads = 0;
+                self.engine.on_local_read(content)
+            }
+            Err(ClipboardError::Busy { reason }) => {
+                self.busy_reads += 1;
+                self.record(Metrics::record_clipboard_contention);
+                if self.busy_reads > MAX_CONSECUTIVE_BUSY_READS {
+                    // Stop nudging: the change listener will wake us for
+                    // anything that actually changes, and continuing would
+                    // starve inbound frames on this same queue.
+                    tracing::warn!(
+                        error = %reason,
+                        attempt_count = self.busy_reads,
+                        "clipboard read still busy; waiting for the next change \
+                         notification instead of re-checking"
+                    );
+                } else {
+                    tracing::debug!(
+                        error = %reason,
+                        attempt_count = self.busy_reads,
+                        "clipboard read busy; will look again"
+                    );
+                    let notify = self.events_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(READ_RETRY_DELAY).await;
+                        let _ = notify.try_send(SyncEvent::LocalChanged);
+                    });
+                }
+                Vec::new()
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "clipboard read failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Hand one engine message to the send path. `None` once the app side
+    /// is gone; otherwise whatever the engine wants done next — which for
+    /// a chunk is the *next* chunk.
+    ///
+    /// One chunk per command, on purpose: a chunk is ADR 0013's preemption
+    /// unit, and this `send` awaits the Background lane's byte budget, so
+    /// a streaming transfer is paced by the wire rather than racing ahead
+    /// of the input it must never delay.
+    async fn send_message(&mut self, message: OutboundMessage) -> Option<Vec<Action>> {
+        let (message_type, payload) = match message.encode() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                // Engine-built messages are always valid; log the
+                // impossible rather than panic (NFR-1 discipline).
+                tracing::error!(error = %error, "unencodable engine message dropped");
+                return Some(Vec::new());
+            }
+        };
+        let streamed = match &message {
+            OutboundMessage::Chunk(chunk) => Some(chunk.id),
+            _ => None,
+        };
+        self.commands_tx
+            .send(SessionCommand::SendFrame {
+                target: FrameTarget::Broadcast,
+                message_type,
+                payload,
+            })
+            .await
+            .ok()?;
+        Some(match streamed {
+            Some(id) => self.engine.on_chunk_sent(id),
+            None => Vec::new(),
+        })
+    }
+
     /// Execute engine actions, feeding results back through the engine
     /// until the queue drains. Returns `false` when the app side is gone.
     async fn execute(&mut self, actions: Vec<Action>) -> bool {
         let mut queue: VecDeque<Action> = actions.into();
         while let Some(action) = queue.pop_front() {
             match action {
-                Action::ReadClipboard => match self.provider.read_text() {
-                    Ok(content) => {
-                        self.busy_reads = 0;
-                        queue.extend(self.engine.on_local_read(content));
-                    }
-                    Err(ClipboardError::Busy { reason }) => {
-                        self.busy_reads += 1;
-                        self.record(Metrics::record_clipboard_contention);
-                        if self.busy_reads > MAX_CONSECUTIVE_BUSY_READS {
-                            // Stop nudging: the change listener will wake
-                            // us for anything that actually changes, and
-                            // continuing would starve inbound frames on
-                            // this same queue.
-                            tracing::warn!(
-                                error = %reason,
-                                attempt_count = self.busy_reads,
-                                "clipboard read still busy; waiting for the next change                                  notification instead of re-checking"
-                            );
-                        } else {
-                            tracing::debug!(
-                                error = %reason,
-                                attempt_count = self.busy_reads,
-                                "clipboard read busy; will look again"
-                            );
-                            let notify = self.events_tx.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(READ_RETRY_DELAY).await;
-                                let _ = notify.try_send(SyncEvent::LocalChanged);
-                            });
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(error = %error, "clipboard read failed");
-                    }
-                },
-                Action::WriteClipboard { id, text } => {
-                    let result = match self.provider.write_text(&text) {
+                Action::ReadClipboard => {
+                    let more = self.read_clipboard();
+                    queue.extend(more);
+                }
+                Action::WriteClipboard { id, content } => {
+                    let result = match self.provider.write(&content) {
                         Ok(()) => Ok(()),
                         Err(ClipboardError::Busy { reason }) => {
                             tracing::debug!(clipboard_id = %id, error = %reason, "write busy");
@@ -344,26 +404,9 @@ impl ClipboardSyncDriver {
                     };
                     queue.extend(self.engine.on_write_result(id, result));
                 }
-                Action::Send(message) => match message.encode() {
-                    Ok((message_type, payload)) => {
-                        if self
-                            .commands_tx
-                            .send(SessionCommand::SendFrame {
-                                target: FrameTarget::Broadcast,
-                                message_type,
-                                payload,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return false;
-                        }
-                    }
-                    Err(error) => {
-                        // Engine-built messages are always valid; log the
-                        // impossible rather than panic (NFR-1 discipline).
-                        tracing::error!(error = %error, "unencodable engine message dropped");
-                    }
+                Action::Send(message) => match self.send_message(message).await {
+                    Some(more) => queue.extend(more),
+                    None => return false,
                 },
                 Action::ScheduleRetry { id, delay } => {
                     self.record(Metrics::record_clipboard_retry);
@@ -377,6 +420,19 @@ impl ClipboardSyncDriver {
                     if !self.terminate_session(reason).await {
                         return false;
                     }
+                }
+                Action::ScheduleTransferTimeout {
+                    scope,
+                    generation,
+                    delay,
+                } => {
+                    let notify = self.events_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = notify
+                            .send(SyncEvent::TransferTimeout { scope, generation })
+                            .await;
+                    });
                 }
                 Action::ScheduleSettle { delay } => {
                     // Bump the generation: any timer already in flight
@@ -432,6 +488,7 @@ mod tests {
             },
             // Tests drive the trigger's *behaviour*, not the wait.
             transmit_debounce: Duration::from_millis(5),
+            ..ClipboardConfig::new()
         };
         let metrics = Arc::new(Metrics::new());
         let (driver, events, commands) = clipboard_sync(
@@ -721,6 +778,209 @@ mod tests {
             .unwrap();
         let quiet = timeout(Duration::from_millis(200), rig.commands.recv()).await;
         assert!(quiet.is_err());
+    }
+
+    /// The driver's half of a chunked transfer (ADR 0014): one chunk per
+    /// `SessionCommand`, in order, straight from the engine's retained
+    /// buffer — no pre-rendered chunk list anywhere in the path.
+    #[tokio::test]
+    async fn a_local_image_streams_out_one_chunk_per_command() {
+        use crossover_platform::ClipboardImageFormat;
+        use crossover_protocol::clipboard::{
+            ClipboardAccept, ClipboardChunk, ClipboardOffer, MAX_CHUNK_BYTES,
+        };
+
+        let mut rig = rig();
+        let bytes: Vec<u8> = (0..MAX_CHUNK_BYTES * 2 + 9)
+            .map(|i| u8::try_from(i % 256).unwrap_or(0))
+            .collect();
+        rig.clipboard
+            .set_image_locally(ClipboardImageFormat::Dib, bytes.clone());
+
+        let SessionCommand::SendFrame {
+            message_type,
+            payload,
+            ..
+        } = next_command(&mut rig).await
+        else {
+            panic!("expected an offer");
+        };
+        assert_eq!(message_type, MessageType::ClipboardOffer.wire());
+        let offer = ClipboardOffer::decode_payload(&payload).unwrap();
+        assert_eq!(offer.meta.content_length, bytes.len() as u64);
+
+        // Accept it, and the stream follows as individual chunk frames.
+        let accept = ClipboardAccept { id: offer.meta.id };
+        rig.events
+            .send(frame(
+                MessageType::ClipboardAccept,
+                accept.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let mut streamed = Vec::new();
+        for index in 0..3u32 {
+            let SessionCommand::SendFrame {
+                message_type,
+                payload,
+                ..
+            } = next_command(&mut rig).await
+            else {
+                panic!("expected chunk {index}");
+            };
+            assert_eq!(message_type, MessageType::ClipboardChunk.wire());
+            let chunk = ClipboardChunk::decode_payload(&payload).unwrap();
+            assert_eq!(chunk.id, offer.meta.id);
+            assert_eq!(chunk.index, index);
+            streamed.extend(chunk.payload);
+        }
+        assert_eq!(streamed, bytes, "the image was not streamed verbatim");
+
+        // The transfer is over; nothing else is emitted.
+        let quiet = timeout(Duration::from_millis(200), rig.commands.recv()).await;
+        assert!(quiet.is_err(), "extra traffic after the stream: {quiet:?}");
+    }
+
+    /// The other direction end to end through the driver: offer, accept,
+    /// chunks, verified reassembly, a typed clipboard install, and only
+    /// then the verdict (FR-3.2).
+    #[tokio::test]
+    async fn an_inbound_image_is_installed_typed_and_then_acknowledged() {
+        use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+        use crossover_protocol::clipboard::{
+            ClipboardMeta, ClipboardOffer, ImageFormat, MAX_CHUNK_BYTES, chunk_content,
+            content_hash,
+        };
+
+        let mut rig = rig();
+        // Deliberately hostile bytes for anything that assumes text.
+        let bytes: Vec<u8> = (0..=MAX_CHUNK_BYTES)
+            .map(|i| if i % 3 == 0 { 0xFF } else { 0x00 })
+            .collect();
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xBB; 16]),
+            sequence: 0,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: bytes.len() as u64,
+            content_hash: content_hash(&bytes),
+        };
+        rig.events
+            .send(frame(
+                MessageType::ClipboardOffer,
+                ClipboardOffer { meta }.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected an accept");
+        };
+        assert_eq!(message_type, MessageType::ClipboardAccept.wire());
+
+        for chunk in chunk_content(meta.id, &bytes).unwrap() {
+            rig.events
+                .send(frame(
+                    MessageType::ClipboardChunk,
+                    chunk.encode_payload().unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let SessionCommand::SendFrame {
+            message_type,
+            payload,
+            ..
+        } = next_command(&mut rig).await
+        else {
+            panic!("expected a verdict");
+        };
+        assert_eq!(message_type, MessageType::ClipboardApplied.wire());
+        let applied = ClipboardApplied::decode_payload(&payload).unwrap();
+        assert_eq!(applied.id, meta.id);
+        assert_eq!(applied.result, ApplyResult::Applied);
+
+        // Destination-updated is the definition of success, and the bytes
+        // are the ones that were offered.
+        assert_eq!(
+            rig.clipboard.peek_content(),
+            Some(ClipboardContent::Image {
+                format: ClipboardImageFormat::Dib,
+                bytes,
+            })
+        );
+        // The own-write notification must not echo the image back.
+        let quiet = timeout(Duration::from_millis(300), rig.commands.recv()).await;
+        assert!(quiet.is_err(), "echoed an applied image: {quiet:?}");
+    }
+
+    /// The driver actually wires the deadline: a peer that offers and then
+    /// goes silent gets an answer instead of holding a buffer forever
+    /// (ADR 0014, NFR-3).
+    #[tokio::test]
+    async fn a_stalled_inbound_transfer_times_out_through_the_driver() {
+        use crossover_protocol::clipboard::{
+            ClipboardMeta, ClipboardOffer, ImageFormat, content_hash,
+        };
+
+        let clipboard = Arc::new(InMemoryClipboard::new());
+        let (driver, events, mut commands) = clipboard_sync(
+            Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig {
+                // The deadline is the subject here, so it is short — the
+                // production default is a minute (see TRANSFER_TIMEOUT).
+                transfer_timeout: Duration::from_millis(50),
+                ..ClipboardConfig::new()
+            },
+            None,
+        )
+        .unwrap();
+        tokio::spawn(driver.run());
+
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xBB; 16]),
+            sequence: 0,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: 4 * 1024 * 1024,
+            content_hash: content_hash(b"never arrives"),
+        };
+        events
+            .send(frame(
+                MessageType::ClipboardOffer,
+                ClipboardOffer { meta }.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let mut verdict = None;
+        for _ in 0..2 {
+            let command = timeout(Duration::from_secs(5), commands.recv())
+                .await
+                .expect("the stalled transfer was never answered")
+                .expect("command channel closed");
+            let SessionCommand::SendFrame {
+                message_type,
+                payload,
+                ..
+            } = command
+            else {
+                panic!("unexpected termination");
+            };
+            if message_type == MessageType::ClipboardApplied.wire() {
+                verdict = Some(ClipboardApplied::decode_payload(&payload).unwrap());
+                break;
+            }
+            assert_eq!(message_type, MessageType::ClipboardAccept.wire());
+        }
+        let verdict = verdict.expect("no verdict for the abandoned transfer");
+        assert_eq!(verdict.id, meta.id);
+        assert_eq!(verdict.result, ApplyResult::ContentRejected);
+        // Nothing was installed from a transfer that never completed.
+        assert_eq!(clipboard.peek_content(), None);
     }
 
     #[tokio::test]

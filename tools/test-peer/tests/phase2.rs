@@ -44,6 +44,7 @@ fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
                 delay: Duration::from_millis(20),
             },
             transmit_debounce: Duration::from_millis(5),
+            ..ClipboardConfig::new()
         },
         None,
     )
