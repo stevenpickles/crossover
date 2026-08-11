@@ -132,12 +132,23 @@ SECURITY.md threat-model additions before any implementation — see the
 
 ## Open questions (to settle when scheduled)
 
+The decision above is fixed. Where implementation has since settled one of
+these, the resolution is noted inline — bookkeeping, not a change of decision.
+
 - The image size ceiling (`MAX_CLIPBOARD_IMAGE_BYTES`) — where to set it.
+  **Settled: 64 MiB**, with the arithmetic (a dual-4K uncompressed DIB is
+  63.3 MiB) in [PROTOCOL.md](../PROTOCOL.md) §8.
 - How image support is gated for interop. Unknown message types are currently
   ignored rather than fatal, so a peer that does not understand chunks would
   simply never answer — a silent stall, which NFR-3 forbids. Both mechanisms
   exist: `supported_features` in `Hello` (PROTOCOL.md §3's stated route for
   future clipboard types) or another hard version-floor bump as v1→v2 was.
+  **Settled: the `Hello` feature bit** (`CHUNKED_CLIPBOARD`), sender-gated on
+  the negotiated intersection; no version bump, so text keeps synchronizing
+  with a peer that lacks the bit. See [PROTOCOL.md](../PROTOCOL.md) §3.1.
+- The chunk size ADR 0013 left to this ADR. **Settled: 64 KiB**
+  (`MAX_CHUNK_BYTES`), derived from the input-latency budget; arithmetic in
+  [PROTOCOL.md](../PROTOCOL.md) §8.
 - Which clipboard formats to capture and restore, and whether to advertise more
   than one format on the far side for maximum paste compatibility.
 - Interaction with clipboard citizenship (FR-3.1a) — how long the far side owns
