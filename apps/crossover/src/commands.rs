@@ -1039,6 +1039,38 @@ fn retire_session_route(
     registry_lock(registry).remove(&session_id);
 }
 
+/// Everything an ended session needs done, **in the order it must be done
+/// in**. One function so the order is reviewable in one place and guarded by
+/// one test, rather than living as loose statements a tidy-up can reorder.
+///
+/// The order is not a preference:
+///
+/// 1. `retire_session_route` — synchronous, and first. Until the receiver
+///    drops, the session's byte budget is held and everything queued behind
+///    it stays parked, including the drivers.
+/// 2. drop the event sender, then wait for the drain task. It calls
+///    `SessionFanout::frame`, which pushes into the drivers' bounded event
+///    channels — so it can only finish once step 1 has unparked them.
+/// 3. fan the loss out, which pushes into those same channels, and which
+///    releases held input on the control driver (FR-4.4).
+///
+/// Steps 2 and 3 both wait on drivers that step 1 releases. Doing either
+/// first closes a cycle that parks the accept loop permanently — see
+/// `retire_session_route` for the full chain.
+async fn finish_session(
+    outbound: crossover_core::OutboundReceiver,
+    registry: &SessionRegistry,
+    session_id: Uuid,
+    events_tx: mpsc::Sender<SessionEvent>,
+    drain: tokio::task::JoinHandle<()>,
+    fanout: &SessionFanout,
+) {
+    retire_session_route(outbound, registry, session_id);
+    drop(events_tx);
+    let _ = drain.await;
+    fanout.lost(session_id).await;
+}
+
 /// Every live session keyed by its locally generated id, so a command
 /// can be routed to exactly the session the driver named (control/input)
 /// or broadcast to all (clipboard, FR-5.4).
@@ -1305,14 +1337,8 @@ async fn listener_loop(
                     &keepalive,
                 )
                 .await;
-                // FIRST, and before anything that can await: retire the
-                // session's send path. See `retire_session_route` — every
-                // await below depends on it.
-                retire_session_route(outbound_rx, registry, session_id);
-                drop(events_tx);
-                let _ = drain.await;
                 metrics.record_session_ended(&reason, established_at.elapsed());
-                fanout.lost(session_id).await;
+                finish_session(outbound_rx, registry, session_id, events_tx, drain, fanout).await;
                 println!(
                     "Session with \"{}\" ended: {reason}.",
                     info.peer_device_name
@@ -1801,6 +1827,108 @@ mod tests {
             wedged.at_wedge
         );
         wedged.producer.abort();
+    }
+
+    /// The deadlock guarded at the level that actually ships: the whole
+    /// `finish_session` sequence, with a real mux, a real fanout, and a
+    /// driver stand-in that parks exactly where the clipboard driver does —
+    /// mid-send, and therefore not draining its own event channel.
+    ///
+    /// Testing `retire_session_route` alone was not enough: it left the one
+    /// line a refactor is most likely to move — *where* teardown calls it —
+    /// completely unguarded. Move it below `drain.await` and this hangs.
+    #[tokio::test]
+    async fn the_teardown_sequence_completes_against_a_parked_driver() {
+        use crossover_core::supervision::SessionEvent;
+        use crossover_protocol::RawFrame;
+
+        use super::{SessionFanout, finish_session};
+
+        let rig = wedge_rig();
+
+        // Deliberately shallow, so the drain task reaches the block quickly.
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
+        let fanout = SessionFanout {
+            sync: sync_tx,
+            control: control_tx,
+            metrics: None,
+        };
+
+        // The clipboard driver, in miniature: a serial loop that turns each
+        // event into an outbound frame. Once the send path wedges it parks
+        // mid-send and stops consuming events — the whole point.
+        let clipboard_driver = {
+            let sender = rig.clipboard.clone();
+            let session = rig.session;
+            tokio::spawn(async move {
+                while sync_rx.recv().await.is_some() {
+                    let bulk = SessionCommand::SendFrame {
+                        target: FrameTarget::Session(session),
+                        message_type: MessageType::ClipboardData.wire(),
+                        payload: vec![0xBB; 4 * 1024 * 1024],
+                    };
+                    if sender.send(bulk).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        // The control driver drains freely; it is not what parks.
+        let control_driver =
+            tokio::spawn(async move { while control_rx.recv().await.is_some() {} });
+
+        // The session's own event drain, exactly as `listener_loop` spawns it.
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+        let drain = {
+            let fanout = fanout.clone();
+            let session = rig.session;
+            tokio::spawn(async move {
+                while let Some(event) = events_rx.recv().await {
+                    if let SessionEvent::Frame(frame) = event {
+                        fanout.frame(session, frame).await;
+                    }
+                }
+            })
+        };
+
+        // Fill the pipeline until it stops accepting: driver parked, event
+        // channels full, drain task blocked pushing into them.
+        while events_tx
+            .try_send(SessionEvent::Frame(RawFrame {
+                message_type: MessageType::ClipboardData.wire(),
+                message_id: 1,
+                payload: b"inbound".to_vec(),
+            }))
+            .is_ok()
+        {}
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !clipboard_driver.is_finished() && !drain.is_finished(),
+            "nothing parked; this test is not exercising the deadlock"
+        );
+
+        // The session dies. Teardown must complete.
+        let teardown = {
+            let fanout = fanout.clone();
+            let registry = Arc::clone(&rig.registry);
+            let session = rig.session;
+            tokio::spawn(async move {
+                finish_session(rig.outbound, &registry, session, events_tx, drain, &fanout).await;
+            })
+        };
+        for _ in 0..1024 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            teardown.is_finished(),
+            "session teardown deadlocked against a parked driver: the send \
+             path is retired too late to unpark it"
+        );
+        clipboard_driver.abort();
+        control_driver.abort();
     }
 
     /// A session ending must release held input even while the clipboard
