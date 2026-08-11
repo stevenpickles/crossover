@@ -305,4 +305,15 @@ pub trait InputInjector: Send + Sync {
     ///
     /// [`InputError::InjectionFailed`] if the platform refuses the move.
     fn place_cursor(&self, position: crate::display::CursorPoint) -> Result<(), InputError>;
+
+    /// Whether input can currently reach the active input desktop. `false`
+    /// when a **secure desktop** is up — a UAC elevation prompt, the lock
+    /// screen, or Ctrl-Alt-Del — where a user-privilege process cannot
+    /// inject and `SendInput` is silently dropped (R-1). The controlled side
+    /// polls this to give up a peer's grant it can no longer serve, so the
+    /// controller returns to local instead of driving a dead session
+    /// (feature/87). Defaults to `true` for platforms without the concept.
+    fn can_inject(&self) -> bool {
+        true
+    }
 }

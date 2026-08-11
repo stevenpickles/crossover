@@ -262,6 +262,18 @@ impl InputControlDriver {
                         // state confusion hid it (ADR 0009).
                         self.wake_cursor_on_local_input();
                     }
+                    // If a peer controls this machine but the input desktop
+                    // switched to one we cannot inject into (a UAC/secure-
+                    // desktop prompt), give up the grant so the controller
+                    // returns to local instead of driving a dead session — the
+                    // controller un-hides its cursor on the resulting release
+                    // (feature/87). Polled only while controlled, so cheap.
+                    if self.engine.is_controlled() && !self.injector.can_inject() {
+                        let actions = self.dispatch(ControlEvent::InputDesktopUnavailable);
+                        if !self.execute(actions).await {
+                            return;
+                        }
+                    }
                 }
             }
             // Any branch may have changed the control state; keep the edge
@@ -1611,6 +1623,49 @@ mod tests {
             ControlNotice::ControlEnded(crate::control::ControlEndReason::HandedBack)
         );
         assert!(!rig.capture.is_capturing(), "escape must stop capture");
+    }
+
+    /// feature/87: when a peer controls this machine and its input desktop
+    /// switches to one that cannot be injected into (a UAC/secure-desktop
+    /// prompt), the driver's health poll gives up the grant — the controller
+    /// returns to local — rather than leaving the link wedged with a hidden
+    /// cursor.
+    #[tokio::test]
+    async fn a_secure_desktop_releases_the_controlling_peer() {
+        let mut rig = rig();
+        // A peer takes control of this machine.
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest {
+                    request_id: 1,
+                    entry: None,
+                }
+                .encode_payload()
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+
+        // The input desktop switches to a secure one: injection is impossible.
+        rig.injector.set_can_inject(false);
+
+        // The next health poll gives up the grant: a ControlRelease to the
+        // peer and the distinct notice.
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected a ControlRelease after the desktop switched");
+        };
+        assert_eq!(message_type, MessageType::ControlRelease.wire());
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::PeerControlLostToDesktop
+        );
     }
 
     /// An edge-driven grant places the cursor on the entry edge (ADR

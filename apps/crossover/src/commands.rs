@@ -873,6 +873,11 @@ fn describe_notice(notice: ControlNotice) -> String {
         ControlNotice::PeerControlLostOnDisconnect => {
             "The peer's control ended with the session; input released.".to_owned()
         }
+        ControlNotice::PeerControlLostToDesktop => {
+            "The peer's control ended: this machine's desktop switched to a secure prompt \
+             (e.g. UAC); input released."
+                .to_owned()
+        }
     }
 }
 
