@@ -473,7 +473,7 @@ async fn a_local_image_is_offered_and_streamed_to_the_peer() {
 async fn an_un_negotiated_image_never_reaches_the_wire_and_text_still_flows() {
     use crossover_platform::ClipboardImageFormat;
 
-    let (side, mut conn) = connected_pair().await; // both sides: no features
+    let (side, mut conn) = connected_pair().await; // peer advertises nothing
     side.clipboard
         .set_image_locally(ClipboardImageFormat::Dib, snip_bytes(MAX_CHUNK_BYTES * 2));
 
@@ -485,4 +485,55 @@ async fn an_un_negotiated_image_never_reaches_the_wire_and_text_still_flows() {
     let data = ClipboardData::decode_payload(&payload).unwrap();
     assert_eq!(data.content, b"text after a refused image");
     assert_eq!(data.meta.content_type, ContentType::Utf8Text);
+}
+
+/// The other side of the same coin, and the end-to-end proof that flipping
+/// `FeatureFlags::ADVERTISED` is all it takes: **neither** side overrides
+/// anything, so both advertise exactly what a shipped build advertises,
+/// and a local image copy reaches the wire as a chunked offer.
+///
+/// The tests above deliberately state their negotiation, which means none
+/// of them would notice the constant regressing to empty. This one would.
+#[tokio::test]
+async fn two_default_builds_negotiate_image_transfer_with_no_overrides() {
+    use crossover_platform::ClipboardImageFormat;
+
+    let (side, mut conn) =
+        connected_pair_with(FeatureFlags::ADVERTISED, FeatureFlags::ADVERTISED).await;
+
+    let bytes = snip_bytes(MAX_CHUNK_BYTES + 9);
+    side.clipboard
+        .set_image_locally(ClipboardImageFormat::Dib, bytes.clone());
+
+    // An image is always offered, never inlined (ADR 0014), and it got
+    // past the send gate on the negotiated capability alone.
+    let payload = recv_typed(&mut conn, MessageType::ClipboardOffer).await;
+    let offer = ClipboardOffer::decode_payload(&payload).unwrap();
+    assert_eq!(
+        offer.meta.content_type,
+        ContentType::Image(ImageFormat::Dib)
+    );
+    assert_eq!(offer.meta.content_length, bytes.len() as u64);
+
+    // And the chunks follow, which is the traffic an un-negotiated peer
+    // must never see.
+    conn.send_frame(
+        MessageType::ClipboardAccept.wire(),
+        3,
+        &ClipboardAccept { id: offer.meta.id }
+            .encode_payload()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut reassembly = ChunkReassembly::begin(offer.meta).unwrap();
+    let received = loop {
+        let payload = recv_typed(&mut conn, MessageType::ClipboardChunk).await;
+        let chunk = ClipboardChunk::decode_payload(&payload).unwrap();
+        match reassembly.accept(&chunk).unwrap() {
+            ChunkOutcome::More => {}
+            ChunkOutcome::Complete(bytes) => break bytes,
+        }
+    };
+    assert_eq!(received, bytes);
 }
