@@ -110,10 +110,27 @@ frames are applied as they arrive while chunks route to reassembly.
 
 ## Open questions (to settle when scheduled)
 
-- Exact chunk size (latency budget vs per-frame overhead).
+The decision above is fixed. These were the loose ends; where implementation
+has since settled one, the resolution is noted inline — bookkeeping, not a
+change of decision.
+
+- Exact chunk size (latency budget vs per-frame overhead). **Still open**,
+  and belongs with [ADR 0014](0014-chunked-rich-clipboard-transfer.md)'s
+  chunking work.
 - Whether small clipboard *text* rides High or Background (it is tiny either
-  way).
+  way). **Settled: Background, along with every other clipboard message.**
+  Splitting a transaction across classes would let its acknowledgement
+  overtake its data, which the ADR 0005 state machine forbids. See
+  `SendPriority::of` in `crossover-core/src/outbound.rs` and
+  [ARCHITECTURE.md](../ARCHITECTURE.md) §5.4.
 - Backpressure policy on the Background queue, and how much starvation of
   Background under sustained input is acceptable before a transfer is
   considered stalled (strict High-first drain permits unbounded starvation).
+  **Settled: block, never drop — bounded by bytes as well as message count —
+  and accept unbounded starvation without aging.** Rationale in
+  [ARCHITECTURE.md](../ARCHITECTURE.md) §5.4.
 - Where to measure input latency under load to prove the guarantee.
+  **Settled: `tools/test-peer/tests/priority.rs`**, which saturates every
+  queue and the socket and asserts structurally — arrival positions and frame
+  counts, not elapsed time ([TESTING.md](../TESTING.md) §1.5). Numeric
+  latency remains a measurement (TESTING.md §4), not a gate.

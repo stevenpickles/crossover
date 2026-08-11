@@ -12,15 +12,16 @@ use anyhow::Context;
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
+use crossover_core::outbound::{BudgetedReceiver, CommandReceiver, command_lanes};
 use crossover_core::pairing::{PairingListener, pair_with};
 use crossover_core::supervision::{
     KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
 };
 use crossover_core::{
     ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
-    FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics, SeamlessInputs, SessionCommand,
-    SessionListener, SessionOptions, SyncEvent, Topology, clipboard_sync, edge_detect,
-    input_control,
+    FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics, OutboundSender, SeamlessInputs,
+    SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology, clipboard_sync,
+    edge_detect, input_control, outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
@@ -406,10 +407,7 @@ fn setup_input_control(
     side: Option<LinkSide>,
     metrics: &Arc<Metrics>,
     no_cursor_mask: bool,
-) -> anyhow::Result<(
-    mpsc::Sender<InputControlEvent>,
-    mpsc::Receiver<SessionCommand>,
-)> {
+) -> anyhow::Result<(mpsc::Sender<InputControlEvent>, CommandReceiver)> {
     let (capture, injector) = open_input()?;
     // Diagnostic switch: run without masking to isolate cursor behavior
     // from control transfer (ADR 0009).
@@ -514,9 +512,9 @@ pub async fn run(
     let registry: SessionRegistry =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    // Both drivers emit the same SessionCommands; merge them into one
-    // stream for the mux.
-    let commands = merge_command_streams(sync_commands, control_commands);
+    // Both drivers emit the same SessionCommands; merge them into the two
+    // priority lanes the mux drains independently (ADR 0013).
+    let commands = merge_command_lanes(sync_commands, control_commands);
 
     // Outbound role: supervised session with automatic reconnect.
     let (handle, events) =
@@ -631,20 +629,44 @@ struct SessionFanout {
 }
 
 impl SessionFanout {
+    /// Deliver to both drivers **concurrently**, never one behind the other.
+    ///
+    /// Sequential delivery makes the first driver's backpressure the second
+    /// driver's latency. That is exactly backwards here: the clipboard driver
+    /// is the one that parks under bulk backpressure, and the control driver
+    /// is the one that releases held input. Awaiting the clipboard send first
+    /// would gate the release-all-input path behind a stalled transfer — a
+    /// stuck key after disconnect, which CLAUDE.md ranks release-blocking.
+    ///
+    /// `join!` polls both in this task, so neither can gate the other. A full
+    /// channel still delays *its own* driver, as it must.
+    ///
+    /// **Not cancel-safe**: cancelled mid-`join!` this can leave one driver
+    /// notified and the other not. Every caller either runs to completion or
+    /// is cancelled only at process shutdown, where both drivers are going
+    /// away regardless and the asymmetry is unobservable. Do not put it in a
+    /// `select!` branch without revisiting that.
+    async fn fan_out(&self, sync: SyncEvent, control: InputControlEvent) {
+        let (sync_sent, control_sent) =
+            tokio::join!(self.sync.send(sync), self.control.send(control));
+        let _ = sync_sent;
+        let _ = control_sent;
+    }
+
     async fn established(&self, session: Uuid) {
-        let _ = self.sync.send(SyncEvent::SessionEstablished).await;
-        let _ = self
-            .control
-            .send(InputControlEvent::SessionEstablished { session })
-            .await;
+        self.fan_out(
+            SyncEvent::SessionEstablished,
+            InputControlEvent::SessionEstablished { session },
+        )
+        .await;
     }
 
     async fn lost(&self, session: Uuid) {
-        let _ = self.sync.send(SyncEvent::SessionLost).await;
-        let _ = self
-            .control
-            .send(InputControlEvent::SessionLost { session })
-            .await;
+        self.fan_out(
+            SyncEvent::SessionLost,
+            InputControlEvent::SessionLost { session },
+        )
+        .await;
     }
 
     async fn frame(&self, session: Uuid, frame: crossover_protocol::RawFrame) {
@@ -657,11 +679,11 @@ impl SessionFanout {
         {
             metrics.record_input_received(total, keys);
         }
-        let _ = self.sync.send(SyncEvent::Frame(frame.clone())).await;
-        let _ = self
-            .control
-            .send(InputControlEvent::Frame { session, frame })
-            .await;
+        self.fan_out(
+            SyncEvent::Frame(frame.clone()),
+            InputControlEvent::Frame { session, frame },
+        )
+        .await;
     }
 }
 
@@ -680,29 +702,60 @@ fn input_counts(payload: &[u8]) -> Option<(u64, u64)> {
     Some((total, keys))
 }
 
-/// Forward two `SessionCommand` streams into one, so the mux has a single
-/// receiver. The forwarders end when their drivers drop the senders.
-fn merge_command_streams(
-    mut a: mpsc::Receiver<SessionCommand>,
-    mut b: mpsc::Receiver<SessionCommand>,
-) -> mpsc::Receiver<SessionCommand> {
-    let (merged_tx, merged_rx) = mpsc::channel(64);
-    let tx_a = merged_tx.clone();
-    tokio::spawn(async move {
-        while let Some(command) = a.recv().await {
-            if tx_a.send(command).await.is_err() {
-                break;
+/// The drivers' commands, merged and split by priority class (ADR 0013).
+///
+/// Two lanes, not one queue with a tag: the mux *awaits* delivery into each
+/// session's queue, so a single task draining both classes would let one
+/// saturated Background path stall High traffic for every session — the
+/// head-of-line block moved upstream rather than removed. Each lane gets its
+/// own mux task, and only the Background one ever waits on bulk.
+struct ClassifiedCommands {
+    high: mpsc::Receiver<SessionCommand>,
+    background: BudgetedReceiver<SessionCommand>,
+}
+
+/// Fold both drivers' already-classified command lanes into one merged pair.
+///
+/// **One forwarder task per source lane, never per source.** A task that read
+/// a driver's two lanes together would serialize them: parked handing a bulk
+/// command downstream, it could not pick up that driver's next High command —
+/// so a fail-closed `TerminateSession` emitted during a stalled transfer
+/// would sit behind the very bulk that stalled it. Four single-class tasks
+/// have nothing to serialize; each waits only on its own class.
+///
+/// Classification is a pure function of the message type, so re-running it on
+/// the merged sender maps each lane onto the matching lane, never across.
+fn merge_command_lanes(a: CommandReceiver, b: CommandReceiver) -> ClassifiedCommands {
+    let (merged_tx, merged_rx) = command_lanes();
+    for source in [a, b] {
+        let (mut source_high, mut source_background) = source.into_lanes();
+
+        let high_tx = merged_tx.clone();
+        tokio::spawn(async move {
+            while let Some(command) = source_high.recv().await {
+                if high_tx.send(command).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
-    tokio::spawn(async move {
-        while let Some(command) = b.recv().await {
-            if merged_tx.send(command).await.is_err() {
-                break;
+        });
+
+        let background_tx = merged_tx.clone();
+        tokio::spawn(async move {
+            while let Some(command) = source_background.recv().await {
+                // Hold this hop's byte budget until the next hop has taken
+                // the command, so the two bounds cannot both be spent on the
+                // same bytes.
+                let (command, hold) = command.into_parts();
+                let delivered = background_tx.send(command).await.is_ok();
+                drop(hold);
+                if !delivered {
+                    break;
+                }
             }
-        }
-    });
-    merged_rx
+        });
+    }
+    let (high, background) = merged_rx.into_lanes();
+    ClassifiedCommands { high, background }
 }
 
 /// Build the seamless wiring for a `--left`/`--right` run (ADR 0009): the
@@ -936,10 +989,14 @@ struct SessionRoute {
 
 /// Where a session's outbound frames go. Cloned out from under the
 /// registry lock before any `.await`, so sends never hold it.
+///
+/// Both variants classify the frame into the session's High/Background
+/// lanes on the way in (ADR 0013), so the priority split survives this hop
+/// as well as the mux's.
 #[derive(Clone)]
 enum FrameSink {
     /// An accepted inbound session: frames queue to its writer task.
-    Inbound(mpsc::Sender<(u16, Vec<u8>)>),
+    Inbound(OutboundSender),
     /// The supervised outbound session: frames go through the handle,
     /// which targets whatever session is currently established.
     Outbound(Arc<crossover_core::supervision::SupervisorHandle>),
@@ -949,13 +1006,75 @@ impl FrameSink {
     async fn deliver(&self, message_type: u16, payload: Vec<u8>) {
         match self {
             Self::Inbound(tx) => {
-                let _ = tx.send((message_type, payload)).await;
+                let _ = tx.send(message_type, payload).await;
             }
             Self::Outbound(handle) => {
                 let _ = handle.send(message_type, payload).await;
             }
         }
     }
+}
+
+/// Retire a dead session's send path — **synchronously, and before any
+/// other teardown step.**
+///
+/// Dropping the receiver is the only thing that closes the session's
+/// Background byte budget, and closing that budget is the only thing that
+/// unparks everything queued behind it: the mux's bulk task, the merge
+/// forwarder, and finally the driver itself, which is parked mid-`execute`
+/// and therefore not draining its own event channel.
+///
+/// Every later teardown step *depends* on that. `drain.await` and
+/// `SessionFanout::lost` both push into the drivers' bounded event channels,
+/// so with the budget still held they wait on a driver that is waiting on
+/// them — a cycle that runs: teardown → driver event channel → driver
+/// command lane → merge forwarder → merged lane → mux → session lane →
+/// released only by this drop. A trusted-but-hostile peer that floods the
+/// clipboard and then stops reading could park the accept loop there
+/// permanently: no new sessions, no input, restart required.
+///
+/// Removing the registry entry belongs here too, and is likewise
+/// synchronous: it stops the mux routing anything else at a session that no
+/// longer exists.
+fn retire_session_route(
+    outbound: crossover_core::OutboundReceiver,
+    registry: &SessionRegistry,
+    session_id: Uuid,
+) {
+    drop(outbound);
+    registry_lock(registry).remove(&session_id);
+}
+
+/// Everything an ended session needs done, **in the order it must be done
+/// in**. One function so the order is reviewable in one place and guarded by
+/// one test, rather than living as loose statements a tidy-up can reorder.
+///
+/// The order is not a preference:
+///
+/// 1. `retire_session_route` — synchronous, and first. Until the receiver
+///    drops, the session's byte budget is held and everything queued behind
+///    it stays parked, including the drivers.
+/// 2. drop the event sender, then wait for the drain task. It calls
+///    `SessionFanout::frame`, which pushes into the drivers' bounded event
+///    channels — so it can only finish once step 1 has unparked them.
+/// 3. fan the loss out, which pushes into those same channels, and which
+///    releases held input on the control driver (FR-4.4).
+///
+/// Steps 2 and 3 both wait on drivers that step 1 releases. Doing either
+/// first closes a cycle that parks the accept loop permanently — see
+/// `retire_session_route` for the full chain.
+async fn finish_session(
+    outbound: crossover_core::OutboundReceiver,
+    registry: &SessionRegistry,
+    session_id: Uuid,
+    events_tx: mpsc::Sender<SessionEvent>,
+    drain: tokio::task::JoinHandle<()>,
+    fanout: &SessionFanout,
+) {
+    retire_session_route(outbound, registry, session_id);
+    drop(events_tx);
+    let _ = drain.await;
+    fanout.lost(session_id).await;
 }
 
 /// Every live session keyed by its locally generated id, so a command
@@ -1036,82 +1155,118 @@ async fn enforce_revocations(storage: &Arc<dyn SecureStorage>, registry: &Sessio
 /// frames broadcast (FR-5.4). Fail-closed terminations kill the named
 /// session where it can be killed — the supervised outbound session has
 /// no per-session kill, an accepted limitation logged when it bites.
+///
+/// **One task per priority lane** (ADR 0013). Delivery into a session's
+/// queue is awaited, so a saturated Background path parks its own task
+/// indefinitely; the High task shares nothing with it and keeps running.
 fn spawn_command_mux(
     registry: SessionRegistry,
-    mut commands: mpsc::Receiver<SessionCommand>,
+    commands: ClassifiedCommands,
     metrics: Option<Arc<Metrics>>,
 ) {
+    let ClassifiedCommands {
+        mut high,
+        mut background,
+    } = commands;
+
+    let high_registry = Arc::clone(&registry);
+    let high_metrics = metrics.clone();
     tokio::spawn(async move {
-        while let Some(command) = commands.recv().await {
-            match command {
-                SessionCommand::SendFrame {
-                    target,
-                    message_type,
-                    payload,
-                } => {
-                    // Count input events forwarded to the peer as they pass
-                    // through the one place every outbound frame does.
-                    if message_type == MessageType::InputBatch.wire()
-                        && let Some(metrics) = &metrics
-                        && let Some((total, keys)) = input_counts(&payload)
-                    {
-                        metrics.record_input_sent(total, keys);
-                    }
-                    // Collect matching sinks under the lock, then send
-                    // after releasing it (never hold a std Mutex over an
-                    // await).
-                    let sinks: Vec<FrameSink> = {
-                        let routes = registry_lock(&registry);
-                        match target {
-                            FrameTarget::Broadcast => {
-                                routes.values().map(|r| r.sink.clone()).collect()
-                            }
-                            FrameTarget::Session(id) => routes
-                                .get(&id)
-                                .map(|r| r.sink.clone())
-                                .into_iter()
-                                .collect(),
-                        }
-                    };
-                    for sink in sinks {
-                        sink.deliver(message_type, payload.clone()).await;
-                    }
+        while let Some(command) = high.recv().await {
+            dispatch_command(&high_registry, high_metrics.as_ref(), command).await;
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(command) = background.recv().await {
+            let (command, hold) = command.into_parts();
+            dispatch_command(&registry, metrics.as_ref(), command).await;
+            // The byte budget returns here, once the command has been
+            // handed to every sink — not merely dequeued.
+            drop(hold);
+        }
+    });
+}
+
+/// Execute one driver command against the live sessions. Shared by both
+/// mux lanes; the lane decides *when* it runs, never *what* it does.
+async fn dispatch_command(
+    registry: &SessionRegistry,
+    metrics: Option<&Arc<Metrics>>,
+    command: SessionCommand,
+) {
+    match command {
+        SessionCommand::SendFrame {
+            target,
+            message_type,
+            payload,
+        } => {
+            // Count input events forwarded to the peer as they pass
+            // through the one place every outbound frame does.
+            if message_type == MessageType::InputBatch.wire()
+                && let Some(metrics) = metrics
+                && let Some((total, keys)) = input_counts(&payload)
+            {
+                metrics.record_input_sent(total, keys);
+            }
+            // Collect matching sinks under the lock, then send
+            // after releasing it (never hold a std Mutex over an
+            // await).
+            let mut sinks: Vec<FrameSink> = {
+                let routes = registry_lock(registry);
+                match target {
+                    FrameTarget::Broadcast => routes.values().map(|r| r.sink.clone()).collect(),
+                    FrameTarget::Session(id) => routes
+                        .get(&id)
+                        .map(|r| r.sink.clone())
+                        .into_iter()
+                        .collect(),
                 }
-                SessionCommand::TerminateSession { target, reason } => {
-                    let kills: Vec<watch::Sender<bool>> = {
-                        let routes = registry_lock(&registry);
-                        match target {
-                            FrameTarget::Broadcast => {
-                                routes.values().filter_map(|r| r.kill.clone()).collect()
-                            }
-                            FrameTarget::Session(id) => routes
-                                .get(&id)
-                                .and_then(|r| r.kill.clone())
-                                .into_iter()
-                                .collect(),
-                        }
-                    };
-                    if kills.is_empty() {
-                        // No killable route: either the session already
-                        // ended, or it is the outbound session the
-                        // supervisor cannot kill per-session. Fail-closed
-                        // still holds — the driver emitted Terminate
-                        // instead of injecting — but say so (NFR-3).
-                        tracing::warn!(
-                            error = %reason,
-                            ?target,
-                            "payload violation with no killable session route"
-                        );
-                    } else {
-                        tracing::error!(error = %reason, ?target, "terminating session on violation");
-                        for kill in kills {
-                            let _ = kill.send(true);
-                        }
+            };
+            // The last sink takes the payload itself. Broadcast is the
+            // rare case and one session the common one, so copying a
+            // multi-megabyte clipboard frame for the only recipient would
+            // be pure waste (ADR 0014 makes this traffic routine).
+            let Some(last) = sinks.pop() else {
+                return; // no live session matches this target
+            };
+            for sink in sinks {
+                sink.deliver(message_type, payload.clone()).await;
+            }
+            last.deliver(message_type, payload).await;
+        }
+        SessionCommand::TerminateSession { target, reason } => {
+            let kills: Vec<watch::Sender<bool>> = {
+                let routes = registry_lock(registry);
+                match target {
+                    FrameTarget::Broadcast => {
+                        routes.values().filter_map(|r| r.kill.clone()).collect()
                     }
+                    FrameTarget::Session(id) => routes
+                        .get(&id)
+                        .and_then(|r| r.kill.clone())
+                        .into_iter()
+                        .collect(),
+                }
+            };
+            if kills.is_empty() {
+                // No killable route: either the session already
+                // ended, or it is the outbound session the
+                // supervisor cannot kill per-session. Fail-closed
+                // still holds — the driver emitted Terminate
+                // instead of injecting — but say so (NFR-3).
+                tracing::warn!(
+                    error = %reason,
+                    ?target,
+                    "payload violation with no killable session route"
+                );
+            } else {
+                tracing::error!(error = %reason, ?target, "terminating session on violation");
+                for kill in kills {
+                    let _ = kill.send(true);
                 }
             }
         }
-    });
+    }
 }
 
 async fn listener_loop(
@@ -1159,7 +1314,7 @@ async fn listener_loop(
                 let established_at = Instant::now();
 
                 let (events_tx, mut events_rx) = mpsc::channel(64);
-                let (outbound_tx, mut outbound_rx) = mpsc::channel::<(u16, Vec<u8>)>(64);
+                let (outbound_tx, mut outbound_rx) = outbound_channel();
                 let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
                 let session_id = info.session_id;
                 registry_lock(registry).insert(
@@ -1188,11 +1343,8 @@ async fn listener_loop(
                     &keepalive,
                 )
                 .await;
-                drop(events_tx);
-                let _ = drain.await;
                 metrics.record_session_ended(&reason, established_at.elapsed());
-                registry_lock(registry).remove(&session_id);
-                fanout.lost(session_id).await;
+                finish_session(outbound_rx, registry, session_id, events_tx, drain, fanout).await;
                 println!(
                     "Session with \"{}\" ended: {reason}.",
                     info.peer_device_name
@@ -1367,11 +1519,19 @@ fn age(unix: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::watch;
     use uuid::Uuid;
 
+    use crossover_core::outbound::{CommandSender, command_lanes};
+    use crossover_core::{
+        FrameTarget, MAX_BACKGROUND_QUEUE_FRAMES, SendPriority, SessionCommand, outbound_channel,
+    };
+    use crossover_protocol::hello::MessageType;
     use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore, TrustedPeer};
 
-    use super::{age, revoked_session_ids};
+    use super::{SessionRegistry, age, registry_lock, revoked_session_ids};
 
     #[test]
     fn revoked_sessions_are_those_whose_peer_left_the_trust_store() {
@@ -1406,6 +1566,421 @@ mod tests {
             )
             .unwrap();
         assert!(revoked_session_ids(&live, &trust).is_empty());
+    }
+
+    /// A fail-closed termination is a security action, so it rides High
+    /// even though it comes off the clipboard driver's otherwise-bulk
+    /// stream (docs/PROTOCOL.md §7).
+    #[test]
+    fn terminations_ride_the_interactive_lane_and_bulk_frames_do_not() {
+        use crossover_core::outbound::command_priority;
+        use crossover_core::{FrameTarget, SendPriority, SessionCommand};
+        use crossover_protocol::hello::MessageType;
+
+        let target = FrameTarget::Broadcast;
+        let frame = |message_type: MessageType| SessionCommand::SendFrame {
+            target,
+            message_type: message_type.wire(),
+            payload: Vec::new(),
+        };
+        assert_eq!(
+            command_priority(&SessionCommand::TerminateSession {
+                target,
+                reason: "invalid payload".to_owned(),
+            }),
+            SendPriority::High
+        );
+        assert_eq!(
+            command_priority(&frame(MessageType::InputBatch)),
+            SendPriority::High
+        );
+        assert_eq!(
+            command_priority(&frame(MessageType::ClipboardData)),
+            SendPriority::Background
+        );
+    }
+
+    /// One live session whose writer never runs, plus a running mux: the rig
+    /// the two wedged-path tests share.
+    struct WedgeRig {
+        session: Uuid,
+        clipboard: CommandSender,
+        control: CommandSender,
+        outbound: crossover_core::OutboundReceiver,
+        registry: SessionRegistry,
+        killed: watch::Receiver<bool>,
+    }
+
+    fn wedge_rig() -> WedgeRig {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        use super::{FrameSink, SessionRoute, merge_command_lanes, spawn_command_mux};
+
+        let identity = DeviceIdentity::generate("wedged-peer").unwrap();
+        let certified = CertifiedIdentity::from_identity(&identity).unwrap();
+        let session = Uuid::from_bytes([0x55; 16]);
+
+        let (sink, outbound) = outbound_channel();
+        let (kill_tx, killed) = watch::channel(false);
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::from([(
+            session,
+            SessionRoute {
+                sink: FrameSink::Inbound(sink),
+                kill: Some(kill_tx),
+                peer_fingerprint: certified.fingerprint(),
+            },
+        )])));
+
+        let (clipboard, clipboard_rx) = command_lanes();
+        let (control, control_rx) = command_lanes();
+        spawn_command_mux(
+            Arc::clone(&registry),
+            merge_command_lanes(clipboard_rx, control_rx),
+            None,
+        );
+
+        WedgeRig {
+            session,
+            clipboard,
+            control,
+            outbound,
+            registry,
+            killed,
+        }
+    }
+
+    /// A producer parked on the wedged path, and how far it got.
+    struct Wedged {
+        producer: tokio::task::JoinHandle<()>,
+        sent: Arc<std::sync::atomic::AtomicUsize>,
+        at_wedge: usize,
+    }
+
+    impl Wedged {
+        fn sent(&self) -> usize {
+            self.sent.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Wedge the whole Background path solid — the driver's own lane, the
+    /// mux's, and the session's — and return once the producer is *provably*
+    /// parked, with the number of commands it got in.
+    ///
+    /// Deterministic rather than timed: `#[tokio::test]` gives a
+    /// current-thread runtime, so a sweep of `yield_now` runs every other
+    /// task to its next await point. A producer that has not advanced across
+    /// a whole sweep is parked on backpressure, not merely behind us.
+    async fn wedge_background(sender: &CommandSender, session: Uuid) -> Wedged {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sent = Arc::new(AtomicUsize::new(0));
+        let producer = {
+            let sender = sender.clone();
+            let sent = Arc::clone(&sent);
+            tokio::spawn(async move {
+                loop {
+                    let bulk = SessionCommand::SendFrame {
+                        target: FrameTarget::Session(session),
+                        message_type: MessageType::ClipboardData.wire(),
+                        payload: vec![0xBB; 128 * 1024],
+                    };
+                    if sender.send(bulk).await.is_err() {
+                        return;
+                    }
+                    sent.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+
+        let mut previous = usize::MAX;
+        loop {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            let now = sent.load(Ordering::Relaxed);
+            assert!(now < 4096, "the background path never saturated");
+            if now == previous {
+                assert!(!producer.is_finished(), "the producer stopped early");
+                return Wedged {
+                    producer,
+                    sent,
+                    at_wedge: now,
+                };
+            }
+            previous = now;
+        }
+    }
+
+    /// The hop the ADR 0013 drift-check singled out: the command mux
+    /// *awaits* delivery into each session's queue, so a single task
+    /// draining both classes would let one wedged Background path stall
+    /// input for every session.
+    #[tokio::test]
+    async fn a_wedged_background_path_never_delays_a_high_frame_through_the_mux() {
+        let mut rig = wedge_rig();
+        let wedged = wedge_background(&rig.clipboard, rig.session).await.at_wedge;
+        assert!(
+            wedged >= MAX_BACKGROUND_QUEUE_FRAMES,
+            "expected a full bulk backlog, got {wedged} commands"
+        );
+
+        // With bulk wedged solid, an input batch still crosses the mux…
+        rig.control
+            .send(SessionCommand::SendFrame {
+                target: FrameTarget::Session(rig.session),
+                message_type: MessageType::InputBatch.wire(),
+                payload: b"pointer moved".to_vec(),
+            })
+            .await
+            .unwrap();
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        // …and is the very next frame the writer would put on the wire.
+        let frame = rig.outbound.recv().await.expect("a frame for the writer");
+        assert_eq!(
+            frame.message_type,
+            MessageType::InputBatch.wire(),
+            "input queued behind {wedged} bulk commands"
+        );
+        assert_eq!(frame.priority, SendPriority::High);
+        assert_eq!(frame.payload, b"pointer moved");
+    }
+
+    /// The sharper case, and the one a per-*source* forwarder gets wrong:
+    /// the High command comes from the **same driver** whose bulk wedged the
+    /// path.
+    ///
+    /// A peer that stops reading its socket and then sends a malformed
+    /// clipboard payload must still get its session killed. If the
+    /// termination queues behind the bulk it just stalled, that peer has
+    /// bought immunity from the fail-closed path (docs/PROTOCOL.md §7) by
+    /// doing nothing more than refusing to read.
+    #[tokio::test]
+    async fn a_termination_overtakes_the_bulk_from_its_own_driver() {
+        let mut rig = wedge_rig();
+        let wedged = wedge_background(&rig.clipboard, rig.session).await.at_wedge;
+        assert!(wedged >= MAX_BACKGROUND_QUEUE_FRAMES);
+        assert!(
+            !*rig.killed.borrow_and_update(),
+            "the session died before the test began"
+        );
+
+        rig.clipboard
+            .send(SessionCommand::TerminateSession {
+                target: FrameTarget::Session(rig.session),
+                reason: "malformed clipboard payload".to_owned(),
+            })
+            .await
+            .expect("a wedged bulk lane blocked a fail-closed termination");
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            *rig.killed.borrow_and_update(),
+            "the session was never killed: the termination is stuck behind \
+             {wedged} bulk commands from the same driver"
+        );
+    }
+
+    /// The teardown deadlock, in a test.
+    ///
+    /// Every step of session teardown after `run_session` returns —
+    /// `drain.await`, `SessionFanout::lost` — pushes into the drivers'
+    /// bounded event channels, and a driver parked on Background
+    /// backpressure is not draining them. Dropping the session's receiver
+    /// is the only thing that frees that path, so if it happens *after*
+    /// those awaits the whole cycle closes: teardown waits on the driver,
+    /// the driver waits on the send path, the send path waits on teardown.
+    ///
+    /// Structural: the producer's progress is the evidence. Retiring the
+    /// route must unpark it; removing the registry entry alone must not be
+    /// mistaken for having done so.
+    #[tokio::test]
+    async fn retiring_a_dead_session_unparks_everything_queued_behind_it() {
+        use super::retire_session_route;
+
+        let rig = wedge_rig();
+        let wedged = wedge_background(&rig.clipboard, rig.session).await;
+        assert!(wedged.at_wedge >= MAX_BACKGROUND_QUEUE_FRAMES);
+
+        // Registry removal on its own changes nothing: the queues, not the
+        // routing table, are what the producer is parked on.
+        registry_lock(&rig.registry).remove(&rig.session);
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            wedged.sent(),
+            wedged.at_wedge,
+            "registry removal appeared to unpark the producer; the test is \
+             no longer proving what it claims"
+        );
+
+        // Retiring the route drops the receiver, closes the byte budget,
+        // and the whole chain drains.
+        retire_session_route(rig.outbound, &rig.registry, rig.session);
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            wedged.sent() > wedged.at_wedge,
+            "the producer is still parked after the session was retired: \
+             stuck at {} commands",
+            wedged.at_wedge
+        );
+        wedged.producer.abort();
+    }
+
+    /// The deadlock guarded at the level that actually ships: the whole
+    /// `finish_session` sequence, with a real mux, a real fanout, and a
+    /// driver stand-in that parks exactly where the clipboard driver does —
+    /// mid-send, and therefore not draining its own event channel.
+    ///
+    /// Testing `retire_session_route` alone was not enough: it left the one
+    /// line a refactor is most likely to move — *where* teardown calls it —
+    /// completely unguarded. Move it below `drain.await` and this hangs.
+    #[tokio::test]
+    async fn the_teardown_sequence_completes_against_a_parked_driver() {
+        use crossover_core::supervision::SessionEvent;
+        use crossover_protocol::RawFrame;
+
+        use super::{SessionFanout, finish_session};
+
+        let rig = wedge_rig();
+
+        // Deliberately shallow, so the drain task reaches the block quickly.
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
+        let fanout = SessionFanout {
+            sync: sync_tx,
+            control: control_tx,
+            metrics: None,
+        };
+
+        // The clipboard driver, in miniature: a serial loop that turns each
+        // event into an outbound frame. Once the send path wedges it parks
+        // mid-send and stops consuming events — the whole point.
+        let clipboard_driver = {
+            let sender = rig.clipboard.clone();
+            let session = rig.session;
+            tokio::spawn(async move {
+                while sync_rx.recv().await.is_some() {
+                    let bulk = SessionCommand::SendFrame {
+                        target: FrameTarget::Session(session),
+                        message_type: MessageType::ClipboardData.wire(),
+                        payload: vec![0xBB; 4 * 1024 * 1024],
+                    };
+                    if sender.send(bulk).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        // The control driver drains freely; it is not what parks.
+        let control_driver =
+            tokio::spawn(async move { while control_rx.recv().await.is_some() {} });
+
+        // The session's own event drain, exactly as `listener_loop` spawns it.
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+        let drain = {
+            let fanout = fanout.clone();
+            let session = rig.session;
+            tokio::spawn(async move {
+                while let Some(event) = events_rx.recv().await {
+                    if let SessionEvent::Frame(frame) = event {
+                        fanout.frame(session, frame).await;
+                    }
+                }
+            })
+        };
+
+        // Fill the pipeline until it stops accepting: driver parked, event
+        // channels full, drain task blocked pushing into them.
+        while events_tx
+            .try_send(SessionEvent::Frame(RawFrame {
+                message_type: MessageType::ClipboardData.wire(),
+                message_id: 1,
+                payload: b"inbound".to_vec(),
+            }))
+            .is_ok()
+        {}
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !clipboard_driver.is_finished() && !drain.is_finished(),
+            "nothing parked; this test is not exercising the deadlock"
+        );
+
+        // The session dies. Teardown must complete.
+        let teardown = {
+            let fanout = fanout.clone();
+            let registry = Arc::clone(&rig.registry);
+            let session = rig.session;
+            tokio::spawn(async move {
+                finish_session(rig.outbound, &registry, session, events_tx, drain, &fanout).await;
+            })
+        };
+        for _ in 0..1024 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            teardown.is_finished(),
+            "session teardown deadlocked against a parked driver: the send \
+             path is retired too late to unpark it"
+        );
+        clipboard_driver.abort();
+        control_driver.abort();
+    }
+
+    /// A session ending must release held input even while the clipboard
+    /// driver is backed up, so the release path cannot be sequenced behind
+    /// the clipboard one. A stuck key after disconnect is release-blocking
+    /// (CLAUDE.md).
+    #[tokio::test]
+    async fn session_loss_reaches_the_control_driver_past_a_full_clipboard_queue() {
+        use super::SessionFanout;
+        use crossover_core::{InputControlEvent, SyncEvent};
+
+        let (sync_tx, _sync_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        let fanout = SessionFanout {
+            sync: sync_tx,
+            control: control_tx,
+            metrics: None,
+        };
+
+        // Back the clipboard driver's channel right up; nothing drains it.
+        while fanout.sync.try_send(SyncEvent::LocalChanged).is_ok() {}
+
+        let session = Uuid::from_bytes([0x77; 16]);
+        let lost = {
+            let fanout = fanout.clone();
+            tokio::spawn(async move { fanout.lost(session).await })
+        };
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        let event = control_rx
+            .try_recv()
+            .expect("session loss never reached the control driver");
+        assert!(matches!(
+            event,
+            InputControlEvent::SessionLost { session: id } if id == session
+        ));
+        // And it got there without the clipboard send having completed —
+        // proving the two are concurrent, not sequenced.
+        assert!(
+            !lost.is_finished(),
+            "the clipboard channel drained; this test no longer proves the \
+             release path is independent of it"
+        );
+        lost.abort();
     }
 
     #[test]

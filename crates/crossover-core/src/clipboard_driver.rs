@@ -24,7 +24,9 @@ use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
 use crossover_protocol::hello::MessageType;
 
 use crate::clipboard::{Action, ClipboardConfig, ClipboardEngine, InboundMessage};
+use crate::command::{FrameTarget, SessionCommand};
 use crate::metrics::Metrics;
+use crate::outbound::{CommandReceiver, CommandSender, command_lanes};
 
 /// How long after a `Busy` *read* before re-checking the clipboard. Reads
 /// have no transaction to retry inside the engine; the driver simply
@@ -66,41 +68,6 @@ pub enum SyncEvent {
     SettleDue(u64),
 }
 
-/// Which session(s) a [`SessionCommand`] is directed at.
-///
-/// Clipboard sync is session-agnostic (FR-5.4) and broadcasts; control
-/// and input traffic is authority for one authenticated session and is
-/// routed to exactly that one (FR-5.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameTarget {
-    /// Every active session.
-    Broadcast,
-    /// One session, by its locally generated id.
-    Session(Uuid),
-}
-
-/// What a driver asks the app to do.
-#[derive(Debug)]
-pub enum SessionCommand {
-    /// Send this frame to the target session(s).
-    SendFrame {
-        /// Which session(s) to send it to.
-        target: FrameTarget,
-        /// Frame message type.
-        message_type: u16,
-        /// Encoded payload.
-        payload: Vec<u8>,
-    },
-    /// The target sent an invalid payload: terminate it (fail closed);
-    /// supervision handles the rest.
-    TerminateSession {
-        /// Which session(s) to terminate.
-        target: FrameTarget,
-        /// Diagnostic for logs.
-        reason: String,
-    },
-}
-
 /// The clipboard sync driver. Create with [`clipboard_sync`], then spawn
 /// [`ClipboardSyncDriver::run`].
 pub struct ClipboardSyncDriver {
@@ -108,7 +75,7 @@ pub struct ClipboardSyncDriver {
     provider: Arc<dyn ClipboardProvider>,
     events_rx: mpsc::Receiver<SyncEvent>,
     events_tx: mpsc::Sender<SyncEvent>,
-    commands_tx: mpsc::Sender<SessionCommand>,
+    commands_tx: CommandSender,
     /// Consecutive `Busy` reads; reset by any successful read.
     busy_reads: u32,
     /// Generation of the newest settle timer; older ones are ignored
@@ -139,12 +106,14 @@ pub fn clipboard_sync(
     (
         ClipboardSyncDriver,
         mpsc::Sender<SyncEvent>,
-        mpsc::Receiver<SessionCommand>,
+        CommandReceiver,
     ),
     ClipboardError,
 > {
     let (events_tx, events_rx) = mpsc::channel(64);
-    let (commands_tx, commands_rx) = mpsc::channel(64);
+    // Two lanes, not one queue: a driver parked on bulk backpressure must
+    // still have a clear path for its fail-closed termination (ADR 0013).
+    let (commands_tx, commands_rx) = command_lanes();
 
     // Bridge the dataless provider callback into the event loop.
     // try_send + drop-on-full IS the documented coalescing: a full queue
@@ -430,7 +399,7 @@ mod tests {
     struct Rig {
         clipboard: Arc<InMemoryClipboard>,
         events: mpsc::Sender<SyncEvent>,
-        commands: mpsc::Receiver<SessionCommand>,
+        commands: crate::outbound::CommandReceiver,
         metrics: Arc<Metrics>,
     }
 

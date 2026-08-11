@@ -71,14 +71,36 @@ Four logical classes, initially multiplexed over the single TLS connection:
 
 | Class | Contents | Delivery requirement |
 |-------|----------|----------------------|
-| CONTROL | Hello, control-transfer negotiation, keepalive, ReleaseAllInput, session management | Ordered, lossless |
-| INPUT | Key transitions, pointer motion/buttons/scroll | Keys: ordered, lossless. Pointer motion: coalescable (§6) |
-| CLIPBOARD | Clipboard transaction messages | Ordered, lossless, acknowledged |
+| CONTROL | Hello, control-transfer negotiation, keepalive, ReleaseAllInput, session management | Ordered *within the class*, lossless |
+| INPUT | Key transitions, pointer motion/buttons/scroll | Keys: ordered within the class, lossless. Pointer motion: coalescable (§6) |
+| CLIPBOARD | Clipboard transaction messages | Ordered within the class, lossless, acknowledged |
 | TELEMETRY | Latency probes, statistics | Best effort |
 
+**Ordering is per class, not total.** The sender schedules interactive
+traffic (CONTROL, INPUT) ahead of bulk (CLIPBOARD) rather than strictly
+first-come-first-served, so a large clipboard payload cannot head-of-line
+block the pointer and keyboard on the single connection
+([ADR 0013](adr/0013-interactive-over-bulk-prioritization.md);
+[ARCHITECTURE.md](ARCHITECTURE.md) §5.4). Consequences a receiver may rely
+on:
+
+- Messages **within** a class arrive in the order the sender produced them.
+  In particular a clipboard transaction — `Offer`, `Accept`, `Data`,
+  `Applied` — is never reordered against itself, which is what §5's state
+  machine depends on.
+- Messages of **different** classes may arrive in a different relative order
+  than they were produced. A receiver must not infer causality across
+  classes from arrival order.
+- Nothing is dropped to achieve this. Deprioritized traffic is deferred,
+  never discarded; only pointer motion is ever coalesced, and only under the
+  rule in §6.
+- `message_id` is assigned at the writer, after scheduling, so it stays
+  monotonic in wire order and remains usable for logging and duplicate
+  detection (§2).
+
 The architecture permits moving classes onto separate connections later if
-measurement shows head-of-line blocking; the class tag exists from v1 so
-that split requires no message redesign.
+app-level prioritization proves insufficient; the class tag exists from v1
+so that split requires no message redesign.
 
 ## 5. Clipboard transactions
 
@@ -155,7 +177,10 @@ Unicode `text` for mismatched layouts (ADR 0008).
   release events for everything the sender believes is pressed; it is also
   executed locally by the destination on session loss (FR-4.4).
 - Sockets carrying INPUT/CONTROL traffic set `TCP_NODELAY`; latency is then
-  managed by coalescing, not by Nagle buffering.
+  managed by coalescing and by send-side prioritization (§4), not by Nagle
+  buffering. Input frames are scheduled ahead of any queued clipboard bulk,
+  and only one bulk frame is written between re-checks, so the kernel send
+  buffer cannot re-serialize input behind a transfer.
 
 ### 6.1 Control transfer (CONTROL class)
 

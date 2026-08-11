@@ -238,10 +238,7 @@ async fn supervisor_reestablishes_through_the_test_peer() {
             // Any session here counts as stable (resets the backoff).
             reset_after: Duration::from_millis(1),
         },
-        keepalive: KeepaliveConfig {
-            interval: Duration::from_secs(2),
-            timeout: Duration::from_secs(30),
-        },
+        keepalive: KeepaliveConfig::new(Duration::from_secs(2), Duration::from_secs(30)).unwrap(),
         session: options(),
     };
     let (handle, mut events) = supervise_outbound(

@@ -44,7 +44,7 @@ fn update_count() -> usize {
 struct Side {
     clipboard: Arc<InMemoryClipboard>,
     events: mpsc::Sender<SyncEvent>,
-    commands: mpsc::Receiver<SessionCommand>,
+    commands: crossover_core::outbound::CommandReceiver,
 }
 
 fn side(origin: u8) -> Side {
@@ -305,7 +305,7 @@ async fn one_update(
     }
 }
 
-async fn next_command(commands: &mut mpsc::Receiver<SessionCommand>) -> SessionCommand {
+async fn next_command(commands: &mut crossover_core::outbound::CommandReceiver) -> SessionCommand {
     timeout(Duration::from_secs(10), commands.recv())
         .await
         .expect("timed out waiting for a sync command")

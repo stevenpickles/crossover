@@ -8,20 +8,21 @@
 
 pub mod clipboard;
 pub mod clipboard_driver;
+pub mod command;
 pub mod control;
 pub mod control_driver;
 pub mod edge_driver;
 pub mod input;
 pub mod metrics;
 pub mod net;
+pub mod outbound;
 pub mod pairing;
 pub mod supervision;
 pub mod topology;
 
 pub use clipboard::{ClipboardConfig, ClipboardEngine, RetryPolicy as ClipboardRetryPolicy};
-pub use clipboard_driver::{
-    ClipboardSyncDriver, FrameTarget, SessionCommand, SyncEvent, clipboard_sync,
-};
+pub use clipboard_driver::{ClipboardSyncDriver, SyncEvent, clipboard_sync};
+pub use command::{FrameTarget, SessionCommand};
 pub use control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
     OutboundControl,
@@ -37,6 +38,11 @@ pub use metrics::{FrameClass, Metrics, Report};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
     connect,
+};
+pub use outbound::{
+    MAX_BACKGROUND_QUEUE_BYTES, MAX_BACKGROUND_QUEUE_FRAMES, MAX_HIGH_QUEUE_FRAMES, OutboundClosed,
+    OutboundFrame, OutboundReceiver, OutboundSender, SendPriority, budgeted_channel,
+    outbound_channel,
 };
 pub use pairing::{PairingDriveError, PairingListener, pair_with};
 pub use supervision::{
