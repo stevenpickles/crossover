@@ -238,9 +238,12 @@ So: **no Background backpressure anywhere on the path can delay a High frame
 in transit.** One honest limit remains, upstream of the path: a driver is a
 serial event loop, and a driver parked on Background backpressure is not
 emitting *anything* until it drains — its own High commands included. That
-is correct backpressure (it is how the wire tells the clipboard engine to
-stop producing) and it is bounded, because a peer that accepts no data ends
-the session by the write budget below rather than stalling indefinitely.
+is correct backpressure — it is how the wire tells the clipboard engine to
+stop producing — and it is bounded: a peer that will not consume ends the
+session by the write bounds below, and teardown then retires the path, which
+is what actually unparks the driver. Both halves are needed; the ordering
+that makes the second one work is spelled out below, because getting it
+wrong deadlocks the application.
 
 **Drain policy: strict High-first, no aging.** The writer takes everything
 queued High before a *single* Background frame, then re-checks High. Because
@@ -280,11 +283,47 @@ the keepalive tick. Against a peer that stops reading its socket, an
 unbounded write would park forever and freeze the idle clock with it: the
 keepalive timeout could never fire, the session would never disconnect, and
 the `ReleaseAllInput` a disconnect triggers would never run — held keys stay
-held (FR-4.4). Every write therefore carries a budget of the keepalive
-timeout, and expiry ends the session as a transport failure, fail-closed,
-for supervision to retry. The polite TLS shutdown on the way out is bounded
-too, for the same reason: it has to flush, and the commonest reason to be
-closing is a peer that stopped reading.
+held (FR-4.4). Two bounds, both fail-closed, make that state terminal:
+
+1. **No single write may exceed the keepalive timeout.** A cancelled write
+   leaves the TLS stream mid-record and unusable, so expiry is necessarily
+   fatal rather than a retry.
+2. **Application writes may not stall continuously for longer than the
+   keepalive timeout.** A write slower than the keepalive *interval* counts
+   as stalling; any faster write clears the run, and a genuinely idle spell
+   clears it too (an empty outbound queue is health, not a stall). This is
+   what catches a peer that accepts one frame just inside bound 1's deadline
+   for ever — bound 1 alone resets every frame and waves that through.
+   Keepalive frames are excluded: a `Ping` is a dozen bytes and fits in any
+   window that is open at all, so it is no evidence of throughput and must
+   neither count as a stall nor clear one.
+
+The polite TLS shutdown on the way out is bounded too, for the same reason:
+it has to flush, and the commonest reason to be closing is a peer that
+stopped reading.
+
+What these bounds do **not** do is keep the session loop responsive *during*
+a write. While one is pending the loop still polls nothing else, so a slow
+peer delays input by up to one write — the guarantee is that this ends the
+session in bounded time, not that it never happens. Two things shrink it:
+ADR 0014's chunking makes the unit smaller, and moving the writer to its own
+task would remove the freeze entirely. The latter is deferred, not
+forgotten — it would take keepalive off the direct path to the writer that
+ADR 0013 specifies, so it needs an ADR of its own.
+
+Session **teardown** has an ordering requirement that falls out of all this.
+When a session ends, its send path is retired — receiver dropped, registry
+entry removed — *synchronously, before any other teardown step*. Dropping
+the receiver is the only thing that closes the session's byte budget, and
+closing that budget is the only thing that unparks the mux, the forwarder,
+and the driver behind them. Every later step (draining the session's event
+task, fanning the loss out to the drivers) pushes into the drivers' bounded
+event channels, so doing any of it first waits on a driver that is waiting
+on the send path that this drop releases. For the same reason the fanout
+delivers to both drivers concurrently rather than in sequence: the clipboard
+driver is the one that parks under bulk backpressure, and sequencing the
+control driver behind it would gate `ReleaseAllInput` — a stuck key — on a
+stalled transfer.
 
 Keepalive never enters the queues at all: `run_session` writes `Ping`
 straight to the writer on its idle tick and answers `Pong` from the dispatch

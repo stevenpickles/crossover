@@ -364,6 +364,7 @@ pub async fn run_session(
     let session_id = session.info().session_id;
     let (mut reader, mut writer) = session.split();
     let mut last_rx = Instant::now();
+    let mut write_health = WriteHealth::default();
     let mut tick = tokio::time::interval(keepalive.interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -381,7 +382,8 @@ pub async fn run_session(
                             &mut writer,
                             frame.message_type,
                             &frame.payload,
-                            keepalive.timeout,
+                            keepalive,
+                            Some(&mut write_health),
                         )
                         .await;
                         // Dropping the frame returns its Background byte
@@ -401,7 +403,7 @@ pub async fn run_session(
                     Ok(frame) => {
                         last_rx = Instant::now();
                         if let Some(reason) =
-                            dispatch_frame(frame, &mut writer, events, keepalive.timeout).await
+                            dispatch_frame(frame, &mut writer, events, keepalive).await
                         {
                             break reason;
                         }
@@ -421,13 +423,9 @@ pub async fn run_session(
                     break DisconnectReason::KeepaliveTimeout;
                 }
                 if idle >= keepalive.interval
-                    && let Err(reason) = write_bounded(
-                        &mut writer,
-                        MessageType::Ping.wire(),
-                        &[],
-                        keepalive.timeout,
-                    )
-                    .await
+                    && let Err(reason) =
+                        write_bounded(&mut writer, MessageType::Ping.wire(), &[], keepalive, None)
+                            .await
                 {
                     break reason;
                 }
@@ -457,7 +455,65 @@ pub async fn run_session(
     reason
 }
 
-/// Write one frame, giving up if it cannot complete inside `budget`.
+/// How the outbound direction has been behaving, across writes.
+///
+/// A per-write deadline alone is not a liveness bound, because it resets
+/// every frame: a peer that accepts one frame just inside the deadline, over
+/// and over, passes every individual check forever while making the session
+/// useless. This carries the history that catches that.
+#[derive(Debug, Default)]
+struct WriteHealth {
+    /// Start of the current unbroken run of stalling writes, if any.
+    stalling_since: Option<Instant>,
+    /// When the last write finished, to tell a *stall* from a quiet spell.
+    last_write_end: Option<Instant>,
+}
+
+impl WriteHealth {
+    /// Fold one completed application write into the record, and say whether
+    /// the outbound direction has stopped being usable.
+    ///
+    /// Pure in the sense that matters for testing: both timestamps are
+    /// arguments, so the policy is exercised with no clock and no sleeps
+    /// (docs/TESTING.md §1.1).
+    fn record(
+        &mut self,
+        started: Instant,
+        finished: Instant,
+        keepalive: &KeepaliveConfig,
+    ) -> Result<(), DisconnectReason> {
+        // A quiet spell is not a stall: with nothing queued there was nothing
+        // to be held up, so an older stall record is stale evidence.
+        if self
+            .last_write_end
+            .is_some_and(|end| finished.duration_since(end) >= keepalive.timeout)
+        {
+            self.stalling_since = None;
+        }
+        self.last_write_end = Some(finished);
+
+        if finished.duration_since(started) < keepalive.interval {
+            self.stalling_since = None;
+            return Ok(());
+        }
+        let stalling_since = *self.stalling_since.get_or_insert(started);
+        let stalling_for = finished.duration_since(stalling_since);
+        if stalling_for < keepalive.timeout {
+            return Ok(());
+        }
+        Err(DisconnectReason::Transport {
+            reason: format!(
+                "outbound writes have been stalling continuously for {}s (every frame \
+                 slower than the {}s keepalive interval); the peer is consuming too \
+                 slowly for the session to be usable",
+                stalling_for.as_secs_f32(),
+                keepalive.interval.as_secs_f32()
+            ),
+        })
+    }
+}
+
+/// Write one frame under two bounds, both fail-closed.
 ///
 /// The write runs as the body of a `select!` branch, so while it is pending
 /// the session loop polls nothing else — not the reader, not the keepalive
@@ -468,31 +524,51 @@ pub async fn run_session(
 /// triggers would never run. A hostile peer would hold input hostage by
 /// doing nothing at all.
 ///
-/// Bounding it makes that state terminal instead. The budget is the
-/// keepalive timeout, because the two failures are the same one seen from
-/// either end — a peer that has not taken a byte in that long is gone
-/// whether or not it is still answering — and reusing it means one knob,
-/// not two. Expiry is fail-closed: the session ends, supervision reconnects
-/// (FR-6.2), and input is released.
+/// So, exactly:
 ///
-/// This matters more as bulk grows: ADR 0014's chunking keeps individual
-/// writes small, but the *stall* is a property of the peer, not the frame.
+/// 1. **No single write may exceed `keepalive.timeout`.** This catches a
+///    peer that has frozen outright. A cancelled write leaves the TLS stream
+///    mid-record and unusable, so expiry is necessarily fatal, not a retry.
+/// 2. **Application writes may not stall continuously for longer than
+///    `keepalive.timeout`.** A write slower than `keepalive.interval` counts
+///    as stalling; any faster write clears the run. This is what catches the
+///    trickle — one frame accepted just inside the per-write deadline,
+///    forever — which bound 1 alone waves through.
+///
+/// `health` is `None` for keepalive frames. A `Ping` is a dozen bytes and
+/// fits in any window that is open at all, so it is no evidence of usable
+/// throughput: it must neither count as a stall nor clear one. A genuinely
+/// idle spell — no write at all for longer than the timeout — does clear the
+/// run, because an empty outbound queue is health, not a stalled one.
+///
+/// What this deliberately does **not** provide is a responsive loop during a
+/// write; see docs/ARCHITECTURE.md §5.4.
 async fn write_bounded(
     writer: &mut crate::net::SessionWriter,
     message_type: u16,
     payload: &[u8],
-    budget: Duration,
+    keepalive: &KeepaliveConfig,
+    health: Option<&mut WriteHealth>,
 ) -> Result<(), DisconnectReason> {
-    match tokio::time::timeout(budget, writer.send(message_type, payload)).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(transport_reason(&error)),
-        Err(_) => Err(DisconnectReason::Transport {
-            reason: format!(
-                "peer accepted no data for {}s: the write stalled, so the session is \
-                 unusable and is failing closed",
-                budget.as_secs_f32()
-            ),
-        }),
+    let started = Instant::now();
+    match tokio::time::timeout(keepalive.timeout, writer.send(message_type, payload)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return Err(transport_reason(&error)),
+        Err(_) => {
+            return Err(DisconnectReason::Transport {
+                reason: format!(
+                    "a single {}-byte frame did not finish sending within {}s; the peer is \
+                     not consuming this connection",
+                    payload.len(),
+                    keepalive.timeout.as_secs_f32()
+                ),
+            });
+        }
+    }
+
+    match health {
+        Some(health) => health.record(started, Instant::now(), keepalive),
+        None => Ok(()),
     }
 }
 
@@ -502,7 +578,7 @@ async fn dispatch_frame(
     frame: crossover_protocol::RawFrame,
     writer: &mut crate::net::SessionWriter,
     events: &mpsc::Sender<SessionEvent>,
-    write_budget: Duration,
+    keepalive: &KeepaliveConfig,
 ) -> Option<DisconnectReason> {
     let violation = |reason: &str| {
         Some(DisconnectReason::ProtocolViolation {
@@ -516,7 +592,7 @@ async fn dispatch_frame(
             }
             // Bounded like every other write: answering a Ping must not be
             // the thing that wedges the loop.
-            write_bounded(writer, MessageType::Pong.wire(), &[], write_budget)
+            write_bounded(writer, MessageType::Pong.wire(), &[], keepalive, None)
                 .await
                 .err()
         }
@@ -582,6 +658,89 @@ mod tests {
     };
     use crate::net::{LocalNode, SessionListener, SessionOptions};
     use crate::outbound::outbound_channel;
+
+    // --- write health (pure) ---
+
+    /// 5 s interval / 15 s timeout, the shipped defaults.
+    fn keepalive() -> KeepaliveConfig {
+        KeepaliveConfig::default()
+    }
+
+    /// A healthy link never trips either bound, however long it runs.
+    #[test]
+    fn brisk_writes_never_look_like_a_stall() {
+        let mut health = super::WriteHealth::default();
+        let mut at = tokio::time::Instant::now();
+        for _ in 0..1000 {
+            let finished = at + Duration::from_millis(1);
+            assert!(health.record(at, finished, &keepalive()).is_ok());
+            at = finished + Duration::from_millis(50);
+        }
+    }
+
+    /// The trickle a per-write deadline waves through: every frame lands
+    /// just inside the 15 s per-write bound, so no single write ever fails —
+    /// and the session is useless. Continuous stalling has to end it.
+    #[test]
+    fn a_peer_that_trickles_just_inside_the_per_write_bound_is_cut_off() {
+        let mut health = super::WriteHealth::default();
+        let mut at = tokio::time::Instant::now();
+
+        // First slow write: stalling starts, but there is no run yet.
+        let finished = at + Duration::from_millis(14_900);
+        assert!(health.record(at, finished, &keepalive()).is_ok());
+
+        // Second: the run is now longer than the keepalive timeout.
+        at = finished;
+        let finished = at + Duration::from_millis(14_900);
+        let verdict = health.record(at, finished, &keepalive());
+        let Err(DisconnectReason::Transport { reason }) = verdict else {
+            panic!("a trickling peer was not cut off: {verdict:?}");
+        };
+        assert!(reason.contains("stalling continuously"), "{reason}");
+    }
+
+    /// One healthy write is enough to say the link recovered; the run of
+    /// stalls must start over rather than accumulate across good periods.
+    #[test]
+    fn a_single_brisk_write_clears_the_stall_run() {
+        let mut health = super::WriteHealth::default();
+        let mut at = tokio::time::Instant::now();
+        // Two slow writes: a run of 12 s, still inside the 15 s bound.
+        for _ in 0..2 {
+            let finished = at + Duration::from_secs(6);
+            assert!(health.record(at, finished, &keepalive()).is_ok());
+            at = finished;
+        }
+        // Recovery.
+        let finished = at + Duration::from_millis(1);
+        assert!(health.record(at, finished, &keepalive()).is_ok());
+        at = finished;
+        // The next slow write starts a fresh run, so it is not fatal.
+        let finished = at + Duration::from_secs(6);
+        assert!(
+            health.record(at, finished, &keepalive()).is_ok(),
+            "the stall run survived a healthy write"
+        );
+    }
+
+    /// An idle session is not a stalling one: with nothing queued there was
+    /// nothing to hold up, so a long gap must not be charged as a stall.
+    #[test]
+    fn a_quiet_spell_between_writes_is_not_a_stall() {
+        let mut health = super::WriteHealth::default();
+        let at = tokio::time::Instant::now();
+        let finished = at + Duration::from_secs(6);
+        assert!(health.record(at, finished, &keepalive()).is_ok());
+
+        // Nothing to send for a minute, then one slow write.
+        let at = finished + Duration::from_mins(1);
+        let finished = at + Duration::from_secs(6);
+        assert!(
+            health.record(at, finished, &keepalive()).is_ok(),
+            "an idle gap was charged as continuous stalling"
+        );
+    }
 
     // --- ReconnectPolicy (pure) ---
 
