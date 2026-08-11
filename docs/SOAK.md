@@ -663,6 +663,25 @@ Then use the machines normally. Over the soak window (target: multiple days):
   relaunches, and errors after a multi-day run. `crossover status` and Task
   Manager give the at-a-glance state; the log files give the history.
 
+### Findings
+
+- **UAC / secure desktop (fixed, feature/87).** The first live soak found that
+  if the *controlled* machine raised a UAC elevation prompt while a peer was
+  driving it, Windows switched it to the **secure desktop** — where a
+  user-privilege process cannot inject (by design; you cannot drive a UAC prompt
+  remotely) — and the control link **wedged**: neither side returned to local,
+  and the controller's masked cursor stayed hidden with no recovery. Root
+  cause: there is no liveness once controlling (input batches are
+  fire-and-forget), the controlled side could not tell its injection was being
+  dropped (`SendInput` reports success even when the secure desktop discards
+  it), and the cursor fail-safe skips the controller. Fix: the controlled side
+  now detects the secure desktop (`OpenInputDesktop` denies a user process) and
+  releases the grant, so the controller returns to local and un-hides its
+  cursor, and the log names the reason. Immediate manual recovery is the
+  both-Control escape on the controller. A controller-side liveness ack (for the
+  case where the controlled side's notification is itself lost) remains a
+  possible follow-up.
+
 Record the outcome in the Phase 6 exit-criteria notes (docs/ROADMAP.md): the
 soak duration, reboots and network interruptions survived, any manual
 intervention required, worker relaunches observed, and whether clipboard and

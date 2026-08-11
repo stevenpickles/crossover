@@ -147,6 +147,11 @@ pub enum ControlEvent {
     /// Capture reported unhealthy (`is_capturing` false while `REMOTE`) —
     /// the Windows watchdog detected silent hook loss (R-2).
     CaptureLost,
+    /// The input desktop switched to one this machine cannot inject into —
+    /// a UAC/secure-desktop or lock-screen prompt. A peer can no longer
+    /// drive this machine, so any grant it holds is given up rather than
+    /// left wedged pretending to be driven (feature/87). Controlled side.
+    InputDesktopUnavailable,
     /// The request timeout scheduled for a session's request came due.
     RequestTimeout {
         /// The session the request went to.
@@ -301,6 +306,10 @@ pub enum ControlNotice {
     /// A peer's control of this machine ended with the session; its
     /// input was released locally (FR-4.4).
     PeerControlLostOnDisconnect,
+    /// A peer's control ended because this machine's input desktop switched
+    /// to one it cannot inject into (a UAC/secure-desktop or lock prompt);
+    /// its input was released locally (feature/87).
+    PeerControlLostToDesktop,
 }
 
 /// What the engine asks the driver to do. Order within the returned
@@ -419,6 +428,7 @@ impl ControlEngine {
             ControlEvent::SessionLost { session } => self.on_session_lost(session),
             ControlEvent::Captured(events) => self.on_captured(&events),
             ControlEvent::CaptureLost => self.on_capture_lost(),
+            ControlEvent::InputDesktopUnavailable => self.on_input_desktop_unavailable(),
             ControlEvent::RequestTimeout {
                 session,
                 request_id,
@@ -538,6 +548,35 @@ impl ControlEngine {
                 }
             }
         }
+    }
+
+    /// Give up a peer's control of this machine because the input desktop
+    /// switched to one we cannot inject into (a UAC/secure-desktop prompt).
+    /// Mirrors the revoke path in `on_release` — drain what we hold locally
+    /// and tell the peer to release — but it is machine-driven, not the
+    /// user's escape hatch, and is reported distinctly so a headless log says
+    /// *why* control dropped. The peer, on the `Release`, returns to local
+    /// and un-hides its cursor (feature/87). No-op if no peer holds control.
+    fn on_input_desktop_unavailable(&mut self) -> Vec<ControlAction> {
+        let Some(mut controlled) = self.controlled.take() else {
+            return Vec::new();
+        };
+        // In-flight input from before the peer sees our release is an
+        // expected race, not a violation (as in the revoke path).
+        self.recently_released = Some(controlled.session);
+        let releases = drain_releases(&mut controlled.applied_state);
+        let mut actions = Vec::new();
+        if !releases.is_empty() {
+            actions.push(ControlAction::Inject(releases));
+        }
+        actions.push(ControlAction::Send {
+            session: controlled.session,
+            message: OutboundControl::Release(None),
+        });
+        actions.push(ControlAction::Notify(
+            ControlNotice::PeerControlLostToDesktop,
+        ));
+        actions
     }
 
     fn on_session_lost(&mut self, session: Uuid) -> Vec<ControlAction> {
@@ -1516,6 +1555,44 @@ mod tests {
             ]
         );
         assert!(!engine.is_controlled());
+    }
+
+    #[test]
+    fn a_secure_desktop_releases_the_peer_and_reports_distinctly() {
+        // feature/87: when the input desktop switches to a secure one (a UAC
+        // prompt), the controlled side gives up the grant exactly like a
+        // revoke — drains what it holds and tells the peer, so the controller
+        // returns to local and un-hides its cursor — but reports it distinctly
+        // so a headless log says why rather than looking like a user revoke.
+        let mut engine = controlled_engine();
+        let _ = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 1,
+            events: vec![WireInputEvent::Button {
+                button: WireButton::Left,
+                pressed: true,
+            }],
+        })));
+
+        let actions = engine.handle(ControlEvent::InputDesktopUnavailable);
+        assert_eq!(
+            actions,
+            vec![
+                inject(vec![PointerEvent::Button {
+                    button: PointerButton::Left,
+                    pressed: false,
+                }]),
+                send(OutboundControl::Release(None)),
+                ControlAction::Notify(ControlNotice::PeerControlLostToDesktop),
+            ]
+        );
+        assert!(!engine.is_controlled());
+
+        // No peer holds control now, so a second desktop event is a no-op.
+        assert!(
+            engine
+                .handle(ControlEvent::InputDesktopUnavailable)
+                .is_empty()
+        );
     }
 
     /// Keyboard through the engine (ADR 0008): a granted key batch injects

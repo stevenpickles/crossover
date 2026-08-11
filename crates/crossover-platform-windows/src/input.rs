@@ -30,6 +30,9 @@
 use crossover_platform::{
     CursorPoint, InputError, InputEvent, InputInjector, KeyEvent, PointerButton, PointerEvent,
 };
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, OpenInputDesktop,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
@@ -113,6 +116,32 @@ impl InputInjector for WindowsInputInjector {
                 reason: format!("SetCursorPos failed: {e}"),
             }
         })
+    }
+
+    fn can_inject(&self) -> bool {
+        input_desktop_is_injectable()
+    }
+}
+
+/// Whether the desktop currently receiving user input is one this process can
+/// inject into. On the **secure desktop** — a UAC elevation prompt, the lock
+/// screen, or Ctrl-Alt-Del — a user-privilege process is denied
+/// `OpenInputDesktop` (that access denial *is* the signal), and `SendInput`
+/// there is silently dropped (R-1). On the user's own `Default` desktop the
+/// open succeeds. The controlled side polls this to give up a grant it can no
+/// longer serve (feature/87).
+fn input_desktop_is_injectable() -> bool {
+    // SAFETY: OpenInputDesktop has no preconditions; on success it returns a
+    // desktop handle owned by the caller, which must be closed once.
+    match unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) } {
+        Ok(desktop) => {
+            // SAFETY: `desktop` is the live handle from the successful open.
+            unsafe {
+                let _ = CloseDesktop(desktop);
+            }
+            true
+        }
+        Err(_) => false,
     }
 }
 

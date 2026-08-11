@@ -326,6 +326,10 @@ pub struct FakeInputInjector {
     injected: Mutex<Vec<InputEvent>>,
     placements: Mutex<Vec<CursorPoint>>,
     fail_next: Mutex<Option<String>>,
+    /// Scripts [`InputInjector::can_inject`]: `true` (default) = injectable;
+    /// set to script a secure desktop. Stored inverted so the derived default
+    /// (`false`) means "injectable".
+    blocked: Mutex<bool>,
 }
 
 impl FakeInputInjector {
@@ -370,6 +374,13 @@ impl FakeInputInjector {
     pub fn fail_next(&self, reason: &str) {
         *lock(&self.fail_next) = Some(reason.to_owned());
     }
+
+    /// Script whether input can currently be injected — `false` simulates a
+    /// secure desktop (a UAC prompt) so the controlled-side release is
+    /// testable without a real desktop switch (feature/87).
+    pub fn set_can_inject(&self, available: bool) {
+        *lock(&self.blocked) = !available;
+    }
 }
 
 impl InputInjector for FakeInputInjector {
@@ -384,6 +395,10 @@ impl InputInjector for FakeInputInjector {
     fn place_cursor(&self, position: CursorPoint) -> Result<(), InputError> {
         lock(&self.placements).push(position);
         Ok(())
+    }
+
+    fn can_inject(&self) -> bool {
+        !*lock(&self.blocked)
     }
 }
 
