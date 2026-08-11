@@ -137,13 +137,15 @@ impl ClipboardProvider for WindowsClipboard {
     /// Writes `CF_UNICODETEXT` only.
     ///
     /// **ADR 0014 platform slice**: an image cannot be installed yet, and
-    /// says so — a permanent, non-retryable refusal that closes the
-    /// origin's transaction with an honest verdict rather than a silent
-    /// stall or a pretended success (FR-3.2, NFR-3).
+    /// says so as [`ClipboardError::Unsupported`] — the type will never
+    /// work here, which is a different message for the origin than a
+    /// clipboard that is merely busy or broken. It closes the transaction
+    /// with an honest verdict rather than a silent stall or a pretended
+    /// success (FR-3.2, NFR-3).
     fn write(&self, content: &ClipboardContent) -> Result<(), ClipboardError> {
         match content {
             ClipboardContent::Text(text) => write_unicode_text(text),
-            ClipboardContent::Image { format, .. } => Err(ClipboardError::Unavailable {
+            ClipboardContent::Image { format, .. } => Err(ClipboardError::Unsupported {
                 reason: format!(
                     "this build cannot install {format:?} clipboard images \
                      (ADR 0014 platform slice not yet implemented)"
@@ -437,9 +439,10 @@ mod tests {
             bytes: vec![0u8; 64],
         });
         match refusal {
-            // Unavailable, not Busy: retrying will not make this build
-            // grow a DIB writer (FR-3.4's split is load-bearing).
-            Err(ClipboardError::Unavailable { reason }) => {
+            // Unsupported, not Busy and not Unavailable: retrying will not
+            // make this build grow a DIB writer, and the origin is owed
+            // "this type never works here" rather than "try again later".
+            Err(ClipboardError::Unsupported { reason }) => {
                 assert!(
                     reason.contains("ADR 0014"),
                     "the diagnostic must name why: {reason}"

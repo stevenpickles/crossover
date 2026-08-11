@@ -33,6 +33,7 @@ use crossover_protocol::hello::MessageType;
 
 use crate::clipboard::{
     Action, ClipboardConfig, ClipboardEngine, InboundMessage, OutboundMessage, TransferScope,
+    WriteFailure,
 };
 use crate::command::{FrameTarget, SessionCommand};
 use crate::metrics::Metrics;
@@ -545,11 +546,19 @@ impl ClipboardSyncDriver {
                     Err(ClipboardError::Busy { reason }) => {
                         tracing::debug!(clipboard_id = %id, error = %reason, "write busy");
                         self.record(Metrics::record_clipboard_contention);
-                        Err(true)
+                        Err(WriteFailure::Busy)
+                    }
+                    Err(error @ ClipboardError::Unsupported { .. }) => {
+                        tracing::warn!(
+                            clipboard_id = %id,
+                            error = %error,
+                            "clipboard content type not supported by this platform"
+                        );
+                        Err(WriteFailure::UnsupportedType)
                     }
                     Err(error) => {
                         tracing::warn!(clipboard_id = %id, error = %error, "write failed");
-                        Err(false)
+                        Err(WriteFailure::Unavailable)
                     }
                 };
                 let more = self.engine.on_write_result(id, result);

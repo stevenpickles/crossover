@@ -269,6 +269,25 @@ pub enum TransferScope {
     Inbound,
 }
 
+/// Why a clipboard write did not succeed.
+///
+/// Three outcomes rather than a retryable/not-retryable flag, because the
+/// third one is a different *kind* of answer: a content type this
+/// destination cannot represent is a permanent statement about the item,
+/// where an unavailable clipboard is a transient statement about the
+/// machine. Collapsing them would tell the origin "clipboard
+/// unavailable" for an image that will never install here, whatever it
+/// tries (NFR-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteFailure {
+    /// Transient contention (FR-3.4): the only failure that is retried.
+    Busy,
+    /// The clipboard could not be written and retrying will not help.
+    Unavailable,
+    /// The backend does not handle this content type at all.
+    UnsupportedType,
+}
+
 /// What the driver must do next.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -628,10 +647,7 @@ impl ClipboardEngine {
     }
 
     /// The driver finished (or failed) a clipboard write.
-    ///
-    /// `retryable` distinguishes `Busy` (true) from `Unavailable`
-    /// (false).
-    pub fn on_write_result(&mut self, id: Uuid, result: Result<(), bool>) -> Vec<Action> {
+    pub fn on_write_result(&mut self, id: Uuid, result: Result<(), WriteFailure>) -> Vec<Action> {
         // Take-then-restore: no panic path exists (NFR-1 discipline).
         let Some(pending) = self.pending_write.take() else {
             tracing::debug!(clipboard_id = %id, "write result for no pending write; ignoring");
@@ -661,8 +677,10 @@ impl ClipboardEngine {
                     result: ApplyResult::Applied,
                 }))]
             }
-            Err(retryable) => {
-                if retryable && pending.attempts_made < self.config.retry.max_attempts {
+            Err(failure) => {
+                if failure == WriteFailure::Busy
+                    && pending.attempts_made < self.config.retry.max_attempts
+                {
                     let delay = self.config.retry.delay;
                     tracing::debug!(
                         clipboard_id = %id,
@@ -672,16 +690,28 @@ impl ClipboardEngine {
                     self.pending_write = Some(pending);
                     return vec![Action::ScheduleRetry { id, delay }];
                 }
+                // A type this destination cannot represent is a statement
+                // about the *content*, not about the clipboard's
+                // availability, and the origin acts on the two
+                // differently: one will never work here, the other might
+                // work on the next copy (NFR-3).
+                let verdict = match failure {
+                    WriteFailure::UnsupportedType => ApplyResult::ContentRejected,
+                    WriteFailure::Busy | WriteFailure::Unavailable => {
+                        ApplyResult::ClipboardUnavailable
+                    }
+                };
                 tracing::warn!(
                     clipboard_id = %pending.meta.id,
                     origin_peer = %pending.meta.origin,
+                    content_type = ?pending.meta.content_type,
                     attempt_count = pending.attempts_made,
-                    result = "clipboard_unavailable",
+                    result = ?verdict,
                     "clipboard item could not be installed"
                 );
                 vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
                     id,
-                    result: ApplyResult::ClipboardUnavailable,
+                    result: verdict,
                 }))]
             }
         }
@@ -1509,7 +1539,7 @@ mod tests {
 
     use super::{
         Action, ClipboardConfig, ClipboardEngine, InboundMessage, OutboundMessage, RetryPolicy,
-        TransferScope,
+        TransferScope, WriteFailure,
     };
 
     fn engine(origin_fill: u8) -> ClipboardEngine {
@@ -1777,7 +1807,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            e.on_write_result(id, Err(true)).as_slice(),
+            e.on_write_result(id, Err(WriteFailure::Busy)).as_slice(),
             [Action::ScheduleRetry { .. }]
         ));
         assert!(matches!(
@@ -1785,7 +1815,7 @@ mod tests {
             [Action::WriteClipboard { .. }]
         ));
         assert!(matches!(
-            e.on_write_result(id, Err(true)).as_slice(),
+            e.on_write_result(id, Err(WriteFailure::Busy)).as_slice(),
             [Action::ScheduleRetry { .. }]
         ));
         assert!(matches!(
@@ -1793,7 +1823,7 @@ mod tests {
             [Action::WriteClipboard { .. }]
         ));
         // Third attempt fails: the cap closes the transaction honestly.
-        let actions = e.on_write_result(id, Err(true));
+        let actions = e.on_write_result(id, Err(WriteFailure::Busy));
         assert!(matches!(
             sent(&actions).as_slice(),
             [OutboundMessage::Applied(ClipboardApplied {
@@ -1812,7 +1842,7 @@ mod tests {
         );
         let id2 = item2.meta.id;
         e.on_peer_message(InboundMessage::Data(item2));
-        let actions = e.on_write_result(id2, Err(false));
+        let actions = e.on_write_result(id2, Err(WriteFailure::Unavailable));
         assert!(matches!(
             sent(&actions).as_slice(),
             [OutboundMessage::Applied(ClipboardApplied {
@@ -2330,19 +2360,56 @@ mod tests {
     /// A destination that cannot install the content — which is exactly
     /// this build's Windows backend for an image — says so, and says it
     /// after the bytes arrived rather than pretending success (FR-3.2).
+    ///
+    /// *Which* failure it reports matters. A type this destination cannot
+    /// represent is `ContentRejected`: permanent, about the item. A
+    /// clipboard that would not take it is `ClipboardUnavailable`:
+    /// transient, about the machine. An origin that cannot tell those
+    /// apart cannot tell "never send me images" from "try again".
     #[test]
     fn an_image_the_platform_cannot_install_reports_the_failure() {
+        for (failure, verdict) in [
+            (WriteFailure::UnsupportedType, ApplyResult::ContentRejected),
+            (WriteFailure::Unavailable, ApplyResult::ClipboardUnavailable),
+        ] {
+            let mut e = engine(0xBB);
+            let bytes = image_bytes(4096);
+            let (meta, _) = inbound_image(&mut e, 0xAA, 1, &bytes);
+
+            let closed = e.on_write_result(meta.id, Err(failure));
+            match sent(&closed).as_slice() {
+                [OutboundMessage::Applied(applied)] => {
+                    assert_eq!(applied.result, verdict, "for {failure:?}");
+                }
+                other => panic!("expected a typed failure verdict, got {other:?}"),
+            }
+        }
+    }
+
+    /// An unsupported type is never retried: the retry budget exists for
+    /// contention (FR-3.4), and no number of attempts will teach this
+    /// build a raster format.
+    #[test]
+    fn an_unsupported_content_type_is_answered_without_burning_retries() {
         let mut e = engine(0xBB);
         let bytes = image_bytes(4096);
         let (meta, _) = inbound_image(&mut e, 0xAA, 1, &bytes);
 
-        let closed = e.on_write_result(meta.id, Err(false));
-        match sent(&closed).as_slice() {
-            [OutboundMessage::Applied(applied)] => {
-                assert_eq!(applied.result, ApplyResult::ClipboardUnavailable);
-            }
-            other => panic!("expected a typed failure verdict, got {other:?}"),
-        }
+        let closed = e.on_write_result(meta.id, Err(WriteFailure::UnsupportedType));
+        assert!(
+            !closed
+                .iter()
+                .any(|a| matches!(a, Action::ScheduleRetry { .. })),
+            "an unsupported type was retried: {closed:?}"
+        );
+        assert!(matches!(
+            sent(&closed).as_slice(),
+            [OutboundMessage::Applied(ClipboardApplied {
+                result: ApplyResult::ContentRejected,
+                ..
+            })]
+        ));
+        assert_eq!(meta.content_type, ContentType::Image(ImageFormat::Dib));
     }
 
     /// A newer local copy supersedes a chunk stream in flight: the old

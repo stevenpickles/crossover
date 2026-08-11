@@ -35,6 +35,17 @@ pub enum ClipboardError {
     /// contain clipboard contents (FR-7.4).
     #[error("clipboard unavailable: {reason}")]
     Unavailable { reason: String },
+
+    /// The backend does not handle this content *type* at all.
+    ///
+    /// Split from [`ClipboardError::Unavailable`] because the two mean
+    /// different things to the peer that sent the item: a clipboard that
+    /// is unavailable might work in a second, while a type this build
+    /// cannot represent will never work, and the origin deserves to be
+    /// told which it met (NFR-3). It is what a backend returns for a
+    /// raster image before ADR 0014's platform slice lands.
+    #[error("clipboard content type unsupported: {reason}")]
+    Unsupported { reason: String },
 }
 
 /// Raster formats a [`ClipboardContent::Image`] may carry (ADR 0014).
