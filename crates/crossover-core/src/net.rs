@@ -124,6 +124,13 @@ pub struct SessionInfo {
     pub peer_os: OsFamily,
     /// The negotiated protocol version this session speaks.
     pub protocol_version: u16,
+    /// Capabilities **both** sides advertised (docs/PROTOCOL.md §3): the
+    /// intersection of ours and the peer's, so a feature is present here
+    /// only if it can actually be used. Senders gate optional content
+    /// types on this — offering something the peer cannot decode would be
+    /// answered by silence, and a transaction with no answer is a silent
+    /// failure (NFR-3).
+    pub features: FeatureFlags,
 }
 
 /// A mutually authenticated, version-negotiated session. The only type in
@@ -432,7 +439,7 @@ async fn establish(
         device_id: local.identity.device_id(),
         device_name: local.identity.device_name().to_owned(),
         operating_system: local_os_family(),
-        supported_features: FeatureFlags::NONE,
+        supported_features: FeatureFlags::ADVERTISED,
     };
     let payload = hello.encode_payload()?;
     let frame = encode_frame(MessageType::Hello.wire(), 1, &payload)?;
@@ -482,6 +489,10 @@ async fn establish(
             peer_device_name: peer_hello.device_name,
             peer_os: peer_hello.operating_system,
             protocol_version,
+            features: FeatureFlags::negotiate(
+                FeatureFlags::ADVERTISED,
+                peer_hello.supported_features,
+            ),
         },
         metrics,
     })
@@ -636,6 +647,17 @@ mod tests {
         );
         assert_eq!(server_session.info().peer_device_name, "machine-a");
         assert_eq!(client_session.info().peer_device_id, b.identity.device_id());
+
+        // Capability negotiation is the intersection of the two Hellos
+        // (docs/PROTOCOL.md §3). Empty while this build advertises
+        // nothing; this is the assertion that starts carrying a feature
+        // the day `FeatureFlags::ADVERTISED` gains one.
+        let expected = crossover_protocol::hello::FeatureFlags::negotiate(
+            crossover_protocol::hello::FeatureFlags::ADVERTISED,
+            crossover_protocol::hello::FeatureFlags::ADVERTISED,
+        );
+        assert_eq!(client_session.info().features, expected);
+        assert_eq!(server_session.info().features, expected);
 
         // Application frames flow both ways with monotonic ids from 2.
         let id = client_session.send(0x0042, b"ping").await.unwrap();

@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crossover_protocol::clipboard::{
-    ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardAccept, ClipboardApplied, ClipboardData,
-    ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
+    ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardAccept, ClipboardApplied, ClipboardChunk,
+    ClipboardData, ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
     MAX_CLIPBOARD_TEXT_BYTES, content_hash,
 };
 use crossover_protocol::hello::MessageType;
@@ -188,6 +188,8 @@ pub enum InboundMessage {
     Decline(ClipboardDecline),
     /// Peer sends item content.
     Data(ClipboardData),
+    /// Peer sends one fragment of a chunked item (ADR 0014).
+    Chunk(ClipboardChunk),
     /// Peer reports the verdict on our item.
     Applied(ClipboardApplied),
 }
@@ -217,6 +219,9 @@ impl InboundMessage {
             }
             Some(MessageType::ClipboardData) => {
                 Some(Self::Data(ClipboardData::decode_payload(payload)?))
+            }
+            Some(MessageType::ClipboardChunk) => {
+                Some(Self::Chunk(ClipboardChunk::decode_payload(payload)?))
             }
             Some(MessageType::ClipboardApplied) => {
                 Some(Self::Applied(ClipboardApplied::decode_payload(payload)?))
@@ -403,6 +408,7 @@ impl ClipboardEngine {
             InboundMessage::Accept(accept) => self.on_peer_accept(accept.id),
             InboundMessage::Decline(decline) => self.on_peer_decline(&decline),
             InboundMessage::Data(data) => self.on_peer_data(data),
+            InboundMessage::Chunk(chunk) => Self::on_peer_chunk(&chunk),
             InboundMessage::Applied(applied) => self.on_peer_applied(&applied),
         }
     }
@@ -531,6 +537,29 @@ impl ClipboardEngine {
     }
 
     fn on_peer_offer(&mut self, offer: ClipboardOffer) -> Vec<Action> {
+        // ---- ADR 0014 placeholder: replaced by the engine slice --------
+        // The wire layer can carry chunked items (images) and prove them
+        // correct; this engine cannot yet reassemble one or hand it to a
+        // typed clipboard write, and the platform layer cannot yet read or
+        // write a raster format. Until those land, refuse *honestly*: a
+        // typed, permanent decline closes the origin's transaction at once
+        // (NFR-3), where silence would strand it. Nothing should reach
+        // here in practice — `FeatureFlags::ADVERTISED` does not offer the
+        // capability, so a conforming peer never offers such an item — so
+        // this is the answer for a peer that ignores negotiation.
+        if offer.meta.content_type.is_chunked() {
+            tracing::info!(
+                clipboard_id = %offer.meta.id,
+                content_type = ?offer.meta.content_type,
+                result = "unsupported_type",
+                "declining an offer of a type this build cannot install"
+            );
+            return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
+                id: offer.meta.id,
+                reason: DeclineReason::UnsupportedType,
+            }))];
+        }
+        // ---------------------------------------------------------------
         if let Some(reason) = self.conflict_verdict(offer.meta) {
             return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
                 id: offer.meta.id,
@@ -653,6 +682,24 @@ impl ClipboardEngine {
             id: data.meta.id,
             text,
         }]
+    }
+
+    /// A chunk arrived (ADR 0014).
+    ///
+    /// **ADR 0014 placeholder: replaced by the engine slice**, which owns
+    /// the `ChunkReassembly` this routes into. Until then no offer of a
+    /// chunked type is ever accepted, so a chunk can only be unsolicited:
+    /// log it and drop it. Deliberately not fatal — the transfer it
+    /// belongs to does not exist here, so there is nothing to stall and
+    /// nothing to acknowledge.
+    fn on_peer_chunk(chunk: &ClipboardChunk) -> Vec<Action> {
+        tracing::warn!(
+            clipboard_id = %chunk.id,
+            chunk_index = chunk.index,
+            byte_count = chunk.payload.len(),
+            "unsolicited clipboard chunk with no accepted offer; ignoring"
+        );
+        Vec::new()
     }
 
     fn on_peer_applied(&mut self, applied: &ClipboardApplied) -> Vec<Action> {
@@ -1219,6 +1266,52 @@ mod tests {
         );
         e.on_peer_message(InboundMessage::Data(inbound));
         assert_eq!(metrics.snapshot().clipboard_conflicts, 1);
+    }
+
+    /// ADR 0014 placeholder behaviour, asserted so the engine slice
+    /// deliberately replaces it rather than quietly inheriting it: a type
+    /// this build cannot install is refused with a typed, permanent
+    /// decline — never left unanswered (NFR-3), never a panic.
+    #[test]
+    fn a_chunked_offer_is_declined_as_an_unsupported_type() {
+        use crossover_protocol::clipboard::ImageFormat;
+
+        let mut e = engine(0xBB);
+        let meta = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xAA; 16]),
+            sequence: 1,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: 4096,
+            content_hash: content_hash(b"a snip"),
+        };
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        match sent(&actions).as_slice() {
+            [OutboundMessage::Decline(decline)] => {
+                assert_eq!(decline.id, meta.id);
+                assert_eq!(decline.reason, DeclineReason::UnsupportedType);
+            }
+            other => panic!("expected an UnsupportedType decline, got {other:?}"),
+        }
+    }
+
+    /// A chunk with no accepted offer behind it: nothing to reassemble,
+    /// nothing to acknowledge, and nothing to stall — it is dropped, not
+    /// applied and not fatal.
+    #[test]
+    fn an_unsolicited_chunk_is_ignored() {
+        use crossover_protocol::clipboard::ClipboardChunk;
+
+        let mut e = engine(0xBB);
+        let actions = e.on_peer_message(InboundMessage::Chunk(ClipboardChunk {
+            id: Uuid::new_v4(),
+            index: 0,
+            payload: vec![0xAB; 32],
+        }));
+        assert!(
+            actions.is_empty(),
+            "unsolicited chunk acted on: {actions:?}"
+        );
     }
 
     #[test]
