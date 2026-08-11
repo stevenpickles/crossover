@@ -27,6 +27,7 @@ use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore};
 use crate::net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionOptions, connect,
 };
+use crate::outbound::{OutboundReceiver, OutboundSender, outbound_channel};
 
 /// Bounded exponential backoff between reconnection attempts.
 #[derive(Debug, Clone)]
@@ -155,7 +156,7 @@ pub enum SessionEvent {
 
 /// The application's grip on a supervisor.
 pub struct SupervisorHandle {
-    outbound: mpsc::Sender<(u16, Vec<u8>)>,
+    outbound: OutboundSender,
     shutdown: watch::Sender<bool>,
 }
 
@@ -166,14 +167,19 @@ pub struct SupervisorGone;
 
 impl SupervisorHandle {
     /// Queue a frame for the current (or, while reconnecting, the next)
-    /// session. Queued frames flush in order once a session exists.
+    /// session, on the lane its message type belongs to (ADR 0013).
+    ///
+    /// Frames flush in order *within their class* once a session exists;
+    /// interactive frames overtake queued bulk, which is the whole point of
+    /// the split. Waiting here for room on the Background lane is expected
+    /// backpressure and never delays the High lane.
     ///
     /// # Errors
     ///
     /// [`SupervisorGone`] if the supervisor has stopped.
     pub async fn send(&self, message_type: u16, payload: Vec<u8>) -> Result<(), SupervisorGone> {
         self.outbound
-            .send((message_type, payload))
+            .send(message_type, payload)
             .await
             .map_err(|_| SupervisorGone)
     }
@@ -199,7 +205,7 @@ pub fn supervise_outbound(
     config: SupervisorConfig,
 ) -> (SupervisorHandle, mpsc::Receiver<SessionEvent>) {
     let (events_tx, events_rx) = mpsc::channel(64);
-    let (outbound_tx, outbound_rx) = mpsc::channel(64);
+    let (outbound_tx, outbound_rx) = outbound_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tokio::spawn(run_supervisor(
@@ -230,7 +236,7 @@ async fn run_supervisor(
     trust: Arc<RwLock<TrustStore>>,
     config: SupervisorConfig,
     events: mpsc::Sender<SessionEvent>,
-    mut outbound: mpsc::Receiver<(u16, Vec<u8>)>,
+    mut outbound: OutboundReceiver,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut attempt: u32 = 0;
@@ -328,12 +334,24 @@ async fn run_supervisor(
 /// keepalive timeout, forward non-control frames as events, and flush
 /// outbound frames. Returns why the session ended.
 ///
+/// This is the writer end of the prioritized send path (ADR 0013):
+/// [`OutboundReceiver::recv`] hands over everything queued High before a
+/// single Background frame, and because exactly **one** frame is written per
+/// iteration the High lane is re-checked between every pair of frames. That
+/// is what keeps the kernel send buffer shallow enough for the app-level
+/// priority to survive to the wire — queueing several bulk frames at once
+/// would put input bytes behind them where no scheduler can reach.
+///
+/// Keepalive deliberately bypasses the lanes entirely: the idle-tick `Ping`
+/// below and the `Pong` in [`dispatch_frame`] go straight to the writer,
+/// which is the strongest form of High there is.
+///
 /// Exposed so the listener side runs identical session semantics without
 /// the reconnect wrapper.
 pub async fn run_session(
     session: EstablishedSession,
     events: &mpsc::Sender<SessionEvent>,
-    outbound: &mut mpsc::Receiver<(u16, Vec<u8>)>,
+    outbound: &mut OutboundReceiver,
     shutdown: &mut watch::Receiver<bool>,
     keepalive: &KeepaliveConfig,
 ) -> DisconnectReason {
@@ -352,8 +370,13 @@ pub async fn run_session(
             }
             maybe = outbound.recv() => {
                 match maybe {
-                    Some((message_type, payload)) => {
-                        if let Err(e) = writer.send(message_type, &payload).await {
+                    Some(frame) => {
+                        let result = writer.send(frame.message_type, &frame.payload).await;
+                        // Dropping the frame returns its Background byte
+                        // budget, so the lane only refills once the bytes
+                        // are actually out of our hands.
+                        drop(frame);
+                        if let Err(e) = result {
                             break transport_reason(&e);
                         }
                     }
@@ -493,6 +516,7 @@ mod tests {
         run_session, supervise_outbound,
     };
     use crate::net::{LocalNode, SessionListener, SessionOptions};
+    use crate::outbound::outbound_channel;
 
     // --- ReconnectPolicy (pure) ---
 
@@ -742,7 +766,7 @@ mod tests {
         let (b_local, opts) = (b.local(), SessionOptions::default());
         let server_session = listener.accept(&b_local, &opts).await.unwrap();
         let (server_events_tx, mut server_events_rx) = mpsc::channel(16);
-        let (_server_out_tx, mut server_out_rx) = mpsc::channel::<(u16, Vec<u8>)>(16);
+        let (_server_out_tx, mut server_out_rx) = outbound_channel();
         let (_server_shutdown_tx, mut server_shutdown_rx) = watch::channel(false);
         let server_keepalive = KeepaliveConfig {
             interval: Duration::from_secs(2),

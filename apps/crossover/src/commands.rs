@@ -12,15 +12,17 @@ use anyhow::Context;
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
+use crossover_core::outbound::{BudgetedReceiver, budgeted_channel};
 use crossover_core::pairing::{PairingListener, pair_with};
 use crossover_core::supervision::{
     KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
 };
 use crossover_core::{
     ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
-    FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics, SeamlessInputs, SessionCommand,
-    SessionListener, SessionOptions, SyncEvent, Topology, clipboard_sync, edge_detect,
-    input_control,
+    FrameTarget, InputControlEvent, LinkSide, LocalNode, MAX_BACKGROUND_QUEUE_BYTES,
+    MAX_BACKGROUND_QUEUE_FRAMES, MAX_HIGH_QUEUE_FRAMES, Metrics, OutboundSender, SeamlessInputs,
+    SendPriority, SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology,
+    clipboard_sync, edge_detect, input_control, outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
@@ -514,9 +516,9 @@ pub async fn run(
     let registry: SessionRegistry =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    // Both drivers emit the same SessionCommands; merge them into one
-    // stream for the mux.
-    let commands = merge_command_streams(sync_commands, control_commands);
+    // Both drivers emit the same SessionCommands; merge them into the two
+    // priority lanes the mux drains independently (ADR 0013).
+    let commands = classify_command_streams(sync_commands, control_commands);
 
     // Outbound role: supervised session with automatic reconnect.
     let (handle, events) =
@@ -680,29 +682,75 @@ fn input_counts(payload: &[u8]) -> Option<(u64, u64)> {
     Some((total, keys))
 }
 
-/// Forward two `SessionCommand` streams into one, so the mux has a single
-/// receiver. The forwarders end when their drivers drop the senders.
-fn merge_command_streams(
-    mut a: mpsc::Receiver<SessionCommand>,
-    mut b: mpsc::Receiver<SessionCommand>,
-) -> mpsc::Receiver<SessionCommand> {
-    let (merged_tx, merged_rx) = mpsc::channel(64);
-    let tx_a = merged_tx.clone();
-    tokio::spawn(async move {
-        while let Some(command) = a.recv().await {
-            if tx_a.send(command).await.is_err() {
-                break;
+/// The drivers' commands, merged and split by priority class (ADR 0013).
+///
+/// Two lanes, not one queue with a tag: the mux *awaits* delivery into each
+/// session's queue, so a single task draining both classes would let one
+/// saturated Background path stall High traffic for every session — the
+/// head-of-line block moved upstream rather than removed. Each lane gets its
+/// own mux task, and only the Background one ever waits on bulk.
+struct ClassifiedCommands {
+    high: mpsc::Receiver<SessionCommand>,
+    background: BudgetedReceiver<SessionCommand>,
+}
+
+/// Which lane a driver command rides.
+///
+/// A fail-closed `TerminateSession` is High: it is a security action
+/// (docs/PROTOCOL.md §7), and putting it behind a bulk transfer would delay
+/// the response to a misbehaving peer.
+fn command_priority(command: &SessionCommand) -> SendPriority {
+    match command {
+        SessionCommand::SendFrame { message_type, .. } => SendPriority::of(*message_type),
+        SessionCommand::TerminateSession { .. } => SendPriority::High,
+    }
+}
+
+/// What a command charges against the Background lane's byte budget.
+fn command_bytes(command: &SessionCommand) -> usize {
+    match command {
+        SessionCommand::SendFrame { payload, .. } => payload.len(),
+        SessionCommand::TerminateSession { .. } => 0,
+    }
+}
+
+/// Fold both drivers' `SessionCommand` streams into one High lane and one
+/// Background lane, classifying each command as it passes. Each forwarder
+/// ends when its driver drops the sender.
+///
+/// A driver blocked here is correct backpressure: the clipboard driver's
+/// output is entirely Background, so it is the one that waits, and the
+/// control driver — whose output is entirely High — never does.
+fn classify_command_streams(
+    a: mpsc::Receiver<SessionCommand>,
+    b: mpsc::Receiver<SessionCommand>,
+) -> ClassifiedCommands {
+    let (high_tx, high_rx) = mpsc::channel(MAX_HIGH_QUEUE_FRAMES);
+    let (background_tx, background_rx) =
+        budgeted_channel(MAX_BACKGROUND_QUEUE_FRAMES, MAX_BACKGROUND_QUEUE_BYTES);
+    for source in [a, b] {
+        let high = high_tx.clone();
+        let background = background_tx.clone();
+        tokio::spawn(async move {
+            let mut source = source;
+            while let Some(command) = source.recv().await {
+                let delivered = match command_priority(&command) {
+                    SendPriority::High => high.send(command).await.is_ok(),
+                    SendPriority::Background => {
+                        let bytes = command_bytes(&command);
+                        background.send(command, bytes).await.is_ok()
+                    }
+                };
+                if !delivered {
+                    break;
+                }
             }
-        }
-    });
-    tokio::spawn(async move {
-        while let Some(command) = b.recv().await {
-            if merged_tx.send(command).await.is_err() {
-                break;
-            }
-        }
-    });
-    merged_rx
+        });
+    }
+    ClassifiedCommands {
+        high: high_rx,
+        background: background_rx,
+    }
 }
 
 /// Build the seamless wiring for a `--left`/`--right` run (ADR 0009): the
@@ -936,10 +984,14 @@ struct SessionRoute {
 
 /// Where a session's outbound frames go. Cloned out from under the
 /// registry lock before any `.await`, so sends never hold it.
+///
+/// Both variants classify the frame into the session's High/Background
+/// lanes on the way in (ADR 0013), so the priority split survives this hop
+/// as well as the mux's.
 #[derive(Clone)]
 enum FrameSink {
     /// An accepted inbound session: frames queue to its writer task.
-    Inbound(mpsc::Sender<(u16, Vec<u8>)>),
+    Inbound(OutboundSender),
     /// The supervised outbound session: frames go through the handle,
     /// which targets whatever session is currently established.
     Outbound(Arc<crossover_core::supervision::SupervisorHandle>),
@@ -949,7 +1001,7 @@ impl FrameSink {
     async fn deliver(&self, message_type: u16, payload: Vec<u8>) {
         match self {
             Self::Inbound(tx) => {
-                let _ = tx.send((message_type, payload)).await;
+                let _ = tx.send(message_type, payload).await;
             }
             Self::Outbound(handle) => {
                 let _ = handle.send(message_type, payload).await;
@@ -1036,82 +1088,107 @@ async fn enforce_revocations(storage: &Arc<dyn SecureStorage>, registry: &Sessio
 /// frames broadcast (FR-5.4). Fail-closed terminations kill the named
 /// session where it can be killed — the supervised outbound session has
 /// no per-session kill, an accepted limitation logged when it bites.
+///
+/// **One task per priority lane** (ADR 0013). Delivery into a session's
+/// queue is awaited, so a saturated Background path parks its own task
+/// indefinitely; the High task shares nothing with it and keeps running.
 fn spawn_command_mux(
     registry: SessionRegistry,
-    mut commands: mpsc::Receiver<SessionCommand>,
+    commands: ClassifiedCommands,
     metrics: Option<Arc<Metrics>>,
 ) {
+    let ClassifiedCommands {
+        mut high,
+        mut background,
+    } = commands;
+
+    let high_registry = Arc::clone(&registry);
+    let high_metrics = metrics.clone();
     tokio::spawn(async move {
-        while let Some(command) = commands.recv().await {
-            match command {
-                SessionCommand::SendFrame {
-                    target,
-                    message_type,
-                    payload,
-                } => {
-                    // Count input events forwarded to the peer as they pass
-                    // through the one place every outbound frame does.
-                    if message_type == MessageType::InputBatch.wire()
-                        && let Some(metrics) = &metrics
-                        && let Some((total, keys)) = input_counts(&payload)
-                    {
-                        metrics.record_input_sent(total, keys);
-                    }
-                    // Collect matching sinks under the lock, then send
-                    // after releasing it (never hold a std Mutex over an
-                    // await).
-                    let sinks: Vec<FrameSink> = {
-                        let routes = registry_lock(&registry);
-                        match target {
-                            FrameTarget::Broadcast => {
-                                routes.values().map(|r| r.sink.clone()).collect()
-                            }
-                            FrameTarget::Session(id) => routes
-                                .get(&id)
-                                .map(|r| r.sink.clone())
-                                .into_iter()
-                                .collect(),
-                        }
-                    };
-                    for sink in sinks {
-                        sink.deliver(message_type, payload.clone()).await;
+        while let Some(command) = high.recv().await {
+            dispatch_command(&high_registry, high_metrics.as_ref(), &command).await;
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(command) = background.recv().await {
+            dispatch_command(&registry, metrics.as_ref(), &command).await;
+            // The command's byte budget returns here, once it has been
+            // handed to every sink — not merely dequeued.
+            drop(command);
+        }
+    });
+}
+
+/// Execute one driver command against the live sessions. Shared by both
+/// mux lanes; the lane decides *when* it runs, never *what* it does.
+async fn dispatch_command(
+    registry: &SessionRegistry,
+    metrics: Option<&Arc<Metrics>>,
+    command: &SessionCommand,
+) {
+    match command {
+        SessionCommand::SendFrame {
+            target,
+            message_type,
+            payload,
+        } => {
+            // Count input events forwarded to the peer as they pass
+            // through the one place every outbound frame does.
+            if *message_type == MessageType::InputBatch.wire()
+                && let Some(metrics) = metrics
+                && let Some((total, keys)) = input_counts(payload)
+            {
+                metrics.record_input_sent(total, keys);
+            }
+            // Collect matching sinks under the lock, then send
+            // after releasing it (never hold a std Mutex over an
+            // await).
+            let sinks: Vec<FrameSink> = {
+                let routes = registry_lock(registry);
+                match target {
+                    FrameTarget::Broadcast => routes.values().map(|r| r.sink.clone()).collect(),
+                    FrameTarget::Session(id) => {
+                        routes.get(id).map(|r| r.sink.clone()).into_iter().collect()
                     }
                 }
-                SessionCommand::TerminateSession { target, reason } => {
-                    let kills: Vec<watch::Sender<bool>> = {
-                        let routes = registry_lock(&registry);
-                        match target {
-                            FrameTarget::Broadcast => {
-                                routes.values().filter_map(|r| r.kill.clone()).collect()
-                            }
-                            FrameTarget::Session(id) => routes
-                                .get(&id)
-                                .and_then(|r| r.kill.clone())
-                                .into_iter()
-                                .collect(),
-                        }
-                    };
-                    if kills.is_empty() {
-                        // No killable route: either the session already
-                        // ended, or it is the outbound session the
-                        // supervisor cannot kill per-session. Fail-closed
-                        // still holds — the driver emitted Terminate
-                        // instead of injecting — but say so (NFR-3).
-                        tracing::warn!(
-                            error = %reason,
-                            ?target,
-                            "payload violation with no killable session route"
-                        );
-                    } else {
-                        tracing::error!(error = %reason, ?target, "terminating session on violation");
-                        for kill in kills {
-                            let _ = kill.send(true);
-                        }
+            };
+            for sink in sinks {
+                sink.deliver(*message_type, payload.clone()).await;
+            }
+        }
+        SessionCommand::TerminateSession { target, reason } => {
+            let kills: Vec<watch::Sender<bool>> = {
+                let routes = registry_lock(registry);
+                match target {
+                    FrameTarget::Broadcast => {
+                        routes.values().filter_map(|r| r.kill.clone()).collect()
                     }
+                    FrameTarget::Session(id) => routes
+                        .get(id)
+                        .and_then(|r| r.kill.clone())
+                        .into_iter()
+                        .collect(),
+                }
+            };
+            if kills.is_empty() {
+                // No killable route: either the session already
+                // ended, or it is the outbound session the
+                // supervisor cannot kill per-session. Fail-closed
+                // still holds — the driver emitted Terminate
+                // instead of injecting — but say so (NFR-3).
+                tracing::warn!(
+                    error = %reason,
+                    ?target,
+                    "payload violation with no killable session route"
+                );
+            } else {
+                tracing::error!(error = %reason, ?target, "terminating session on violation");
+                for kill in kills {
+                    let _ = kill.send(true);
                 }
             }
         }
-    });
+    }
 }
 
 async fn listener_loop(
@@ -1159,7 +1236,7 @@ async fn listener_loop(
                 let established_at = Instant::now();
 
                 let (events_tx, mut events_rx) = mpsc::channel(64);
-                let (outbound_tx, mut outbound_rx) = mpsc::channel::<(u16, Vec<u8>)>(64);
+                let (outbound_tx, mut outbound_rx) = outbound_channel();
                 let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
                 let session_id = info.session_id;
                 registry_lock(registry).insert(

@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crossover_core::supervision::{KeepaliveConfig, SessionEvent, run_session};
 use crossover_core::{
-    ClipboardConfig, ClipboardRetryPolicy, LocalNode, SessionCommand, SessionListener,
-    SessionOptions, SyncEvent, clipboard_sync,
+    ClipboardConfig, ClipboardRetryPolicy, LocalNode, OutboundSender, SessionCommand,
+    SessionListener, SessionOptions, SyncEvent, clipboard_sync, outbound_channel,
 };
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::{ClipboardFailure, ClipboardOp, InMemoryClipboard};
@@ -29,7 +29,7 @@ use crossover_test_peer::{TestConnection, TestNode};
 struct AppSide {
     clipboard: Arc<InMemoryClipboard>,
     /// Send frames as if another subsystem wanted the session (unused).
-    _session_outbound: mpsc::Sender<(u16, Vec<u8>)>,
+    _session_outbound: OutboundSender,
     _shutdown: watch::Sender<bool>,
 }
 
@@ -51,7 +51,7 @@ fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
     tokio::spawn(driver.run());
 
     let (session_events_tx, mut session_events_rx) = mpsc::channel(64);
-    let (session_outbound_tx, mut session_outbound_rx) = mpsc::channel::<(u16, Vec<u8>)>(64);
+    let (session_outbound_tx, mut session_outbound_rx) = outbound_channel();
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     // Session task: accept once, run the shared session loop.
@@ -97,7 +97,7 @@ fn spawn_app_side(listener: SessionListener, node: TestNode) -> AppSide {
                 },
                 maybe = sync_commands.recv() => match maybe {
                     Some(SessionCommand::SendFrame { message_type, payload, .. }) => {
-                        let _ = outbound_for_glue.send((message_type, payload)).await;
+                        let _ = outbound_for_glue.send(message_type, payload).await;
                     }
                     Some(SessionCommand::TerminateSession { reason, .. }) => {
                         panic!("unexpected session termination: {reason}");
