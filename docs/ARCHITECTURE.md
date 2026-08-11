@@ -215,14 +215,32 @@ the clipboard only latency — which SPECIFICATION.md §2 never ranks above
 input. `TerminateSession`, the fail-closed kill, is High: it is a security
 action and must not queue behind a transfer.
 
-**The split spans every hop, not just the last one.** Each driver's
-`SessionCommand` stream is classified where the streams merge; from there
-High and Background are separate queues, drained by **separate mux tasks**,
-into **separate per-session lanes**, to the writer. This is not decoration:
-the mux *awaits* delivery into a session's queue, so one task draining both
-classes would let a saturated Background path stall input for every
-session — the head-of-line block moved upstream rather than removed. No
-Background backpressure at any hop can delay a High frame.
+**The split spans every hop, and starts at the driver.** Each driver emits
+into its *own* High/Background pair (`command_lanes`); the mux merges those
+with one task per source lane; each session has its own pair again, drained
+by the writer. Every queue on the path is single-class from end to end.
+
+That is not decoration, and a partial split does not work:
+
+- The mux *awaits* delivery into a session's queue, so one task draining both
+  classes would let a saturated Background path stall input for **every**
+  session — the head-of-line block moved upstream rather than removed.
+- A driver emitting into one mixed queue is worse still. A forwarder reading
+  that queue handles the two classes in sequence, so while it is parked
+  handing a bulk command downstream it cannot pick up that driver's next High
+  command; and the mixed queue itself fills with bulk, burying anything
+  behind it. Concretely: a peer stops reading its socket until the lanes
+  fill, then sends a malformed clipboard payload — and the fail-closed
+  `TerminateSession` that payload must trigger never reaches the session.
+  Refusing to read would have bought that peer immunity from PROTOCOL.md §7.
+
+So: **no Background backpressure anywhere on the path can delay a High frame
+in transit.** One honest limit remains, upstream of the path: a driver is a
+serial event loop, and a driver parked on Background backpressure is not
+emitting *anything* until it drains — its own High commands included. That
+is correct backpressure (it is how the wire tells the clipboard engine to
+stop producing) and it is bounded, because a peer that accepts no data ends
+the session by the write budget below rather than stalling indefinitely.
 
 **Drain policy: strict High-first, no aging.** The writer takes everything
 queued High before a *single* Background frame, then re-checks High. Because
@@ -242,16 +260,31 @@ on, not a policy to pre-empt.
 cross-class reordering is the only thing prioritization changes
 ([PROTOCOL.md](PROTOCOL.md) §4). Nothing is discarded to keep up.
 
-**Bounds** (NFR-1) are named constants in `crossover-core::outbound`. The
-High lane is bounded by message count (`MAX_HIGH_QUEUE_FRAMES` = 64;
-interactive frames are tens of bytes). The Background lane is bounded by
-**bytes** as well as messages (`MAX_BACKGROUND_QUEUE_BYTES` = 8 MiB,
-`MAX_BACKGROUND_QUEUE_FRAMES` = 64) — sixty-four queued maximum-size
-clipboard frames would be a quarter-gigabyte commitment per hop. The byte
-budget is held until a frame has been *written*, not merely dequeued, and a
-frame larger than the whole budget still passes on an empty lane rather than
-deadlocking. Producers block on these bounds; that backpressure is the
-design, and it never crosses into the High lane.
+**Bounds** (NFR-1) are named constants in `crossover-core::outbound`, and the
+same pair applies at every hop. The High lane is bounded by message count
+(`MAX_HIGH_QUEUE_FRAMES` = 64; interactive frames are tens of bytes). The
+Background lane is bounded by **bytes** as well as messages
+(`MAX_BACKGROUND_QUEUE_BYTES` = 8 MiB, `MAX_BACKGROUND_QUEUE_FRAMES` = 64) —
+sixty-four queued maximum-size clipboard frames would be a
+quarter-gigabyte commitment *per hop*. The byte budget is held until an item
+has been passed on, not merely dequeued, and a frame larger than the whole
+budget still passes on an empty lane rather than deadlocking on permits that
+cannot exist. Producers block on these bounds; that backpressure is the
+design, and it never crosses into the High lane. Dropping the receiving end
+closes the budget, so a producer parked on it unwinds at teardown instead of
+waiting for a permit the departed writer still holds.
+
+**Every write is bounded.** The writer sends inside a `select!` branch body,
+so while a write is pending the session loop polls neither the reader nor
+the keepalive tick. Against a peer that stops reading its socket, an
+unbounded write would park forever and freeze the idle clock with it: the
+keepalive timeout could never fire, the session would never disconnect, and
+the `ReleaseAllInput` a disconnect triggers would never run — held keys stay
+held (FR-4.4). Every write therefore carries a budget of the keepalive
+timeout, and expiry ends the session as a transport failure, fail-closed,
+for supervision to retry. The polite TLS shutdown on the way out is bounded
+too, for the same reason: it has to flush, and the commonest reason to be
+closing is a peer that stopped reading.
 
 Keepalive never enters the queues at all: `run_session` writes `Ping`
 straight to the writer on its idle tick and answers `Pong` from the dispatch
