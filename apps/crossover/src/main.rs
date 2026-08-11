@@ -152,6 +152,23 @@ async fn main() -> anyhow::Result<()> {
         "starting"
     );
 
+    let outcome = dispatch(cli).await;
+    // Record a fatal error in the log too. For a headless service-launched
+    // worker, stderr goes to NUL (ADR 0011), so without this a startup failure
+    // (e.g. no role from a missing config) is invisible behind the relaunch
+    // loop — you see that it restarts, never why. `{error:#}` includes the full
+    // anyhow cause chain; the error is still returned, so the exit code and the
+    // interactive stderr message are unchanged.
+    if let Err(error) = &outcome {
+        tracing::error!(error = format!("{error:#}"), "command failed");
+    }
+    outcome
+}
+
+/// Route the parsed command to its handler. Separate from `main` so every
+/// failure path — including a `?` or `bail!` inside an arm — returns here and is
+/// logged, not only the errors an arm yields as its value.
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Run(args) => {
             // Merge CLI flags over the startup config file: a flag present on
@@ -166,6 +183,15 @@ async fn main() -> anyhow::Result<()> {
                 right: args.right,
                 no_cursor_mask: args.no_cursor_mask,
             });
+            // Log the resolved role up front so a headless worker's log shows
+            // what it is trying to do (listen/dial/side), not just that it
+            // started — the fastest read on a "not connecting" soak.
+            tracing::info!(
+                listen = effective.listen,
+                connect = ?effective.connect,
+                side = ?effective.side,
+                "run configuration",
+            );
             if !effective.listen && effective.connect.is_none() {
                 anyhow::bail!(
                     "`crossover run` needs a role: --listen (or `listen = true` in \
