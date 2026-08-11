@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
-use crossover_core::supervision::{KeepaliveConfig, run_session};
+use crossover_core::supervision::{DisconnectReason, KeepaliveConfig, run_session};
 use crossover_core::{
     LocalNode, MAX_BACKGROUND_QUEUE_FRAMES, OutboundSender, SessionListener, SessionOptions,
 };
@@ -43,10 +43,26 @@ const MAX_BULK_FRAMES: usize = 512;
 /// `OutboundReceiver` → `SessionWriter`.
 struct AppSide {
     outbound: OutboundSender,
+    /// The session loop, so a test can wait for the reason it ended.
+    session: tokio::task::JoinHandle<DisconnectReason>,
     _shutdown: watch::Sender<bool>,
 }
 
+/// A generous keepalive: most of this suite deliberately stalls the writer,
+/// and a deliberate stall must not be mistaken for a dead peer. The one test
+/// that *wants* the stall detected passes its own short config.
+fn patient_keepalive() -> KeepaliveConfig {
+    KeepaliveConfig {
+        interval: Duration::from_secs(30),
+        timeout: Duration::from_mins(2),
+    }
+}
+
 async fn connected_pair() -> (AppSide, TestConnection) {
+    connected_pair_with(patient_keepalive()).await
+}
+
+async fn connected_pair_with(keepalive: KeepaliveConfig) -> (AppSide, TestConnection) {
     let mut app = TestNode::generate("app").unwrap();
     let mut peer = TestNode::generate("scripted-peer").unwrap();
     app.trust(&peer).unwrap();
@@ -59,14 +75,8 @@ async fn connected_pair() -> (AppSide, TestConnection) {
     let (events_tx, mut events_rx) = mpsc::channel(64);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
-    // A generous keepalive: this suite deliberately stalls the writer, and
-    // a stalled writer must not be mistaken for a dead peer.
-    let keepalive = KeepaliveConfig {
-        interval: Duration::from_secs(30),
-        timeout: Duration::from_mins(2),
-    };
     tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
-    tokio::spawn(async move {
+    let session = tokio::spawn(async move {
         let (identity, certified, trust) = (app.identity, app.certified, app.trust);
         let local = LocalNode {
             identity: &identity,
@@ -94,6 +104,7 @@ async fn connected_pair() -> (AppSide, TestConnection) {
     (
         AppSide {
             outbound: outbound_tx,
+            session,
             _shutdown: shutdown_tx,
         },
         conn,
@@ -154,6 +165,43 @@ async fn drain_frames(conn: &mut TestConnection, expected: usize) -> Vec<u16> {
     seen
 }
 
+/// A peer that simply stops reading must not be able to hold the session
+/// open forever.
+///
+/// The write runs as a `select!` branch *body*, so while it is stalled the
+/// loop polls neither the reader nor the keepalive tick — an unbounded write
+/// would freeze the idle clock along with it, and a session that never
+/// disconnects never runs the release-all-input that a disconnect triggers.
+/// That is the stuck-key defect with a hostile peer in place of a crash.
+///
+/// The assertion is on the *reason*, not the timing: the session must end
+/// itself, fail-closed, rather than wait for a peer that is not coming back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_stops_reading_cannot_suppress_disconnect_detection() {
+    // Short enough that the test is quick, long enough to be a real stall.
+    let (app, _conn) = connected_pair_with(KeepaliveConfig {
+        interval: Duration::from_millis(200),
+        timeout: Duration::from_secs(1),
+    })
+    .await;
+
+    // The peer never reads a byte from here on; push until the writer is
+    // stuck mid-frame with a full socket behind it.
+    let _bulk = saturate_background(&app).await;
+
+    let reason = timeout(Duration::from_secs(30), app.session)
+        .await
+        .expect("the session never noticed a peer that stopped reading")
+        .expect("the session task panicked");
+    assert!(
+        matches!(
+            reason,
+            DisconnectReason::Transport { .. } | DisconnectReason::KeepaliveTimeout
+        ),
+        "expected a fail-closed end to a stalled session, got {reason:?}"
+    );
+}
+
 /// The headline guarantee: with the whole background path saturated and the
 /// socket stalled, an input batch handed over *after* the backlog still
 /// reaches the wire ahead of that backlog.
@@ -163,6 +211,12 @@ async fn drain_frames(conn: &mut TestConnection, expected: usize) -> Vec<u16> {
 /// still queued must follow it — so at least a full Background lane's worth
 /// of bulk has to arrive *after* the input batch. Nothing is dropped: every
 /// accepted bulk frame is accounted for.
+///
+/// The `bulk_before` count is whatever the OS chose to buffer, so the
+/// assertion deliberately says nothing about it. A platform with very large
+/// autotuned loopback buffers could swallow more than a full lane before the
+/// producer is refused; that would fail here loudly rather than silently
+/// weaken the guarantee, which is the right way round.
 #[tokio::test(flavor = "multi_thread")]
 async fn input_preempts_a_saturating_background_transfer() {
     let (app, mut conn) = connected_pair().await;

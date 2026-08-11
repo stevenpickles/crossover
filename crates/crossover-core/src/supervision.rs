@@ -75,6 +75,12 @@ impl ReconnectPolicy {
     }
 }
 
+/// How long the polite TLS shutdown at the end of a session may take before
+/// the socket is simply dropped. Short by design: the session is already
+/// over and its diagnostic already decided, so this buys tidiness, not
+/// correctness, and must never hold a task open (NFR-1).
+const GRACEFUL_CLOSE_BUDGET: Duration = Duration::from_secs(1);
+
 /// Keepalive tuning for an established session.
 #[derive(Debug, Clone)]
 pub struct KeepaliveConfig {
@@ -371,13 +377,19 @@ pub async fn run_session(
             maybe = outbound.recv() => {
                 match maybe {
                     Some(frame) => {
-                        let result = writer.send(frame.message_type, &frame.payload).await;
+                        let result = write_bounded(
+                            &mut writer,
+                            frame.message_type,
+                            &frame.payload,
+                            keepalive.timeout,
+                        )
+                        .await;
                         // Dropping the frame returns its Background byte
                         // budget, so the lane only refills once the bytes
                         // are actually out of our hands.
                         drop(frame);
-                        if let Err(e) = result {
-                            break transport_reason(&e);
+                        if let Err(reason) = result {
+                            break reason;
                         }
                     }
                     // All senders gone: treat as local shutdown.
@@ -388,7 +400,9 @@ pub async fn run_session(
                 match received {
                     Ok(frame) => {
                         last_rx = Instant::now();
-                        if let Some(reason) = dispatch_frame(frame, &mut writer, events).await {
+                        if let Some(reason) =
+                            dispatch_frame(frame, &mut writer, events, keepalive.timeout).await
+                        {
                             break reason;
                         }
                     }
@@ -407,16 +421,26 @@ pub async fn run_session(
                     break DisconnectReason::KeepaliveTimeout;
                 }
                 if idle >= keepalive.interval
-                    && let Err(e) = writer.send(MessageType::Ping.wire(), &[]).await
+                    && let Err(reason) = write_bounded(
+                        &mut writer,
+                        MessageType::Ping.wire(),
+                        &[],
+                        keepalive.timeout,
+                    )
+                    .await
                 {
-                    break transport_reason(&e);
+                    break reason;
                 }
             }
         }
     };
 
-    // Best-effort graceful close; the reason above is the diagnostic.
-    let _ = writer.close().await;
+    // Best-effort graceful close — and bounded, because "best effort" has to
+    // mean it can fail. A TLS shutdown has to flush, and the commonest reason
+    // to be here is a peer that stopped reading, so an unbounded close would
+    // hang on exactly the sessions that most need to end. The reason above is
+    // already decided; this only tidies the socket.
+    let _ = tokio::time::timeout(GRACEFUL_CLOSE_BUDGET, writer.close()).await;
     match &reason {
         DisconnectReason::ShutdownRequested => {
             tracing::info!(session_id = %session_id, state = "closed", "session shut down");
@@ -433,12 +457,52 @@ pub async fn run_session(
     reason
 }
 
+/// Write one frame, giving up if it cannot complete inside `budget`.
+///
+/// The write runs as the body of a `select!` branch, so while it is pending
+/// the session loop polls nothing else — not the reader, not the keepalive
+/// tick. A peer that stops reading its socket therefore stalls the write
+/// once the kernel buffers fill, and an *unbounded* write would freeze
+/// `last_rx` with it: the keepalive timeout could never fire, the session
+/// would never disconnect, and the release-all-input that a disconnect
+/// triggers would never run. A hostile peer would hold input hostage by
+/// doing nothing at all.
+///
+/// Bounding it makes that state terminal instead. The budget is the
+/// keepalive timeout, because the two failures are the same one seen from
+/// either end — a peer that has not taken a byte in that long is gone
+/// whether or not it is still answering — and reusing it means one knob,
+/// not two. Expiry is fail-closed: the session ends, supervision reconnects
+/// (FR-6.2), and input is released.
+///
+/// This matters more as bulk grows: ADR 0014's chunking keeps individual
+/// writes small, but the *stall* is a property of the peer, not the frame.
+async fn write_bounded(
+    writer: &mut crate::net::SessionWriter,
+    message_type: u16,
+    payload: &[u8],
+    budget: Duration,
+) -> Result<(), DisconnectReason> {
+    match tokio::time::timeout(budget, writer.send(message_type, payload)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(transport_reason(&error)),
+        Err(_) => Err(DisconnectReason::Transport {
+            reason: format!(
+                "peer accepted no data for {}s: the write stalled, so the session is \
+                 unusable and is failing closed",
+                budget.as_secs_f32()
+            ),
+        }),
+    }
+}
+
 /// Dispatch one inbound frame: control messages are handled here, app
 /// frames become events. `Some(reason)` ends the session.
 async fn dispatch_frame(
     frame: crossover_protocol::RawFrame,
     writer: &mut crate::net::SessionWriter,
     events: &mpsc::Sender<SessionEvent>,
+    write_budget: Duration,
 ) -> Option<DisconnectReason> {
     let violation = |reason: &str| {
         Some(DisconnectReason::ProtocolViolation {
@@ -450,10 +514,11 @@ async fn dispatch_frame(
             if !frame.payload.is_empty() {
                 return violation("Ping with non-empty payload");
             }
-            match writer.send(MessageType::Pong.wire(), &[]).await {
-                Ok(_) => None,
-                Err(e) => Some(transport_reason(&e)),
-            }
+            // Bounded like every other write: answering a Ping must not be
+            // the thing that wedges the loop.
+            write_bounded(writer, MessageType::Pong.wire(), &[], write_budget)
+                .await
+                .err()
         }
         Some(MessageType::Pong) => {
             if frame.payload.is_empty() {
