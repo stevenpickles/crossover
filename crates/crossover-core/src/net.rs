@@ -106,6 +106,26 @@ pub enum SessionError {
     /// impossible by configuration, rejected anyway (fail closed).
     #[error("peer presented no certificate after mutual TLS")]
     MissingPeerCertificate,
+
+    /// A frame was refused **locally, before any bytes reached the
+    /// socket**: it needs a capability this session did not negotiate
+    /// (docs/PROTOCOL.md §3.1).
+    ///
+    /// Not a peer fault and not a transport failure — the session is
+    /// healthy and continues; only this frame does not travel. It is a
+    /// *local* bug (something tried to send content the peer never said
+    /// it could take), and the reason it fails here rather than at the
+    /// call site is that unknown payload enum discriminants are fatal to
+    /// a peer that predates them: sending one would kill an older peer's
+    /// session, which is precisely what the negotiation exists to
+    /// prevent.
+    #[error("refused to send message type {message_type} unnegotiated for this session: {reason}")]
+    FeatureNotNegotiated {
+        /// The wire message type refused.
+        message_type: u16,
+        /// What the frame needed and did not have.
+        reason: String,
+    },
 }
 
 /// Facts about an established session, fixed at establishment.
@@ -143,6 +163,35 @@ pub struct EstablishedSession {
     metrics: Option<Arc<Metrics>>,
 }
 
+/// The send-path gate (docs/PROTOCOL.md §3.1): refuse anything this
+/// session has not negotiated, **before** it reaches the socket.
+///
+/// Deliberately here, at the one place every application frame passes on
+/// its way to the wire, rather than at the call sites that build
+/// messages. Call-site checks are checks a future caller can forget; this
+/// one cannot be bypassed, so a subsystem that gains an optional content
+/// type inherits the guarantee instead of having to re-earn it.
+///
+/// The rule it enforces matters because §2's forward-compatibility is
+/// asymmetric: an unknown *message type* is skipped, but an unknown
+/// payload enum discriminant is a decode failure, and a decode failure is
+/// session-fatal. Offering an un-negotiated content type would therefore
+/// not merely go unanswered — it would kill the peer's session.
+fn gate_outbound(
+    features: FeatureFlags,
+    message_type: u16,
+    payload: &[u8],
+) -> Result<(), SessionError> {
+    let required = crossover_protocol::clipboard::required_feature_for_frame(message_type, payload);
+    if features.contains(required) {
+        return Ok(());
+    }
+    Err(SessionError::FeatureNotNegotiated {
+        message_type,
+        reason: format!("peer never advertised the capability this frame needs ({required:?})"),
+    })
+}
+
 /// On-wire byte length of a frame carrying `payload_len` payload bytes:
 /// the length prefix and body header plus the payload (docs/PROTOCOL.md
 /// §2). Used to count received frames, where the encoded frame is not in
@@ -162,9 +211,13 @@ impl EstablishedSession {
     ///
     /// # Errors
     ///
-    /// [`SessionError::Protocol`] if the payload exceeds frame bounds;
-    /// [`SessionError::Io`] on transport failure.
+    /// [`SessionError::FeatureNotNegotiated`] if the frame needs a
+    /// capability this session did not negotiate — refused locally,
+    /// nothing sent, session unharmed; [`SessionError::Protocol`] if the
+    /// payload exceeds frame bounds; [`SessionError::Io`] on transport
+    /// failure.
     pub async fn send(&mut self, message_type: u16, payload: &[u8]) -> Result<u64, SessionError> {
+        gate_outbound(self.info.features, message_type, payload)?;
         let message_id = self.next_message_id;
         let frame = encode_frame(message_type, message_id, payload)?;
         self.stream.write_all(&frame).await?;
@@ -275,6 +328,7 @@ impl SessionWriter {
     ///
     /// As [`EstablishedSession::send`].
     pub async fn send(&mut self, message_type: u16, payload: &[u8]) -> Result<u64, SessionError> {
+        gate_outbound(self.info.features, message_type, payload)?;
         let message_id = self.next_message_id;
         let frame = encode_frame(message_type, message_id, payload)?;
         self.write.write_all(&frame).await?;
@@ -725,6 +779,161 @@ mod tests {
         // Counted bytes include the framing overhead (length prefix + body
         // header), so they exceed the bare payloads on every frame.
         assert!(report.bytes_received > report.frames_received * 4);
+    }
+
+    /// The gate, at the wire (docs/PROTOCOL.md §3.1). An un-negotiated
+    /// content type must never leave this machine: a peer that predates
+    /// the type cannot *skip* it — an unknown payload discriminant is a
+    /// decode failure and a decode failure is session-fatal — so sending
+    /// one would kill a healthy peer's session. Text, needing no
+    /// capability, is untouched by the check.
+    #[tokio::test]
+    async fn unnegotiated_content_is_refused_before_it_reaches_the_wire() {
+        use std::time::Duration as StdDuration;
+
+        use crossover_protocol::clipboard::{
+            ClipboardData, ClipboardMeta, ClipboardOffer, ContentType, ImageFormat, content_hash,
+        };
+        use crossover_protocol::hello::MessageType;
+
+        let mut a = Node::new("machine-a");
+        let mut b = Node::new("machine-b");
+        a.trust_peer(&b);
+        b.trust_peer(&a);
+
+        let listener = SessionListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (a_local, b_local, opts) = (a.local(), b.local(), options());
+        let (inbound, outbound) = tokio::join!(
+            listener.accept(&b_local, &opts),
+            connect(addr, &a_local, &opts),
+        );
+        let mut server = inbound.unwrap();
+        let mut client = outbound.unwrap();
+
+        // Neither side advertised CHUNKED_CLIPBOARD, so an image offer is
+        // refused locally — a typed error, not a transport failure.
+        let image = ClipboardOffer {
+            meta: ClipboardMeta {
+                id: uuid::Uuid::from_bytes([0x11; 16]),
+                origin: uuid::Uuid::from_bytes([0x22; 16]),
+                sequence: 0,
+                content_type: ContentType::Image(ImageFormat::Dib),
+                content_length: 4096,
+                content_hash: content_hash(b"a snip"),
+            },
+        };
+        assert!(matches!(
+            client
+                .send(
+                    MessageType::ClipboardOffer.wire(),
+                    &image.encode_payload().unwrap()
+                )
+                .await,
+            Err(SessionError::FeatureNotNegotiated { .. })
+        ));
+        // A chunk is refused on its message type alone.
+        assert!(matches!(
+            client
+                .send(MessageType::ClipboardChunk.wire(), b"anything")
+                .await,
+            Err(SessionError::FeatureNotNegotiated { .. })
+        ));
+
+        // Text is base protocol: it travels, and it is the *first* thing
+        // the peer sees — proof that nothing above reached the wire.
+        let text = ClipboardData::from_content(
+            uuid::Uuid::from_bytes([0x33; 16]),
+            uuid::Uuid::from_bytes([0x22; 16]),
+            1,
+            ContentType::Utf8Text,
+            b"plain text still flows".to_vec(),
+        );
+        client
+            .send(
+                MessageType::ClipboardData.wire(),
+                &text.encode_payload().unwrap(),
+            )
+            .await
+            .expect("base-protocol content must not be gated");
+
+        let frame = tokio::time::timeout(StdDuration::from_secs(5), server.recv())
+            .await
+            .expect("the text frame never arrived")
+            .unwrap();
+        assert_eq!(frame.message_type, MessageType::ClipboardData.wire());
+        assert_eq!(
+            ClipboardData::decode_payload(&frame.payload).unwrap(),
+            text,
+            "the refused frames must not have preceded it on the wire"
+        );
+
+        // The session survived both refusals.
+        client.send(0x0042, b"still alive").await.unwrap();
+        let frame = server.recv().await.unwrap();
+        assert_eq!(frame.payload, b"still alive");
+    }
+
+    /// The gate's decision table, without sockets.
+    #[test]
+    fn the_send_gate_classifies_frames_from_the_payload_prefix_alone() {
+        use crossover_protocol::clipboard::{ClipboardData, ContentType};
+        use crossover_protocol::hello::{FeatureFlags, MessageType};
+
+        let text = ClipboardData::from_content(
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            0,
+            ContentType::Utf8Text,
+            b"hello".to_vec(),
+        )
+        .encode_payload()
+        .unwrap();
+
+        // Base protocol passes with no capability at all.
+        assert!(
+            super::gate_outbound(FeatureFlags::NONE, MessageType::ClipboardData.wire(), &text)
+                .is_ok()
+        );
+        assert!(
+            super::gate_outbound(FeatureFlags::NONE, MessageType::InputBatch.wire(), b"x").is_ok()
+        );
+        // Chunks need the bit, and get through once it is negotiated.
+        assert!(matches!(
+            super::gate_outbound(FeatureFlags::NONE, MessageType::ClipboardChunk.wire(), b"x"),
+            Err(SessionError::FeatureNotNegotiated { .. })
+        ));
+        assert!(
+            super::gate_outbound(
+                FeatureFlags::CHUNKED_CLIPBOARD,
+                MessageType::ClipboardChunk.wire(),
+                b"x"
+            )
+            .is_ok()
+        );
+        // Bytes that are not a decodable clipboard item claim no
+        // capability: the peer cannot read them as a typed item either,
+        // so they can carry no un-negotiated content type. Transport-level
+        // traffic (the priority suites' synthetic bulk) stays unaffected
+        // by a gate that is about content types, not payload validity.
+        assert!(
+            super::gate_outbound(
+                FeatureFlags::NONE,
+                MessageType::ClipboardOffer.wire(),
+                &[0xFF; 4]
+            )
+            .is_ok()
+        );
+        // …but a chunk is gated on its message type, so arbitrary bytes
+        // cannot smuggle one past an un-negotiated session.
+        assert!(matches!(
+            super::gate_outbound(
+                FeatureFlags::NONE,
+                MessageType::ClipboardChunk.wire(),
+                &[0xFF; 4]
+            ),
+            Err(SessionError::FeatureNotNegotiated { .. })
+        ));
     }
 
     #[tokio::test]

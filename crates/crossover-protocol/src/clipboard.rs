@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use crate::ProtocolError;
 use crate::decode_strict;
-use crate::hello::FeatureFlags;
+use crate::hello::{FeatureFlags, MessageType};
 
 /// SHA-256 of clipboard content — the identity that dedup and loop
 /// prevention key on. Exposed so the engine hashes local observations
@@ -867,6 +867,46 @@ impl ChunkReassembly {
         }
         self.complete = true;
         Ok(ChunkOutcome::Complete(std::mem::take(&mut self.buffer)))
+    }
+}
+
+/// The capability a peer must have advertised before this frame may be
+/// sent to it (docs/PROTOCOL.md §3.1), from the frame alone.
+///
+/// This is the shape the **send-path gate** needs: a chokepoint that sees
+/// every outbound frame sees `(message_type, payload)` and nothing else,
+/// so the rule has to be answerable from exactly that. Gating there
+/// rather than at each call site is what makes the guarantee
+/// unbypassable — no future caller can forget it.
+///
+/// Cheap by construction: `ClipboardMeta` is the first field of both
+/// [`ClipboardOffer`] and [`ClipboardData`], and postcard is sequential,
+/// so only that prefix is decoded — never the content.
+///
+/// **A payload whose meta prefix does not decode claims no capability**,
+/// and that is sound rather than lenient: decoding is deterministic and
+/// schema-identical on both ends, so bytes this side cannot read as a
+/// `ClipboardMeta` are bytes the peer cannot read as a typed item either.
+/// They can therefore neither carry an un-negotiated content type nor
+/// kill a session by discriminant. Classifying a capability and
+/// validating a payload are separate jobs; `encode_payload` owns the
+/// second one, at the point the message is built.
+#[must_use]
+pub fn required_feature_for_frame(message_type: u16, payload: &[u8]) -> FeatureFlags {
+    match MessageType::from_wire(message_type) {
+        // The message type *is* the capability: a peer without the bit
+        // has no decoder for it, whatever it carries.
+        Some(MessageType::ClipboardChunk) => FeatureFlags::CHUNKED_CLIPBOARD,
+        // These two carry a content type, and a content type a peer
+        // cannot decode is fatal to it, not skippable (§2).
+        Some(MessageType::ClipboardOffer | MessageType::ClipboardData) => {
+            crate::decode_prefix::<ClipboardMeta>(payload, "ClipboardMeta")
+                .map_or(FeatureFlags::NONE, |meta| {
+                    meta.content_type.required_feature()
+                })
+        }
+        // Everything else is base protocol.
+        _ => FeatureFlags::NONE,
     }
 }
 

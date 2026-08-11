@@ -44,6 +44,22 @@ pub(crate) fn decode_strict<'a, T: serde::Deserialize<'a>>(
     Ok(value)
 }
 
+/// Decode the leading value of a payload and **ignore what follows** —
+/// the deliberate opposite of [`decode_strict`], for the one case that
+/// wants a prefix: reading a message's fixed-size header without touching
+/// (or copying) the variable-length content behind it. postcard is
+/// sequential, so a struct's first field is a decodable prefix of it.
+pub(crate) fn decode_prefix<'a, T: serde::Deserialize<'a>>(
+    payload: &'a [u8],
+    what: &str,
+) -> Result<T, ProtocolError> {
+    let (value, _rest): (T, &[u8]) =
+        postcard::take_from_bytes(payload).map_err(|e| ProtocolError::Malformed {
+            reason: format!("undecodable {what} prefix: {e}"),
+        })?;
+    Ok(value)
+}
+
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =
     "wire messages, framing, versioning, and validation (docs/PROTOCOL.md)";
