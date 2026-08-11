@@ -10,6 +10,14 @@
 //! Fail-closed lever: a clipboard-typed frame whose payload fails
 //! validation produces [`SessionCommand::TerminateSession`] — the app kills
 //! that session (docs/PROTOCOL.md §7) and supervision reconnects.
+//!
+//! One thing here is *not* mechanical, and it is the reason
+//! [`ClipboardSyncDriver::send_command`] exists rather than a bare
+//! `send().await`: a driver parked on send backpressure stops consuming
+//! its own event channel, and with a chunk stream that lasts long enough
+//! to matter, that turns four independently-correct pieces of
+//! backpressure into a session that wedges instead of failing closed. The
+//! full cycle is written out on that method.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -52,6 +60,29 @@ const MAX_COALESCE_BATCH: usize = 512;
 /// here loses no content, only a redundant look.
 const MAX_CONSECUTIVE_BUSY_READS: u32 = 5;
 
+/// How many events the driver may hold aside while it is parked on send
+/// backpressure (see [`ClipboardSyncDriver::send_command`]).
+///
+/// Deferring is what keeps the driver a live consumer of its own event
+/// channel while it waits for lane room, which is the link it owns in the
+/// wedge cycle documented there. It is bounded, and bounded at the
+/// channel's own depth on purpose: draining a full channel into this queue
+/// moves the same events to a different place rather than admitting more
+/// of them, so the worst case is unchanged in order of magnitude (NFR-1).
+const MAX_DEFERRED_EVENTS: usize = 64;
+
+/// What became of a command handed to the send path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendOutcome {
+    /// Queued for the wire.
+    Sent,
+    /// The session was lost while it waited for room, so it was dropped
+    /// rather than queued — nothing is left to send it to.
+    Abandoned,
+    /// The consuming side is gone: the app is shutting down.
+    Closed,
+}
+
 /// Events the app (or the driver itself) feeds in.
 #[derive(Debug)]
 pub enum SyncEvent {
@@ -87,6 +118,13 @@ pub struct ClipboardSyncDriver {
     commands_tx: CommandSender,
     /// Consecutive `Busy` reads; reset by any successful read.
     busy_reads: u32,
+    /// Actions still to perform, carried across turns of the event loop
+    /// so a long chunk stream cannot monopolize the driver (see `run`).
+    pending: VecDeque<Action>,
+    /// Events taken off the channel while parked on send backpressure,
+    /// waiting to be processed in the order they arrived. Bounded by
+    /// [`MAX_DEFERRED_EVENTS`].
+    deferred: VecDeque<SyncEvent>,
     /// Generation of the newest settle timer; older ones are ignored
     /// when they fire, which is how the debounce restarts cleanly
     /// without cancelling tasks.
@@ -138,6 +176,8 @@ pub fn clipboard_sync(
         events_rx,
         events_tx: events_tx.clone(),
         commands_tx,
+        pending: VecDeque::new(),
+        deferred: VecDeque::new(),
         busy_reads: 0,
         settle_generation: 0,
         metrics,
@@ -154,60 +194,93 @@ impl ClipboardSyncDriver {
     }
 
     /// Run until every event sender is dropped. Spawn this.
+    ///
+    /// One turn of the loop takes **at most one event and performs at most
+    /// one action**, and that alternation is load-bearing rather than
+    /// stylistic. An action can produce the next action — a chunk send
+    /// asks the engine for the following chunk — so draining actions to
+    /// exhaustion would run an entire image transfer inside one turn, with
+    /// the event channel unread for its whole duration. That is how a
+    /// long transfer turns into a deaf driver, and a deaf driver is one
+    /// hop of the wedge cycle documented on [`Self::send_command`].
+    /// Alternating costs a `try_recv` per action and bounds the delay on
+    /// any event at one action.
     pub async fn run(mut self) {
-        while let Some(event) = self.events_rx.recv().await {
-            // Coalesce before acting. The OS clipboard is a single-value
-            // register, not a queue: when several items are already
-            // waiting, applying the older ones writes content nobody can
-            // ever paste, and every wasted write takes the machine-global
-            // clipboard lock — which is how Crossover made other
-            // applications' clipboard calls fail in the two-machine soak
-            // (52 writes in one second while draining a backlog).
-            let batch = self.coalesce(event).await;
-            for event in batch {
-                let actions = match event {
-                    SyncEvent::SessionEstablished => self.engine.on_session_established(),
-                    SyncEvent::SessionLost => self.engine.on_session_lost(),
-                    SyncEvent::LocalChanged => self.engine.on_local_change(),
-                    SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
-                    SyncEvent::TransferTimeout { scope, generation } => {
-                        self.engine.on_transfer_timeout(scope, generation)
-                    }
-                    SyncEvent::SettleDue(generation) => {
-                        if generation == self.settle_generation {
-                            self.engine.on_settle_due()
-                        } else {
-                            Vec::new() // a newer local change restarted the timer
-                        }
-                    }
-                    SyncEvent::Frame(frame) => {
-                        match InboundMessage::decode(frame.message_type, &frame.payload) {
-                            Ok(Some(message)) => self.engine.on_peer_message(message),
-                            Ok(None) => Vec::new(), // not clipboard traffic
-                            Err(error) => {
-                                // Peer nonconformance: fail closed. Clipboard
-                                // is session-agnostic and does not track which
-                                // session a frame arrived on, so the fail-
-                                // closed kill is a broadcast (two-machine: the
-                                // one session).
-                                let _ = self
-                                    .commands_tx
-                                    .send(SessionCommand::TerminateSession {
-                                        target: FrameTarget::Broadcast,
-                                        reason: error.to_string(),
-                                    })
-                                    .await;
-                                Vec::new()
-                            }
-                        }
-                    }
-                };
-                if !self.execute(actions).await {
-                    return; // command receiver gone: the app is shutting down
+        loop {
+            // An event that is already waiting is taken first; the loop
+            // only *blocks* for one when there is no work to do.
+            let ready = self
+                .deferred
+                .pop_front()
+                .or_else(|| self.events_rx.try_recv().ok());
+            let event = match ready {
+                Some(event) => Some(event),
+                None if !self.pending.is_empty() => None,
+                None => match self.events_rx.recv().await {
+                    Some(event) => Some(event),
+                    None => break,
+                },
+            };
+
+            if let Some(event) = event {
+                // Coalesce before acting. The OS clipboard is a
+                // single-value register, not a queue: when several items
+                // are already waiting, applying the older ones writes
+                // content nobody can ever paste, and every wasted write
+                // takes the machine-global clipboard lock — which is how
+                // Crossover made other applications' clipboard calls fail
+                // in the two-machine soak (52 writes in one second while
+                // draining a backlog).
+                let batch = self.coalesce(event).await;
+                for event in batch {
+                    let actions = self.dispatch(event).await;
+                    // Appended, never prepended: outbound order is what
+                    // makes the newest item the last one the peer sees.
+                    self.pending.extend(actions);
                 }
+            }
+
+            if let Some(action) = self.pending.pop_front()
+                && !self.perform(action).await
+            {
+                return; // command receiver gone: the app is shutting down
             }
         }
         tracing::debug!("clipboard sync driver stopped");
+    }
+
+    /// Feed one event to the engine and return what it wants done.
+    async fn dispatch(&mut self, event: SyncEvent) -> Vec<Action> {
+        match event {
+            SyncEvent::SessionEstablished => self.engine.on_session_established(),
+            SyncEvent::SessionLost => self.engine.on_session_lost(),
+            SyncEvent::LocalChanged => self.engine.on_local_change(),
+            SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
+            SyncEvent::TransferTimeout { scope, generation } => {
+                self.engine.on_transfer_timeout(scope, generation)
+            }
+            SyncEvent::SettleDue(generation) => {
+                if generation == self.settle_generation {
+                    self.engine.on_settle_due()
+                } else {
+                    Vec::new() // a newer local change restarted the timer
+                }
+            }
+            SyncEvent::Frame(frame) => {
+                match InboundMessage::decode(frame.message_type, &frame.payload) {
+                    Ok(Some(message)) => self.engine.on_peer_message(message),
+                    Ok(None) => Vec::new(), // not clipboard traffic
+                    Err(error) => {
+                        // Peer nonconformance: fail closed. Clipboard is
+                        // session-agnostic and does not track which session
+                        // a frame arrived on, so the fail-closed kill is a
+                        // broadcast (two-machine: the one session).
+                        self.terminate_session(error.to_string()).await;
+                        Vec::new()
+                    }
+                }
+            }
+        }
     }
 
     /// Drain what is immediately available and drop superseded clipboard
@@ -220,6 +293,13 @@ impl ClipboardSyncDriver {
     async fn coalesce(&mut self, first: SyncEvent) -> Vec<SyncEvent> {
         let mut batch = vec![first];
         while batch.len() < MAX_COALESCE_BATCH {
+            // Deferred events were taken off the channel earlier, so they
+            // precede anything still on it — order is preserved across the
+            // two sources, not just within each.
+            if let Some(event) = self.deferred.pop_front() {
+                batch.push(event);
+                continue;
+            }
             match self.events_rx.try_recv() {
                 Ok(event) => batch.push(event),
                 Err(_) => break, // empty or closed; closed is handled by run()
@@ -289,15 +369,79 @@ impl ClipboardSyncDriver {
     /// payload triggers (docs/PROTOCOL.md §7), reached instead by
     /// repetition of individually-survivable violations. `false` once the
     /// app side is gone.
-    async fn terminate_session(&self, reason: String) -> bool {
+    async fn terminate_session(&mut self, reason: String) -> bool {
         tracing::warn!(error = %reason, "terminating session on clipboard violations");
-        self.commands_tx
-            .send(SessionCommand::TerminateSession {
-                target: FrameTarget::Broadcast,
-                reason,
-            })
-            .await
-            .is_ok()
+        self.send_command(SessionCommand::TerminateSession {
+            target: FrameTarget::Broadcast,
+            reason,
+        })
+        .await
+            != SendOutcome::Closed
+    }
+
+    /// Hand one command to the send path **without going deaf.**
+    ///
+    /// A plain `send().await` parks until the lane has room, and a parked
+    /// driver consumes no [`SyncEvent`]s. That is fine for one frame and
+    /// fatal for a chunk stream, because it closes a four-hop cycle with
+    /// no timeout anywhere on it:
+    ///
+    /// 1. this driver parks on a saturated Background lane, so it stops
+    ///    consuming its own event channel;
+    /// 2. that channel (bounded) fills, so the app's fan-out parks trying
+    ///    to deliver the next frame to it;
+    /// 3. the fan-out holding still means the session-events channel fills;
+    /// 4. `run_session`'s frame dispatch parks on *that* — inside the one
+    ///    `select!` that also drains the outbound lane and answers
+    ///    keepalives — so the writer stops, the lane never drains, and (1)
+    ///    holds forever.
+    ///
+    /// Every hop is legitimate backpressure; together they are a wedge
+    /// rather than a fail-closed disconnect, because the keepalive tick
+    /// that would notice is in the loop that stopped turning.
+    ///
+    /// This driver owns exactly one link of that cycle — the first — so
+    /// this is where it is broken: while waiting for lane room, keep
+    /// taking events off the channel (bounded by
+    /// [`MAX_DEFERRED_EVENTS`], so nothing here is unbounded), and if the
+    /// session is *lost* while waiting, stop waiting. A frame queued for a
+    /// session that no longer exists is not worth parking for.
+    async fn send_command(&mut self, command: SessionCommand) -> SendOutcome {
+        // Cloned so the in-flight send borrows nothing of `self`, leaving
+        // the event channel free to be drained alongside it.
+        let sender = self.commands_tx.clone();
+        let send = sender.send(command);
+        tokio::pin!(send);
+        loop {
+            tokio::select! {
+                // Biased: making progress on the send is the point; the
+                // event drain is what keeps us reachable meanwhile.
+                biased;
+                result = &mut send => {
+                    return if result.is_ok() { SendOutcome::Sent } else { SendOutcome::Closed };
+                }
+                event = self.events_rx.recv(), if self.deferred.len() < MAX_DEFERRED_EVENTS => {
+                    let Some(event) = event else {
+                        // Unreachable while the driver holds a sender of
+                        // its own; finish the send rather than spin.
+                        return if send.await.is_ok() {
+                            SendOutcome::Sent
+                        } else {
+                            SendOutcome::Closed
+                        };
+                    };
+                    let lost = matches!(event, SyncEvent::SessionLost);
+                    self.deferred.push_back(event);
+                    if lost {
+                        tracing::debug!(
+                            deferred = self.deferred.len(),
+                            "session lost while queueing a frame; abandoning it"
+                        );
+                        return SendOutcome::Abandoned;
+                    }
+                }
+            }
+        }
     }
 
     /// Read the provider and feed the result back, absorbing contention
@@ -343,109 +487,119 @@ impl ClipboardSyncDriver {
         }
     }
 
-    /// Hand one engine message to the send path. `None` once the app side
-    /// is gone; otherwise whatever the engine wants done next — which for
-    /// a chunk is the *next* chunk.
+    /// Hand one engine message to the send path.
     ///
     /// One chunk per command, on purpose: a chunk is ADR 0013's preemption
-    /// unit, and this `send` awaits the Background lane's byte budget, so
-    /// a streaming transfer is paced by the wire rather than racing ahead
-    /// of the input it must never delay.
-    async fn send_message(&mut self, message: OutboundMessage) -> Option<Vec<Action>> {
+    /// unit, and [`Self::send_command`] awaits the Background lane's byte
+    /// budget, so a streaming transfer is paced by the wire rather than
+    /// racing ahead of the input it must never delay.
+    async fn send_message(&mut self, message: OutboundMessage) -> (SendOutcome, Vec<Action>) {
         let (message_type, payload) = match message.encode() {
             Ok(encoded) => encoded,
             Err(error) => {
                 // Engine-built messages are always valid; log the
                 // impossible rather than panic (NFR-1 discipline).
                 tracing::error!(error = %error, "unencodable engine message dropped");
-                return Some(Vec::new());
+                return (SendOutcome::Sent, Vec::new());
             }
         };
         let streamed = match &message {
             OutboundMessage::Chunk(chunk) => Some(chunk.id),
             _ => None,
         };
-        self.commands_tx
-            .send(SessionCommand::SendFrame {
+        let outcome = self
+            .send_command(SessionCommand::SendFrame {
                 target: FrameTarget::Broadcast,
                 message_type,
                 payload,
             })
-            .await
-            .ok()?;
-        Some(match streamed {
-            Some(id) => self.engine.on_chunk_sent(id),
-            None => Vec::new(),
-        })
+            .await;
+        if outcome != SendOutcome::Sent {
+            return (outcome, Vec::new());
+        }
+        (
+            outcome,
+            match streamed {
+                // Only now, with the chunk genuinely on the path, is the
+                // next one asked for: the stream advances at the rate the
+                // wire accepts it.
+                Some(id) => self.engine.on_chunk_sent(id),
+                None => Vec::new(),
+            },
+        )
     }
 
-    /// Execute engine actions, feeding results back through the engine
-    /// until the queue drains. Returns `false` when the app side is gone.
-    async fn execute(&mut self, actions: Vec<Action>) -> bool {
-        let mut queue: VecDeque<Action> = actions.into();
-        while let Some(action) = queue.pop_front() {
-            match action {
-                Action::ReadClipboard => {
-                    let more = self.read_clipboard();
-                    queue.extend(more);
-                }
-                Action::WriteClipboard { id, content } => {
-                    let result = match self.provider.write(&content) {
-                        Ok(()) => Ok(()),
-                        Err(ClipboardError::Busy { reason }) => {
-                            tracing::debug!(clipboard_id = %id, error = %reason, "write busy");
-                            self.record(Metrics::record_clipboard_contention);
-                            Err(true)
-                        }
-                        Err(error) => {
-                            tracing::warn!(clipboard_id = %id, error = %error, "write failed");
-                            Err(false)
-                        }
-                    };
-                    queue.extend(self.engine.on_write_result(id, result));
-                }
-                Action::Send(message) => match self.send_message(message).await {
-                    Some(more) => queue.extend(more),
-                    None => return false,
-                },
-                Action::ScheduleRetry { id, delay } => {
-                    self.record(Metrics::record_clipboard_retry);
-                    let notify = self.events_tx.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = notify.send(SyncEvent::RetryDue(id)).await;
-                    });
-                }
-                Action::TerminateSession { reason } => {
-                    if !self.terminate_session(reason).await {
-                        return false;
+    /// Perform one engine action, queueing whatever it produces.
+    ///
+    /// Deliberately **one** action, not a drain: see [`Self::run`] for why
+    /// the loop alternates. Returns `false` when the app side is gone.
+    async fn perform(&mut self, action: Action) -> bool {
+        match action {
+            Action::ReadClipboard => {
+                let more = self.read_clipboard();
+                self.pending.extend(more);
+            }
+            Action::WriteClipboard { id, content } => {
+                let result = match self.provider.write(&content) {
+                    Ok(()) => Ok(()),
+                    Err(ClipboardError::Busy { reason }) => {
+                        tracing::debug!(clipboard_id = %id, error = %reason, "write busy");
+                        self.record(Metrics::record_clipboard_contention);
+                        Err(true)
                     }
+                    Err(error) => {
+                        tracing::warn!(clipboard_id = %id, error = %error, "write failed");
+                        Err(false)
+                    }
+                };
+                let more = self.engine.on_write_result(id, result);
+                self.pending.extend(more);
+            }
+            Action::Send(message) => match self.send_message(message).await {
+                (SendOutcome::Sent, more) => self.pending.extend(more),
+                (SendOutcome::Closed, _) => return false,
+                // The session died while this frame waited for room; the
+                // deferred `SessionLost` is the next event the loop takes,
+                // and the engine's own cleanup makes the rest moot.
+                (SendOutcome::Abandoned, _) => {}
+            },
+            Action::ScheduleRetry { id, delay } => {
+                self.record(Metrics::record_clipboard_retry);
+                let notify = self.events_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = notify.send(SyncEvent::RetryDue(id)).await;
+                });
+            }
+            Action::TerminateSession { reason } => {
+                if !self.terminate_session(reason).await {
+                    return false;
                 }
-                Action::ScheduleTransferTimeout {
-                    scope,
-                    generation,
-                    delay,
-                } => {
-                    let notify = self.events_tx.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = notify
-                            .send(SyncEvent::TransferTimeout { scope, generation })
-                            .await;
-                    });
-                }
-                Action::ScheduleSettle { delay } => {
-                    // Bump the generation: any timer already in flight
-                    // becomes a no-op when it fires, so the debounce
-                    // restarts without cancellation bookkeeping.
-                    self.settle_generation += 1;
-                    let generation = self.settle_generation;
-                    let notify = self.events_tx.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = notify.send(SyncEvent::SettleDue(generation)).await;
-                    });
-                }
+            }
+            Action::ScheduleTransferTimeout {
+                scope,
+                generation,
+                delay,
+            } => {
+                let notify = self.events_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = notify
+                        .send(SyncEvent::TransferTimeout { scope, generation })
+                        .await;
+                });
+            }
+            Action::ScheduleSettle { delay } => {
+                // Bump the generation: any timer already in flight becomes
+                // a no-op when it fires, so the debounce restarts without
+                // cancellation bookkeeping.
+                self.settle_generation += 1;
+                let generation = self.settle_generation;
+                let notify = self.events_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = notify.send(SyncEvent::SettleDue(generation)).await;
+                });
             }
         }
         true
@@ -914,6 +1068,96 @@ mod tests {
         // The own-write notification must not echo the image back.
         let quiet = timeout(Duration::from_millis(300), rig.commands.recv()).await;
         assert!(quiet.is_err(), "echoed an applied image: {quiet:?}");
+    }
+
+    /// The wedge, as a test. A chunk stream far longer than the command
+    /// lane can hold, with a consumer that has stopped: the driver must
+    /// **still consume events**, and a `SessionLost` delivered mid-stream
+    /// must take effect rather than sit in a channel behind a driver
+    /// parked on backpressure.
+    ///
+    /// Before the fix the whole stream ran inside one `execute` call, the
+    /// event channel filled, and nothing reached the engine until the
+    /// transfer finished — which, with the consumer stalled, was never. In
+    /// the real app that closes a cycle through the session loop's single
+    /// `select!` and the session stops failing closed (see
+    /// `send_command`). Here it is reduced to its observable core.
+    #[tokio::test]
+    async fn a_saturated_chunk_stream_does_not_deafen_the_driver() {
+        use crossover_platform::ClipboardImageFormat;
+        use crossover_protocol::clipboard::{ClipboardAccept, ClipboardOffer, MAX_CHUNK_BYTES};
+
+        use crate::outbound::MAX_BACKGROUND_QUEUE_FRAMES;
+
+        let mut rig = rig();
+        // Far more chunks than the Background lane's 64-frame bound, so
+        // the driver is genuinely parked partway through.
+        const CHUNKS: usize = 200;
+        rig.clipboard.set_image_locally(
+            ClipboardImageFormat::Dib,
+            vec![0xAB; MAX_CHUNK_BYTES * CHUNKS],
+        );
+
+        let SessionCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
+            panic!("expected an offer");
+        };
+        let offer = ClipboardOffer::decode_payload(&payload).unwrap();
+        rig.events
+            .send(frame(
+                MessageType::ClipboardAccept,
+                ClipboardAccept { id: offer.meta.id }
+                    .encode_payload()
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        // Consume nothing: the lane fills and the driver parks mid-stream.
+        // Give it a moment to get there, then pull the session out from
+        // under it. This send must not block on a full event channel, and
+        // the driver must act on it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        timeout(
+            Duration::from_millis(500),
+            rig.events.send(SyncEvent::SessionLost),
+        )
+        .await
+        .expect("the driver stopped consuming events during the stream")
+        .unwrap();
+
+        // Now drain. The stream must have stopped early — a session that
+        // no longer exists gets no more frames.
+        let mut chunks = 0usize;
+        while let Ok(Some(command)) = timeout(Duration::from_millis(200), rig.commands.recv()).await
+        {
+            let SessionCommand::SendFrame { message_type, .. } = command else {
+                panic!("unexpected termination");
+            };
+            assert_eq!(message_type, MessageType::ClipboardChunk.wire());
+            chunks += 1;
+        }
+        // Only what was already committed to the lane before the loss
+        // may appear — in practice the lane's depth plus the frame in
+        // hand, nowhere near the whole transfer.
+        assert!(
+            chunks <= MAX_BACKGROUND_QUEUE_FRAMES * 2,
+            "{chunks} of {CHUNKS} chunks were emitted for a lost session; the              driver kept streaming instead of noticing"
+        );
+
+        // And the driver is alive, not wedged: a fresh local copy still
+        // flows all the way out.
+        rig.events
+            .send(SyncEvent::SessionEstablished)
+            .await
+            .unwrap();
+        rig.clipboard.set_text_locally("still responsive");
+        let SessionCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
+            panic!("the driver wedged after the abandoned stream");
+        };
+        assert_eq!(
+            ClipboardData::decode_payload(&payload).unwrap().content,
+            b"still responsive"
+        );
     }
 
     /// The driver actually wires the deadline: a peer that offers and then
