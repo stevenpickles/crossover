@@ -801,6 +801,14 @@ mod tests {
     /// decode failure and a decode failure is session-fatal — so sending
     /// one would kill a healthy peer's session. Text, needing no
     /// capability, is untouched by the check.
+    ///
+    /// This is also the compatibility proof for the day
+    /// `FeatureFlags::ADVERTISED` gained `CHUNKED_CLIPBOARD` (ADR 0014's
+    /// platform slice): the peer here advertises **nothing**, exactly as a
+    /// build from before the bit existed would, and the negotiated
+    /// intersection is therefore empty. An advertising build talking to
+    /// one of those must still send it nothing new — which is what makes
+    /// the flip safe — while text keeps flowing untouched.
     #[tokio::test]
     async fn unnegotiated_content_is_refused_before_it_reaches_the_wire() {
         use std::time::Duration as StdDuration;
@@ -808,7 +816,7 @@ mod tests {
         use crossover_protocol::clipboard::{
             ClipboardData, ClipboardMeta, ClipboardOffer, ContentType, ImageFormat, content_hash,
         };
-        use crossover_protocol::hello::MessageType;
+        use crossover_protocol::hello::{FeatureFlags, MessageType};
 
         let mut a = Node::new("machine-a");
         let mut b = Node::new("machine-b");
@@ -817,16 +825,27 @@ mod tests {
 
         let listener = SessionListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        // The peer side stands in for a build that predates the feature
+        // bit: it advertises nothing, so nothing negotiates.
+        let older_peer = SessionOptions {
+            advertised_features: FeatureFlags::NONE,
+            ..options()
+        };
         let (a_local, b_local, opts) = (a.local(), b.local(), options());
         let (inbound, outbound) = tokio::join!(
-            listener.accept(&b_local, &opts),
+            listener.accept(&b_local, &older_peer),
             connect(addr, &a_local, &opts),
         );
         let mut server = inbound.unwrap();
         let mut client = outbound.unwrap();
+        assert_eq!(
+            client.info().features,
+            FeatureFlags::NONE,
+            "an advertisement the peer does not share must not activate"
+        );
 
-        // Neither side advertised CHUNKED_CLIPBOARD, so an image offer is
-        // refused locally — a typed error, not a transport failure.
+        // The capability did not negotiate, so an image offer is refused
+        // locally — a typed error, not a transport failure.
         let image = ClipboardOffer {
             meta: ClipboardMeta {
                 id: uuid::Uuid::from_bytes([0x11; 16]),

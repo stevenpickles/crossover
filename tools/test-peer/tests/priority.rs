@@ -67,9 +67,10 @@ async fn connected_pair() -> (AppSide, TestConnection) {
 }
 
 /// A pair that has negotiated chunked clipboard, so `ClipboardChunk`
-/// frames pass the send gate (docs/PROTOCOL.md §3.1). Explicit here
-/// because `FeatureFlags::ADVERTISED` is still empty — ADR 0014's platform
-/// slice is what flips it — and the lane property has to be provable now.
+/// frames pass the send gate (docs/PROTOCOL.md §3.1). Both sides are set
+/// explicitly rather than reading `FeatureFlags::ADVERTISED`, so the lane
+/// property this suite proves stays pinned to a stated negotiation instead
+/// of moving with the constant.
 async fn chunk_capable_pair() -> (AppSide, TestConnection) {
     let (app, conn, events) =
         connected_pair_with(patient_keepalive(), FeatureFlags::ALL, FeatureFlags::ALL).await;

@@ -70,9 +70,11 @@ fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFl
         };
         let options = SessionOptions {
             // What this side promises the peer. Production reads
-            // `FeatureFlags::ADVERTISED`; the image suites below negotiate
-            // explicitly because ADR 0014's platform slice has not landed,
-            // so the constant is honestly still empty (PROTOCOL.md §3.1).
+            // `FeatureFlags::ADVERTISED` (now `ALL`, since ADR 0014's
+            // platform slice); the suites below set it explicitly so each
+            // test states the negotiation it depends on rather than
+            // inheriting whatever the constant currently says
+            // (PROTOCOL.md §3.1).
             advertised_features: features,
             ..SessionOptions::default()
         };
@@ -460,10 +462,13 @@ async fn a_local_image_is_offered_and_streamed_to_the_peer() {
     .unwrap();
 }
 
-/// The honesty rule, end to end (docs/PROTOCOL.md §3.1 — and this build's
-/// actual configuration, since `FeatureFlags::ADVERTISED` is empty). With
-/// the capability un-negotiated, an image copy must not reach the wire and
-/// must not wedge the pipeline: text keeps synchronizing immediately after.
+/// The honesty rule, end to end (docs/PROTOCOL.md §3.1). The app side
+/// advertises `FeatureFlags::ADVERTISED` — `ALL` since ADR 0014's platform
+/// slice — and the scripted peer advertises nothing, exactly as a build
+/// from before the bit would. So this is the compatibility case the flip
+/// has to survive: with the capability un-negotiated, an image copy must
+/// not reach the wire and must not wedge the pipeline: text keeps
+/// synchronizing immediately after.
 #[tokio::test]
 async fn an_un_negotiated_image_never_reaches_the_wire_and_text_still_flows() {
     use crossover_platform::ClipboardImageFormat;
