@@ -15,6 +15,8 @@ that supersedes the old one and update both statuses.
 - Any change to the trust model, pairing semantics, or credential storage
 - Creating or dissolving a workspace crate
 - Any deliberate weakening or strengthening of a security requirement
+- Introducing or widening a filesystem-write surface driven by network input
+  (requires SECURITY.md threat-model additions alongside the ADR)
 - Meaningful increases in `unsafe` Rust usage
 
 ## Format
@@ -60,25 +62,25 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0010](0010-active-session-revocation.md) | Revocation terminates active sessions via a trust-store poll, not just new connections | Accepted |
 | [0011](0011-background-service-launcher.md) | Background operation: a minimal LocalSystem service launches the worker into the user session, behind a `ServiceManager` boundary | Accepted (amended by 0012) |
 | [0012](0012-elevated-worker-integrity.md) | Worker runs at high integrity, launched with the user's elevated linked token, so it can drive elevated windows | Accepted |
-| [0013](0013-interactive-over-bulk-prioritization.md) | Interactive input takes wire priority over bulk transfers (Phase 7) | Proposed |
-| [0014](0014-chunked-rich-clipboard-transfer.md) | Chunked rich-clipboard transfer: images first, native format verbatim (Phase 7) | Proposed |
+| [0013](0013-interactive-over-bulk-prioritization.md) | Interactive input takes wire priority over bulk transfers (Phase 7) | Accepted |
+| [0014](0014-chunked-rich-clipboard-transfer.md) | Chunked rich-clipboard transfer: images first, native format verbatim (Phase 7) | Accepted |
+| [0015](0015-drop-folder-file-transfer.md) | Files/folders transfer: drop-folder model, sender-zipped archives, per-peer permission (Phase 7) | Proposed |
 
 ## Known decisions awaiting an ADR
 
-- **Rich-clipboard files/folders transfer (Phase 7).** The images side of rich
-  clipboard has a proposed design (0014); files/folders do not, because they add
-  a **filesystem-write surface** that needs its own security design. Sketched
-  direction (in 0014): a drop-folder model, folders zipped to a single blob,
-  with a configured destination, per-peer permission, name sanitization, and
-  size/count caps. Requires its own ADR **and** SECURITY.md threat-model
-  additions before implementation.
+None outstanding. The files/folders **filesystem-write surface** sketched in
+0014 is now designed in [0015](0015-drop-folder-file-transfer.md) (Proposed),
+with the matching threat-model additions in
+[SECURITY.md](../SECURITY.md) §7 (invariants F1–F11, threats T12–T18) — the
+precondition 0014 set for any implementation.
 
 The deferred *specification* decisions are all recorded — wire format (0001),
 pairing mechanism (0002), identity credential (0003), default port (0004),
 clipboard transaction flow (0005), Windows input capture (0007), and keyboard
 key representation (0008); 0006 was raised by evidence rather than deferred.
-ADRs 0013 and 0014 are **Proposed** — the Phase 8 rich-clipboard direction is
-captured but not yet ratified or scheduled.
+ADRs 0013 and 0014 are **Accepted** — the Phase 7 rich-clipboard direction is
+ratified after a drift-check against the current code. ADR 0015 is **Proposed**
+— files/folders transfer stays gated on its ratification.
 
 New entries belong here when a decision is identified but not yet made,
 so that the gap is visible rather than implicit.

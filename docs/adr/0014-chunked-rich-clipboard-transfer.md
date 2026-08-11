@@ -1,14 +1,18 @@
 # 0014. Chunked rich-clipboard transfer: images first, native format verbatim
 
-Status: Proposed (Phase 7 — design captured 2026-08-11, not yet scheduled)
+Status: Accepted (Phase 7)
 Date: 2026-08-11
+Amends: [0005](0005-clipboard-transaction-flow.md) (the transaction *shape* —
+Offer/Accept → Data → Applied, and the 64 KiB inline threshold — is unchanged;
+"no chunking" is the part this supersedes, and the bounds gain a per-type cap)
 
 ## Context
 
 [ADR 0005](0005-clipboard-transaction-flow.md) fixed the text transaction flow
 and explicitly deferred chunking: *"Chunking gets its own ADR if rich clipboard
-types (images, files — Phase 8) demand it."* FR-3.7 designed the data model and
-protocol to extend past UTF-8 text. This is that ADR.
+types (images, files — Phase 8) demand it."* (Phase 8 as the roadmap then read;
+rich clipboard was re-sequenced to Phase 7 on 2026-08-11.) FR-3.7 designed the
+data model and protocol to extend past UTF-8 text. This is that ADR.
 
 Maintainer's use case, which shapes the scope:
 
@@ -19,13 +23,17 @@ Maintainer's use case, which shapes the scope:
   single-digit milliseconds — timing is a simplicity/consistency question, not
   a performance one.
 
-## Decision (proposed)
+## Decision
 
 ### Images: an extension of the existing model, not new machinery
 
-- **Add an image type** to the clipboard transaction — the FR-3.7 groundwork: a
-  type tag on `ClipboardOffer`/`ClipboardData` so payloads are not assumed
-  UTF-8.
+- **Add an image type** to the clipboard transaction. The FR-3.7 groundwork is
+  already in place: `ClipboardMeta` — shared by `ClipboardOffer` and
+  `ClipboardData` — carries a `ContentType` tag whose only variant today is
+  `Utf8Text`, so this is a new variant on an existing tag, not new structure.
+  Type-specific validation follows it: the UTF-8 check and the
+  `MAX_CLIPBOARD_TEXT_BYTES` bound become per-type rules rather than the single
+  rule they are now.
 - **Native raster format, verbatim — no transcode, no image codec.** Capture
   the clipboard's raster format and ship the bytes as-is; byte-identical by
   construction (matches FR-3.2), and it avoids DIB pixel-format wrangling and a
@@ -36,17 +44,37 @@ Maintainer's use case, which shapes the scope:
   the bytes verbatim.
 - **Eager chunked sync, consistent with text.** On copy: `ClipboardOffer`
   (id, type, length, hash) → `ClipboardAccept`/`Decline` (decline on
-  already-have-this-hash, so re-pasting the same snip moves zero bytes) →
-  `ClipboardData` **streamed as bounded chunks** → the receiver reassembles into
+  already-have-this-hash, so re-pasting the same snip moves zero bytes) → the
+  content **streamed as bounded chunks** → the receiver reassembles into
   a buffer **sized from the offered length, validated ≤
   `MAX_CLIPBOARD_IMAGE_BYTES` before allocating** (NFR-1) → sets its clipboard.
   Paste is then a normal, instant local paste — the same "sync the clipboard"
   model text already uses.
+- **A chunk is its own message type, not a `ClipboardData`.** Today's
+  `ClipboardData` validates at decode that the declared `content_length` equals
+  the bytes carried and that `content_hash` covers all of them, which a partial
+  payload cannot satisfy. Chunks therefore travel as a distinct clipboard
+  message, each one bounded and validated on its own (item id, offset/sequence,
+  length), and the item's `content_hash` is verified over the **reassembled**
+  bytes before the OS clipboard is touched — PROTOCOL.md §5's bounds invariant,
+  preserved unchanged. `ClipboardApplied` still closes the transaction, so
+  FR-3.2's end-to-end acknowledgement is untouched.
 - **Chunk size answers to [ADR 0013](0013-interactive-over-bulk-prioritization.md):**
   chunks are the preemption unit that keeps live input ahead of the transfer, so
   they are sized for the input-latency budget, not just memory.
-- Reuse the engine's transaction state machine, hash-dedup, bounds, and
-  loop-prevention as-is.
+- **Reuse the engine's rules; generalize its surface.** The transaction state
+  machine, hash-dedup, conflict order, bounded retry, and loop prevention carry
+  over unchanged as *rules*. Their surface does not: `ClipboardEngine` is
+  text-typed throughout — `Action::WriteClipboard { text: String }`,
+  `on_local_read(Option<String>)`, `PendingWrite.text`, and a hardcoded
+  `ContentType::Utf8Text` on every item it mints — so those become typed bytes.
+  That is a mechanical widening, not a redesign.
+- **The platform boundary widens with it.** `ClipboardProvider`
+  (`crossover-platform/src/clipboard.rs`) exposes only `read_text`/`write_text`
+  and reports non-text content as absent; the Windows backend handles
+  `CF_UNICODETEXT` alone. The trait gains typed read/write, and all `CF_DIB`
+  handling lives behind it in `crossover-platform-windows` — core and protocol
+  crates stay platform-free (NFR-4).
 
 Windows **delayed rendering** (true transfer-only-on-paste) is *not* used for
 images — it would make Crossover own the far clipboard and service
@@ -92,12 +120,24 @@ SECURITY.md threat-model additions before any implementation — see the
   increment resting on existing machinery plus [ADR 0013](0013-interactive-over-bulk-prioritization.md).
 - Files remain a separate, later, deliberately-bounded capability with its own
   ADR and security review.
-- The clipboard protocol gains a type tag and a chunked data path; the
-  before-allocation length validation keeps NFR-1 intact for the larger frames.
+- The clipboard protocol gains an image content type and a chunked data path;
+  the before-allocation length validation keeps NFR-1 intact, now over a
+  reassembly buffer rather than a single frame.
+- Specification updates land with the implementation, not after it: PROTOCOL.md
+  §5 currently states the offered flow carries "no chunking, per ADR 0005" and
+  §8 justifies the 4 MiB + 64 KiB frame body as "one maximum clipboard item per
+  frame" — both are superseded here, and the new image cap and chunk size join
+  §8's constants table. `MAX_FRAME_BODY_BYTES` itself does **not** grow; chunks
+  are far smaller than a frame.
 
 ## Open questions (to settle when scheduled)
 
 - The image size ceiling (`MAX_CLIPBOARD_IMAGE_BYTES`) — where to set it.
+- How image support is gated for interop. Unknown message types are currently
+  ignored rather than fatal, so a peer that does not understand chunks would
+  simply never answer — a silent stall, which NFR-3 forbids. Both mechanisms
+  exist: `supported_features` in `Hello` (PROTOCOL.md §3's stated route for
+  future clipboard types) or another hard version-floor bump as v1→v2 was.
 - Which clipboard formats to capture and restore, and whether to advertise more
   than one format on the far side for maximum paste compatibility.
 - Interaction with clipboard citizenship (FR-3.1a) — how long the far side owns
