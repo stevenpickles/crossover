@@ -160,6 +160,13 @@ pub struct InputControlDriver {
     /// a different tick, the user has touched this machine, so the cursor is
     /// shown again. `None` until the first poll after hiding sets it.
     cursor_wake_baseline: Option<u32>,
+    /// The local-input tick attributed to *our own* injection while a peer
+    /// controls this machine (ADR 0009). Re-baselined after each injection we
+    /// make, so the peer's driving does not read as the user's; if a later
+    /// poll sees a different tick, genuine local input arrived — the user is
+    /// here — and control is relinquished to neutral. `None` while not
+    /// controlled, or on a platform without the tick query (detection off).
+    controlled_input_baseline: Option<u32>,
     /// Seamless wiring, present exactly when the machine runs
     /// `--left`/`--right`. `None` makes placement and edge-mode emission
     /// no-ops (an explicit-only run).
@@ -209,6 +216,7 @@ pub fn input_control(
         cursor_tx,
         cursor_hidden: false,
         cursor_wake_baseline: None,
+        controlled_input_baseline: None,
         seamless,
         // Idle until a session establishes: emitting the initial mode is
         // the driver's job on the first state change.
@@ -262,17 +270,31 @@ impl InputControlDriver {
                         // state confusion hid it (ADR 0009).
                         self.wake_cursor_on_local_input();
                     }
-                    // If a peer controls this machine but the input desktop
-                    // switched to one we cannot inject into (a UAC/secure-
-                    // desktop prompt), give up the grant so the controller
-                    // returns to local instead of driving a dead session — the
-                    // controller un-hides its cursor on the resulting release
-                    // (feature/87). Polled only while controlled, so cheap.
-                    if self.engine.is_controlled() && !self.injector.can_inject() {
-                        let actions = self.dispatch(ControlEvent::InputDesktopUnavailable);
-                        if !self.execute(actions).await {
-                            return;
+                    // While a peer controls this machine, two conditions end
+                    // its grant and return both sides to neutral (the
+                    // controller un-hides its cursor on the resulting release):
+                    //   - the input desktop switched to one we cannot inject
+                    //     into (a UAC/secure-desktop prompt) — feature/87; or
+                    //   - the user produced genuine local input here, so the
+                    //     user is at this machine (ADR 0009).
+                    // Polled only while controlled, so cheap; the baseline is
+                    // dropped otherwise so detection re-arms on the next grant.
+                    if self.engine.is_controlled() {
+                        let event = if !self.injector.can_inject() {
+                            Some(ControlEvent::InputDesktopUnavailable)
+                        } else if self.local_input_reclaim_due() {
+                            Some(ControlEvent::LocalInputReclaim)
+                        } else {
+                            None
+                        };
+                        if let Some(event) = event {
+                            let actions = self.dispatch(event);
+                            if !self.execute(actions).await {
+                                return;
+                            }
                         }
+                    } else {
+                        self.controlled_input_baseline = None;
                     }
                 }
             }
@@ -548,6 +570,30 @@ impl InputControlDriver {
         }
     }
 
+    /// Whether genuine local input — not our own injection — has arrived while
+    /// a peer controls this machine, meaning the user is here (ADR 0009).
+    ///
+    /// The signal is the system input tick, re-baselined after every injection
+    /// we make (see `execute`), so the peer's driving does not read as the
+    /// user's. The first poll of a fresh grant only arms the baseline; a later
+    /// poll seeing a different tick fires. A platform without the tick query
+    /// keeps `None` and never fires, so the reclaim is simply unavailable
+    /// there. During simultaneous driving-and-touching the peer's next
+    /// injection can re-baseline past a local event; that contention is not
+    /// the reversal case, and it resolves the moment the peer pauses.
+    fn local_input_reclaim_due(&mut self) -> bool {
+        let Some(tick) = self.capture.last_input_tick() else {
+            return false; // no query on this platform — detection off
+        };
+        match self.controlled_input_baseline {
+            None => {
+                self.controlled_input_baseline = Some(tick);
+                false
+            }
+            Some(baseline) => tick != baseline,
+        }
+    }
+
     /// Execute engine actions in order. Returns `false` when the
     /// application side is gone.
     async fn execute(&mut self, actions: Vec<ControlAction>) -> bool {
@@ -610,6 +656,13 @@ impl InputControlDriver {
                         // Nothing to retry into (UIPI and friends, R-1);
                         // observable, not silent (NFR-3).
                         tracing::warn!(error = %error, "input injection failed");
+                    }
+                    // Our injection advances the system input tick; re-baseline
+                    // so the peer's driving is not mistaken for the user's
+                    // local input (ADR 0009). Only meaningful while controlled;
+                    // drain-on-release injections run after the grant is gone.
+                    if self.engine.is_controlled() {
+                        self.controlled_input_baseline = self.capture.last_input_tick();
                     }
                 }
                 ControlAction::PlaceCursor(fraction) => self.place_cursor(fraction),
@@ -1083,6 +1136,73 @@ mod tests {
         // health-tick fail-safe brings the cursor back.
         rig.capture.set_last_input_tick(2000);
         await_cursor(&rig, false).await;
+    }
+
+    /// ADR 0009: while a peer controls this machine, genuine local input —
+    /// distinguished from the peer's own injections by re-baselining the tick
+    /// on each injection — reclaims the grant to neutral. The peer is told to
+    /// release (returning it to local) and it is reported distinctly.
+    #[tokio::test]
+    async fn local_input_reclaims_the_peers_grant() {
+        let mut rig = rig();
+        rig.capture.set_last_input_tick(1000);
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+
+        // Peer takes control (no entry → no cursor placement to consume).
+        let take = ControlRequest {
+            request_id: 1,
+            entry: None,
+        };
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                take.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+
+        // The peer drives (motion only, nothing held): injecting it re-baselines
+        // the input tick to 1000, so the peer's own driving does not read as the
+        // user's local input.
+        let batch = InputBatch {
+            sequence: 1,
+            events: vec![WireInputEvent::Motion { dx: 10, dy: 0 }],
+        };
+        rig.events
+            .send(frame(
+                MessageType::InputBatch,
+                batch.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        // Wait until that motion is actually injected — the injection is what
+        // re-baselines the tick to 1000 — before simulating local input, or the
+        // bump below could be re-baselined away.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while rig.injector.injected_pointers().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "peer motion never injected"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The user touches this machine: the tick advances past our injection
+        // baseline, so within a health period the grant is reclaimed to neutral.
+        rig.capture.set_last_input_tick(2000);
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected the Release frame to the peer");
+        };
+        assert_eq!(message_type, MessageType::ControlRelease.wire());
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::PeerControlReclaimedLocally
+        );
     }
 
     #[tokio::test]
