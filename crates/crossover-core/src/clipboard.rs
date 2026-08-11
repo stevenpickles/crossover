@@ -151,6 +151,18 @@ pub const TRANSMIT_DEBOUNCE: Duration = Duration::from_millis(300);
 /// long burst of typing. A transfer that loses even a minute to that is
 /// better abandoned observably than kept forever — the content is still on
 /// the origin's clipboard, and re-copying re-sends it.
+///
+/// **Known coarseness.** One case reaches this deadline having never had a
+/// chance: an offer the session's send gate refuses locally, because the
+/// peer never advertised the content type (docs/PROTOCOL.md §3.1). The
+/// engine is sans-io and holds no session knowledge — it cannot know a
+/// capability was missing — so it waits out the full minute holding the
+/// item, then abandons it like any other unanswered offer. The wait is
+/// bounded and the outcome is *counted*
+/// ([`Metrics::record_clipboard_abandoned`]) rather than merely logged, so
+/// the case is diagnosable instead of silent; teaching the engine the
+/// negotiated feature set would fix it properly, and would mean handing
+/// the state machine session state it otherwise has no reason to know.
 pub const TRANSFER_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Retry policy for `Busy` clipboard writes (FR-3.4): centrally defined,
@@ -740,17 +752,20 @@ impl ClipboardEngine {
                 let Some(outbound) = self.outbound.take() else {
                     return Vec::new();
                 };
-                if !outbound.retains_content() {
-                    // Already past the point of holding the item; leave it
-                    // to close on its Applied.
-                    self.outbound = Some(outbound);
-                    return Vec::new();
-                }
+                // Every outbound state expires, not only the ones holding
+                // an item buffer. `AwaitingApplied` costs almost no
+                // memory, but a peer that never answers would occupy the
+                // single outbound slot forever — and that slot is an input
+                // to the conflict rule, so a zombie transaction would keep
+                // deciding races against items minted long after it
+                // (FR-3.5).
+                self.record(Metrics::record_clipboard_abandoned);
                 tracing::warn!(
                     clipboard_id = %outbound.meta().id,
                     byte_count = outbound.meta().content_length,
+                    retained_content = outbound.retains_content(),
                     result = "abandoned",
-                    "outbound clipboard transfer abandoned: no answer within the deadline"
+                    "outbound clipboard transaction abandoned: no answer within the deadline"
                 );
                 Vec::new()
             }
@@ -760,6 +775,7 @@ impl ClipboardEngine {
                 }
                 let mut actions = Vec::new();
                 if let Some(meta) = self.expecting_data.take() {
+                    self.record(Metrics::record_clipboard_abandoned);
                     tracing::warn!(
                         clipboard_id = %meta.id,
                         result = "abandoned",
@@ -776,6 +792,7 @@ impl ClipboardEngine {
                     })));
                 }
                 if let Some(reassembly) = self.abandon_reassembly("deadline") {
+                    self.record(Metrics::record_clipboard_abandoned);
                     actions.push(Action::Send(OutboundMessage::Applied(ClipboardApplied {
                         id: reassembly,
                         result: ApplyResult::ContentRejected,
@@ -856,12 +873,20 @@ impl ClipboardEngine {
         // memory before megabytes arrive (ADR 0014).
         let offered = meta.content_type.is_chunked()
             || meta.content_length > CLIPBOARD_INLINE_MAX_BYTES as u64;
+        // Armed for *every* outbound transaction, inline text included.
+        // The buffer is only half the reason: the other half is that
+        // `outbound` is the single slot the conflict rule reads, so a
+        // transaction nobody ever answers would go on deciding races it
+        // has no business in (FR-3.5). One deadline covers the whole
+        // transaction — offer, stream and verdict — so accepting does not
+        // restart the clock.
+        let deadline = self.arm_timeout(TransferScope::Outbound);
         if !offered {
             self.outbound = Some(Outbound::AwaitingApplied { meta, started });
-            return vec![Action::Send(OutboundMessage::Data(ClipboardData {
-                meta,
-                content,
-            }))];
+            return vec![
+                Action::Send(OutboundMessage::Data(ClipboardData { meta, content })),
+                deadline,
+            ];
         }
         self.outbound = Some(Outbound::AwaitingAccept {
             meta,
@@ -870,7 +895,7 @@ impl ClipboardEngine {
         });
         vec![
             Action::Send(OutboundMessage::Offer(ClipboardOffer { meta })),
-            self.arm_timeout(TransferScope::Outbound),
+            deadline,
         ]
     }
 
@@ -2473,6 +2498,57 @@ mod tests {
             other => panic!("expected the origin to be told, got {other:?}"),
         }
         assert!(e.expecting_data.is_none());
+    }
+
+    /// An unanswered transaction must not occupy the single outbound slot
+    /// forever — not for its memory (an `AwaitingApplied` holds almost
+    /// none) but because that slot decides conflicts: a peer that never
+    /// acknowledges would otherwise leave a zombie item winning races
+    /// against everything minted after it (FR-3.5).
+    #[test]
+    fn an_unacknowledged_inline_item_expires_instead_of_skewing_conflicts() {
+        use std::sync::Arc;
+
+        use crate::metrics::Metrics;
+
+        let metrics = Arc::new(Metrics::new());
+        let mut e = ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig::new(),
+            Some(Arc::clone(&metrics)),
+        );
+        let actions = copy(&mut e, "sent into silence");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::ScheduleTransferTimeout {
+                    scope: TransferScope::Outbound,
+                    ..
+                }
+            )),
+            "even an inline item must be bounded in time: {actions:?}"
+        );
+
+        assert!(e.outbound.is_some());
+        assert!(
+            e.on_transfer_timeout(TransferScope::Outbound, e.outbound_generation)
+                .is_empty()
+        );
+        assert!(e.outbound.is_none(), "the zombie transaction survived");
+        assert_eq!(metrics.snapshot().clipboard_abandoned, 1);
+
+        // With the slot free, a later inbound item is judged on its own
+        // merits rather than raced against one nobody is waiting for.
+        let inbound = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0x01; 16]), // lower origin: would have lost
+            0,
+            ContentType::Utf8Text,
+            b"theirs".to_vec(),
+        );
+        let actions = e.on_peer_message(InboundMessage::Data(inbound));
+        assert_eq!(written_text(&actions).as_deref(), Some("theirs"));
+        assert_eq!(metrics.snapshot().clipboard_conflicts, 0);
     }
 
     /// An outbound offer nobody answers releases its item — the retained

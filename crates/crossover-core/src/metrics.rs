@@ -198,6 +198,7 @@ pub struct Metrics {
     clipboard_contention: AtomicU64,
     clipboard_loop_suppressed: AtomicU64,
     clipboard_conflicts: AtomicU64,
+    clipboard_abandoned: AtomicU64,
     clipboard_latency_ms: Mutex<Vec<u32>>,
     clipboard_latency_dropped: AtomicU64,
 
@@ -293,6 +294,17 @@ impl Metrics {
     /// An item was superseded by a newer one before it took effect.
     pub fn record_clipboard_superseded(&self) {
         self.clipboard_superseded.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A clipboard transfer was abandoned unfinished: its deadline
+    /// expired before the transaction closed (ADR 0014).
+    ///
+    /// Counted rather than merely logged because it is the *only* signal
+    /// for a class of silent stalls — an offer refused locally by the
+    /// send gate, or a peer that accepts and then goes quiet — where
+    /// nothing else observable happens for a minute and then a
+    /// transaction simply is not there any more (NFR-3, FR-7.3).
+    pub fn record_clipboard_abandoned(&self) {
+        self.clipboard_abandoned.fetch_add(1, Ordering::Relaxed);
     }
     /// A clipboard write was retried after `Busy` contention.
     pub fn record_clipboard_retry(&self) {
@@ -419,6 +431,7 @@ impl Metrics {
             clipboard_contention: load(&self.clipboard_contention),
             clipboard_loop_suppressed: load(&self.clipboard_loop_suppressed),
             clipboard_conflicts: load(&self.clipboard_conflicts),
+            clipboard_abandoned: load(&self.clipboard_abandoned),
             clipboard_latency_dropped: load(&self.clipboard_latency_dropped),
             latency_p50: percentile(&sorted_latency, 50),
             latency_p95: percentile(&sorted_latency, 95),
@@ -492,6 +505,8 @@ pub struct Report {
     pub clipboard_applied: u64,
     /// Clipboard items superseded before taking effect.
     pub clipboard_superseded: u64,
+    /// Clipboard transfers abandoned on their deadline (ADR 0014).
+    pub clipboard_abandoned: u64,
     /// Clipboard write retries (`Busy`).
     pub clipboard_retries: u64,
     /// Clipboard contention events (`Busy`).
