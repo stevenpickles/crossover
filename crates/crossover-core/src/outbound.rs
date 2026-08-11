@@ -40,7 +40,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crossover_protocol::hello::MessageType;
 
-use crate::clipboard_driver::SessionCommand;
+use crate::command::SessionCommand;
 
 /// Depth of a High lane, in frames. Interactive frames are small (an input
 /// batch is tens of bytes, a control message a handful), so a message count
@@ -592,15 +592,25 @@ pub struct CommandReceiver {
     background: BudgetedReceiver<SessionCommand>,
     high_closed: bool,
     background_closed: bool,
+    /// Budget for the command handed out by the last [`Self::recv`], held
+    /// until the caller comes back for the next one. See `recv`.
+    in_flight: Option<BudgetHold>,
 }
 
 impl CommandReceiver {
     /// The next command, High lane first. Cancel-safe.
     ///
-    /// The Background byte budget is returned as the command leaves the
-    /// queue; a consumer that must hold the budget until it has passed the
-    /// command on should take the lanes apart with [`Self::into_lanes`].
+    /// The Background byte budget behaves exactly as it does everywhere else
+    /// on this path: it covers the queued commands **plus the one the
+    /// consumer is currently holding**, and is returned when the consumer
+    /// comes back for the next command (or drops the receiver). A consumer
+    /// that needs the two lanes separately — to forward each with its own
+    /// task — takes them apart with [`Self::into_lanes`] instead, and the
+    /// bound means the same thing there.
     pub async fn recv(&mut self) -> Option<SessionCommand> {
+        // The previous command is finished with by definition: the caller is
+        // asking for another one.
+        self.in_flight = None;
         let lane = drain_high_first(
             &mut self.high,
             &mut self.background,
@@ -610,13 +620,21 @@ impl CommandReceiver {
         .await?;
         Some(match lane {
             Lane::High(command) => command,
-            Lane::Background(budgeted) => budgeted.into_parts().0,
+            Lane::Background(budgeted) => {
+                let (command, hold) = budgeted.into_parts();
+                self.in_flight = Some(hold);
+                command
+            }
         })
     }
 
     /// Take the two lanes apart, so each can be forwarded by its own task.
     /// This is what keeps a parked Background forwarder from holding up High
     /// commands from the same driver.
+    ///
+    /// Any budget still held for a command handed out by [`Self::recv`] is
+    /// released here; mixing the two access styles is not a pattern the
+    /// path uses.
     #[must_use]
     pub fn into_lanes(
         self,
@@ -645,6 +663,7 @@ pub fn command_lanes() -> (CommandSender, CommandReceiver) {
             background: background_rx,
             high_closed: false,
             background_closed: false,
+            in_flight: None,
         },
     )
 }

@@ -24,6 +24,7 @@ use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
 use crossover_protocol::hello::MessageType;
 
 use crate::clipboard::{Action, ClipboardConfig, ClipboardEngine, InboundMessage};
+use crate::command::{FrameTarget, SessionCommand};
 use crate::metrics::Metrics;
 use crate::outbound::{CommandReceiver, CommandSender, command_lanes};
 
@@ -65,41 +66,6 @@ pub enum SyncEvent {
     RetryDue(Uuid),
     /// The settle window elapsed (ADR 0006): time to read.
     SettleDue(u64),
-}
-
-/// Which session(s) a [`SessionCommand`] is directed at.
-///
-/// Clipboard sync is session-agnostic (FR-5.4) and broadcasts; control
-/// and input traffic is authority for one authenticated session and is
-/// routed to exactly that one (FR-5.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameTarget {
-    /// Every active session.
-    Broadcast,
-    /// One session, by its locally generated id.
-    Session(Uuid),
-}
-
-/// What a driver asks the app to do.
-#[derive(Debug)]
-pub enum SessionCommand {
-    /// Send this frame to the target session(s).
-    SendFrame {
-        /// Which session(s) to send it to.
-        target: FrameTarget,
-        /// Frame message type.
-        message_type: u16,
-        /// Encoded payload.
-        payload: Vec<u8>,
-    },
-    /// The target sent an invalid payload: terminate it (fail closed);
-    /// supervision handles the rest.
-    TerminateSession {
-        /// Which session(s) to terminate.
-        target: FrameTarget,
-        /// Diagnostic for logs.
-        reason: String,
-    },
 }
 
 /// The clipboard sync driver. Create with [`clipboard_sync`], then spawn

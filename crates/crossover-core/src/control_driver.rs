@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crossover_platform::{CursorMask, DisplayInfo, InputCapture, InputInjector};
 use crossover_protocol::RawFrame;
 
-use crate::clipboard_driver::{FrameTarget, SessionCommand};
+use crate::command::{FrameTarget, SessionCommand};
 use crate::control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
     OutboundControl,
@@ -826,7 +826,7 @@ mod tests {
     };
 
     use super::{InputControlEvent, input_control};
-    use crate::clipboard_driver::{FrameTarget, SessionCommand};
+    use crate::command::{FrameTarget, SessionCommand};
     use crate::control::{ControlConfig, ControlNotice};
     use crate::edge_driver::EdgeMode;
     use crate::input::{InputEvent, KeyEvent, PointerButton, PointerEvent, hid};

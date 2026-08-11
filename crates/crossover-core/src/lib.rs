@@ -8,6 +8,7 @@
 
 pub mod clipboard;
 pub mod clipboard_driver;
+pub mod command;
 pub mod control;
 pub mod control_driver;
 pub mod edge_driver;
@@ -20,9 +21,8 @@ pub mod supervision;
 pub mod topology;
 
 pub use clipboard::{ClipboardConfig, ClipboardEngine, RetryPolicy as ClipboardRetryPolicy};
-pub use clipboard_driver::{
-    ClipboardSyncDriver, FrameTarget, SessionCommand, SyncEvent, clipboard_sync,
-};
+pub use clipboard_driver::{ClipboardSyncDriver, SyncEvent, clipboard_sync};
+pub use command::{FrameTarget, SessionCommand};
 pub use control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
     OutboundControl,
