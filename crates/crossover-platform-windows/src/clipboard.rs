@@ -99,7 +99,7 @@ use windows::Win32::System::DataExchange::{
     RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -491,12 +491,22 @@ fn alloc_block(bytes: &[u8]) -> Result<HGLOBAL, ClipboardError> {
             reason: "refusing to install an empty clipboard block".to_owned(),
         });
     }
-    // SAFETY: allocating a movable global block for the clipboard.
-    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }.map_err(|e| {
-        ClipboardError::Unavailable {
-            reason: format!("GlobalAlloc failed: {e}"),
-        }
-    })?;
+    // GMEM_ZEROINIT is not decoration. `GlobalAlloc` may return a block
+    // larger than the requested size, `GlobalSize` reports that larger
+    // size, and the read path copies all of it — so without zeroing,
+    // reading back a block Crossover itself installed would copy
+    // uninitialized bytes through a `&[u8]`, which the abstract machine
+    // calls undefined even though canonicalization then discards them.
+    // Zeroing costs nothing measurable and makes any slack deterministic,
+    // which the round-trip stability the loop guard rests on can only
+    // benefit from.
+    // SAFETY: allocating a zeroed movable global block for the clipboard.
+    let hglobal =
+        unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) }.map_err(|e| {
+            ClipboardError::Unavailable {
+                reason: format!("GlobalAlloc failed: {e}"),
+            }
+        })?;
     // SAFETY: `hglobal` is ours and unlocked; lock it, copy exactly the
     // `bytes.len()` bytes it was allocated for, unlock. On failure before
     // the system takes ownership we free it rather than leak.
