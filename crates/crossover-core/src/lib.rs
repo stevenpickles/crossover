@@ -14,6 +14,7 @@ pub mod edge_driver;
 pub mod input;
 pub mod metrics;
 pub mod net;
+pub mod outbound;
 pub mod pairing;
 pub mod supervision;
 pub mod topology;
@@ -37,6 +38,11 @@ pub use metrics::{FrameClass, Metrics, Report};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
     connect,
+};
+pub use outbound::{
+    MAX_BACKGROUND_QUEUE_BYTES, MAX_BACKGROUND_QUEUE_FRAMES, MAX_HIGH_QUEUE_FRAMES, OutboundClosed,
+    OutboundFrame, OutboundReceiver, OutboundSender, SendPriority, budgeted_channel,
+    outbound_channel,
 };
 pub use pairing::{PairingDriveError, PairingListener, pair_with};
 pub use supervision::{
