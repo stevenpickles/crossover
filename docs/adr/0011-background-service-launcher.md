@@ -3,6 +3,12 @@
 Status: Accepted
 Date: 2026-08-09
 
+Amended by [0012](0012-elevated-worker-integrity.md): the worker still runs as
+the user (never SYSTEM), but for an administrator it now launches at **high
+integrity** (via the user's elevated linked token) so it can capture and inject
+over elevated windows. The "no privilege escalation of the input path" clause
+below is revised there; the minimal-service invariant is unchanged.
+
 ## Context
 
 Phase 6 wants Crossover to run **unattended** — start automatically, survive

@@ -24,7 +24,9 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{
-    DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenPrimary,
+    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TOKEN_ALL_ACCESS,
+    TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TokenElevationType, TokenElevationTypeLimited,
+    TokenLinkedToken, TokenPrimary,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
@@ -281,6 +283,59 @@ fn probe_active_session() -> Option<u32> {
     }
 }
 
+/// Whether a console user's token has a *full* linked token worth launching
+/// with. Only the UAC-filtered (`Limited`) token does: `Default` means there is
+/// no split token (standard user, UAC disabled, or the built-in Administrator)
+/// and `Full` is already the full token — both launch as-is. Pure, so the
+/// decision is unit-tested without a real token (ADR 0012).
+fn wants_linked_token(elevation: TOKEN_ELEVATION_TYPE) -> bool {
+    elevation == TokenElevationTypeLimited
+}
+
+/// The console user's *full* (elevated) token when their session token is the
+/// UAC-filtered one, so the worker runs at high integrity and can capture and
+/// inject over elevated windows (ADR 0012). Returns `None` — the caller falls
+/// back to the filtered token, medium-integrity as before — when there is no
+/// elevated token (standard user, UAC off, built-in admin) or any query fails.
+fn linked_elevated_token(user_token: &Handle) -> Option<Handle> {
+    let mut elevation = TokenElevationTypeLimited;
+    let mut returned = 0u32;
+    // SAFETY: `user_token.0` is a live token with query rights; the out buffer
+    // is a valid `TOKEN_ELEVATION_TYPE` of the stated size; `returned` is a
+    // valid out-pointer. A failure just falls back (medium integrity).
+    unsafe {
+        GetTokenInformation(
+            user_token.0,
+            TokenElevationType,
+            Some((&raw mut elevation).cast()),
+            u32::try_from(size_of::<TOKEN_ELEVATION_TYPE>()).unwrap_or(0),
+            &raw mut returned,
+        )
+    }
+    .ok()?;
+
+    if !wants_linked_token(elevation) {
+        return None;
+    }
+
+    let mut linked = TOKEN_LINKED_TOKEN::default();
+    // SAFETY: as above; the out buffer is a valid `TOKEN_LINKED_TOKEN` of the
+    // stated size. On success `linked.LinkedToken` is a token handle we own and
+    // must close — wrapped in `Handle` so drop does exactly that.
+    unsafe {
+        GetTokenInformation(
+            user_token.0,
+            TokenLinkedToken,
+            Some((&raw mut linked).cast()),
+            u32::try_from(size_of::<TOKEN_LINKED_TOKEN>()).unwrap_or(0),
+            &raw mut returned,
+        )
+    }
+    .ok()?;
+
+    (!linked.LinkedToken.is_invalid()).then(|| Handle(linked.LinkedToken))
+}
+
 /// Launch `crossover.exe run` as the user of `session`, in their session and
 /// desktop, and return the process handle.
 fn launch_worker(worker_exe: &Path, session: u32) -> windows::core::Result<Handle> {
@@ -290,12 +345,23 @@ fn launch_worker(worker_exe: &Path, session: u32) -> windows::core::Result<Handl
     unsafe { WTSQueryUserToken(session, &raw mut user_token) }?;
     let user_token = Handle(user_token);
 
+    // Launch at high integrity when the user has a full (elevated) linked token,
+    // so the worker's low-level hooks and injection reach elevated windows
+    // (ADR 0012). A standard user (or UAC-off session) has none — fall back to
+    // the filtered token and run medium-integrity, exactly as ADR 0011 did.
+    let elevated = linked_elevated_token(&user_token);
+    let launch_token = elevated.as_ref().unwrap_or(&user_token);
+    tracing::info!(
+        high_integrity = elevated.is_some(),
+        "selected worker launch token"
+    );
+
     let mut primary_token = HANDLE::default();
-    // SAFETY: `user_token` is live; a primary token is required for
+    // SAFETY: `launch_token` is live; a primary token is required for
     // CreateProcessAsUser. `primary_token` is a valid out-pointer we then own.
     unsafe {
         DuplicateTokenEx(
-            user_token.0,
+            launch_token.0,
             TOKEN_ALL_ACCESS,
             None,
             SecurityImpersonation,
@@ -486,5 +552,23 @@ impl Drop for EnvBlock {
                 let _ = DestroyEnvironmentBlock(self.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wants_linked_token;
+    use windows::Win32::Security::{
+        TokenElevationTypeDefault, TokenElevationTypeFull, TokenElevationTypeLimited,
+    };
+
+    #[test]
+    fn only_a_filtered_token_has_a_full_linked_token_to_launch_with() {
+        // The UAC-filtered admin token elevates via its linked full token; a
+        // standard user / UAC-off session (Default) and an already-full token
+        // launch as-is (ADR 0012).
+        assert!(wants_linked_token(TokenElevationTypeLimited));
+        assert!(!wants_linked_token(TokenElevationTypeDefault));
+        assert!(!wants_linked_token(TokenElevationTypeFull));
     }
 }
