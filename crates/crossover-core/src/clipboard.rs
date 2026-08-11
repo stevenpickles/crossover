@@ -75,6 +75,21 @@ const MAX_CLIPBOARD_VIOLATIONS: u32 = 8;
 /// scale: a superseded transfer can leave a whole background lane's worth
 /// of chunks in flight, far past [`MAX_CLIPBOARD_VIOLATIONS`], and killing
 /// a healthy session over that would be its own defect.
+///
+/// **What this concedes, stated plainly.** An id in this ring is a
+/// permanently free channel for the rest of the session: a peer may send
+/// chunks bearing it forever and be charged nothing. That is deliberate,
+/// and the reasoning is economic rather than structural. To obtain such an
+/// id a peer must first have had a transfer complete or be abandoned —
+/// and having got one, the traffic buys it nothing: no state is created,
+/// no memory is committed, no answer is sent, and the frames are logged at
+/// **debug**, so at default levels the cost to this side is a decode and a
+/// comparison per frame. That is strictly less than the peer spends
+/// sending them, and it is no better than what any unknown message type
+/// already costs (docs/PROTOCOL.md §7 — skipped, counted, debug). The one
+/// caveat worth knowing when diagnosing: under `RUST_LOG=debug` the
+/// *volume* of that logging is the peer's to choose, so a machine left in
+/// debug logging can have its log growth driven from the far end.
 const RECENT_TRANSFER_MEMORY: usize = 4;
 
 /// Clipboard engine tuning. Grouped because all three knobs are timing
@@ -935,7 +950,20 @@ impl ClipboardEngine {
         Some(id)
     }
 
+    /// Remember a finished or abandoned transfer, at most once.
+    ///
+    /// The de-duplication is not tidiness. The same id can arrive here
+    /// twice — a transfer abandoned and then re-offered under its original
+    /// id, say — and without the check those repeats would evict the ring
+    /// with copies of one value. A ring holding four of the same id
+    /// remembers exactly one transfer, so the tail of a *different*
+    /// superseded transfer would suddenly be chargeable as unsolicited:
+    /// the peer's repetition, not its misbehaviour, would decide whether a
+    /// benign race costs it violations.
     fn remember_transfer(&mut self, id: Uuid) {
+        if self.recent_transfers.contains(&id) {
+            return;
+        }
         if self.recent_transfers.len() >= RECENT_TRANSFER_MEMORY {
             self.recent_transfers.pop_front();
         }
@@ -1067,6 +1095,27 @@ impl ClipboardEngine {
         }
     }
 
+    /// A decline closes an offer that is still **awaiting an answer** —
+    /// and only that.
+    ///
+    /// The asymmetry with [`Self::on_peer_applied`], which does stop a
+    /// stream in flight, is deliberate and worth stating because the race
+    /// that raises the question is legal: chunk 0 leaves as soon as the
+    /// accept arrives, so a decline the peer sent for some *other* reason
+    /// can cross it on the wire (docs/PROTOCOL.md §4 orders messages
+    /// within a class, not between the two directions of one).
+    ///
+    /// A decline reaching a live stream therefore means the peer answered
+    /// the same offer twice. Stopping the stream on it would let one
+    /// stray or duplicated frame cancel a transfer the peer has already
+    /// accepted and is actively reassembling — trading a real transfer for
+    /// a message that contradicts the peer's own earlier answer. Ignoring
+    /// it costs at most the rest of one bounded stream, which the receiver
+    /// either completes (and acknowledges) or refuses per §7. `Applied` is
+    /// different in kind: it is the *verdict*, the only message that ends
+    /// a transaction, and a receiver that has rendered one has genuinely
+    /// stopped reassembling — continuing to push chunks at it would be
+    /// spending the wire on nobody.
     fn on_peer_decline(&mut self, decline: &ClipboardDecline) -> Vec<Action> {
         match self.outbound.take() {
             Some(Outbound::AwaitingAccept { meta, started, .. }) if meta.id == decline.id => {
@@ -2655,6 +2704,53 @@ mod tests {
             assert_eq!(written(&actions), Some(snip(fresh)), "{label}");
             assert!(!sent(&e.on_write_result(fresh_meta.id, Ok(()))).is_empty());
         }
+    }
+
+    /// The recent-transfer ring must remember four *distinct* transfers,
+    /// not four copies of one. If a repeated id could evict the others,
+    /// the tail of a genuinely different superseded transfer would become
+    /// chargeable — the peer's repetition deciding whether a benign race
+    /// costs it violations.
+    #[test]
+    fn the_recent_transfer_ring_remembers_distinct_transfers() {
+        use super::RECENT_TRANSFER_MEMORY;
+
+        let mut e = engine(0xBB);
+        let bytes = image_bytes(64);
+
+        // The oldest of RECENT_TRANSFER_MEMORY transfers, whose tail must
+        // still be recognized at the end.
+        let (oldest, _) = inbound_image(&mut e, 0xAA, 0, &bytes);
+        e.on_write_result(oldest.id, Ok(()));
+
+        // A second transfer, completed repeatedly — its trailing chunks
+        // arrive again and again, each one re-remembering the same id.
+        let (repeated, _) = inbound_image(&mut e, 0xAA, 1, &image_bytes(96));
+        e.on_write_result(repeated.id, Ok(()));
+        let tail = chunk_content(repeated.id, &image_bytes(96)).unwrap();
+        for _ in 0..RECENT_TRANSFER_MEMORY * 3 {
+            assert!(
+                e.on_peer_message(InboundMessage::Chunk(tail[0].clone()))
+                    .is_empty()
+            );
+        }
+
+        // The oldest transfer's tail is still absorbed, not charged.
+        let old_tail = chunk_content(oldest.id, &bytes).unwrap();
+        let actions = e.on_peer_message(InboundMessage::Chunk(old_tail[0].clone()));
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(
+            e.violations, 0,
+            "a repeated id crowded the ring and made a benign tail chargeable"
+        );
+        // A genuinely unknown id is still a violation: the ring absorbs
+        // races, not everything.
+        e.on_peer_message(InboundMessage::Chunk(ClipboardChunk {
+            id: Uuid::from_bytes([0x5A; 16]),
+            index: 0,
+            payload: vec![0x11; 32],
+        }));
+        assert_eq!(e.violations, 1);
     }
 
     /// A conflict decided *before* the transfer starts: an image offer
