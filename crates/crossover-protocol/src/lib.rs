@@ -14,8 +14,9 @@ pub mod pairing;
 pub mod version;
 
 pub use clipboard::{
-    ApplyResult, ClipboardAccept, ClipboardApplied, ClipboardData, ClipboardDecline, ClipboardMeta,
-    ClipboardOffer, ContentType, DeclineReason,
+    ApplyResult, ChunkOutcome, ChunkPlan, ChunkReassembly, ClipboardAccept, ClipboardApplied,
+    ClipboardChunk, ClipboardData, ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType,
+    DeclineReason, ImageFormat,
 };
 pub use control::{ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason};
 pub use framing::{FrameDecoder, RawFrame, encode_frame};

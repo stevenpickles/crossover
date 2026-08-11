@@ -575,7 +575,9 @@ impl ClipboardEngine {
                     // Success-shaped: the peer already has the content, or
                     // a newer item won the race.
                     DeclineReason::AlreadyHave | DeclineReason::Superseded => "converged",
-                    DeclineReason::TooLarge | DeclineReason::NotReady => "declined",
+                    DeclineReason::TooLarge
+                    | DeclineReason::NotReady
+                    | DeclineReason::UnsupportedType => "declined",
                 };
                 tracing::info!(
                     clipboard_id = %decline.id,
