@@ -1698,7 +1698,14 @@ mod tests {
 
         let placements = rig.injector.placements();
         assert_eq!(placements.len(), 1, "exactly one placement on entry");
-        assert_eq!(placements[0].x, 1919, "entered on the right (linked) edge");
+        // Just *inside* the right (linked) edge, not on pixel 1919 — so the
+        // detector re-primes at_edge=false and the first crossing back fires
+        // (the reversal-stall fix, feature/90).
+        assert!(
+            (1915..1919).contains(&placements[0].x),
+            "entered just inside the right (linked) edge, got x={}",
+            placements[0].x
+        );
         assert!(
             (placements[0].y - 540).abs() <= 1,
             "placed at mid-height, got y={}",
