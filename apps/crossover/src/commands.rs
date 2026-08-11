@@ -791,12 +791,17 @@ fn log_display_and_edge(display: &dyn DisplayInfo, side: Option<LinkSide>) {
     }
 }
 
-/// Print control-transfer state changes as they happen. Every failed or
-/// ended transfer is user-visible here (NFR-3); detail is in the logs.
+/// Surface control-transfer state changes as they happen. Every failed or
+/// ended transfer is user-visible here (NFR-3), both on the console and in the
+/// log — the latter matters because the service-launched worker is headless, so
+/// the `println!` alone goes to `NUL` (ADR 0011) and the soak log would
+/// otherwise show no control transfers at all.
 async fn print_control_notices(mut notices: mpsc::Receiver<ControlNotice>, metrics: Arc<Metrics>) {
     while let Some(notice) = notices.recv().await {
         count_control_notice(&metrics, notice);
-        println!("{}", describe_notice(notice));
+        let message = describe_notice(notice);
+        tracing::info!(?notice, "control: {message}");
+        println!("{message}");
     }
 }
 
