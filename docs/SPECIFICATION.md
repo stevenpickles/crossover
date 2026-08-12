@@ -96,8 +96,8 @@ secure WAN operation; diagnostics UI.
 
 > **Re-scoped:** clipboard **images** left this list on 2026-08-11 and are
 > being built in Phase 7 ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md));
-> file lists are sketched for a later, deliberately minimal drop-folder
-> capability ([ADR 0015](adr/0015-drop-folder-file-transfer.md)). §3.1's
+> file lists are designed for a later, deliberately minimal spool-and-paste
+> capability ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)). §3.1's
 > "UTF-8 **text**" remains an accurate description of what a *shipped*
 > build synchronizes until ADR 0014's platform slice lands — the feature is
 > negotiated, and this build advertises nothing (PROTOCOL.md §3.1).
