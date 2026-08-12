@@ -100,6 +100,19 @@ This adds a **filesystem-write surface** and so requires its own ADR **and**
 SECURITY.md threat-model additions before any implementation — see the
 "Known decisions awaiting an ADR" entry.
 
+> **Forward reference, corrected 2026-08-12** (annotation only; the sketch
+> above is left as written). That ADR is
+> [0015](0015-spooled-virtual-file-paste.md) (Proposed), and it settles the
+> receive side differently from this sketch: files transfer **eagerly** into a
+> bounded internal spool and are then offered as a **virtual file list**, so the
+> user's paste target is the destination and the drop folder is a documented
+> alternative rather than the plan. Two consequences for the paragraphs above:
+> the sketch's "files land in a configured folder" no longer describes the
+> decision, and delayed rendering *is* used for files — but as a **disposal**
+> mechanism serving already-transferred local bytes, not as the
+> transfer-on-paste mechanism this ADR reserved it for. The zip-to-a-single-blob
+> shape and the guardrails survive unchanged.
+
 ## Alternatives Considered
 
 - **Transcode images to PNG on the wire** (the size lever). Rejected by the

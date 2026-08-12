@@ -64,14 +64,16 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0012](0012-elevated-worker-integrity.md) | Worker runs at high integrity, launched with the user's elevated linked token, so it can drive elevated windows | Accepted |
 | [0013](0013-interactive-over-bulk-prioritization.md) | Interactive input takes wire priority over bulk transfers (Phase 7) | Accepted |
 | [0014](0014-chunked-rich-clipboard-transfer.md) | Chunked rich-clipboard transfer: images first, native format verbatim (Phase 7) | Accepted |
-| [0015](0015-drop-folder-file-transfer.md) | Files/folders transfer: drop-folder model, sender-zipped archives, per-peer permission (Phase 7) | Proposed |
+| [0015](0015-spooled-virtual-file-paste.md) | Files/folders transfer: eager transfer to a bounded internal spool, pasted as a virtual file list, sender-zipped archives, per-peer permission (Phase 7) | Proposed |
 
 ## Known decisions awaiting an ADR
 
 None outstanding. The files/folders **filesystem-write surface** sketched in
-0014 is now designed in [0015](0015-drop-folder-file-transfer.md) (Proposed),
-with the matching threat-model additions in
-[SECURITY.md](../SECURITY.md) §7 (invariants F1–F11, threats T12–T18) — the
+0014 is now designed in [0015](0015-spooled-virtual-file-paste.md) (Proposed) —
+eager verified transfer into a bounded internal spool, disposed of by pasting a
+virtual file list, superseding the drop-folder model 0014 sketched and 0015's
+own first draft carried — with the matching threat-model additions in
+[SECURITY.md](../SECURITY.md) §7 (invariants F1–F15, threats T12–T21) — the
 precondition 0014 set for any implementation.
 
 The deferred *specification* decisions are all recorded — wire format (0001),
