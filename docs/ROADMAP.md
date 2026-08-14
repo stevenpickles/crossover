@@ -7,13 +7,14 @@
 > between the two workstations under the background service, with no manual
 > intervention and no re-pairing (outcome recorded in docs/SOAK.md §Phase 6
 > soak). The hardening was exercised for real: machine A was off from midday
-> 08-12 to early 08-14 and machine B's reconnect supervisor retried the whole
-> outage at the capped 30 s backoff, re-establishing on its own when A
-> returned; an early-soak stretch of immediate worker exits on B had the
+> 08-12 to early 08-14 — with B itself down for stretches of that window —
+> and B's supervisor retried at the capped 30 s backoff whenever it was up,
+> re-establishing on its own within seconds of both machines returning; an
+> early-soak stretch of immediate worker exits on B had the
 > service relaunch on the ADR 0011 backoff until a launch came up cleanly,
 > ~19 minutes later, unattended. Clipboard and input reliability held
-> throughout — the one clipboard failure was bounded and observable, and no
-> input was ever left stuck. Two follow-ups came out of the soak: the display
+> throughout — the few clipboard failures were bounded and observable
+> (retries, then a logged reason), and no input was ever left stuck. Two follow-ups came out of the soak: the display
 > topology is captured once at startup, so unplugging or powering off a
 > monitor leaves a stale seamless edge (scheduled next as feature/107), and a
 > worker that exits before its run loop logs nothing about why
@@ -352,10 +353,10 @@ Exit criteria:
 - **Live input stays responsive during a concurrent bulk transfer** — measured:
   input latency bounded under a saturating background transfer (the ADR 0013
   guarantee), not merely subjectively smooth.
-- Delivered files materialize on disk only through an explicit user paste from
-  the internal spool, with every ADR 0015 guardrail enforced; oversized or
-  path-dubious inputs are rejected **observably** (FR-3.6), never a traversal
-  write or a silent drop.
+- Delivered files leave Crossover's internal spool and materialize in a
+  user-visible location only through an explicit user paste, with every ADR
+  0015 guardrail enforced; oversized or path-dubious inputs are rejected
+  **observably** (FR-3.6), never a traversal write or a silent drop.
 - No regression in text-clipboard reliability (the Phase 2 stress gate still
   passes) or in input latency/correctness.
 

@@ -723,21 +723,23 @@ service-launched on both sides, with **no manual intervention and no
 re-pairing**. The exit criteria held:
 
 - **Continuous operation.** Seamless crossing, keyboard follow, one visible
-  cursor, and clipboard sync kept working across the whole window — over a
-  hundred clipboard transactions applied across the two sides, and repeated
-  control transfers every day of the soak.
+  cursor, and clipboard sync kept working whenever both machines were up —
+  68 distinct clipboard transactions applied across the two sides, and
+  repeated control transfers on every day the pair was running together.
 - **Peer-outage recovery, at full scale.** Machine A was off from midday
-  08-12 (UTC) to early 08-14. Machine B's reconnect supervisor retried the
-  entire outage at the capped 30 s backoff (attempt counts into the
-  seventies) and re-established on its own the moment A returned.
+  08-12 (UTC) to early 08-14, and machine B was itself shut down for
+  multi-hour stretches inside that window. Whenever B was up it retried at
+  the capped 30 s backoff (one contiguous run reached attempt 139), and the
+  session re-established on its own within seconds of both machines being
+  back — never with a manual step.
 - **Worker relaunch, for real.** Early on 08-11 (02:21–02:40 UTC) machine
   B's worker exited immediately after startup, repeatedly; the service
   relaunched it on the ADR 0011 backoff (1 s doubling to the 30 s cap) until
   the 02:40 launch came up cleanly, computed its topology, connected, and
   applied a waiting clipboard item. Recovery was fully automatic.
-- **Failures stayed bounded and observable.** One inbound clipboard item
-  could not be installed (five attempts, then a logged
-  `clipboard_unavailable` — no hang, no loop). Transient injection warnings
+- **Failures stayed bounded and observable.** Three inbound clipboard items
+  could not be installed (bounded retries — up to five attempts — then a
+  logged `clipboard_unavailable`; no hang, no loop). Transient injection warnings
   (SendInput rejected during a blocked-input window, SetCursorPos timeouts)
   were logged and self-cleared. No stuck key or button after any transfer,
   disconnect, or relaunch.
