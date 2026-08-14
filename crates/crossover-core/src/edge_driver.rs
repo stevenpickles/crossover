@@ -73,15 +73,23 @@ pub struct EdgeCrossing {
 }
 
 /// The pure crossing detector: rising-edge detection against the linked
-/// edge. Holds only whether the cursor was at the edge last time, so a
-/// crossing fires once on arrival, never repeatedly while the cursor sits
-/// pinned there. No I/O.
+/// edge. Holds whether the cursor was at the edge last time — and the
+/// monitor layout that judgment was made against — so a crossing fires
+/// once on arrival, never repeatedly while the cursor sits pinned there,
+/// and never because the *edge* moved under a stationary cursor. No I/O.
 #[derive(Debug)]
 pub struct EdgeDetector {
     topology: Topology,
     /// Whether the cursor was against the linked edge at the last
     /// observation.
     at_edge: bool,
+    /// The monitor layout `at_edge` was computed against. A layout change
+    /// (dock, undock, a monitor powering off) moves the linked edge without
+    /// the cursor moving, so the flag no longer describes the geometry the
+    /// cursor is actually in: an interior column can become the edge in one
+    /// tick. The next observation after a change re-primes instead of
+    /// firing, so a hotplug never transfers control by itself.
+    layout: Vec<MonitorRect>,
 }
 
 impl EdgeDetector {
@@ -92,6 +100,7 @@ impl EdgeDetector {
         Self {
             topology,
             at_edge: false,
+            layout: Vec::new(),
         }
     }
 
@@ -101,17 +110,32 @@ impl EdgeDetector {
     /// transfer — only a fresh arrival does.
     pub fn prime(&mut self, cursor: CursorPoint, monitors: &[MonitorRect]) {
         self.at_edge = self.topology.leaving(cursor, monitors).is_some();
+        if self.layout.as_slice() != monitors {
+            self.layout = monitors.to_vec();
+        }
+    }
+
+    /// Whether `monitors` differs from the layout of the last observation.
+    #[must_use]
+    pub fn layout_changed(&self, monitors: &[MonitorRect]) -> bool {
+        self.layout.as_slice() != monitors
     }
 
     /// Observe a cursor position. Returns the crossing fraction only on
     /// the rising edge — the cursor reaching the linked edge after being
-    /// away from it — and `None` otherwise (away, or still pinned).
+    /// away from it — and `None` otherwise (away, still pinned, or a
+    /// monitor-layout change, which re-primes against the new geometry
+    /// rather than treating a moved edge as an arrival).
     #[must_use]
     pub fn observe(
         &mut self,
         cursor: CursorPoint,
         monitors: &[MonitorRect],
     ) -> Option<EdgeFraction> {
+        if self.layout_changed(monitors) {
+            self.prime(cursor, monitors);
+            return None;
+        }
         let touching = self.topology.leaving(cursor, monitors);
         let rising = touching.is_some() && !self.at_edge;
         self.at_edge = touching.is_some();
@@ -216,7 +240,27 @@ impl EdgeDetectDriver {
                 return true;
             }
         };
+        if self.detector.layout_changed(&monitors) {
+            tracing::debug!(
+                ?monitors,
+                "edge: monitor layout changed; re-priming against the new layout"
+            );
+        }
         if let Some(position) = self.detector.observe(cursor, &monitors) {
+            // The monitors and cursor reads race a display change: each is
+            // normalized to the virtual origin at its own call time, so a
+            // change landing between them pairs the cursor with the wrong
+            // origin — which can read as an edge touch from anywhere on
+            // screen. A crossing is trusted only if the layout is unchanged
+            // when re-read after the cursor; otherwise it is dropped, and
+            // the next tick observes the settled layout and re-primes.
+            match self.display.monitors() {
+                Ok(after) if after == monitors => {}
+                _ => {
+                    tracing::debug!("edge: display changed mid-poll; crossing discarded");
+                    return true;
+                }
+            }
             let Some(kind) = self.mode.crossing_kind() else {
                 return true; // idle: nothing to emit (unreachable while polling)
             };
@@ -289,6 +333,64 @@ mod tests {
         // Leaves and returns: fires again.
         assert!(d.observe(at(900, 305), &HD_MON).is_none());
         assert!(d.observe(at(1919, 305), &HD_MON).is_some());
+    }
+
+    /// The soak layout: a laptop panel with an external monitor to its
+    /// right, so the laptop's right column (x == 1919) is *interior* while
+    /// the external is present and becomes the linked edge when it goes.
+    const LAPTOP_AND_EXTERNAL: [MonitorRect; 2] = [
+        MonitorRect {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        },
+        MonitorRect {
+            left: 1920,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        },
+    ];
+
+    #[test]
+    fn unplugging_the_edge_monitor_does_not_fire_under_a_stationary_cursor() {
+        // Left member: the linked edge is the rightmost monitor's right
+        // column — the external's while it is plugged in.
+        let mut d = EdgeDetector::new(Topology::new(LinkSide::Left));
+        // Cursor on the laptop's right column: interior, not the edge.
+        assert!(d.observe(at(1919, 540), &LAPTOP_AND_EXTERNAL).is_none());
+        // The external is unplugged. The cursor has not moved, but the
+        // column under it is suddenly the linked edge — which must read as
+        // a moved edge, never as an arrival, or an unplug would transfer
+        // control by itself.
+        assert!(d.observe(at(1919, 540), &HD_MON).is_none());
+        // Pinned there afterwards: still nothing.
+        assert!(d.observe(at(1919, 540), &HD_MON).is_none());
+        // A genuine arrival on the new layout fires as usual.
+        assert!(d.observe(at(900, 540), &HD_MON).is_none());
+        assert!(d.observe(at(1919, 540), &HD_MON).is_some());
+    }
+
+    #[test]
+    fn plugging_a_monitor_in_moves_the_edge_off_a_pinned_cursor() {
+        // The plug-in direction never had a firing bug — the edge moves
+        // *away* from the cursor — so the observable behavior here matches
+        // the pre-fix detector. What this pins is layout adoption: the
+        // change must be recognized and stored, or a later refactor could
+        // lose the plug-in re-prime while the unplug tests stay green.
+        let mut d = EdgeDetector::new(Topology::new(LinkSide::Left));
+        // Pinned at the single monitor's linked edge (fires once on arrival).
+        assert!(d.observe(at(960, 540), &HD_MON).is_none());
+        assert!(d.observe(at(1919, 540), &HD_MON).is_some());
+        // The external arrives: the linked edge is now its far column, and
+        // the pinned cursor is interior. No crossing, the new layout is
+        // adopted, and the state re-primes as away-from-edge...
+        assert!(d.layout_changed(&LAPTOP_AND_EXTERNAL));
+        assert!(d.observe(at(1919, 540), &LAPTOP_AND_EXTERNAL).is_none());
+        assert!(!d.layout_changed(&LAPTOP_AND_EXTERNAL));
+        // ...so reaching the *new* edge fires.
+        assert!(d.observe(at(3839, 540), &LAPTOP_AND_EXTERNAL).is_some());
     }
 
     #[test]
@@ -380,6 +482,28 @@ mod tests {
         assert!(quiet.is_err(), "fired on a cursor already at the edge");
         // A fresh arrival does fire: leave the edge, let a poll see it,
         // then return.
+        display.set_cursor(at(900, 540));
+        sleep(SETTLE).await;
+        display.set_cursor(at(1919, 540));
+        let crossing = next_crossing(&mut crossings).await;
+        assert_eq!(crossing.kind, CrossingKind::Leave);
+    }
+
+    #[tokio::test]
+    async fn a_mid_watch_unplug_emits_no_crossing_until_a_fresh_arrival() {
+        let (display, mode_tx, mut crossings) = rig(LinkSide::Left);
+        display.set_monitors(LAPTOP_AND_EXTERNAL.to_vec());
+        mode_tx.send(EdgeMode::Leaving).await.unwrap();
+        sleep(SETTLE).await; // primes: middle of the laptop, away from any edge
+        // Park the cursor on the laptop's right column — interior while the
+        // external monitor is present — and let a poll observe it there.
+        display.set_cursor(at(1919, 540));
+        sleep(SETTLE).await;
+        // Unplug the external: the parked cursor is now on the linked edge.
+        display.set_monitors(vec![HD_MON[0]]);
+        let quiet = timeout(Duration::from_millis(200), crossings.recv()).await;
+        assert!(quiet.is_err(), "an unplug fired a crossing by itself");
+        // The user moving away and back to the (new) edge still crosses.
         display.set_cursor(at(900, 540));
         sleep(SETTLE).await;
         display.set_cursor(at(1919, 540));

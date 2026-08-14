@@ -105,6 +105,11 @@ impl DisplayInfo for WindowsDisplayInfo {
                 reason: "EnumDisplayMonitors reported no monitors".to_owned(),
             });
         }
+        // EnumDisplayMonitors guarantees no order. Consumers compare
+        // successive layouts for equality (the edge detector re-primes on
+        // any change), so an order flap between identical layouts must not
+        // read as a change — sort into a canonical order here.
+        monitors.sort_by_key(|m| (m.left, m.top));
         Ok(monitors)
     }
 }
