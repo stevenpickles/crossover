@@ -746,13 +746,23 @@ re-pairing**. The exit criteria held:
 
 Findings feeding follow-up work:
 
-- **Static display topology (scheduled as feature/107).** The virtual
-  desktop and seamless edge are computed once at worker startup. Unplugging
-  or powering off the external monitor mid-run leaves the stale edge in
-  place — the worker keeps believing the monitor is there, so the edge can
-  sit at still-reachable coordinates and hand control across when the user
-  does not expect it. Under a boot-started background service this is an
-  everyday event (docking, monitor power-off), not a corner case.
+- **Display topology change mishandled (fixed, feature/107; hardware check
+  pending).** The maintainer observed the seamless edge not following a
+  monitor unplug/power-off. The edge *geometry* was never the stale part —
+  it is re-read from the OS on every 8 ms poll — but three things were:
+  the rising-edge detector's at-edge latch was not invalidated by a layout
+  change, so an unplug could turn an interior cursor column into the
+  linked edge in a single tick and fire a control transfer by itself; the
+  only topology log line was the startup one, stale the moment the layout
+  moved; and a display change makes Windows reload the system cursors,
+  which can un-blank a hidden cursor mask. feature/107 re-primes the
+  detector across a layout change (a moved edge is never an arrival),
+  logs the new layout, and re-asserts a hidden mask. Under a boot-started
+  background service, docking and monitor power-off are everyday events,
+  not corner cases. Known residual: when Windows itself keeps a sleeping
+  monitor in the layout (common over HDMI), the desktop genuinely still
+  extends there and Crossover follows Windows — nothing to detect. The
+  two-machine unplug/replug check joins the Phase 7 soak procedure.
 - **Silent worker exit (diagnosability).** During the 08-11 relaunch loop
   the worker logged `starting` and nothing else — it exited before reaching
   its run loop without recording why. The window is consistent with a
