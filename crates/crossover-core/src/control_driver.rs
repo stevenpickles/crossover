@@ -188,7 +188,11 @@ pub struct InputControlDriver {
     /// topology line goes stale the moment the layout moves) and a hidden
     /// cursor mask is re-asserted, because a display change makes Windows
     /// reload the system cursors, which can un-blank a mask applied before
-    /// it. `None` until the first successful read, or without seamless.
+    /// it. The rects are origin-normalized, so a change that only re-anchors
+    /// the origin (a primary-monitor swap) or moves no rect (a mode change)
+    /// is invisible to this proxy; an un-blanked mask in those cases
+    /// self-heals on the next control transition or local-input fail-safe.
+    /// `None` until the first successful read, or without seamless.
     seen_monitors: Option<Vec<MonitorRect>>,
     events_rx: mpsc::Receiver<InputControlEvent>,
     events_tx: mpsc::Sender<InputControlEvent>,

@@ -247,6 +247,20 @@ impl EdgeDetectDriver {
             );
         }
         if let Some(position) = self.detector.observe(cursor, &monitors) {
+            // The monitors and cursor reads race a display change: each is
+            // normalized to the virtual origin at its own call time, so a
+            // change landing between them pairs the cursor with the wrong
+            // origin — which can read as an edge touch from anywhere on
+            // screen. A crossing is trusted only if the layout is unchanged
+            // when re-read after the cursor; otherwise it is dropped, and
+            // the next tick observes the settled layout and re-primes.
+            match self.display.monitors() {
+                Ok(after) if after == monitors => {}
+                _ => {
+                    tracing::debug!("edge: display changed mid-poll; crossing discarded");
+                    return true;
+                }
+            }
             let Some(kind) = self.mode.crossing_kind() else {
                 return true; // idle: nothing to emit (unreachable while polling)
             };
@@ -360,14 +374,21 @@ mod tests {
 
     #[test]
     fn plugging_a_monitor_in_moves_the_edge_off_a_pinned_cursor() {
+        // The plug-in direction never had a firing bug — the edge moves
+        // *away* from the cursor — so the observable behavior here matches
+        // the pre-fix detector. What this pins is layout adoption: the
+        // change must be recognized and stored, or a later refactor could
+        // lose the plug-in re-prime while the unplug tests stay green.
         let mut d = EdgeDetector::new(Topology::new(LinkSide::Left));
         // Pinned at the single monitor's linked edge (fires once on arrival).
         assert!(d.observe(at(960, 540), &HD_MON).is_none());
         assert!(d.observe(at(1919, 540), &HD_MON).is_some());
         // The external arrives: the linked edge is now its far column, and
-        // the pinned cursor is interior. No crossing, and the state
-        // re-primes as away-from-edge...
+        // the pinned cursor is interior. No crossing, the new layout is
+        // adopted, and the state re-primes as away-from-edge...
+        assert!(d.layout_changed(&LAPTOP_AND_EXTERNAL));
         assert!(d.observe(at(1919, 540), &LAPTOP_AND_EXTERNAL).is_none());
+        assert!(!d.layout_changed(&LAPTOP_AND_EXTERNAL));
         // ...so reaching the *new* edge fires.
         assert!(d.observe(at(3839, 540), &LAPTOP_AND_EXTERNAL).is_some());
     }
