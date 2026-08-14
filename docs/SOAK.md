@@ -772,3 +772,29 @@ Findings feeding follow-up work:
   carry unrelated `GetLastError` text (e.g. a WSAEWOULDBLOCK socket
   string): the failure is real and transient, but the label is stale errno
   noise and worth cleaning up when touching that path.
+
+## Hardware check: display topology changes (two machines)
+
+The feature/107 fix for the display-topology finding above is fully covered
+by unit tests against a scripted display; what only hardware shows is how
+*Windows* reports this pair's real monitors through a change. With the pair
+running seamlessly (machine A has the external monitor):
+
+1. **Unplug the external monitor** (cable out, not power) while the cursor
+   sits on the laptop panel. Within a health tick the log must show
+   `display topology changed` with the single-monitor layout — and nothing
+   else: no control transfer fires on its own, and the peer stays where it
+   was.
+2. **Cross afterwards.** The laptop's own edge is now the linked edge;
+   crossing it must transfer as usual and return cleanly.
+3. **Replug.** The log shows the two-monitor layout again; crossing now
+   happens at the external monitor's far edge, not the laptop's.
+4. **Unplug while driving the peer** (cursor hidden). The mask must stay
+   blanked through the change (the re-assert), and the both-Control escape
+   must still return control.
+5. **Monitor power-off instead of unplug.** Note what the log shows: over
+   DisplayPort the monitor usually leaves the layout (same as unplug);
+   over HDMI Windows may keep it, in which case the desktop genuinely
+   still extends there and the edge staying put is correct — record which
+   this hardware does, so the earlier finding's residual is documented
+   for this pair.
