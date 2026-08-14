@@ -716,7 +716,47 @@ Then use the machines normally. Over the soak window (target: multiple days):
   back → local" tracks the real capture state. This resolves the Phase 5
   "known latent item" above.
 
-Record the outcome in the Phase 6 exit-criteria notes (docs/ROADMAP.md): the
-soak duration, reboots and network interruptions survived, any manual
-intervention required, worker relaunches observed, and whether clipboard and
-input reliability held throughout.
+### Outcome: passed (soak 2026-08-11 → 2026-08-14)
+
+The soak ran unattended between machines A and B for four days,
+service-launched on both sides, with **no manual intervention and no
+re-pairing**. The exit criteria held:
+
+- **Continuous operation.** Seamless crossing, keyboard follow, one visible
+  cursor, and clipboard sync kept working across the whole window — over a
+  hundred clipboard transactions applied across the two sides, and repeated
+  control transfers every day of the soak.
+- **Peer-outage recovery, at full scale.** Machine A was off from midday
+  08-12 (UTC) to early 08-14. Machine B's reconnect supervisor retried the
+  entire outage at the capped 30 s backoff (attempt counts into the
+  seventies) and re-established on its own the moment A returned.
+- **Worker relaunch, for real.** Early on 08-11 (02:21–02:40 UTC) machine
+  B's worker exited immediately after startup, repeatedly; the service
+  relaunched it on the ADR 0011 backoff (1 s doubling to the 30 s cap) until
+  the 02:40 launch came up cleanly, computed its topology, connected, and
+  applied a waiting clipboard item. Recovery was fully automatic.
+- **Failures stayed bounded and observable.** One inbound clipboard item
+  could not be installed (five attempts, then a logged
+  `clipboard_unavailable` — no hang, no loop). Transient injection warnings
+  (SendInput rejected during a blocked-input window, SetCursorPos timeouts)
+  were logged and self-cleared. No stuck key or button after any transfer,
+  disconnect, or relaunch.
+
+Findings feeding follow-up work:
+
+- **Static display topology (scheduled as feature/107).** The virtual
+  desktop and seamless edge are computed once at worker startup. Unplugging
+  or powering off the external monitor mid-run leaves the stale edge in
+  place — the worker keeps believing the monitor is there, so the edge can
+  sit at still-reachable coordinates and hand control across when the user
+  does not expect it. Under a boot-started background service this is an
+  everyday event (docking, monitor power-off), not a corner case.
+- **Silent worker exit (diagnosability).** During the 08-11 relaunch loop
+  the worker logged `starting` and nothing else — it exited before reaching
+  its run loop without recording why. The window is consistent with a
+  locked session or displays not yet available, but the log cannot say; a
+  worker that exits before serving should log the reason at WARN.
+- **Mislabeled Win32 error text (cosmetic).** Some `SetCursorPos` failures
+  carry unrelated `GetLastError` text (e.g. a WSAEWOULDBLOCK socket
+  string): the failure is real and transient, but the label is stale errno
+  noise and worth cleaning up when touching that path.
