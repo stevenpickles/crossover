@@ -53,7 +53,7 @@ use crate::control::{
 use crate::edge_driver::EdgeMode;
 use crate::input::InputEvent;
 use crate::outbound::{CommandReceiver, CommandSender, command_lanes};
-use crate::topology::{EdgeFraction, Topology};
+use crate::topology::{EdgeFraction, MonitorRect, Topology};
 
 /// How often, while controlling, the driver polls the platform for a
 /// lost capture (R-2) and for the release escape gesture (ADR 0008). One
@@ -181,6 +181,15 @@ pub struct InputControlDriver {
     seamless: Option<SeamlessInputs>,
     /// The last edge mode emitted, so only changes are sent.
     last_edge_mode: EdgeMode,
+    /// The monitor layout last seen on the health tick, for noticing a
+    /// display change (dock, undock, a monitor powering off) while running.
+    /// The seamless machinery re-reads geometry on every use, so nothing
+    /// here needs recomputing — but a change is *logged* (the startup
+    /// topology line goes stale the moment the layout moves) and a hidden
+    /// cursor mask is re-asserted, because a display change makes Windows
+    /// reload the system cursors, which can un-blank a mask applied before
+    /// it. `None` until the first successful read, or without seamless.
+    seen_monitors: Option<Vec<MonitorRect>>,
     events_rx: mpsc::Receiver<InputControlEvent>,
     events_tx: mpsc::Sender<InputControlEvent>,
     commands_tx: CommandSender,
@@ -230,6 +239,7 @@ pub fn input_control(
         // Idle until a session establishes: emitting the initial mode is
         // the driver's job on the first state change.
         last_edge_mode: EdgeMode::Idle,
+        seen_monitors: None,
         events_rx,
         events_tx: events_tx.clone(),
         commands_tx,
@@ -253,6 +263,10 @@ impl InputControlDriver {
                     }
                 }
                 _ = health.tick() => {
+                    // Notice a monitor-layout change first, whatever the
+                    // control state: the edge detector re-primes itself, but
+                    // the topology log line and a hidden cursor mask do not.
+                    self.refresh_display_topology();
                     if self.engine.is_controlling() {
                         // The platform watchdog reports loss through
                         // is_capturing (R-2); this poll turns it into the
@@ -439,6 +453,47 @@ impl InputControlDriver {
             }
             Err(error) => {
                 tracing::warn!(error = %error, "cannot place cursor: display unavailable");
+            }
+        }
+    }
+
+    /// Notice a monitor-layout change while running (Phase 6 soak finding:
+    /// under a boot-started service, docking and monitor power-off are
+    /// everyday events, not corner cases). Geometry is never cached — edge
+    /// detection and cursor placement re-read the layout on every use, and
+    /// the edge detector re-primes itself across a change — so what remains
+    /// is the stateful part: say in the log where the seamless edge now is
+    /// (the startup line is stale the moment the layout moves), and
+    /// re-assert a hidden cursor mask, because a display change makes
+    /// Windows reload the system cursors, which can un-blank a mask applied
+    /// before it. A read failure skips the tick; the next one retries.
+    fn refresh_display_topology(&mut self) {
+        let Some(seamless) = &self.seamless else {
+            return; // explicit-only run: no display, no edge
+        };
+        let Ok(monitors) = seamless.display.monitors() else {
+            return;
+        };
+        match &self.seen_monitors {
+            Some(seen) if *seen == monitors => {}
+            Some(_) => {
+                tracing::info!(
+                    ?monitors,
+                    side = ?seamless.topology.side(),
+                    linked_edge = ?seamless.topology.linked_edge(),
+                    "display topology changed; the seamless edge follows the new layout"
+                );
+                self.seen_monitors = Some(monitors);
+                if self.cursor_hidden {
+                    // Same desired state, fresh apply: the watch channel
+                    // re-notifies the applier even for an equal value.
+                    let _ = self.cursor_tx.send(true);
+                }
+            }
+            None => {
+                // First successful read is the baseline, not a change: the
+                // startup topology was already logged by the launcher.
+                self.seen_monitors = Some(monitors);
             }
         }
     }
@@ -830,7 +885,7 @@ mod tests {
     use crate::control::{ControlConfig, ControlNotice};
     use crate::edge_driver::EdgeMode;
     use crate::input::{InputEvent, KeyEvent, PointerButton, PointerEvent, hid};
-    use crate::topology::{EdgeFraction, LinkSide, Topology};
+    use crate::topology::{EdgeFraction, LinkSide, MonitorRect, Topology};
 
     const HD: Screen = Screen {
         width: 1920,
@@ -846,6 +901,7 @@ mod tests {
         capture: Arc<FakeInputCapture>,
         injector: Arc<FakeInputInjector>,
         cursor_mask: Arc<FakeCursorMask>,
+        display: Arc<FakeDisplay>,
         events: mpsc::Sender<InputControlEvent>,
         commands: crate::outbound::CommandReceiver,
         notices: mpsc::Receiver<ControlNotice>,
@@ -879,6 +935,7 @@ mod tests {
             capture,
             injector,
             cursor_mask,
+            display,
             events,
             commands,
             notices,
@@ -1095,6 +1152,39 @@ mod tests {
             rig.injector.placements().len(),
             1,
             "the returning cursor is placed before it is shown"
+        );
+    }
+
+    /// A display change (dock, undock, a monitor powering off) can make
+    /// Windows reload the system cursors, un-blanking a hidden mask — so a
+    /// monitor-layout change observed while the cursor is hidden re-asserts
+    /// the mask (Phase 6 soak finding).
+    #[tokio::test]
+    async fn a_monitor_layout_change_reasserts_a_hidden_cursor_mask() {
+        let mut rig = rig();
+        make_controlling(&mut rig).await;
+        await_cursor(&rig, true).await; // hidden while driving the peer
+        // Give a health tick time to record the current layout as the
+        // baseline, then move the layout under the driver.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let hides = rig.cursor_mask.hide_calls();
+        rig.display.set_monitors(vec![MonitorRect {
+            left: 0,
+            top: 0,
+            width: 800,
+            height: 600,
+        }]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while rig.cursor_mask.hide_calls() == hides {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the mask was never re-asserted after the layout change"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            rig.cursor_mask.is_hidden(),
+            "the re-assert must keep it hidden"
         );
     }
 
