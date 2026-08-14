@@ -1,22 +1,30 @@
 # Crossover Roadmap
 
-> **Current phase: 6 — Windows Prototype Hardening** (in progress.)
+> **Current phase: 7 — Rich Clipboard (images and files)** (in progress.)
 >
-> Phase 6 progress (2026-08-10): most deliverables are done and, where they
-> touch the OS, validated on real hardware — hardened reconnect (backoff resets
-> only after a stable session), sectioned/versioned startup configuration,
-> active-session revocation ([ADR 0010](adr/0010-active-session-revocation.md)),
-> a dedicated security review against [SECURITY.md](SECURITY.md) §6-§7
-> (docs/security-review-phase6.md; the T6 active-session gap resolved by ADR
-> 0010), reconnect-recovery metrics, and — the largest piece — unattended
-> background operation ([ADR 0011](adr/0011-background-service-launcher.md)): a
-> minimal LocalSystem service (`crossover-svc.exe`) launches and supervises the
-> worker in the user's session, validated end-to-end on machine A (install,
-> user-session launch *as the user*, crash-relaunch, clean uninstall), plus
-> Windows packaging (self-elevating PowerShell scripts and a Chocolatey
-> package). The remaining exit criterion is the **multi-day two-machine soak** —
-> continuous unattended operation between two Windows workstations — which gates
-> closing the phase.
+> Phase 6 (Windows Prototype Hardening) closed 2026-08-14: the multi-day
+> unattended soak — the last exit criterion — ran 2026-08-11 → 2026-08-14
+> between the two workstations under the background service, with no manual
+> intervention and no re-pairing (outcome recorded in docs/SOAK.md §Phase 6
+> soak). The hardening was exercised for real: machine A was off from midday
+> 08-12 to early 08-14 and machine B's reconnect supervisor retried the whole
+> outage at the capped 30 s backoff, re-establishing on its own when A
+> returned; an early-soak stretch of immediate worker exits on B had the
+> service relaunch on the ADR 0011 backoff until a launch came up cleanly,
+> ~19 minutes later, unattended. Clipboard and input reliability held
+> throughout — the one clipboard failure was bounded and observable, and no
+> input was ever left stuck. Two follow-ups came out of the soak: the display
+> topology is captured once at startup, so unplugging or powering off a
+> monitor leaves a stale seamless edge (scheduled next as feature/107), and a
+> worker that exits before its run loop logs nothing about why
+> (diagnosability tidy-up). Earlier Phase 6 deliverables — hardened
+> reconnect, sectioned/versioned startup configuration, active-session
+> revocation ([ADR 0010](adr/0010-active-session-revocation.md)), the
+> dedicated security review against [SECURITY.md](SECURITY.md) §6-§7
+> (docs/security-review-phase6.md), reconnect-recovery metrics, unattended
+> background operation ([ADR 0011](adr/0011-background-service-launcher.md),
+> [ADR 0012](adr/0012-elevated-worker-integrity.md)), and Windows packaging —
+> were validated on hardware as they landed.
 >
 > **Sequencing (2026-08-11):** after Phase 6, **rich clipboard (images and
 > files) is scheduled before cross-platform validation** — maintainer decision.
@@ -323,12 +331,19 @@ in dependency order:
    chunks sized to ADR 0013's latency budget, before-allocation bounds (NFR-1),
    hash-dedup so a re-paste moves zero bytes. Plus the Windows platform
    clipboard read/write for the raster format.
-3. **Files/folders — deliberately minimal, gated on its own ADR.** A
-   drop-folder model (not Explorer-paste fidelity), folders zipped to a single
-   blob, with a configured destination, per-peer permission, name sanitization
-   (no paths/`..`/drive letters), and size/count caps. Adds a filesystem-write
-   surface, so it needs its own ADR **and** SECURITY.md threat additions before
-   implementation (tracked in adr/README.md "Known decisions awaiting an ADR").
+3. **Files/folders — deliberately minimal, spooled virtual-file paste
+   ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)).** Not a drop folder
+   (the first draft's model, rejected on user experience): a completed
+   transfer spools internally and is offered to the OS paste mechanism as a
+   **virtual file list** (`CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS`
+   through an `IDataObject` we own), RDP-style — the paste destination is
+   wherever the user presses Ctrl+V. Folders are zipped by the sender to a
+   single blob and never extracted by the receiver; per-peer permission is
+   default-off; names are validated reject-not-repair (no paths/`..`/drive
+   letters); sizes and counts are capped. This is the first peer-controlled
+   write surface onto disk, so the spool/paste threat additions live in
+   SECURITY.md alongside the ADR (both landed 2026-08-12; implementation not
+   yet scheduled).
 
 Exit criteria:
 
@@ -337,9 +352,10 @@ Exit criteria:
 - **Live input stays responsive during a concurrent bulk transfer** — measured:
   input latency bounded under a saturating background transfer (the ADR 0013
   guarantee), not merely subjectively smooth.
-- Files land only in the configured drop folder with every guardrail enforced;
-  oversized or path-dubious inputs are rejected **observably** (FR-3.6), never a
-  traversal write or a silent drop.
+- Delivered files materialize on disk only through an explicit user paste from
+  the internal spool, with every ADR 0015 guardrail enforced; oversized or
+  path-dubious inputs are rejected **observably** (FR-3.6), never a traversal
+  write or a silent drop.
 - No regression in text-clipboard reliability (the Phase 2 stress gate still
   passes) or in input latency/correctness.
 
