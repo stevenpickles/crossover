@@ -207,7 +207,9 @@ fn print_version_report(json: bool) {
 /// or not.
 fn long_version() -> &'static str {
     static LONG_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    LONG_VERSION.get_or_init(|| version_report(false)).as_str()
+    LONG_VERSION
+        .get_or_init(|| build_info::long_version(&protocol_fields()))
+        .as_str()
 }
 
 /// The full build report, with the protocol range appended. A version
@@ -215,20 +217,22 @@ fn long_version() -> &'static str {
 /// machines that will not talk — so the report answers both at once
 /// (docs/PROTOCOL.md §3).
 fn version_report(json: bool) -> String {
+    build_info::report(&protocol_fields(), json)
+}
+
+/// The versions this build speaks, as report fields.
+fn protocol_fields() -> [(&'static str, build_info::Value); 2] {
     let supported = crossover_protocol::VersionRange::CURRENT;
-    build_info::report(
-        &[
-            (
-                "protocol_version",
-                build_info::Value::Num(u64::from(supported.max)),
-            ),
-            (
-                "min_protocol_version",
-                build_info::Value::Num(u64::from(supported.min)),
-            ),
-        ],
-        json,
-    )
+    [
+        (
+            "protocol_version",
+            build_info::Value::Num(u64::from(supported.max)),
+        ),
+        (
+            "min_protocol_version",
+            build_info::Value::Num(u64::from(supported.min)),
+        ),
+    ]
 }
 
 /// Route the parsed command to its handler. Separate from `main` so every

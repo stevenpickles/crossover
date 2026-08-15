@@ -82,8 +82,23 @@ pub fn report(extra: &[(&'static str, Value)], json: bool) -> String {
     if json {
         render_json(&fields)
     } else {
-        render_text(&fields)
+        render_text(&fields, Headline::WithName)
     }
+}
+
+/// The same text report for clap's `--version`, which prints the binary name
+/// itself — so the headline here must not repeat it.
+pub fn long_version(extra: &[(&'static str, Value)]) -> String {
+    let mut fields = fields();
+    fields.extend(extra.iter().cloned());
+    render_text(&fields, Headline::VersionOnly)
+}
+
+/// Whether the report's first line names the binary.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Headline {
+    WithName,
+    VersionOnly,
 }
 
 /// The build-time and process facts, in reporting order.
@@ -123,12 +138,15 @@ fn executable_path() -> Option<String> {
 }
 
 /// A human-readable block: a headline, then aligned `label  value` rows.
-fn render_text(fields: &[(&'static str, Value)]) -> String {
+fn render_text(fields: &[(&'static str, Value)], headline: Headline) -> String {
+    let name = if headline == Headline::WithName {
+        concat!(env!("CARGO_PKG_NAME"), " ")
+    } else {
+        ""
+    };
     let mut report = format!(
-        "{} {} ({} build)\n",
-        env!("CARGO_PKG_NAME"),
-        BUILD_INFO.version,
-        BUILD_INFO.channel,
+        "{name}{} ({} build)\n",
+        BUILD_INFO.version, BUILD_INFO.channel,
     );
     // The headline already carries name and version; repeating them in the
     // table would be noise.
@@ -259,6 +277,9 @@ mod tests {
     fn the_text_report_names_every_field_it_was_given() {
         let report = report(&[("protocol_version", Value::Num(2))], false);
         assert!(report.starts_with(concat!(env!("CARGO_PKG_NAME"), " ")));
+        // clap prints the binary name before `--version`, so this form must
+        // start at the version or the name appears twice.
+        assert!(long_version(&[]).starts_with(BUILD_INFO.version));
         assert!(report.contains("git commit"));
         let protocol = report
             .lines()
@@ -294,7 +315,7 @@ mod tests {
     #[test]
     fn absent_values_read_as_none_in_text_and_null_in_json() {
         let absent = [("nothing", Value::OptText(None))];
-        assert!(render_text(&absent).contains("nothing  (none)"));
+        assert!(render_text(&absent, Headline::WithName).contains("nothing  (none)"));
         assert!(render_json(&absent).contains("\"nothing\": null"));
     }
 }
