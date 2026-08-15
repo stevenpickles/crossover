@@ -66,11 +66,37 @@ function Write-Step([string]$Message) {
     Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
+# Native tools write progress to stderr - cargo does constantly. Under
+# $ErrorActionPreference = 'Stop', Windows PowerShell turns each of those
+# lines into a terminating error as soon as the script's output is redirected
+# (`build.ps1 > build.log 2>&1`), which would fail a perfectly good build. The
+# preference is relaxed around the call; the exit code decides.
 function Invoke-Native([string]$Command, [string[]]$Arguments) {
-    & $Command @Arguments
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Command @Arguments
+    } finally {
+        $ErrorActionPreference = $previous
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "$Command $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
     }
+}
+
+# The same, for a tool whose output is the point rather than a side effect.
+function Get-NativeOutput([string]$Command, [string[]]$Arguments) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $Command @Arguments
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Command $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
+    }
+    return $output
 }
 
 function Test-Tool([string]$Name) {
@@ -185,10 +211,7 @@ foreach ($binary in $binaries) {
 
 # The build version comes from the binaries themselves, so the artifacts can
 # never be labelled with a version the code does not carry.
-$reportJson = & (Join-Path $releaseDirectory 'crossover.exe') version --json
-if ($LASTEXITCODE -ne 0) {
-    throw "crossover.exe version --json failed with exit code $LASTEXITCODE."
-}
+$reportJson = Get-NativeOutput (Join-Path $releaseDirectory 'crossover.exe') @('version', '--json')
 $report = ($reportJson -join "`n") | ConvertFrom-Json
 $buildVersion = [string]$report.version
 
@@ -292,7 +315,7 @@ if ($SkipChocolatey) {
     if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
         throw "Chocolatey packaging did not produce the expected package: $packagePath"
     }
-    $chocolateyVersion = (& choco --version | Select-Object -First 1).Trim()
+    $chocolateyVersion = ([string[]](Get-NativeOutput 'choco' @('--version')) | Select-Object -First 1).Trim()
 }
 
 Write-Step 'Writing the artifact manifest'

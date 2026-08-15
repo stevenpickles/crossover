@@ -70,7 +70,16 @@ if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+)?$') {
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
 Write-Host "Packing crossover $Version ..."
-& choco pack (Join-Path $chocoDir 'crossover.nuspec') --version $Version --outputdirectory $OutputDirectory | Out-Host
+# 'Continue' for the duration: choco writes to stderr, which would become a
+# terminating error under 'Stop' as soon as this script's output is
+# redirected. The exit code is the verdict.
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & choco pack (Join-Path $chocoDir 'crossover.nuspec') --version $Version --outputdirectory $OutputDirectory | Out-Host
+} finally {
+    $ErrorActionPreference = $previousPreference
+}
 if ($LASTEXITCODE -ne 0) {
     throw "choco pack failed with exit code $LASTEXITCODE."
 }
