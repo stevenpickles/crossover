@@ -47,10 +47,18 @@ never let code and specification diverge silently.
 
 ## Development
 
-- No build tooling exists yet. Once the Phase 0 workspace lands, the CI
-  gate is: `cargo fmt --check`, `cargo clippy --workspace --all-targets`
-  (warnings denied), `cargo build --workspace`, `cargo test --workspace` —
-  on Windows, Linux, and macOS.
+- The CI gate is: `cargo fmt --check`, `cargo clippy --workspace
+  --all-targets` (warnings denied), `cargo build --workspace`, `cargo test
+  --workspace` — on Windows, Linux, and macOS.
+- `scripts/build.ps1` is the one-command build: the gate, then release
+  binaries, then every deliverable (portable archive + checksum, Chocolatey
+  package, `artifacts.json`) into `dist/`. CI runs the same script, so local
+  and CI artifacts come from one code path. `-SkipChecks` / `-SkipChocolatey`
+  shorten it.
+- Binaries carry their own identity (`apps/build_identity.rs` generates it,
+  `apps/build_info.rs` reports it): `crossover version [--json]` and
+  `crossover-svc --version`. Never hand-edit a version into packaging — the
+  build derives it from the source state.
 - Prefer small, independently testable/reviewable/revertible tasks; keep
   the repo buildable after each integrated change.
 - "Done" = the Definition of Done in `docs/TESTING.md` §5, not "worked once
@@ -60,6 +68,9 @@ never let code and specification diverge silently.
 
 - Branching model: feature branches merge into `dev` (the integration
   branch); `main` is the stable branch. Branch new features from `dev`.
+- `dev` and `main` are protected: nothing lands on either by a local merge
+  or a direct push. Every integration goes through a formal GitHub pull
+  request (`feature/<n>/...` → `dev`, `dev` → `main`) that CI must pass.
 - Feature branches: `feature/<n>/<short-description>`, where `<n>` increments
   sequentially per feature. One focused feature per branch, so the branch
   history alone tells the story of what has been developed.

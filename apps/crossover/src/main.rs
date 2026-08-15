@@ -14,6 +14,11 @@ mod logging;
 mod paths;
 mod storage;
 
+// Shared with `crossover-svc` so both binaries of one install report the same
+// identity (apps/build_identity.rs explains why it is an include, not a crate).
+#[path = "../../build_info.rs"]
+mod build_info;
+
 use clap::{Args, Parser, Subcommand};
 use uuid::Uuid;
 
@@ -23,7 +28,15 @@ use uuid::Uuid;
 /// stubs name the phase that implements them so failures are actionable
 /// rather than mysterious.
 #[derive(Debug, Parser)]
-#[command(name = "crossover", version, about, propagate_version = true)]
+#[command(
+    name = "crossover",
+    // `-V` stays terse for scripts and logs; `--version` spells the build out
+    // in full, which is what you actually want when two machines disagree.
+    version = build_info::VERSION,
+    long_version = long_version(),
+    about,
+    propagate_version = true
+)]
 struct Cli {
     /// Device name for this machine (defaults to the hostname). Used when
     /// the identity is first generated; ignored afterwards.
@@ -49,6 +62,13 @@ enum Command {
     Status,
     /// Show the startup config file path and its effective settings.
     Config,
+    /// Report this build in full: version, source commit, toolchain, and the
+    /// protocol versions it speaks.
+    Version {
+        /// Emit the report as a JSON object instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the background service that runs Crossover unattended (ADR 0011).
     Service {
         #[command(subcommand)]
@@ -141,13 +161,23 @@ async fn main() -> anyhow::Result<()> {
     // or creates a window/hook, so coordinates are real pixels across
     // mixed-DPI monitors (R-3, ADR 0009).
     crossover_platform_windows::set_process_dpi_awareness();
+    // A pure query about the binary itself, answered before the logger
+    // starts: `crossover version --json` must be parseable output, not
+    // output with a log line in front of it.
+    if let Command::Version { json } = &cli.command {
+        print_version_report(*json);
+        return Ok(());
+    }
     // Hold the guard for the whole process: dropping it flushes and stops the
     // rolling-file writer (docs/SOAK.md Phase 6 observability).
     let _log_guard = logging::init()?;
     // Structured-field exemplar (docs/ARCHITECTURE.md §10): values as
     // fields, snake_case canonical names, message as the human summary.
+    // The build version, not the Cargo version: a log that says "0.1.0" when
+    // the binary is an untagged dev build names the wrong thing.
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = build_info::VERSION,
+        commit = build_info::BUILD_INFO.git_short_commit,
         command = ?cli.command,
         "starting"
     );
@@ -163,6 +193,46 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(error = format!("{error:#}"), "command failed");
     }
     outcome
+}
+
+/// Write the report to stdout. Shared by the early exit in `main` and the
+/// dispatch arm, which stay separate because the early exit is what keeps
+/// the logger out of the output.
+fn print_version_report(json: bool) {
+    print!("{}", version_report(json));
+}
+
+/// The text report, cached: clap wants a `&'static str`, and it asks for one
+/// every time the command is built — which is once per process, `--version`
+/// or not.
+fn long_version() -> &'static str {
+    static LONG_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LONG_VERSION
+        .get_or_init(|| build_info::long_version(&protocol_fields()))
+        .as_str()
+}
+
+/// The full build report, with the protocol range appended. A version
+/// mismatch and a protocol mismatch look identical from the outside — two
+/// machines that will not talk — so the report answers both at once
+/// (docs/PROTOCOL.md §3).
+fn version_report(json: bool) -> String {
+    build_info::report(&protocol_fields(), json)
+}
+
+/// The versions this build speaks, as report fields.
+fn protocol_fields() -> [(&'static str, build_info::Value); 2] {
+    let supported = crossover_protocol::VersionRange::CURRENT;
+    [
+        (
+            "protocol_version",
+            build_info::Value::Num(u64::from(supported.max)),
+        ),
+        (
+            "min_protocol_version",
+            build_info::Value::Num(u64::from(supported.min)),
+        ),
+    ]
 }
 
 /// Route the parsed command to its handler. Separate from `main` so every
@@ -241,6 +311,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Status => commands::status(&storage::resolve_device_name(cli.name)),
         Command::Config => commands::config_show(),
+        Command::Version { json } => {
+            print_version_report(json);
+            Ok(())
+        }
         Command::Service { action } => match action {
             ServiceAction::Install => commands::service_install(),
             ServiceAction::Uninstall => commands::service_uninstall(),

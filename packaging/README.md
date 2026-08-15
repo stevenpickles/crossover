@@ -14,7 +14,28 @@ There are two ways to install, sharing the same logic. Start with the script;
 adopt Chocolatey when you want versioned, silent install/upgrade/uninstall
 across machines.
 
-## Build the binaries first
+## Build everything first
+
+```powershell
+.\scripts\build.ps1
+```
+
+That is the whole build: it runs the CI gate, compiles both executables,
+verifies they carry matching build metadata, and writes every deliverable to
+`dist\` — the portable archive plus its `.sha256`, the Chocolatey `.nupkg`,
+and an `artifacts.json` manifest recording versions, the source commit, and
+each artifact's hash. `-SkipChecks` skips the gate; `-SkipChocolatey` stops
+after the archive.
+
+The version is derived from the source state rather than typed in: a tagged
+commit produces `0.1.0`, anything else produces something that names its
+origin, such as `0.1.0-dev.7.gabc1234.dirty`. Run `crossover version` (or
+`crossover-svc.exe --version`) to see the full identity of any binary you
+find on a machine. NuGet rejects dots in a pre-release label, so the
+Chocolatey package for that build is versioned `0.1.0-dev-7-gabc1234-dirty`;
+`artifacts.json` carries both forms.
+
+To compile without packaging:
 
 ```powershell
 cargo build --release -p crossover -p crossover-svc
@@ -45,13 +66,16 @@ The `chocolatey\` folder is a package whose install scripts reuse the same
 logic. The two executables are **embedded** in the `.nupkg` (suited to a local
 or private feed).
 
-**Build the package** (after `cargo build --release`):
+**Build the package.** `scripts\build.ps1` does this as part of a full run.
+To build only the package, from binaries you already have:
 
 ```powershell
-.\chocolatey\pack.ps1                # stages the exes, stamps the Cargo version, choco pack
+.\chocolatey\pack.ps1                                   # target\release, Cargo version
+.\chocolatey\pack.ps1 -Version 0.1.0 -OutputDirectory ..\dist
 ```
 
-This produces `chocolatey\crossover.<version>.nupkg`.
+This produces `crossover.<version>.nupkg` in the output directory
+(`chocolatey\` by default).
 
 **Install / upgrade / uninstall** (all silent, all elevated by Chocolatey):
 
