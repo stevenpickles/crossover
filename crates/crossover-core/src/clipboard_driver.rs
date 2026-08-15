@@ -636,7 +636,7 @@ impl ClipboardSyncDriver {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tokio::sync::mpsc;
     use tokio::time::timeout;
@@ -1283,13 +1283,24 @@ mod tests {
     /// event, so the queue never exceeds one and the constant could read 1
     /// or a billion without a test noticing.
     ///
-    /// Here the parked driver is fed until it refuses, which lands on
-    /// channel depth + deferred depth. Deleting the drain halves that;
-    /// unbounding the queue makes it run away. Both are caught.
+    /// Here the parked driver is flooded and the queue's own high-water mark
+    /// is read back: it must reach the bound (deleting the drain leaves it at
+    /// zero) and never pass it (unbounding the queue runs it away). Both
+    /// mutants are caught.
+    ///
+    /// The measurement is deliberately the depth and not "how many events the
+    /// driver swallowed". Absorption is cumulative — a driver that gets one
+    /// frame out, drains its deferred queue and parks again has legitimately
+    /// taken another queue's worth — so counting it measures the scheduler on
+    /// the day rather than the bound, which is how the previous version of
+    /// this test came to fail on slower CI runners and pass everywhere else.
     #[tokio::test]
     async fn a_parked_driver_defers_a_bounded_number_of_events() {
-        /// Events in flight between the channel and the deferred queue.
-        const SLACK: usize = 4;
+        /// How long to keep flooding after the queue first hits its bound,
+        /// so an unbounded queue has room to overshoot and be caught.
+        const OVERSHOOT_WINDOW: Duration = Duration::from_millis(250);
+        /// Give up rather than hang if the queue never fills at all.
+        const DEADLINE: Duration = Duration::from_secs(10);
 
         use crossover_platform::ClipboardImageFormat;
         use crossover_protocol::clipboard::{ClipboardAccept, ClipboardOffer, MAX_CHUNK_BYTES};
@@ -1317,35 +1328,49 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Now count what a parked driver will still take. `LocalChanged` is
-        // the cheapest event that reaches the deferred queue; the count is
-        // the measurement, not the content.
-        let mut accepted = 0usize;
-        loop {
+        // Flood the parked driver. `LocalChanged` is the cheapest event that
+        // reaches the deferred queue; what it carries does not matter, only
+        // that the driver keeps being offered more than it can hold.
+        let peak = |rig: &Rig| {
+            usize::try_from(rig.metrics.snapshot().clipboard_deferred_peak)
+                .expect("a queue depth fits in usize")
+        };
+        let started = Instant::now();
+        let mut filled_at = None;
+        let mut refused = 0usize;
+        while started.elapsed() < DEADLINE {
+            // A full channel is the expected state once the driver is
+            // holding all it can; keep offering rather than concluding
+            // anything from a single refusal.
             if rig.events.try_send(SyncEvent::LocalChanged).is_err() {
-                // Let the driver move one across before concluding it has
-                // stopped taking them.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                if rig.events.try_send(SyncEvent::LocalChanged).is_err() {
-                    break;
-                }
+                refused += 1;
             }
-            accepted += 1;
-            assert!(
-                accepted < 4096,
-                "a parked driver took {accepted} events: the deferred queue                  is not bounded"
-            );
+            tokio::task::yield_now().await;
+            match filled_at {
+                None if peak(&rig) >= MAX_DEFERRED_EVENTS => filled_at = Some(Instant::now()),
+                Some(at) if at.elapsed() >= OVERSHOOT_WINDOW => break,
+                _ => {}
+            }
         }
 
-        // The channel's own depth plus the deferred queue, and nothing more.
-        let deaf_at = EVENT_CHANNEL_CAPACITY + MAX_DEFERRED_EVENTS;
+        let deferred_peak = peak(&rig);
         assert!(
-            accepted + SLACK >= deaf_at,
-            "a parked driver went deaf at {accepted} events, expected about              {deaf_at} — is the deferred queue still being drained?"
+            filled_at.is_some(),
+            "a parked driver's deferred queue peaked at {deferred_peak}, never reaching \
+             {MAX_DEFERRED_EVENTS} — is it still draining the event channel while parked?"
         );
+        assert_eq!(
+            deferred_peak, MAX_DEFERRED_EVENTS,
+            "a parked driver deferred {deferred_peak} events, past the \
+             {MAX_DEFERRED_EVENTS} its bound allows (NFR-1)"
+        );
+        // Holding a bounded amount is only half of it: what the driver
+        // cannot hold has to be refused, so backpressure reaches whoever is
+        // producing rather than stopping here.
         assert!(
-            accepted <= deaf_at + SLACK,
-            "a parked driver absorbed {accepted} events, past the {deaf_at}              its bounds allow (NFR-1)"
+            refused > 0,
+            "the {EVENT_CHANNEL_CAPACITY}-deep event channel never filled — a parked \
+             driver must push backpressure outwards, not absorb without limit"
         );
     }
 }
