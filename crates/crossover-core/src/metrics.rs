@@ -204,6 +204,7 @@ pub struct Metrics {
     clipboard_loop_suppressed: AtomicU64,
     clipboard_conflicts: AtomicU64,
     clipboard_abandoned: AtomicU64,
+    clipboard_deferred_peak: AtomicU64,
     clipboard_latency_ms: Mutex<Vec<u32>>,
     clipboard_latency_dropped: AtomicU64,
 
@@ -310,6 +311,18 @@ impl Metrics {
     /// transaction simply is not there any more (NFR-3, FR-7.3).
     pub fn record_clipboard_abandoned(&self) {
         self.clipboard_abandoned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record how deep the clipboard driver's deferred-event queue got
+    /// while it was parked on bulk backpressure.
+    ///
+    /// A high-water mark rather than a count: the queue is bounded (NFR-1)
+    /// and the only interesting question is how close a real run came to
+    /// that bound. Zero — the normal case — means the driver never had to
+    /// defer at all.
+    pub fn record_deferred_depth(&self, depth: usize) {
+        self.clipboard_deferred_peak
+            .fetch_max(u64::try_from(depth).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
     /// A clipboard write was retried after `Busy` contention.
     pub fn record_clipboard_retry(&self) {
@@ -437,6 +450,7 @@ impl Metrics {
             clipboard_loop_suppressed: load(&self.clipboard_loop_suppressed),
             clipboard_conflicts: load(&self.clipboard_conflicts),
             clipboard_abandoned: load(&self.clipboard_abandoned),
+            clipboard_deferred_peak: load(&self.clipboard_deferred_peak),
             clipboard_latency_dropped: load(&self.clipboard_latency_dropped),
             latency_p50: percentile(&sorted_latency, 50),
             latency_p95: percentile(&sorted_latency, 95),
@@ -520,6 +534,9 @@ pub struct Report {
     pub clipboard_loop_suppressed: u64,
     /// Clipboard conflicts resolved.
     pub clipboard_conflicts: u64,
+    /// Deepest the driver's deferred-event queue got while parked on bulk
+    /// backpressure; `0` if it never had to defer.
+    pub clipboard_deferred_peak: u64,
     /// Latency samples dropped past the retention cap.
     pub clipboard_latency_dropped: u64,
     /// Clipboard round-trip latency p50 (ms), if any samples.
@@ -578,6 +595,7 @@ impl Report {
             clipboard_retries = self.clipboard_retries,
             clipboard_contention = self.clipboard_contention,
             clipboard_conflicts = self.clipboard_conflicts,
+            clipboard_deferred_peak = self.clipboard_deferred_peak,
             latency_p50_ms = self.latency_p50,
             latency_p95_ms = self.latency_p95,
             latency_max_ms = self.latency_max,
@@ -593,6 +611,40 @@ impl Report {
 
     fn total_disconnects(&self) -> u64 {
         self.disconnects.iter().sum()
+    }
+
+    /// The clipboard block of the shutdown report: one summary line, plus
+    /// the sub-lines that only mean something when they happened.
+    fn write_clipboard(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "  clipboard:  {} sent, {} applied, {} superseded; {} retries, {} contention, {} conflicts",
+            self.clipboard_sent,
+            self.clipboard_applied,
+            self.clipboard_superseded,
+            self.clipboard_retries,
+            self.clipboard_contention,
+            self.clipboard_conflicts,
+        )?;
+        // A run that never parked on bulk backpressure has nothing to say
+        // here, and the block stays short.
+        if self.clipboard_deferred_peak > 0 {
+            writeln!(
+                f,
+                "                deferred peak {} events while parked on bulk backpressure",
+                self.clipboard_deferred_peak,
+            )?;
+        }
+        if let (Some(p50), Some(p95), Some(max)) =
+            (self.latency_p50, self.latency_p95, self.latency_max)
+        {
+            writeln!(
+                f,
+                "                latency p50 {p50}ms, p95 {p95}ms, max {max}ms (over {} samples)",
+                self.latency_samples,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -658,25 +710,7 @@ impl fmt::Display for Report {
             )?;
         }
 
-        writeln!(
-            f,
-            "  clipboard:  {} sent, {} applied, {} superseded; {} retries, {} contention, {} conflicts",
-            self.clipboard_sent,
-            self.clipboard_applied,
-            self.clipboard_superseded,
-            self.clipboard_retries,
-            self.clipboard_contention,
-            self.clipboard_conflicts,
-        )?;
-        if let (Some(p50), Some(p95), Some(max)) =
-            (self.latency_p50, self.latency_p95, self.latency_max)
-        {
-            writeln!(
-                f,
-                "                latency p50 {p50}ms, p95 {p95}ms, max {max}ms (over {} samples)",
-                self.latency_samples,
-            )?;
-        }
+        self.write_clipboard(f)?;
 
         writeln!(
             f,
