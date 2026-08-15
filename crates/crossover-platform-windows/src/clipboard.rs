@@ -313,8 +313,20 @@ fn probe_unicode_text(_open: &OpenGuard) -> Result<Option<Vec<u16>>, ClipboardEr
     }
 
     let hglobal = HGLOBAL(handle.0);
-    // SAFETY: `hglobal` came from GetClipboardData while the clipboard
-    // is open; GlobalLock pins it and yields the base pointer.
+    // SAFETY: `hglobal` came from GetClipboardData while the clipboard is
+    // open. GlobalSize reads the block's size without locking or copying
+    // it; it reports 0 for an invalid or discarded block.
+    let size = unsafe { GlobalSize(hglobal) };
+    if size == 0 {
+        // Not an empty string — a zero-byte block cannot hold even the
+        // terminator an empty `CF_UNICODETEXT` is made of, so this is a
+        // block that went away, not a clipboard holding "".
+        return Ok(None);
+    }
+    let max_units = size / 2; // whole UTF-16 units; a stray odd byte is not one
+
+    // SAFETY: `hglobal` is a live clipboard block; GlobalLock pins it and
+    // yields the base pointer.
     let ptr = unsafe { GlobalLock(hglobal) }.cast::<u16>();
     if ptr.is_null() {
         // Same churn window as above: the block can vanish with its
@@ -323,16 +335,14 @@ fn probe_unicode_text(_open: &OpenGuard) -> Result<Option<Vec<u16>>, ClipboardEr
             reason: "GlobalLock on clipboard data failed".to_owned(),
         });
     }
-    // SAFETY: CF_UNICODETEXT is null-terminated UTF-16 by contract;
-    // scan for the terminator, then copy the units out. The copy is the
-    // only work under the clipboard lock — the UTF-16 → String conversion
-    // is the caller's, run once the clipboard is closed, so Crossover is
-    // not the reason another application's clipboard call fails.
+    // SAFETY: `max_units` UTF-16 units starting at `ptr` are within this
+    // block, as GlobalSize reported and GlobalLock pinned, so both the
+    // scan and the copy stay inside it. The copy is the only work under
+    // the clipboard lock — the UTF-16 → String conversion is the caller's,
+    // run once the clipboard is closed, so Crossover is not the reason
+    // another application's clipboard call fails.
     let units: Vec<u16> = unsafe {
-        let mut len = 0usize;
-        while *ptr.add(len) != 0 {
-            len += 1;
-        }
+        let len = terminated_len(ptr, max_units);
         std::slice::from_raw_parts(ptr, len).to_vec()
     };
     // SAFETY: balances the successful GlobalLock above. GlobalUnlock
@@ -340,6 +350,39 @@ fn probe_unicode_text(_open: &OpenGuard) -> Result<Option<Vec<u16>>, ClipboardEr
     let _ = unsafe { GlobalUnlock(hglobal) };
 
     Ok(Some(units))
+}
+
+/// Units before the null terminator, scanning at most `max_units`.
+///
+/// The bound is the whole point. `CF_UNICODETEXT` is null-terminated *by
+/// contract*, but its producer is any application on the machine and this
+/// process cannot verify it obeyed; an unterminated block would otherwise
+/// send the scan off the end of the allocation — undefined behaviour whose
+/// trigger is another program's bug. `GlobalSize` is the only bound
+/// available, so an unterminated block reads as its whole contents rather
+/// than as whatever follows it in memory.
+///
+/// Windows makes this hard to reach in practice — it normalizes an
+/// unterminated `CF_UNICODETEXT` into a terminated block of the same byte
+/// length, dropping the final character, so a block installed through the
+/// clipboard comes back terminated whatever the producer wrote. That is
+/// observed behaviour of one Windows version, not a documented guarantee,
+/// and it says nothing about a block from a delayed-render producer, so
+/// the bound stays. `the_terminator_scan_stops_at_the_bound` proves it
+/// over fixtures, which is the only place the unterminated case is
+/// reachable.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of up to `max_units` `u16`s.
+unsafe fn terminated_len(ptr: *const u16, max_units: usize) -> usize {
+    let mut len = 0usize;
+    // SAFETY: the caller guarantees `max_units` readable units, and `len`
+    // never reaches past that bound before the loop stops.
+    while len < max_units && unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    len
 }
 
 /// What a `CF_DIB` probe found.
@@ -929,6 +972,42 @@ mod tests {
                 );
             }
             other => panic!("expected a permanent refusal, got {other:?}"),
+        }
+    }
+
+    /// The terminator scan is bounded by the block, not by trust in the
+    /// application that produced it: an unterminated `CF_UNICODETEXT` must
+    /// stop at `GlobalSize` rather than read past the allocation.
+    ///
+    /// Fixtures rather than the real clipboard, of necessity — Windows
+    /// normalizes an unterminated block into a terminated one on the way
+    /// through (measured: a 26-unit unterminated block reads back as 25
+    /// units and a terminator), so the case this bound exists for cannot
+    /// be staged through the OS. Owned `Vec`s put it in reach.
+    #[test]
+    fn the_terminator_scan_stops_at_the_bound() {
+        let terminated: Vec<u16> = vec![b'h'.into(), b'i'.into(), 0, b'?'.into()];
+        // SAFETY: every call below reads within its own live allocation.
+        unsafe {
+            // The ordinary case: the terminator ends it, short of the bound.
+            assert_eq!(super::terminated_len(terminated.as_ptr(), 4), 2);
+
+            // Unterminated: the bound ends it, and nothing past it is read.
+            let unterminated: Vec<u16> = vec![b'h'.into(), b'i'.into()];
+            assert_eq!(super::terminated_len(unterminated.as_ptr(), 2), 2);
+
+            // The bound wins even with a terminator beyond it.
+            assert_eq!(super::terminated_len(terminated.as_ptr(), 1), 1);
+
+            // A block that is nothing but its terminator is empty text,
+            // which is the case `empty_text_steps_aside_for_an_image`
+            // depends on telling apart from absent.
+            let empty: Vec<u16> = vec![0];
+            assert_eq!(super::terminated_len(empty.as_ptr(), 1), 0);
+
+            // A zero bound reads nothing at all, which is what a block too
+            // small to hold one unit must produce.
+            assert_eq!(super::terminated_len(terminated.as_ptr(), 0), 0);
         }
     }
 
