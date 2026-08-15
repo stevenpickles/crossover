@@ -58,8 +58,11 @@ sha2 = "0.11"
 spake2 = "0.4"
 thiserror = "2"
 # Human-editable startup configuration file (Phase 6). default-features off
-# drops the datetime/display extras the config never uses.
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+# drops the `display` half — the config is read, never written. `serde` is
+# explicit because 1.0 stopped implying it from `parse`, and `toml::from_str`
+# lives behind it. Held at 1.x so it stays the single TOML implementation in
+# the tree: winresource's build script pulls 1.x regardless.
+toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
 tokio = { version = "1", features = [
     "io-std",
     "io-util",
