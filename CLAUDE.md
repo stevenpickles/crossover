@@ -60,6 +60,9 @@ never let code and specification diverge silently.
 
 - Branching model: feature branches merge into `dev` (the integration
   branch); `main` is the stable branch. Branch new features from `dev`.
+- `dev` and `main` are protected: nothing lands on either by a local merge
+  or a direct push. Every integration goes through a formal GitHub pull
+  request (`feature/<n>/...` → `dev`, `dev` → `main`) that CI must pass.
 - Feature branches: `feature/<n>/<short-description>`, where `<n>` increments
   sequentially per feature. One focused feature per branch, so the branch
   history alone tells the story of what has been developed.
