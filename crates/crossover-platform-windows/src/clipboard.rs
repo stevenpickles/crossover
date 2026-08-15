@@ -195,19 +195,11 @@ impl ClipboardProvider for WindowsClipboard {
     /// An image past [`MAX_CLIPBOARD_IMAGE_BYTES`] reads as *absent* —
     /// the trait's meaning for "nothing this backend represents" — and is
     /// refused before its bytes are copied, never truncated (FR-3.6).
+    ///
+    /// Both probes happen inside one open, so the precedence above is
+    /// decided from a single clipboard state ([`read_current`]).
     fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
-        match read_unicode_text()? {
-            Some(text) if !text.is_empty() => Ok(Some(ClipboardContent::Text(text))),
-            empty_or_absent => {
-                if let Some(bytes) = read_dib(MAX_CLIPBOARD_IMAGE_BYTES)? {
-                    return Ok(Some(ClipboardContent::Image {
-                        format: ClipboardImageFormat::Dib,
-                        bytes,
-                    }));
-                }
-                Ok(empty_or_absent.map(ClipboardContent::Text))
-            }
-        }
+        read_current(MAX_CLIPBOARD_IMAGE_BYTES)
     }
 
     /// Writes `CF_UNICODETEXT`, `CF_DIB`, or the registered `"PNG"`
@@ -232,15 +224,78 @@ impl ClipboardProvider for WindowsClipboard {
     }
 }
 
-/// Read `CF_UNICODETEXT`, or `None` when the clipboard holds no text.
-fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
+/// Decide text-versus-image from **one** clipboard state.
+///
+/// Both probes run under a single `OpenClipboard`, deliberately. Opening
+/// twice would let the clipboard change in between, and the precedence
+/// rule would then be applied to a pair of states that never existed
+/// together: text read as absent from the old contents, an image found in
+/// the new ones, and an image synchronized while the source's clipboard
+/// actually held text. That window is exactly what a user creates by
+/// copying twice in quick succession, and mixed-content precedence is the
+/// part of this backend a human is asked to confirm by eye
+/// (docs/SOAK.md, Phase 7 hardware validation), so it should not be
+/// deciding across two different clipboards.
+///
+/// It costs nothing in lock time for the common case: non-empty text
+/// returns without ever probing `CF_DIB`, so only a clipboard that is
+/// image-or-empty is examined twice under the one open.
+fn read_current(max_image_bytes: usize) -> Result<Option<ClipboardContent>, ClipboardError> {
+    let mut raw_image = None;
+    let mut oversized = None;
+    // Held to the probes and the copies. The UTF-16 decode, the
+    // canonicalization, and the refusal log all run below, once this
+    // guard has dropped and the machine-global lock is free.
+    let units = {
+        let open = OpenGuard::open()?;
+        match probe_unicode_text(&open)? {
+            Some(units) if !units.is_empty() => Some(units),
+            empty_or_absent => {
+                match probe_dib(&open, max_image_bytes)? {
+                    DibProbe::Raw(blob) => raw_image = Some(blob),
+                    DibProbe::TooLarge { byte_count } => oversized = Some(byte_count),
+                    DibProbe::Absent => {}
+                }
+                empty_or_absent
+            }
+        }
+    };
+
+    if let Some(byte_count) = oversized {
+        tracing::warn!(
+            byte_count,
+            max_bytes = max_image_bytes,
+            "clipboard image exceeds the maximum; not synchronized"
+        );
+    }
+    if let Some(blob) = raw_image {
+        return Ok(Some(ClipboardContent::Image {
+            format: ClipboardImageFormat::Dib,
+            bytes: canonical_dib(blob),
+        }));
+    }
+    // An oversized image is *absent*, which leaves an empty text
+    // representation beside it reading as it always has.
+    Ok(units.map(|units| ClipboardContent::Text(String::from_utf16_lossy(&units))))
+}
+
+/// Probe `CF_UNICODETEXT` on the already-open clipboard, yielding its
+/// UTF-16 units, or `None` when the clipboard holds no text.
+///
+/// Takes the open guard rather than opening: the caller decides precedence
+/// across this and [`probe_dib`], and that decision is only meaningful if
+/// both saw the same clipboard ([`read_current`]).
+///
+/// Units rather than a `String` for the same reason [`probe_dib`] returns
+/// [`DibProbe::Raw`]: the decode allocates, and for a multi-megabyte item
+/// that is not cheap, so the caller runs it once the clipboard is closed.
+fn probe_unicode_text(_open: &OpenGuard) -> Result<Option<Vec<u16>>, ClipboardError> {
     // SAFETY: no arguments; checks format availability only.
     if unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)) }.is_err() {
         return Ok(None); // empty clipboard or no text representation
     }
 
-    let open = OpenGuard::open()?;
-    // SAFETY: the clipboard is open (guard); the returned handle is
+    // SAFETY: the clipboard is open (caller's guard); the returned handle is
     // owned by the clipboard, not by us. Everything between here and
     // the explicit drop below is the critical section — keep it to
     // the bytes and nothing else.
@@ -269,11 +324,10 @@ fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
         });
     }
     // SAFETY: CF_UNICODETEXT is null-terminated UTF-16 by contract;
-    // scan for the terminator, then copy the units out. Only the copy
-    // happens under the clipboard lock — the UTF-16 → String
-    // conversion (which allocates, and for a multi-megabyte item is
-    // not cheap) happens after releasing, so Crossover is not the
-    // reason another application's clipboard call fails.
+    // scan for the terminator, then copy the units out. The copy is the
+    // only work under the clipboard lock — the UTF-16 → String conversion
+    // is the caller's, run once the clipboard is closed, so Crossover is
+    // not the reason another application's clipboard call fails.
     let units: Vec<u16> = unsafe {
         let mut len = 0usize;
         while *ptr.add(len) != 0 {
@@ -284,13 +338,32 @@ fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
     // SAFETY: balances the successful GlobalLock above. GlobalUnlock
     // reports "no longer locked" as an error-shaped success; ignore.
     let _ = unsafe { GlobalUnlock(hglobal) };
-    drop(open);
 
-    Ok(Some(String::from_utf16_lossy(&units)))
+    Ok(Some(units))
 }
 
-/// Read `CF_DIB`, or `None` when the clipboard holds no image, holds one
-/// larger than `max_bytes`, or hands back an empty block.
+/// What a `CF_DIB` probe found.
+///
+/// "Too large" is a variant rather than a log line inside the probe
+/// because the probe runs with the clipboard open: `tracing` under the
+/// machine-global lock can block on a subscriber's I/O, and every other
+/// application's clipboard call blocks behind it. The caller reports it
+/// after the guard drops.
+enum DibProbe {
+    /// No raster representation, or a block that came back empty.
+    Absent,
+    /// Present, but past the ceiling — refused whole, never truncated.
+    TooLarge { byte_count: usize },
+    /// Present and inside the ceiling, exactly as the block held it.
+    /// Still to be canonicalized — [`canonical_dib`] is header
+    /// arithmetic the caller runs once the clipboard is closed.
+    Raw(Vec<u8>),
+}
+
+/// Probe `CF_DIB` on the already-open clipboard.
+///
+/// Takes the open guard rather than opening, so this and
+/// [`read_unicode_text`] see one clipboard state — see [`read_current`].
 ///
 /// `max_bytes` is a parameter rather than a constant read inline so the
 /// refusal path is testable without fabricating a 64 MiB clipboard item;
@@ -311,16 +384,15 @@ fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
 /// worst realistic capture, a dual-4K span, is 63.3 MiB
 /// (docs/PROTOCOL.md §8), so roughly 0.7 MiB of rounding is tolerated
 /// before the distinction could ever matter.
-fn read_dib(max_bytes: usize) -> Result<Option<Vec<u8>>, ClipboardError> {
+fn probe_dib(_open: &OpenGuard, max_bytes: usize) -> Result<DibProbe, ClipboardError> {
     // SAFETY: no arguments; checks format availability only. Synthesized
     // formats count as available, which is exactly what makes this one
     // probe cover CF_BITMAP and CF_DIBV5 sources too.
     if unsafe { IsClipboardFormatAvailable(u32::from(CF_DIB.0)) }.is_err() {
-        return Ok(None); // empty clipboard, or no raster representation
+        return Ok(DibProbe::Absent); // empty clipboard, or no raster representation
     }
 
-    let open = OpenGuard::open()?;
-    // SAFETY: the clipboard is open (guard); the returned handle stays
+    // SAFETY: the clipboard is open (caller's guard); the returned handle stays
     // owned by the clipboard, never by us. Ownership can churn between
     // our open and this call, which surfaces as an error here and is
     // retryable contention, not a fault (R-5).
@@ -329,7 +401,7 @@ fn read_dib(max_bytes: usize) -> Result<Option<Vec<u8>>, ClipboardError> {
             reason: format!("GetClipboardData(CF_DIB) failed (ownership churn?): {e}"),
         })?;
     if handle.is_invalid() {
-        return Ok(None);
+        return Ok(DibProbe::Absent);
     }
 
     let hglobal = HGLOBAL(handle.0);
@@ -339,16 +411,12 @@ fn read_dib(max_bytes: usize) -> Result<Option<Vec<u8>>, ClipboardError> {
     // allocation. It reports 0 for an invalid or discarded block.
     let size = unsafe { GlobalSize(hglobal) };
     if size == 0 {
-        return Ok(None);
+        return Ok(DibProbe::Absent);
     }
     if size > max_bytes {
-        drop(open); // release the machine-global lock before logging
-        tracing::warn!(
-            byte_count = size,
-            max_bytes,
-            "clipboard image exceeds the maximum; not synchronized"
-        );
-        return Ok(None); // graceful refusal, never a truncated image
+        // Graceful refusal, never a truncated image — and reported, not
+        // logged here, so the caller can close the clipboard first.
+        return Ok(DibProbe::TooLarge { byte_count: size });
     }
 
     // SAFETY: `hglobal` is a live clipboard block; GlobalLock pins it and
@@ -364,15 +432,15 @@ fn read_dib(max_bytes: usize) -> Result<Option<Vec<u8>>, ClipboardError> {
     // SAFETY: `size` bytes starting at `ptr` are exactly this block, as
     // GlobalSize reported and GlobalLock pinned. The copy is the only
     // work under the machine-global lock — the header parse that
-    // canonicalizes the length happens after releasing it, so Crossover
-    // is not the reason another application's paste fails (FR-3.1a).
+    // canonicalizes the length is left to the caller, which runs it once
+    // the clipboard is closed, so Crossover is not the reason another
+    // application's paste fails (FR-3.1a).
     let blob = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
     // SAFETY: balances the successful GlobalLock above. GlobalUnlock
     // reports "no longer locked" as an error-shaped success; ignore.
     let _ = unsafe { GlobalUnlock(hglobal) };
-    drop(open);
 
-    Ok(Some(canonical_dib(blob)))
+    Ok(DibProbe::Raw(blob))
 }
 
 /// Replace the clipboard with `text` as `CF_UNICODETEXT`.
@@ -390,6 +458,7 @@ fn write_unicode_text(text: &str) -> Result<(), ClipboardError> {
 
 /// Replace the clipboard with an image, verbatim in the format it arrived
 /// in (ADR 0014: no transcoding, here least of all).
+///
 fn write_image(format: ClipboardImageFormat, bytes: &[u8]) -> Result<(), ClipboardError> {
     let clipboard_format = match format {
         ClipboardImageFormat::Dib => u32::from(CF_DIB.0),
@@ -820,6 +889,22 @@ mod tests {
         }))
     }
 
+    /// Probe `CF_DIB` on its own, in the order production uses it: open,
+    /// probe, close, *then* canonicalize (`read_current` keeps the header
+    /// arithmetic out of the machine-global lock). `None` covers both
+    /// "no image" and "refused for size" — which is what the trait-level
+    /// read reports for either, and what these tests assert against.
+    fn probe_dib(max_bytes: usize) -> Result<Option<Vec<u8>>, ClipboardError> {
+        let probe = {
+            let open = super::OpenGuard::open()?;
+            super::probe_dib(&open, max_bytes)?
+        };
+        Ok(match probe {
+            super::DibProbe::Raw(blob) => Some(super::canonical_dib(blob)),
+            super::DibProbe::Absent | super::DibProbe::TooLarge { .. } => None,
+        })
+    }
+
     /// JPEG has no Windows clipboard convention, and ADR 0014 forbids
     /// transcoding it into one that does. The refusal must be
     /// `Unsupported`, not `Busy` and not `Unavailable`: retrying will
@@ -1202,7 +1287,7 @@ mod tests {
         }
         // The image really was there: precedence, not absence.
         assert_eq!(
-            with_retry(|| super::read_dib(super::MAX_CLIPBOARD_IMAGE_BYTES))
+            with_retry(|| probe_dib(super::MAX_CLIPBOARD_IMAGE_BYTES))
                 .unwrap()
                 .map(|b| b.len()),
             Some(picture.len()),
@@ -1279,13 +1364,13 @@ mod tests {
         // A ceiling below the item: absent, and specifically not an error
         // and not a short read.
         assert_eq!(
-            with_retry(|| super::read_dib(picture.len() - 1)).unwrap(),
+            with_retry(|| probe_dib(picture.len() - 1)).unwrap(),
             None,
             "an oversized image must read as absent"
         );
         // The same item under the real ceiling: present and whole.
         assert_eq!(
-            with_retry(|| super::read_dib(super::MAX_CLIPBOARD_IMAGE_BYTES))
+            with_retry(|| probe_dib(super::MAX_CLIPBOARD_IMAGE_BYTES))
                 .unwrap()
                 .map(|b| b.len()),
             Some(picture.len())
@@ -1334,7 +1419,7 @@ mod tests {
         // synthesized from a registered PNG, so this build's own reader
         // reports the clipboard as holding nothing it represents.
         assert_eq!(
-            with_retry(|| super::read_dib(super::MAX_CLIPBOARD_IMAGE_BYTES)).unwrap(),
+            with_retry(|| probe_dib(super::MAX_CLIPBOARD_IMAGE_BYTES)).unwrap(),
             None,
             "Windows unexpectedly synthesized CF_DIB from PNG; \
              the write path's documented caveat needs revisiting"

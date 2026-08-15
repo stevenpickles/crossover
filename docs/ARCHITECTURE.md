@@ -146,7 +146,16 @@ Guidelines:
     A transaction carries one type; the image in a mixed item is a
     rendering of its text, text pastes into strictly more places, and the
     case ADR 0014 exists for — a screenshot — carries no text at all, so
-    the choice costs that case nothing.
+    the choice costs that case nothing. Both probes run under **one**
+    `OpenClipboard`: precedence decided across two opens could be applied
+    to a pair of clipboard states that never coexisted (text absent in the
+    first, an image found in the second), which is exactly what copying
+    twice in quick succession produces. Non-empty text returns without
+    probing `CF_DIB`, so the single open costs no extra lock time in the
+    common case.
+  - **Only copies happen under the clipboard lock.** It is machine-global,
+    so the UTF-16 decode and the DIB canonicalization — both of which
+    allocate — are handed back to the caller and run once it is closed.
   - **The ceiling bites at the source.** `GlobalSize` gives the blob's size
     before it is locked or copied, so an image past
     `MAX_CLIPBOARD_IMAGE_BYTES` is reported *absent* rather than copied out
