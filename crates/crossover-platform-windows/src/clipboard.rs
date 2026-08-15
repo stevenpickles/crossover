@@ -207,11 +207,15 @@ impl ClipboardProvider for WindowsClipboard {
     ///
     /// `Jpeg` is refused as [`ClipboardError::Unsupported`]: permanent, so
     /// the engine does not retry it, and distinguishable by the origin
-    /// from a clipboard that is merely busy or broken (FR-3.2, NFR-3).
+    /// from a clipboard that is merely busy or broken (FR-3.2, NFR-3). An
+    /// image past [`MAX_CLIPBOARD_IMAGE_BYTES`] is refused the same way,
+    /// mirroring the ceiling the read path enforces.
     fn write(&self, content: &ClipboardContent) -> Result<(), ClipboardError> {
         match content {
             ClipboardContent::Text(text) => write_unicode_text(text),
-            ClipboardContent::Image { format, bytes } => write_image(*format, bytes),
+            ClipboardContent::Image { format, bytes } => {
+                write_image(*format, bytes, MAX_CLIPBOARD_IMAGE_BYTES)
+            }
         }
     }
 
@@ -323,6 +327,14 @@ fn probe_unicode_text(_open: &OpenGuard) -> Result<Option<Vec<u16>>, ClipboardEr
         // block that went away, not a clipboard holding "".
         return Ok(None);
     }
+    // The terminator scan below is bounded by the block, not by trust.
+    // `CF_UNICODETEXT` is null-terminated UTF-16 *by contract*, but the
+    // producer is any application on the machine and this process cannot
+    // verify that it obeyed: an unterminated block would send the scan
+    // off the end of the allocation — undefined behaviour, its trigger
+    // chosen by whatever else is running. `GlobalSize` is the only bound
+    // available, so the scan stops there and an unterminated block reads
+    // as its whole contents rather than reading past them.
     let max_units = size / 2; // whole UTF-16 units; a stray odd byte is not one
 
     // SAFETY: `hglobal` is a live clipboard block; GlobalLock pins it and
@@ -502,7 +514,27 @@ fn write_unicode_text(text: &str) -> Result<(), ClipboardError> {
 /// Replace the clipboard with an image, verbatim in the format it arrived
 /// in (ADR 0014: no transcoding, here least of all).
 ///
-fn write_image(format: ClipboardImageFormat, bytes: &[u8]) -> Result<(), ClipboardError> {
+/// `max_bytes` mirrors the read path's ceiling onto the write path, and is
+/// a parameter for the same reason [`probe_dib`]'s is: so the refusal is
+/// provable without a 64 MiB fixture. Production passes
+/// [`MAX_CLIPBOARD_IMAGE_BYTES`].
+///
+/// Nothing should reach here oversized — an inbound image is checked
+/// against the same bound before its reassembly buffer is allocated
+/// (`crossover_protocol::clipboard`), which is where the bound has to bite
+/// for NFR-1. This is the backstop for a caller that is not the session:
+/// it fails closed rather than handing Win32 an allocation the rest of the
+/// system was promised it would never see.
+///
+/// Type is judged before size, deliberately. An oversized JPEG is refused
+/// for being a JPEG, because that is the durable answer — it will never
+/// install at any size — where "too big" invites a smaller retry that
+/// would also fail.
+fn write_image(
+    format: ClipboardImageFormat,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<(), ClipboardError> {
     let clipboard_format = match format {
         ClipboardImageFormat::Dib => u32::from(CF_DIB.0),
         // Registered, not predefined: the de-facto interchange name that
@@ -523,6 +555,18 @@ fn write_image(format: ClipboardImageFormat, bytes: &[u8]) -> Result<(), Clipboa
             });
         }
     };
+    if bytes.len() > max_bytes {
+        // Permanent for this item, like an unsupported type: no retry
+        // makes it smaller, and the origin is owed the wall it hit rather
+        // than an expiring retry budget (NFR-3). The size is named; the
+        // pixels never are (FR-7.4).
+        return Err(ClipboardError::Unsupported {
+            reason: format!(
+                "image is {} bytes, past the {max_bytes}-byte clipboard ceiling",
+                bytes.len()
+            ),
+        });
+    }
     install_formats(&[(clipboard_format, bytes)])
 }
 
@@ -971,6 +1015,48 @@ mod tests {
                     "the diagnostic must name why: {reason}"
                 );
             }
+            other => panic!("expected a permanent refusal, got {other:?}"),
+        }
+    }
+
+    /// The ceiling mirrored onto the write path. An oversized image is
+    /// refused *before* `install_formats`, so nothing reaches Win32 and no
+    /// clipboard lock is taken — the same permanent `Unsupported` the read
+    /// path's absence corresponds to, rather than a `Busy` the engine
+    /// would retry until its budget expired (NFR-3).
+    #[test]
+    fn an_image_over_the_ceiling_is_refused_rather_than_installed() {
+        use crossover_platform::ClipboardImageFormat;
+
+        let picture = dib(8, 8);
+        match super::write_image(ClipboardImageFormat::Dib, &picture, picture.len() - 1) {
+            Err(ClipboardError::Unsupported { reason }) => {
+                assert!(
+                    reason.contains(&picture.len().to_string()),
+                    "the diagnostic must name the size it refused: {reason}"
+                );
+            }
+            other => panic!("an oversized image must be refused, got {other:?}"),
+        }
+        // The same bytes under a ceiling that admits them still install,
+        // so the check bounds the size and nothing else.
+        let _serial = clipboard_lock();
+        with_retry(|| super::write_image(ClipboardImageFormat::Dib, &picture, picture.len()))
+            .unwrap();
+    }
+
+    /// Type is judged before size: an oversized JPEG is refused for being
+    /// a JPEG. "Too big" would invite a smaller retry that must also fail,
+    /// where the type refusal is the durable answer (NFR-3).
+    #[test]
+    fn an_oversized_unsupported_type_is_refused_for_its_type() {
+        use crossover_platform::ClipboardImageFormat;
+
+        match super::write_image(ClipboardImageFormat::Jpeg, &[0u8; 64], 8) {
+            Err(ClipboardError::Unsupported { reason }) => assert!(
+                reason.contains("ADR 0014"),
+                "the type refusal must win over the size one: {reason}"
+            ),
             other => panic!("expected a permanent refusal, got {other:?}"),
         }
     }

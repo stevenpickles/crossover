@@ -42,8 +42,14 @@ pub enum ClipboardError {
     /// different things to the peer that sent the item: a clipboard that
     /// is unavailable might work in a second, while a type this build
     /// cannot represent will never work, and the origin deserves to be
-    /// told which it met (NFR-3). It is what a backend returns for a
-    /// raster image before ADR 0014's platform slice lands.
+    /// told which it met (NFR-3).
+    ///
+    /// Also what a backend returns for an image past
+    /// [`MAX_CLIPBOARD_IMAGE_BYTES`] on the *write* path: permanent for
+    /// that item in the same way, since no retry makes it smaller. The
+    /// read path has no error to return — an oversized image there is
+    /// reported absent — so the two paths refuse the same ceiling in the
+    /// two shapes the trait gives them.
     #[error("clipboard content type unsupported: {reason}")]
     Unsupported { reason: String },
 }

@@ -173,7 +173,14 @@ Guidelines:
   - **Write** installs `CF_DIB` verbatim (Windows synthesizes the rest of
     the family for pasting applications) and PNG verbatim under the
     registered `"PNG"` format, with the known limitation that nothing is
-    synthesized from PNG. Nothing is ever transcoded between formats.
+    synthesized from PNG. Nothing is ever transcoded between formats. The
+    same ceiling is mirrored onto this path as a backstop — the bound that
+    matters for NFR-1 is the one applied before an inbound image's
+    reassembly buffer is allocated, so nothing should arrive here
+    oversized, and a caller that is not the session fails closed rather
+    than reaching Win32. Type is judged before size, so an oversized JPEG
+    is refused for being a JPEG: the durable answer, where "too big"
+    invites a smaller retry that must also fail.
 - `InputCapture` on Windows is backed by two mechanisms rather than one
   (ADR 0007): low-level hooks, because only they can suppress an event
   locally, and Raw Input, because only it reports unaccelerated,
