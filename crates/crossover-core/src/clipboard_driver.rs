@@ -446,6 +446,11 @@ impl ClipboardSyncDriver {
                     };
                     let lost = matches!(event, SyncEvent::SessionLost);
                     self.deferred.push_back(event);
+                    // The only place the queue grows, so the high-water
+                    // mark is exact: how close a run came to the bound
+                    // above, reportable at shutdown (FR-7.3, NFR-1).
+                    let depth = self.deferred.len();
+                    self.record(|metrics| metrics.record_deferred_depth(depth));
                     if lost {
                         tracing::debug!(
                             deferred = self.deferred.len(),
