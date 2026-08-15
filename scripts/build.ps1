@@ -140,6 +140,14 @@ if ($SkipChecks) {
     Write-Step 'Linting (warnings denied)'
     Invoke-Native 'cargo' @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings')
 
+    # The Windows clipboard tests open the real clipboard, and a running
+    # worker holds it — they fail with "Access is denied" for a reason that
+    # has nothing to do with the code. Say so before the failure, not after.
+    $running = @(Get-Process 'crossover', 'crossover-svc' -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0) {
+        Write-Warning ("Crossover is running (PID {0}). The Windows clipboard tests need an uncontended clipboard; stop the service first (Stop-Service Crossover) or pass -SkipChecks." -f ($running.Id -join ', '))
+    }
+
     Write-Step 'Running the test suite'
     Invoke-Native 'cargo' @('test', '--workspace')
 
