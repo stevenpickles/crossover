@@ -58,6 +58,12 @@ Rules:
 crossover/
     Cargo.toml                      # workspace root
     apps/
+        build_identity.rs           # shared by both build scripts: resolves the
+                                    #   build version/commit/channel and emits it
+        build_info.rs               # shared module: the BuildInfo the binaries
+                                    #   report (`crossover version`). Source
+                                    #   includes, not a crate, so the service
+                                    #   binary gains no dependency edge.
         crossover/                  # the binary: CLI, config, wiring, worker
         crossover-svc/              # the service daemon (ADR 0011): a minimal
                                     #   Windows LocalSystem launcher. Depends
@@ -75,6 +81,10 @@ crossover/
     tools/
         test-peer/                  # headless scriptable peer (see TESTING.md)
     tests/                          # cross-crate integration tests
+    scripts/
+        build.ps1                   # one command: gate, build, package (CI runs
+                                    #   this same script)
+    packaging/                      # install scripts and the Chocolatey package
     docs/
 ```
 

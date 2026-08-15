@@ -29,6 +29,30 @@ larger workstation, without weakening the security boundary between them.
 Initial target: two Windows machines on a LAN. Long term: Windows, macOS,
 Linux. Implementation language: Rust.
 
+## Building
+
+```powershell
+.\scripts\build.ps1
+```
+
+One command: runs the CI gate (format, lint, tests, dependency audit), builds
+both executables, and writes every deliverable — portable archive, checksum,
+Chocolatey package, and an `artifacts.json` manifest — into `dist\`. Use
+`-SkipChecks` for a fast iteration build and `-SkipChocolatey` to stop at the
+archive. Installing and packaging are covered in
+[packaging/README.md](packaging/README.md).
+
+Every binary knows exactly what it is:
+
+```powershell
+crossover version          # build version, channel, source commit, toolchain
+crossover version --json   # the same, for scripts
+crossover -V               # just the version string
+```
+
+A build that is not a tagged release says so — `0.1.0-dev.7.gabc1234.dirty`
+names the commit it came from and admits to uncommitted edits.
+
 ## Documentation
 
 | Document | Contents |

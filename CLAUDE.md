@@ -47,10 +47,18 @@ never let code and specification diverge silently.
 
 ## Development
 
-- No build tooling exists yet. Once the Phase 0 workspace lands, the CI
-  gate is: `cargo fmt --check`, `cargo clippy --workspace --all-targets`
-  (warnings denied), `cargo build --workspace`, `cargo test --workspace` —
-  on Windows, Linux, and macOS.
+- The CI gate is: `cargo fmt --check`, `cargo clippy --workspace
+  --all-targets` (warnings denied), `cargo build --workspace`, `cargo test
+  --workspace` — on Windows, Linux, and macOS.
+- `scripts/build.ps1` is the one-command build: the gate, then release
+  binaries, then every deliverable (portable archive + checksum, Chocolatey
+  package, `artifacts.json`) into `dist/`. CI runs the same script, so local
+  and CI artifacts come from one code path. `-SkipChecks` / `-SkipChocolatey`
+  shorten it.
+- Binaries carry their own identity (`apps/build_identity.rs` generates it,
+  `apps/build_info.rs` reports it): `crossover version [--json]` and
+  `crossover-svc --version`. Never hand-edit a version into packaging — the
+  build derives it from the source state.
 - Prefer small, independently testable/reviewable/revertible tasks; keep
   the repo buildable after each integrated change.
 - "Done" = the Definition of Done in `docs/TESTING.md` §5, not "worked once
