@@ -22,8 +22,43 @@
 //! install/uninstall/status` manages this daemon's registration with the SCM;
 //! `crossover-svc` is the thing the SCM then runs.
 
-#[cfg(windows)]
+// The identity source shared with `crossover.exe`. It is an included source
+// file rather than a crate so that reporting a version costs this binary no
+// dependency edge — the isolation described above is the whole point
+// (apps/build_identity.rs).
+#[path = "../../build_info.rs"]
+mod build_info;
+
 fn main() {
+    // Handled before anything else: this binary is normally started by the
+    // SCM with no arguments, so the only way it sees any is a human asking
+    // what it is — typically of the copy sitting in Program Files.
+    if reported_version() {
+        return;
+    }
+    run();
+}
+
+/// Answer `--version` / `-V` (add `--json` for a machine-readable object) and
+/// report whether that is all this invocation wanted.
+///
+/// Deliberately not clap: an argument parser is surface the `LocalSystem`
+/// binary does not need for two flags it is never launched with.
+fn reported_version() -> bool {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if !arguments
+        .iter()
+        .any(|argument| argument == "--version" || argument == "-V")
+    {
+        return false;
+    }
+    let json = arguments.iter().any(|argument| argument == "--json");
+    print!("{}", build_info::report(&[], json));
+    true
+}
+
+#[cfg(windows)]
+fn run() {
     // The service has no console; log to stderr (the SCM/event pipeline
     // captures it) so a launch or supervision failure is never silent (NFR-3).
     tracing_subscriber::fmt()
@@ -35,7 +70,7 @@ fn main() {
 }
 
 #[cfg(not(windows))]
-fn main() {
+fn run() {
     eprintln!(
         "crossover-svc is the Windows service daemon (ADR 0011) and runs only \
          on Windows. Elsewhere, auto-start uses the OS-native user-session \
