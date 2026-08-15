@@ -80,13 +80,26 @@ This produces `crossover.<version>.nupkg` in the output directory
 **Install / upgrade / uninstall** (all silent, all elevated by Chocolatey):
 
 ```powershell
-choco install crossover -y -s <source>     # <source> = the chocolatey folder, or a feed URL
-choco upgrade crossover -y -s <source>
+choco upgrade crossover -y --pre -s <source>   # installs if absent, upgrades if present
 choco uninstall crossover -y
 ```
 
-`<source>` can be the local `chocolatey\` folder to start, or a private feed
-(ProGet / Nexus / Azure Artifacts) once you distribute more widely. Push with:
+> **`--pre` is required for anything but a tagged release.** Chocolatey
+> filters pre-release versions out unless asked for them, and every
+> untagged build carries a pre-release label
+> (`0.1.0-dev-7-gabc1234`). Without it the install fails with
+>
+> ```
+> crossover was not found with the source(s) listed.
+> ```
+>
+> which reads like a missing package but means "found it, declined to
+> offer it". `scripts\build.ps1` prints the exact command for the build it
+> just made. Add `--force` only to reinstall the same version over itself.
+
+`<source>` can be the local `dist\` folder (where `scripts\build.ps1` writes)
+or the `chocolatey\` folder, and later a private feed (ProGet / Nexus / Azure
+Artifacts). Push with:
 
 ```powershell
 choco push crossover.<version>.nupkg -s <feed-url> --api-key <key>

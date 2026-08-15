@@ -351,3 +351,18 @@ foreach ($artifact in $artifacts) {
     Write-Host ("  {0,-20} {1}" -f $artifact.kind, $artifact.file)
 }
 Write-Host ("  {0,-20} {1}" -f 'manifest', (Split-Path -Leaf $manifestPath))
+
+# The command that actually installs what was just built. --pre is not
+# optional for a development or CI build: Chocolatey filters pre-release
+# versions out by default, and the resulting "crossover was not found with
+# the source(s) listed" looks like a broken package rather than a version
+# it declined to offer.
+if ($packagePath) {
+    $prerelease = if ($Version -match '-') { ' --pre' } else { '' }
+    Write-Host ''
+    Write-Host 'Install it (elevated; upgrades in place, service and all):'
+    Write-Host "  choco upgrade crossover -y$prerelease -s `"$OutputDirectory`""
+    if ($prerelease) {
+        Write-Host "  --pre because $Version is a pre-release; a tagged release build does not need it."
+    }
+}

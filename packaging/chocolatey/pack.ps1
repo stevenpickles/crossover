@@ -89,8 +89,14 @@ if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
     throw "choco pack reported success but $packagePath does not exist."
 }
 
+# Chocolatey ignores pre-release versions unless asked for them, and every
+# build that is not a tagged release has a pre-release label. Without --pre
+# the install fails with "crossover was not found with the source(s) listed",
+# which reads like a broken package rather than a filtered one.
+$prerelease = if ($Version -match '-') { ' --pre' } else { '' }
+
 Write-Host ''
 Write-Host "Built $packagePath"
-Write-Host "Install from here:  choco install crossover -y -s `"$OutputDirectory`""
+Write-Host "Install from here:  choco upgrade crossover -y$prerelease -s `"$OutputDirectory`""
 Write-Host "Or push to a feed:  choco push crossover.$Version.nupkg -s <feed-url> --api-key <key>"
 Write-Output $packagePath
