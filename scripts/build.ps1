@@ -341,6 +341,20 @@ $manifest = [ordered]@{
     tools           = [ordered]@{ chocolatey = $chocolateyVersion }
     artifacts       = $artifacts
 }
+# artifacts.json describes the run that wrote it, and there is one per output
+# directory — so writing here replaces any record of an earlier build left in
+# the same folder. Say what else is sitting there rather than quietly
+# redefining what the folder means, because `choco upgrade` resolves the
+# highest version present, not the newest file.
+$otherBuilds = @(
+    Get-ChildItem -LiteralPath $OutputDirectory -File |
+        Where-Object { $_.Extension -in '.nupkg', '.zip' -and $_.Name -notlike "*$Version*" } |
+        ForEach-Object { $_.Name }
+)
+if ($otherBuilds.Count -gt 0) {
+    Write-Warning ("$OutputDirectory also holds artifacts from other builds, and artifacts.json now describes this one only: " + ($otherBuilds -join ', '))
+}
+
 $manifestPath = Join-Path $OutputDirectory 'artifacts.json'
 $manifestJson = $manifest | ConvertTo-Json -Depth 6
 [System.IO.File]::WriteAllText($manifestPath, "$manifestJson`n", [System.Text.UTF8Encoding]::new($false))
