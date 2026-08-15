@@ -1,24 +1,24 @@
-//! Embed the Windows application icon into `crossover.exe` so it carries the
-//! Crossover brand in Explorer, the taskbar, and — later — the system tray.
+//! Give `crossover.exe` its identity: the generated `BUILD_INFO` constant
+//! that `crossover version` reports, plus — on Windows — the application icon
+//! and a version resource carrying the same values.
 //!
-//! Windows-only: on other build hosts this is a no-op (the icon is a Windows PE
-//! resource), so tri-OS CI is unaffected. Best-effort — a resource-compiler
-//! failure warns rather than breaking the build, since branding is not
-//! correctness.
+//! The identity resolution is shared with `crossover-svc` so the two binaries
+//! of one install can never disagree about what they are; see
+//! `apps/build_identity.rs` for the scheme and for why it is an included
+//! source file rather than a crate.
 
-fn main() {
+include!("../build_identity.rs");
+
+fn main() -> io::Result<()> {
+    let identity = emit_build_identity()?;
+
     #[cfg(windows)]
-    {
-        // Relative to this crate; the shared icon lives at the repo root.
-        const ICON: &str = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/branding/crossover.ico"
-        );
-        println!("cargo:rerun-if-changed=../../assets/branding/crossover.ico");
-        let mut resource = winresource::WindowsResource::new();
-        resource.set_icon(ICON);
-        if let Err(error) = resource.compile() {
-            println!("cargo:warning=embedding the application icon failed: {error}");
-        }
-    }
+    stamp_windows_resource(
+        &identity,
+        "Crossover keyboard, mouse, and clipboard sharing",
+    )?;
+    #[cfg(not(windows))]
+    let _ = &identity;
+
+    Ok(())
 }

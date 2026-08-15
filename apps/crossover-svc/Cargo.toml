@@ -18,5 +18,12 @@ repository.workspace = true
 tracing-subscriber = { workspace = true }
 crossover-platform-windows = { workspace = true }
 
+# Windows-only: stamp the icon and the version resource into crossover-svc.exe
+# (build.rs), so the copy the SCM runs out of Program Files identifies itself
+# in Explorer and to the packaging script without being executed. A *build*
+# dependency, so the runtime isolation described in src/main.rs is untouched.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [lints]
 workspace = true
