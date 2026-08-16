@@ -341,6 +341,20 @@ $manifest = [ordered]@{
     tools           = [ordered]@{ chocolatey = $chocolateyVersion }
     artifacts       = $artifacts
 }
+# artifacts.json describes the run that wrote it, and there is one per output
+# directory — so writing here replaces any record of an earlier build left in
+# the same folder. Say what else is sitting there rather than quietly
+# redefining what the folder means, because `choco upgrade` resolves the
+# highest version present, not the newest file.
+$otherBuilds = @(
+    Get-ChildItem -LiteralPath $OutputDirectory -File |
+        Where-Object { $_.Extension -in '.nupkg', '.zip' -and $_.Name -notlike "*$Version*" } |
+        ForEach-Object { $_.Name }
+)
+if ($otherBuilds.Count -gt 0) {
+    Write-Warning ("$OutputDirectory also holds artifacts from other builds, and artifacts.json now describes this one only: " + ($otherBuilds -join ', '))
+}
+
 $manifestPath = Join-Path $OutputDirectory 'artifacts.json'
 $manifestJson = $manifest | ConvertTo-Json -Depth 6
 [System.IO.File]::WriteAllText($manifestPath, "$manifestJson`n", [System.Text.UTF8Encoding]::new($false))
@@ -351,3 +365,18 @@ foreach ($artifact in $artifacts) {
     Write-Host ("  {0,-20} {1}" -f $artifact.kind, $artifact.file)
 }
 Write-Host ("  {0,-20} {1}" -f 'manifest', (Split-Path -Leaf $manifestPath))
+
+# The command that actually installs what was just built. --pre is not
+# optional for a development or CI build: Chocolatey filters pre-release
+# versions out by default, and the resulting "crossover was not found with
+# the source(s) listed" looks like a broken package rather than a version
+# it declined to offer.
+if ($packagePath) {
+    $prerelease = if ($Version -match '-') { ' --pre' } else { '' }
+    Write-Host ''
+    Write-Host 'Install it (elevated; upgrades in place, service and all):'
+    Write-Host "  choco upgrade crossover -y$prerelease -s `"$OutputDirectory`""
+    if ($prerelease) {
+        Write-Host "  --pre because $Version is a pre-release; a tagged release build does not need it."
+    }
+}
