@@ -121,6 +121,12 @@ pub struct WindowsClipboard {
     /// to post the shutdown message; the pump thread owns the window).
     hwnd_raw: isize,
     pump: Option<std::thread::JoinHandle<()>>,
+    /// Signalled by the pump as it leaves its loop, so `Drop` can wait a
+    /// bounded time for it rather than joining a thread that may never
+    /// return (see [`crate::pump`]). Behind a `Mutex` so the provider stays
+    /// `Sync` without widening the assertions below; it is read once, from
+    /// `Drop`.
+    stopped: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 // SAFETY: `hwnd_raw` is only used with PostMessageW (thread-safe by API
@@ -142,10 +148,16 @@ impl WindowsClipboard {
         let listener: SharedListener = Arc::new(Mutex::new(None));
         let pump_listener = Arc::clone(&listener);
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<isize, String>>();
+        // Signalled as the pump leaves its loop, so shutdown can tell
+        // "stopped" from "wedged" without joining blind (see `pump`).
+        let (stopped_tx, stopped) = std::sync::mpsc::channel::<()>();
 
         let pump = std::thread::Builder::new()
             .name("crossover-clipboard-pump".to_owned())
-            .spawn(move || pump_thread(&pump_listener, &init_tx))
+            .spawn(move || {
+                pump_thread(&pump_listener, &init_tx);
+                let _ = stopped_tx.send(());
+            })
             .map_err(|e| ClipboardError::Unavailable {
                 reason: format!("spawning clipboard pump thread: {e}"),
             })?;
@@ -161,6 +173,7 @@ impl WindowsClipboard {
             listener,
             hwnd_raw,
             pump: Some(pump),
+            stopped: Mutex::new(stopped),
         })
     }
 }
@@ -171,9 +184,11 @@ impl Drop for WindowsClipboard {
         // SAFETY: PostMessageW is safe to call from any thread with any
         // window handle; a stale handle at worst fails harmlessly.
         let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_SHUTDOWN, WPARAM(0), LPARAM(0)) };
-        if let Some(pump) = self.pump.take() {
-            let _ = pump.join();
-        }
+        let stopped = self
+            .stopped
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        crate::pump::stop("clipboard", stopped, &mut self.pump);
     }
 }
 

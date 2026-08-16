@@ -369,6 +369,11 @@ pub struct WindowsInputCapture {
     /// only with `PostMessageW`; the pump thread owns the window).
     hwnd_raw: isize,
     pump: Option<std::thread::JoinHandle<()>>,
+    /// Signalled by the pump as it leaves its loop, so `Drop` can wait a
+    /// bounded time for it rather than joining a thread that may never
+    /// return (see [`crate::pump`]). Behind a `Mutex` only to keep the
+    /// capture `Sync` as its trait requires; it is read once, from `Drop`.
+    stopped: Mutex<mpsc::Receiver<()>>,
     /// Serializes start/stop so the single reply slot is unambiguous.
     ops: Mutex<()>,
 }
@@ -391,10 +396,16 @@ impl WindowsInputCapture {
         });
         let pump_shared = Arc::clone(&shared);
         let (init_tx, init_rx) = mpsc::channel::<Result<isize, String>>();
+        // Signalled as the pump leaves its loop, so shutdown can tell
+        // "stopped" from "wedged" without joining blind (see `pump`).
+        let (stopped_tx, stopped) = mpsc::channel::<()>();
 
         let pump = std::thread::Builder::new()
             .name("crossover-input-pump".to_owned())
-            .spawn(move || pump_thread(&pump_shared, &init_tx))
+            .spawn(move || {
+                pump_thread(&pump_shared, &init_tx);
+                let _ = stopped_tx.send(());
+            })
             .map_err(|e| InputError::CaptureUnavailable {
                 reason: format!("spawning input pump thread: {e}"),
             })?;
@@ -410,6 +421,7 @@ impl WindowsInputCapture {
             shared,
             hwnd_raw,
             pump: Some(pump),
+            stopped: Mutex::new(stopped),
             ops: Mutex::new(()),
         })
     }
@@ -501,9 +513,11 @@ impl Drop for WindowsInputCapture {
         // SAFETY: PostMessageW is safe from any thread with any window
         // handle; a stale handle at worst fails harmlessly.
         let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_SHUTDOWN, WPARAM(0), LPARAM(0)) };
-        if let Some(pump) = self.pump.take() {
-            let _ = pump.join();
-        }
+        let stopped = self
+            .stopped
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::pump::stop("input-capture", stopped, &mut self.pump);
     }
 }
 

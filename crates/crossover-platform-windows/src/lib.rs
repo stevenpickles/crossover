@@ -21,6 +21,9 @@ pub mod display;
 pub mod input;
 #[cfg(windows)]
 pub mod keymap;
+
+/// Bounded shutdown for the Win32 message-pump threads (see the module).
+mod pump;
 #[cfg(windows)]
 pub mod secure_storage;
 #[cfg(windows)]
