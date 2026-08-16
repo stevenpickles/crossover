@@ -439,6 +439,10 @@ pub async fn run_session(
             maybe = outbound.recv() => {
                 match maybe {
                     Some(frame) => {
+                        // Split point: everything before here is the frame
+                        // waiting for the writer, everything after is the
+                        // socket accepting it.
+                        let taken_at = std::time::Instant::now();
                         let result = write_bounded(
                             &mut writer,
                             frame.message_type,
@@ -456,6 +460,7 @@ pub async fn run_session(
                             writer.record_input_queue_latency(
                                 frame.message_type,
                                 frame.queued_at,
+                                taken_at,
                             );
                         }
                         // Dropping the frame returns its Background byte
