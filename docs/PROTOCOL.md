@@ -373,9 +373,21 @@ Rules, all fail-closed:
 | Frame body maximum | 4 MiB + 64 KiB (ADR 0005): one maximum *text* item plus envelope per frame. Unchanged by chunking (ADR 0014) — larger content is split, never carried whole, because one giant frame is exactly what cannot be preempted (ADR 0013) |
 | Max clipboard text / inline threshold | 4 MiB / 64 KiB (ADR 0005), named constants in `crossover-protocol` |
 | Max clipboard image | 64 MiB, `MAX_CLIPBOARD_IMAGE_BYTES` (ADR 0014) — see below |
-| Chunk payload maximum | 64 KiB, `MAX_CHUNK_BYTES` (ADR 0014) — see below |
+| Chunk payload maximum | 64 KiB, `MAX_CHUNK_BYTES` (ADR 0014) — a *maximum*, not a fixed size; see below |
 | Chunk count maximum | 1024, `MAX_CHUNK_COUNT` = `MAX_CLIPBOARD_IMAGE_BYTES` ÷ `MAX_CHUNK_BYTES`. Derived, and compile-time asserted against the two constants it comes from |
 | Keepalive interval / timeout | 5 s / 15 s defaults in `crossover-core::supervision` |
+
+**Chunk size is the sender's to choose.** `MAX_CHUNK_BYTES` bounds a chunk;
+it does not fix one. A receiver takes its plan from the size of **chunk 0**
+and holds every later chunk to it — full-sized until the last, which is the
+remainder — so a sender may use any size in `1..=MAX_CHUNK_BYTES` without
+negotiating anything, and two peers using different sizes interoperate.
+
+That matters because chunk size is the latency knob (ADR 0013): a frame
+already being written cannot be preempted, so the worst delay an input
+frame can suffer is roughly one chunk's write time. Reducing it is a
+sender-side change, not a protocol change — which is what makes revisiting
+64 KiB cheap when a measurement calls for it.
 
 **Why 64 MiB for images.** Images travel as the source's native raster
 bytes, verbatim and uncompressed (ADR 0014), so the ceiling has to cover a
