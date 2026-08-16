@@ -294,10 +294,13 @@ that touch them:
   conflict with hooks. Initial scope may exclude these; the limitation must
   be documented.
 
-macOS (accessibility permissions, pasteboard semantics) and Linux
-(X11/Wayland split, clipboard ownership model) risks are catalogued when
-those phases begin ([ROADMAP.md](ROADMAP.md) Phase 8 — Cross-Platform
-Validation).
+macOS and Linux risks are now catalogued, ahead of the ports as Phase 8
+requires: [platform-risks-macos.md](platform-risks-macos.md) and
+[platform-risks-linux.md](platform-risks-linux.md). They are written from
+documented platform behaviour rather than measurement, so each risk carries
+what to verify; anything that survives contact with hardware belongs here in
+§6 alongside the Windows risks, and anything falsified should be struck with
+a note saying so.
 
 ## 7. Process requirements
 
