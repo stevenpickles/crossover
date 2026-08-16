@@ -471,11 +471,36 @@ ADR 0014's chunking caps how large a bulk frame can be.
 What these bounds do **not** do is keep the session loop responsive *during*
 a write. While one is pending the loop still polls nothing else, so a slow
 peer delays input by up to one write — the guarantee is that this ends the
-session in bounded time, not that it never happens. Two things shrink it:
-ADR 0014's chunking makes the unit smaller, and moving the writer to its own
-task would remove the freeze entirely. The latter is deferred, not
-forgotten — it would take keepalive off the direct path to the writer that
-ADR 0013 specifies, so it needs an ADR of its own.
+session in bounded time, not that it never happens.
+
+**Measured, 2026-08-16.** Over WiFi, with a saturating image transfer
+running, input frames waited a mean of 2.9 ms and a worst case of **124 ms**
+for the wire. The split says where: 124.3 ms of that maximum was the frame
+waiting for the writer and 0.18 ms was the socket accepting its own bytes.
+So the delay is entirely this paragraph's effect — one in-flight 64 KiB
+bulk chunk, on a link slow enough to make that write take a tenth of a
+second.
+
+Two things shrink it, and an earlier version of this section named a third
+that does not:
+
+- **ADR 0014's chunking makes the unit smaller.** This is the only lever
+  that acts on the delay directly, and it is a *sender-side* knob: the
+  receiver takes its plan from the first chunk's size
+  ([PROTOCOL.md](PROTOCOL.md) §8), so a sender may use anything up to
+  `MAX_CHUNK_BYTES` without negotiation or a protocol change. Held at
+  64 KiB pending a wired measurement — ADR 0013's arithmetic assumed
+  2.5 GbE, where the same chunk is 0.21 ms rather than 124.
+- **A faster link.** The measurement above is wireless; the design target
+  is wired.
+- **Moving the writer to its own task does _not_ fix this**, though this
+  section used to imply it would. A writer task still writes serially into
+  one TLS stream, so an input frame cannot overtake a bulk frame already
+  being written — the wait is unchanged. What it *would* fix is the loop
+  being unable to poll reads and the keepalive tick during a write, which
+  is a real but different problem. Genuine preemption mid-frame needs
+  separate streams (QUIC) or a second connection, both considered and
+  rejected in ADR 0013.
 
 Session **teardown** has an ordering requirement that falls out of all this.
 When a session ends, its send path is retired — receiver dropped, registry

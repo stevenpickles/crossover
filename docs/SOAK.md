@@ -891,6 +891,12 @@ With both machines running (Phase 5/6 setup), on machine A:
    took that long to be accepted — backpressure or the link, which no local
    scheduling improves. Which half dominates decides what to do about it.
 
+   **Trust the maximum, not the mean.** Every field is cumulative, so the
+   mean falls as idle input accumulates after the transfer — a real reading
+   went 1942 -> 1424 -> 1248 -> 797 -> 586 µs across successive records
+   while nothing improved. Difference two records to get the interval, or
+   read the max, which only moves when something worse happens.
+
    **What good looks like:** a mean in the tens of microseconds, and a
    maximum in single-digit milliseconds. A maximum in the *hundreds* of
    milliseconds means interactive frames queued behind bulk — the lane

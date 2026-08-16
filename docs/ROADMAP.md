@@ -35,13 +35,22 @@
 > worst-case input delay stays sub-millisecond". The measured mean already
 > breaks that, and the maximum is three orders of magnitude past it.
 >
-> **Two caveats on the reading, neither of which rescues it.** The link was
-> **WiFi**, not the wired 2.5 GbE the arithmetic assumed, so airtime and
-> retransmission are in the number; a wired re-measurement is the
-> apples-to-apples test of the ADR's claim. And the figure deliberately
-> spans both the wait for the writer *and* the wait for the socket, so it
-> does not yet say which dominates — feature/118 splits it, and the next run
-> will attribute it.
+> **Attributed on the second run** (feature/118 split the wait): of a
+> 124.3 ms worst case, **124.3 ms was the frame waiting for the writer and
+> 0.18 ms was the socket** accepting its own bytes. The input frame's bytes
+> leave quickly; it waits because the session loop is mid-write on a 64 KiB
+> bulk chunk. Head-of-line blocking behind one in-flight frame — the "a
+> frame in flight is unpreemptable" limit ADR 0013 names — not the lane
+> split failing and not the link refusing small writes.
+>
+> **Held at 64 KiB** (maintainer, 2026-08-16), to be revisited on a wired
+> link. The measurement was taken over **WiFi**, which ADR 0013's arithmetic
+> never contemplated: the same chunk is 0.21 ms of 2.5 GbE and ~124 ms of a
+> bad wireless moment. Chunk size is the only lever that acts on this
+> directly, and it is cheap to move — the receiver takes its plan from the
+> first chunk, so a smaller sender-side chunk needs no protocol change. Note
+> that **moving the writer to its own task would not help**: it still writes
+> serially into one stream (see ARCHITECTURE.md §5.4, corrected).
 >
 > The mechanism is already documented rather than newly discovered:
 > [ARCHITECTURE.md](ARCHITECTURE.md) §5.4 records that the session loop
