@@ -592,9 +592,13 @@ impl Report {
             longest_session_ms = self.longest_session_ms,
             clipboard_sent = self.clipboard_sent,
             clipboard_applied = self.clipboard_applied,
+            clipboard_superseded = self.clipboard_superseded,
+            clipboard_abandoned = self.clipboard_abandoned,
             clipboard_retries = self.clipboard_retries,
             clipboard_contention = self.clipboard_contention,
             clipboard_conflicts = self.clipboard_conflicts,
+            clipboard_loop_suppressed = self.clipboard_loop_suppressed,
+            clipboard_latency_dropped = self.clipboard_latency_dropped,
             clipboard_deferred_peak = self.clipboard_deferred_peak,
             latency_p50_ms = self.latency_p50,
             latency_p95_ms = self.latency_p95,
@@ -618,13 +622,23 @@ impl Report {
     fn write_clipboard(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "  clipboard:  {} sent, {} applied, {} superseded; {} retries, {} contention, {} conflicts",
+            "  clipboard:  {} sent, {} applied, {} superseded, {} abandoned",
             self.clipboard_sent,
             self.clipboard_applied,
             self.clipboard_superseded,
+            self.clipboard_abandoned,
+        )?;
+        // Loop suppressions belong next to the failure counts, not hidden
+        // behind a threshold: a healthy run suppresses roughly one per
+        // applied item, so the *absence* of them is the anomaly worth
+        // seeing — that is what a sync loop looks like from here.
+        writeln!(
+            f,
+            "                {} retries, {} contention, {} conflicts, {} own-write loops suppressed",
             self.clipboard_retries,
             self.clipboard_contention,
             self.clipboard_conflicts,
+            self.clipboard_loop_suppressed,
         )?;
         // A run that never parked on bulk backpressure has nothing to say
         // here, and the block stays short.
@@ -642,6 +656,16 @@ impl Report {
                 f,
                 "                latency p50 {p50}ms, p95 {p95}ms, max {max}ms (over {} samples)",
                 self.latency_samples,
+            )?;
+        }
+        // Only if the cap was reached: otherwise the percentiles above are
+        // over every sample taken, and saying "0 dropped" invites the
+        // reader to wonder what could have been.
+        if self.clipboard_latency_dropped > 0 {
+            writeln!(
+                f,
+                "                {} latency samples dropped past the retention cap",
+                self.clipboard_latency_dropped,
             )?;
         }
         Ok(())
@@ -775,6 +799,67 @@ mod tests {
 
     use super::{FrameClass, Metrics, percentile};
     use crate::supervision::DisconnectReason;
+
+    /// Every counter the registry keeps has to reach a human somewhere.
+    /// A tally nothing renders is worse than no tally: docs/SOAK.md sends
+    /// readers to check numbers, and one that is only ever incremented
+    /// reads as "zero happened" rather than "nobody printed it".
+    #[test]
+    fn the_report_renders_every_clipboard_counter() {
+        let metrics = Metrics::new();
+        metrics.record_clipboard_sent();
+        metrics.record_clipboard_applied();
+        metrics.record_clipboard_superseded();
+        metrics.record_clipboard_abandoned();
+        metrics.record_clipboard_retry();
+        metrics.record_clipboard_contention();
+        metrics.record_clipboard_conflict();
+        metrics.record_clipboard_loop_suppressed();
+        metrics.record_deferred_depth(7);
+
+        let rendered = metrics.snapshot().to_string();
+        for expected in [
+            "1 sent",
+            "1 applied",
+            "1 superseded",
+            "1 abandoned",
+            "1 retries",
+            "1 contention",
+            "1 conflicts",
+            "1 own-write loops suppressed",
+            "deferred peak 7",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "the report never mentions {expected}:
+{rendered}"
+            );
+        }
+    }
+
+    /// The retention note only earns its line when samples were actually
+    /// lost; otherwise the percentiles above it cover everything.
+    #[test]
+    fn dropped_latency_samples_are_reported_only_when_some_were_dropped() {
+        let metrics = Metrics::new();
+        metrics.record_clipboard_latency(5);
+        assert!(
+            !metrics
+                .snapshot()
+                .to_string()
+                .contains("dropped past the retention cap")
+        );
+
+        for _ in 0..super::MAX_LATENCY_SAMPLES {
+            metrics.record_clipboard_latency(5);
+        }
+        assert!(
+            metrics
+                .snapshot()
+                .to_string()
+                .contains("dropped past the retention cap")
+        );
+    }
 
     #[test]
     fn frame_classes_cover_the_message_types() {
