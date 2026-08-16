@@ -21,6 +21,12 @@ pub mod display;
 pub mod input;
 #[cfg(windows)]
 pub mod keymap;
+
+/// Bounded shutdown for the Win32 message-pump threads (see the module).
+/// Windows-gated with its callers: it logs through `tracing`, which is a
+/// dependency only on Windows.
+#[cfg(windows)]
+mod pump;
 #[cfg(windows)]
 pub mod secure_storage;
 #[cfg(windows)]
