@@ -20,11 +20,15 @@
 > followed the decline onto the wire, which is the half the criterion is
 > about.
 >
-> One exit criterion for the images half remains open: the input-latency
-> guarantee under a saturating transfer is proven *structurally* by the
-> hermetic suite (frame order, deliberately never a stopwatch) but has never
-> been **measured**, which is what the criterion asks for — and there is no
-> input-latency metric to measure it with. Files/folders
+> **Input latency is now measurable** (feature/117): every input frame is
+> timed from the moment it is handed to the send path to the moment it
+> reaches the wire — queueing plus the writer's wait behind a bulk frame in
+> flight, which is what ADR 0013 and ADR 0014's chunking jointly bound. The
+> mean and maximum land in the shutdown block, and the hermetic suite
+> asserts the measurement happens *under saturation* without asserting a
+> bound a loaded CI runner could miss. **The criterion is met when the
+> number is taken on hardware**: docs/SOAK.md step 5 says how, and what good
+> looks like. Files/folders
 > ([ADR 0015](adr/0015-spooled-virtual-file-paste.md), still Proposed) is the
 > second sub-milestone and is not started.
 >

@@ -844,6 +844,29 @@ With both machines running (Phase 5/6 setup), on machine A:
 5. **Big image.** Screenshot a full 4K display (`PrtScn`), paste on B, and
    confirm arrival and that live mouse/keyboard stay responsive **while it
    transfers** — that is ADR 0013's preemption claim, on real bytes.
+
+   **Then measure it, because "felt smooth" is not the exit criterion.**
+   Keep the mouse moving and type continuously for the whole transfer, so
+   input is genuinely competing with the bulk stream. On quit (`q` /
+   Ctrl-C), the controlling machine's shutdown block ends with:
+
+   ```
+     input:      12043 events sent (86 keys), 0 events received (0 keys)
+                 queue-to-wire avg 41us, max 2.8ms (over 12043 frames)
+   ```
+
+   That is how long an input frame waited between being handed to the send
+   path and reaching the wire — queueing *and* the writer's wait behind a
+   bulk frame already in flight, which is what ADR 0013 and ADR 0014's
+   chunking jointly bound. Record both numbers in the run's notes.
+
+   **What good looks like:** a mean in the tens of microseconds, and a
+   maximum in single-digit milliseconds. A maximum in the *hundreds* of
+   milliseconds means interactive frames queued behind bulk — the lane
+   split is not doing its job, and that is release-blocking however smooth
+   the session felt. `0 events sent` with no latency line means the
+   measurement did not happen: input flows from the machine in control, so
+   read this block on the machine you were driving *from*.
 6. **Over the ceiling.** A capture larger than 64 MiB (a dual-4K span) must
    be skipped with a log and **must not** disturb the session: copy text
    immediately after and confirm it still synchronizes.
