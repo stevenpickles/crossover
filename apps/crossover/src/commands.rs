@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crossover_core::outbound::{BudgetedReceiver, CommandReceiver, command_lanes};
 use crossover_core::pairing::{PairingListener, pair_with};
 use crossover_core::supervision::{
-    KeepaliveConfig, SessionEvent, SupervisorConfig, run_session, supervise_outbound,
+    DisconnectReason, KeepaliveConfig, SessionEvent, SupervisorConfig, run_session,
+    supervise_outbound,
 };
 use crossover_core::{
     ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
@@ -569,8 +570,25 @@ pub async fn run(
     if let Some(handle) = &handle {
         handle.shutdown();
     }
+    close_live_sessions(&registry, &metrics);
     print_execution_metrics(&metrics);
     Ok(())
+}
+
+/// Account for sessions that were still up when the run ended.
+///
+/// A session reports its duration when it *closes*, and shutdown cancels
+/// the loops that would have closed it — so a run that never lost its peer
+/// reported zero connected time, which is exactly the run the number is
+/// most wanted from. Attributed to `ShutdownRequested`, because that is
+/// what ended them.
+fn close_live_sessions(registry: &SessionRegistry, metrics: &Metrics) {
+    for route in registry_lock(registry).values() {
+        metrics.record_session_ended(
+            &DisconnectReason::ShutdownRequested,
+            route.established_at.elapsed(),
+        );
+    }
 }
 
 /// Dump the run's statistics on shutdown (FR-7.3): the human-readable
@@ -985,6 +1003,9 @@ struct SessionRoute {
     sink: FrameSink,
     kill: Option<watch::Sender<bool>>,
     peer_fingerprint: SpkiFingerprint,
+    /// When this session was established, so a session still live at
+    /// shutdown can still report how long it lasted (`close_live_sessions`).
+    established_at: Instant,
 }
 
 /// Where a session's outbound frames go. Cloned out from under the
@@ -1323,6 +1344,7 @@ async fn listener_loop(
                         sink: FrameSink::Inbound(outbound_tx),
                         kill: Some(shutdown_tx),
                         peer_fingerprint: info.peer_fingerprint,
+                        established_at,
                     },
                 );
                 fanout.established(session_id).await;
@@ -1404,6 +1426,8 @@ async fn outbound_event_loop(
                             sink: FrameSink::Outbound(Arc::clone(handle)),
                             kill: None,
                             peer_fingerprint: info.peer_fingerprint,
+                            // Set just above, when the session came up.
+                            established_at: established_at.unwrap_or_else(Instant::now),
                         },
                     );
                 }
@@ -1614,6 +1638,7 @@ mod tests {
     fn wedge_rig() -> WedgeRig {
         use std::collections::HashMap;
         use std::sync::Mutex;
+        use std::time::Instant;
 
         use super::{FrameSink, SessionRoute, merge_command_lanes, spawn_command_mux};
 
@@ -1629,6 +1654,7 @@ mod tests {
                 sink: FrameSink::Inbound(sink),
                 kill: Some(kill_tx),
                 peer_fingerprint: certified.fingerprint(),
+                established_at: Instant::now(),
             },
         )])));
 
@@ -1799,6 +1825,49 @@ mod tests {
     /// Structural: the producer's progress is the evidence. Retiring the
     /// route must unpark it; removing the registry entry alone must not be
     /// mistaken for having done so.
+    /// A session only reports its duration when it closes, and shutdown
+    /// cancels the loops that would have closed it. Without the sweep, the
+    /// run that never lost its peer — the one whose uptime you actually
+    /// want — reports zero connected time.
+    #[test]
+    fn sessions_still_live_at_shutdown_still_count_towards_connected_time() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        use crossover_core::metrics::Metrics;
+
+        use super::{FrameSink, SessionRoute, close_live_sessions};
+
+        let identity = DeviceIdentity::generate("still-up").unwrap();
+        let certified = CertifiedIdentity::from_identity(&identity).unwrap();
+        let (sink, _outbound) = outbound_channel();
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::from([(
+            Uuid::from_bytes([0x77; 16]),
+            SessionRoute {
+                sink: FrameSink::Inbound(sink),
+                kill: None,
+                peer_fingerprint: certified.fingerprint(),
+                established_at: Instant::now()
+                    .checked_sub(Duration::from_secs(90))
+                    .expect("90s before now is representable"),
+            },
+        )])));
+
+        let metrics = Metrics::new();
+        assert_eq!(metrics.snapshot().total_connected_ms, 0);
+
+        close_live_sessions(&registry, &metrics);
+
+        let report = metrics.snapshot();
+        assert!(
+            report.total_connected_ms >= 90_000,
+            "a 90s live session contributed {}ms",
+            report.total_connected_ms
+        );
+        assert_eq!(report.longest_session_ms, report.total_connected_ms);
+    }
+
     #[tokio::test]
     async fn retiring_a_dead_session_unparks_everything_queued_behind_it() {
         use super::retire_session_route;
