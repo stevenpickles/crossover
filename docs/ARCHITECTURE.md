@@ -526,7 +526,7 @@ knob answering to this section, not just a memory one.
 | Async runtime | tokio | |
 | TLS | rustls + tokio-rustls, TLS 1.3 | See [SECURITY.md](SECURITY.md) |
 | Transport | TCP (+ `TCP_NODELAY` for input/control traffic) | QUIC only if measurement demands it (ADR) |
-| Serialization | **Deferred to ADR-pending** (postcard / CBOR / MessagePack / protobuf) | Must support explicit size limits, evolution, fuzzing, deterministic encoding; do not architect around serde-specific assumptions |
+| Serialization | postcard ([ADR 0001](adr/0001-wire-serialization-format.md)) | Explicit size limits, deterministic encoding, fuzzed parsers; `default-features = false` drops the unmaintained `atomic-polyfill` heapless brings in |
 | Logging | tracing + tracing-subscriber | Structured from first commit |
 | CLI | clap | |
 | Config | TOML, versioned schema | |
