@@ -2,8 +2,11 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>crossover</id>
-    <!-- Keep in step with apps/crossover/Cargo.toml; pack.ps1 can stamp it. -->
-    <version>0.1.0</version>
+    <!-- A placeholder: pack.ps1 always stamps the real version, taken from
+         what the built binaries report. Kept in step with the workspace
+         version anyway, so a hand-run `choco pack` here cannot mint a
+         package claiming a version that no longer exists. -->
+    <version>0.2.0</version>
     <title>Crossover</title>
     <authors>Steven Pickles</authors>
     <owners>Steven Pickles</owners>
