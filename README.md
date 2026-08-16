@@ -21,16 +21,28 @@ larger workstation, without weakening the security boundary between them.
 > built; macOS and Linux come in Phase 8. The
 > [roadmap](docs/ROADMAP.md) carries the authoritative current-phase marker.
 
-## What it will do
+## What it does
 
-- One keyboard and mouse controls multiple computers; moving the pointer
-  across a configured screen edge transfers control, like adjacent monitors
-- Clipboard contents synchronize reliably between trusted machines
+- One keyboard and mouse drives both computers; moving the pointer across a
+  configured screen edge transfers control, like adjacent monitors
+- Clipboard contents synchronize in both directions — text and images,
+  images carried in the source clipboard's own format, byte for byte
 - All traffic mutually authenticated and encrypted (TLS 1.3); explicit
-  pairing; local-first — no cloud, no accounts, no external telemetry
+  pairing with a typed one-time code; local-first — no cloud, no accounts,
+  no external telemetry
+- Runs unattended as a background service, reconnecting on its own
 
-Initial target: two Windows machines on a LAN. Long term: Windows, macOS,
-Linux. Implementation language: Rust.
+## What it does not do yet
+
+- Files and folders on the clipboard — designed
+  ([ADR 0015](docs/adr/0015-spooled-virtual-file-paste.md)), not built
+- macOS and Linux — the platform boundary exists and the core compiles on
+  all three, but only the Windows implementations are written (Phase 8)
+- More than two machines, a tray application, discovery, or auto-update
+  (Phase 9)
+- Code-signed binaries, so SmartScreen will warn on first run
+
+Target today: two Windows machines on a LAN. Implementation language: Rust.
 
 ## Building
 
