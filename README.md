@@ -10,13 +10,16 @@ larger workstation, without weakening the security boundary between them.
 
 **Move. Type. Copy. Paste.**
 
-> **Status: Phase 2 (Reliable Text Clipboard) complete — the Secure
-> Clipboard Prototype works.** Two Windows machines pair with a typed
-> one-time code, hold a mutually authenticated TLS 1.3 session with
-> automatic reconnection, and synchronize the text clipboard in both
-> directions: copy on one, paste on the other. Next up: Phase 3 — Remote
-> Mouse. The [roadmap](docs/ROADMAP.md) carries the authoritative
-> current-phase marker.
+> **Status: Phase 7 (Rich Clipboard) in progress — images work.** Two
+> Windows machines pair with a typed one-time code, hold a mutually
+> authenticated TLS 1.3 session with automatic reconnection, share one
+> keyboard and mouse across a screen edge, run unattended as a background
+> service, and synchronize the clipboard in both directions — **text and
+> images**, the latter carried verbatim and validated over a multi-hour
+> two-machine soak. Files and folders are designed
+> ([ADR 0015](docs/adr/0015-spooled-virtual-file-paste.md)) and not yet
+> built; macOS and Linux come in Phase 8. The
+> [roadmap](docs/ROADMAP.md) carries the authoritative current-phase marker.
 
 ## What it will do
 

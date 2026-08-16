@@ -2,6 +2,25 @@
 
 > **Current phase: 7 — Rich Clipboard (images and files)** (in progress.)
 >
+> **Images landed 2026-08-16.** The Windows CF_DIB backend carries real
+> images between two machines verbatim in both directions, and the feature
+> bit is advertised now that the promise behind it is real (ADR 0014). It was
+> validated on hardware against build `0.1.0-dev.351.g15f28c283` — the first
+> build able to name its own commit — over a 7h45m two-machine session:
+> ~144 MiB received, 11 items sent and 9 applied, one conflict resolved,
+> **zero retries and zero contention**, clipboard latency max 10 ms, and a
+> deferred-queue peak of 0 (the Background lane never backed up hard enough
+> to park the driver, the first real evidence on how `MAX_DEFERRED_EVENTS`
+> is sized).
+>
+> Two of the three exit criteria for the images half remain open: **hash-dedup
+> is not yet demonstrated** (a re-paste moving zero payload bytes), and the
+> input-latency guarantee under a saturating transfer is proven
+> *structurally* by the hermetic suite but has never been **measured** on
+> hardware, which is what the criterion asks for. Files/folders
+> ([ADR 0015](adr/0015-spooled-virtual-file-paste.md), still Proposed) is the
+> second sub-milestone and is not started.
+>
 > Phase 6 (Windows Prototype Hardening) closed 2026-08-14: the multi-day
 > unattended soak — the last exit criterion — ran 2026-08-11 → 2026-08-14
 > between the two workstations under the background service, with no manual
@@ -14,11 +33,12 @@
 > service relaunch on the ADR 0011 backoff until a launch came up cleanly,
 > ~19 minutes later, unattended. Clipboard and input reliability held
 > throughout — the few clipboard failures were bounded and observable
-> (retries, then a logged reason), and no input was ever left stuck. Two follow-ups came out of the soak: the display
-> topology is captured once at startup, so unplugging or powering off a
-> monitor leaves a stale seamless edge (scheduled next as feature/107), and a
-> worker that exits before its run loop logs nothing about why
-> (diagnosability tidy-up). Earlier Phase 6 deliverables — hardened
+> (retries, then a logged reason), and no input was ever left stuck. Two follow-ups came out of the soak, **both now
+> closed**: the display topology was captured once at startup, so unplugging
+> or powering off a monitor left a stale seamless edge (fixed in
+> feature/107), and a worker that exited before its run loop recorded nothing
+> about why — panics went to a `NUL` stderr and the file sink could go
+> missing silently, both fixed in feature/115. Earlier Phase 6 deliverables — hardened
 > reconnect, sectioned/versioned startup configuration, active-session
 > revocation ([ADR 0010](adr/0010-active-session-revocation.md)), the
 > dedicated security review against [SECURITY.md](SECURITY.md) §6-§7

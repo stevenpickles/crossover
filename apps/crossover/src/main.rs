@@ -171,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
     // Hold the guard for the whole process: dropping it flushes and stops the
     // rolling-file writer (docs/SOAK.md Phase 6 observability).
     let _log_guard = logging::init()?;
+    // Installed the moment there is somewhere for it to write: from here on,
+    // a panic reaches the log file rather than a NUL stderr (ADR 0011).
+    logging::install_panic_hook();
     // Structured-field exemplar (docs/ARCHITECTURE.md §10): values as
     // fields, snake_case canonical names, message as the human summary.
     // The build version, not the Cargo version: a log that says "0.1.0" when
