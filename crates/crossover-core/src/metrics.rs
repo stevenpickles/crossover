@@ -207,6 +207,15 @@ pub struct Metrics {
     clipboard_deferred_peak: AtomicU64,
     clipboard_latency_ms: Mutex<Vec<u32>>,
     clipboard_latency_dropped: AtomicU64,
+    // Count/total/max rather than a sample vector, because this is the one
+    // latency recorded on the input path: the module's rule is that the
+    // sample `Mutex` is never taken there, and "bounded" is a question the
+    // maximum answers exactly. Microseconds, not milliseconds — a healthy
+    // wait is tens of µs, which a millisecond scale would round to a column
+    // of zeros.
+    input_queue_latency_count: AtomicU64,
+    input_queue_latency_total_us: AtomicU64,
+    input_queue_latency_max_us: AtomicU64,
 
     // ---- control & input ----
     control_gained: AtomicU64,
@@ -343,6 +352,23 @@ impl Metrics {
     pub fn record_clipboard_conflict(&self) {
         self.clipboard_conflicts.fetch_add(1, Ordering::Relaxed);
     }
+    /// How long an input frame waited between being handed to the send
+    /// path and reaching the wire, in microseconds.
+    ///
+    /// This is the quantity ADR 0013's guarantee is about: a saturating
+    /// bulk transfer must not push interactive frames back. Kept as a
+    /// running mean and maximum rather than a distribution — the guarantee
+    /// is a bound, which the maximum states directly, and aggregating with
+    /// atomics keeps the input path lock-free.
+    pub fn record_input_queue_latency(&self, micros: u32) {
+        self.input_queue_latency_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.input_queue_latency_total_us
+            .fetch_add(u64::from(micros), Ordering::Relaxed);
+        self.input_queue_latency_max_us
+            .fetch_max(u64::from(micros), Ordering::Relaxed);
+    }
+
     /// A completed clipboard round-trip latency, on the originating
     /// clock (the number docs/TESTING.md §4 defines).
     pub fn record_clipboard_latency(&self, ms: u32) {
@@ -452,6 +478,15 @@ impl Metrics {
             clipboard_abandoned: load(&self.clipboard_abandoned),
             clipboard_deferred_peak: load(&self.clipboard_deferred_peak),
             clipboard_latency_dropped: load(&self.clipboard_latency_dropped),
+            input_queue_avg_us: {
+                let n = load(&self.input_queue_latency_count);
+                (n > 0).then(|| {
+                    u32::try_from(load(&self.input_queue_latency_total_us) / n).unwrap_or(u32::MAX)
+                })
+            },
+            input_queue_max_us: (load(&self.input_queue_latency_count) > 0)
+                .then(|| u32::try_from(load(&self.input_queue_latency_max_us)).unwrap_or(u32::MAX)),
+            input_queue_samples: load(&self.input_queue_latency_count),
             latency_p50: percentile(&sorted_latency, 50),
             latency_p95: percentile(&sorted_latency, 95),
             latency_max: sorted_latency.last().copied(),
@@ -539,6 +574,14 @@ pub struct Report {
     pub clipboard_deferred_peak: u64,
     /// Latency samples dropped past the retention cap.
     pub clipboard_latency_dropped: u64,
+    /// Mean input queue-to-wire latency (µs), if any input flowed. The
+    /// ADR 0013 guarantee, as a number rather than an ordering.
+    pub input_queue_avg_us: Option<u32>,
+    /// Worst input queue-to-wire latency (µs) — the one a saturating bulk
+    /// transfer would inflate if the lane split stopped working.
+    pub input_queue_max_us: Option<u32>,
+    /// How many input frames were timed.
+    pub input_queue_samples: u64,
     /// Clipboard round-trip latency p50 (ms), if any samples.
     pub latency_p50: Option<u32>,
     /// Clipboard round-trip latency p95 (ms).
@@ -607,6 +650,9 @@ impl Report {
             control_given = self.control_given,
             control_denied = self.control_denied,
             capture_losses = self.capture_losses,
+            input_queue_avg_us = self.input_queue_avg_us,
+            input_queue_max_us = self.input_queue_max_us,
+            input_queue_samples = self.input_queue_samples,
             input_events_sent = self.input_events_sent,
             input_events_received = self.input_events_received,
             "execution metrics"
@@ -753,14 +799,38 @@ impl fmt::Display for Report {
                 self.capture_losses
             )?;
         }
-        write!(
+        writeln!(
             f,
             "  input:      {} events sent ({} keys), {} events received ({} keys)",
             self.input_events_sent,
             self.key_events_sent,
             self.input_events_received,
             self.key_events_received,
-        )
+        )?;
+        // The ADR 0013 guarantee as a number. Printed only when input
+        // actually flowed, and last, so the line a soak is looking for is
+        // the one at the bottom of the block.
+        match (self.input_queue_avg_us, self.input_queue_max_us) {
+            (Some(avg), Some(max)) => write!(
+                f,
+                "                queue-to-wire avg {}, max {} (over {} frames)",
+                human_micros(avg),
+                human_micros(max),
+                self.input_queue_samples,
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Microseconds at a readable scale: a healthy queue wait is tens of µs and
+/// a degraded one is milliseconds, and neither unit alone reads well for
+/// both.
+fn human_micros(micros: u32) -> String {
+    if micros < 1_000 {
+        format!("{micros}us")
+    } else {
+        format!("{:.1}ms", f64::from(micros) / 1_000.0)
     }
 }
 
@@ -858,6 +928,38 @@ mod tests {
                 .snapshot()
                 .to_string()
                 .contains("dropped past the retention cap")
+        );
+    }
+
+    /// The number the Phase 7 exit criterion asks for has to reach the
+    /// block a soak reads, in a unit that shows both a healthy wait and a
+    /// degraded one.
+    #[test]
+    fn input_queue_latency_reaches_the_report_at_a_readable_scale() {
+        let metrics = Metrics::new();
+        metrics.record_sent(11, 40); // an InputBatch, so the line is earned
+        for micros in [40, 60, 2_500] {
+            metrics.record_input_queue_latency(micros);
+        }
+
+        let rendered = metrics.snapshot().to_string();
+        assert!(rendered.contains("queue-to-wire"), "{rendered}");
+        assert!(
+            rendered.contains("866us"),
+            "the mean, in microseconds: {rendered}"
+        );
+        assert!(rendered.contains("2.5ms"), "a slow wait in ms: {rendered}");
+        assert!(rendered.contains("over 3 frames"), "{rendered}");
+    }
+
+    /// A run with no input says nothing rather than printing empty columns.
+    #[test]
+    fn a_run_with_no_input_omits_the_queue_latency_line() {
+        assert!(
+            !Metrics::new()
+                .snapshot()
+                .to_string()
+                .contains("queue-to-wire")
         );
     }
 
