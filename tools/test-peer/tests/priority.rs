@@ -43,6 +43,9 @@ const MAX_BULK_FRAMES: usize = 512;
 /// `OutboundReceiver` → `SessionWriter`.
 struct AppSide {
     outbound: OutboundSender,
+    /// The session's metrics, so a test can read back what the send path
+    /// measured about itself.
+    metrics: std::sync::Arc<crossover_core::metrics::Metrics>,
     /// The session loop, so a test can wait for the reason it ended.
     session: tokio::task::JoinHandle<DisconnectReason>,
     _shutdown: watch::Sender<bool>,
@@ -97,6 +100,8 @@ async fn connected_pair_with(
     let listener = SessionListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
+    let metrics = std::sync::Arc::new(crossover_core::metrics::Metrics::new());
+    let session_metrics = std::sync::Arc::clone(&metrics);
     let (outbound_tx, mut outbound_rx) = crossover_core::outbound_channel();
     let (events_tx, events_rx) = mpsc::channel(64);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -110,6 +115,7 @@ async fn connected_pair_with(
         };
         let options = SessionOptions {
             advertised_features: app_features,
+            metrics: Some(session_metrics),
             ..SessionOptions::default()
         };
         let session = listener.accept(&local, &options).await.expect("accept");
@@ -131,6 +137,7 @@ async fn connected_pair_with(
     (
         AppSide {
             outbound: outbound_tx,
+            metrics,
             session,
             _shutdown: shutdown_tx,
         },
@@ -405,8 +412,24 @@ async fn input_preempts_a_saturating_background_transfer() {
         "input preempted only {bulk_after} of {bulk} queued bulk frames \
          (arrived at position {position})"
     );
-}
 
+    // The guarantee now has a number attached to it. Deliberately *not* a
+    // bound: this suite refuses stopwatch assertions a loaded runner could
+    // miss (see the module header). What is asserted is that the
+    // measurement happened at all, under exactly the saturation the
+    // guarantee is about — so the figure a soak reads from the shutdown
+    // block is known to be real rather than an empty column.
+    let report = app.metrics.snapshot();
+    assert!(
+        report.input_queue_samples > 0,
+        "the input frame reached the wire but was never timed"
+    );
+    assert!(
+        report.input_queue_max_us.is_some(),
+        "input queue latency has no maximum despite {} frames",
+        report.input_queue_samples
+    );
+}
 /// A delayed release is a stuck key, which is release-blocking — so
 /// `ReleaseAllInput` gets the same proof in its own right.
 #[tokio::test(flavor = "multi_thread")]
