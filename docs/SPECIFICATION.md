@@ -97,10 +97,13 @@ secure WAN operation; diagnostics UI.
 > **Re-scoped:** clipboard **images** left this list on 2026-08-11 and are
 > being built in Phase 7 ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md));
 > file lists are designed for a later, deliberately minimal spool-and-paste
-> capability ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)). §3.1's
-> "UTF-8 **text**" remains an accurate description of what a *shipped*
-> build synchronizes until ADR 0014's platform slice lands — the feature is
-> negotiated, and this build advertises nothing (PROTOCOL.md §3.1).
+> capability ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)). ADR 0014's
+> platform slice has since landed, so §3.1's "UTF-8 **text**" now understates
+> what a build synchronizes: images travel too, in the source clipboard's own
+> raster format, between peers that both advertise `CHUNKED_CLIPBOARD`
+> (PROTOCOL.md §3.1). Text remains the only type every peer can take,
+> because the capability is negotiated and a peer without the bit is sent
+> nothing new.
 
 Long-term capabilities must not complicate the initial implementation except
 where required to preserve a clean architecture (chiefly: the protocol and
@@ -175,6 +178,10 @@ are binding; "should" requirements are strong defaults changeable by ADR.
   rejected gracefully on both send and receive.
 - **FR-3.7** The initial supported type is UTF-8 text. The data model and
   protocol must accommodate future typed payloads without a rewrite.
+  *(Discharged as designed: raster images were added in Phase 7
+  ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md)) as a new content
+  type on the existing model — negotiated, chunked, and carried verbatim —
+  with no protocol version bump.)*
 
 ### 4.4 Input forwarding
 

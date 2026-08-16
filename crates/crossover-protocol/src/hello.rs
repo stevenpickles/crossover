@@ -141,22 +141,21 @@ impl FeatureFlags {
 
     /// What **this build** advertises in its `Hello`.
     ///
-    /// Empty today, deliberately, and now for exactly one reason: the wire
-    /// layer carries chunked images and the clipboard engine reassembles,
-    /// verifies and installs them (ADR 0014's protocol and engine slices),
-    /// but no platform backend can yet put a raster format on a real
-    /// clipboard — `crossover-platform-windows` reads an image as absent
-    /// and refuses to write one. Advertising is a promise to *handle*, so
-    /// promising it here would mean accepting a transfer this build must
-    /// then fail at the last step, after the peer moved every byte.
+    /// [`FeatureFlags::ALL`] since ADR 0014's platform slice: every layer
+    /// of the promise is now real. The wire carries chunked images, the
+    /// engine offers, streams, reassembles, verifies and installs them,
+    /// and `crossover-platform-windows` reads and writes `CF_DIB` on the
+    /// actual OS clipboard. Advertising is a promise to *handle*, and the
+    /// last step that could not be honoured — putting a raster format on a
+    /// real clipboard — is implemented.
     ///
-    /// **The ADR 0014 platform slice sets this to [`FeatureFlags::ALL`]**
-    /// — one line, and image transfer switches on for both sides at once,
-    /// with nothing else to change. Tests that need the negotiated path
-    /// before then override the advertisement per session
-    /// (`SessionOptions::advertised_features`) rather than weakening this
-    /// constant.
-    pub const ADVERTISED: Self = Self::NONE;
+    /// Flipping it is wire-visible (the `Hello` a peer receives changes)
+    /// and deliberately safe: a feature activates only on the
+    /// *intersection* of the two advertisements, so a peer that predates
+    /// the bit negotiates it away and is sent nothing new. Nothing about
+    /// the base protocol's layouts changed, so text keeps synchronizing
+    /// with such a peer exactly as before (docs/PROTOCOL.md §3.1).
+    pub const ADVERTISED: Self = Self::ALL;
 
     /// Whether every bit in `feature` is set. `NONE` is contained by
     /// everything, so base-protocol capabilities never need a bit.
@@ -270,7 +269,9 @@ mod tests {
             device_id: Uuid::from_bytes([0x11; 16]),
             device_name: "left".to_owned(),
             operating_system: OsFamily::Windows,
-            supported_features: FeatureFlags::NONE,
+            // What this build really sends, so the golden snapshot below
+            // pins the actual advertisement rather than a convenient zero.
+            supported_features: FeatureFlags::ADVERTISED,
         }
     }
 
@@ -281,9 +282,17 @@ mod tests {
         assert_eq!(decoded, hello);
     }
 
-    /// Golden wire snapshot (ADR 0001): if this test fails, the version-1
-    /// Hello schema changed — that is a protocol version bump, not a test
-    /// to update casually.
+    /// Golden wire snapshot (ADR 0001): if this test fails, either the
+    /// version-1 Hello *schema* changed — a protocol version bump, not a
+    /// test to update casually — or this build's advertisement did.
+    ///
+    /// The last byte is the one that moves without a version bump. It is
+    /// pinned on purpose: `supported_features` is wire-visible, so a
+    /// change to [`FeatureFlags::ADVERTISED`] must be a deliberate edit
+    /// here rather than something a peer discovers first. It is also the
+    /// safe kind of change — a feature activates only on the intersection
+    /// of the two advertisements, so a peer without the bit negotiates it
+    /// away (docs/PROTOCOL.md §3.1).
     #[test]
     fn golden_wire_snapshot_v1() {
         let encoded = sample().encode_payload().unwrap();
@@ -293,12 +302,28 @@ mod tests {
             &[0x11; 16][..],                     // device_id bytes
             &[0x04, b'l', b'e', b'f', b't'][..], // device_name
             &[0x00],                             // OsFamily::Windows
-            &[0x00],                             // FeatureFlags(0)
+            &[0x01],                             // FeatureFlags(CHUNKED_CLIPBOARD)
         ]
         .concat();
         assert_eq!(
             encoded, expected,
             "Hello wire layout changed: bump the protocol version (ADR 0001)"
+        );
+    }
+
+    /// The bit the snapshot above pins, stated as an invariant rather than
+    /// a byte: bit 0 is `CHUNKED_CLIPBOARD`, and it is what this build
+    /// advertises now that every layer beneath it — wire, engine, and the
+    /// Windows `CF_DIB` backend — can honour the promise (ADR 0014).
+    #[test]
+    fn this_build_advertises_chunked_clipboard() {
+        assert_eq!(FeatureFlags::ADVERTISED, FeatureFlags::ALL);
+        assert!(FeatureFlags::ADVERTISED.contains(FeatureFlags::CHUNKED_CLIPBOARD));
+        // And a peer that has never heard of it still gets nothing: the
+        // intersection with an empty advertisement is empty.
+        assert_eq!(
+            FeatureFlags::negotiate(FeatureFlags::ADVERTISED, FeatureFlags::NONE),
+            FeatureFlags::NONE
         );
     }
 

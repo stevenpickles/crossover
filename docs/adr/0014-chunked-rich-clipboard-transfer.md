@@ -167,8 +167,29 @@ these, the resolution is noted inline — bookkeeping, not a change of decision.
   no inline flow and are always offered, at any size
   ([PROTOCOL.md](../PROTOCOL.md) §5).
 - Which clipboard formats to capture and restore, and whether to advertise more
-  than one format on the far side for maximum paste compatibility. **Still
-  open**: it belongs to the platform slice, where `CF_DIB` handling lands.
+  than one format on the far side for maximum paste compatibility.
+  **Settled by the platform slice, one format each way:**
+  - **Capture `CF_DIB` only.** Windows synthesizes the whole DIB family
+    (`CF_BITMAP` ↔ `CF_DIB` ↔ `CF_DIBV5`) on demand, so a single request
+    already covers every raster source, and the synthesis is the OS's —
+    written once and correct — rather than pixel conversion Crossover would
+    own.
+  - **Restore one format, not several.** Publishing extra formats for paste
+    compatibility would mean *deriving* them, and this ADR forbids
+    transcoding; synthesis gives the DIB family for free anyway. `CF_DIB`
+    goes back as `CF_DIB`; a PNG from a future non-Windows peer goes back
+    verbatim under the registered `"PNG"` format, which Windows synthesizes
+    nothing from — so a `CF_DIB`-only application sees an empty clipboard,
+    and that is the honest cost of not transcoding. JPEG has no comparable
+    Windows convention and is refused permanently rather than guessed at.
+  - **Mixed text+image reads as text** (the Excel/Word/browser case): one
+    type travels, the image there is a rendering of the text, and the
+    screenshot case this ADR exists for carries no text at all.
+  - **Phase 8 follow-up, recorded rather than solved:** a non-Windows sender
+    whose clipboard holds only PNG will produce a Windows clipboard that
+    `CF_DIB`-only applications cannot paste from. The fix is a *sender-side*
+    format choice (offer the DIB the source can also provide), not a
+    receiver-side transcode.
 - Interaction with clipboard citizenship (FR-3.1a) — how long the far side owns
   the clipboard while reassembling. **Settled: not at all.** Reassembly is
   pure accounting in `crossover-protocol` and never touches the OS clipboard;

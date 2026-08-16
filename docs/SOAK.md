@@ -798,3 +798,66 @@ running seamlessly (machine A has the external monitor):
    still extends there and the edge staying put is correct — record which
    this hardware does, so the earlier finding's residual is documented
    for this pair.
+
+## Phase 7 hardware validation: clipboard images (two machines)
+
+ADR 0014's platform slice is the only part of image transfer that
+automation cannot finish. Everything up to the OS boundary is covered by
+tests — chunking and reassembly, the negotiated send gate, a fabricated
+DIB round-tripping through Win32 verbatim, refusal above the ceiling. What
+no test can reach is what a *real* application publishes onto the clipboard
+and whether a *real* application accepts what Crossover installs.
+
+Run this after the Phase 6 soak closes and before the branch merges.
+`FeatureFlags::ADVERTISED` is `ALL` on this build, so image transfer is
+live between two peers that both run it.
+
+### Single machine first (cheap, catches the obvious)
+
+```
+cargo test -p crossover-platform-windows -- --ignored
+```
+
+1. `manual_a_real_snip_is_read_as_a_stable_image` — take a snip
+   (`Win+Shift+S`) first. It must read as `CF_DIB`, inside the ceiling,
+   with two consecutive reads byte-identical. **An unstable length here
+   predicts a sync loop**, so treat any mismatch as release-blocking.
+2. `manual_an_installed_image_pastes_into_other_applications` — then paste
+   into Paint, Word, and a browser compose box. The blue/green gradient
+   must appear in each.
+
+### Then the pair
+
+With both machines running (Phase 5/6 setup), on machine A:
+
+1. **Snip → paste.** `Win+Shift+S`, snip a region, paste on B into Paint
+   and into Word. The image must arrive within a second on the LAN and be
+   pixel-identical to the snip.
+2. **The other direction**, same check.
+3. **No loop.** After a transfer settles, watch both sides for 30 s: no
+   further clipboard traffic, and `clipboard_loop_suppressed` in the
+   metrics increments once per applied item, not repeatedly. Any repeating
+   offer/apply cycle is release-blocking.
+4. **Mixed content.** Copy a block of cells from Excel on A, paste on B.
+   The *text* must arrive (the deliberate precedence rule), not a picture
+   of the cells.
+5. **Big image.** Screenshot a full 4K display (`PrtScn`), paste on B, and
+   confirm arrival and that live mouse/keyboard stay responsive **while it
+   transfers** — that is ADR 0013's preemption claim, on real bytes.
+6. **Over the ceiling.** A capture larger than 64 MiB (a dual-4K span) must
+   be skipped with a log and **must not** disturb the session: copy text
+   immediately after and confirm it still synchronizes.
+7. **A copy during a transfer.** Copy something new on A while a large
+   image is still streaming; the newer item must win and the older one must
+   close out rather than stall.
+8. **Interop with a text-only peer**, if one is available: a build without
+   the feature bit must still synchronize text and simply never receive
+   images.
+
+If clipboard operations fail wholesale with "Access is denied", read the
+troubleshooting section above before concluding anything.
+
+Record the outcome in the Phase 7 exit-criteria notes (docs/ROADMAP.md):
+which applications accepted the pasted image, observed transfer times by
+size, whether input stayed responsive during transfer, and any loop or
+stall seen.

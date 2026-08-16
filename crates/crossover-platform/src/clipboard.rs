@@ -42,11 +42,35 @@ pub enum ClipboardError {
     /// different things to the peer that sent the item: a clipboard that
     /// is unavailable might work in a second, while a type this build
     /// cannot represent will never work, and the origin deserves to be
-    /// told which it met (NFR-3). It is what a backend returns for a
-    /// raster image before ADR 0014's platform slice lands.
+    /// told which it met (NFR-3).
+    ///
+    /// Also what a backend returns for an image past
+    /// [`MAX_CLIPBOARD_IMAGE_BYTES`] on the *write* path: permanent for
+    /// that item in the same way, since no retry makes it smaller. The
+    /// read path has no error to return — an oversized image there is
+    /// reported absent — so the two paths refuse the same ceiling in the
+    /// two shapes the trait gives them.
     #[error("clipboard content type unsupported: {reason}")]
     Unsupported { reason: String },
 }
+
+/// The largest image a provider may hand across this boundary, in bytes.
+///
+/// A deliberate mirror of `crossover_protocol::clipboard::MAX_CLIPBOARD_IMAGE_BYTES`
+/// — this crate has no dependencies by design (docs/ARCHITECTURE.md §4), so
+/// the boundary cannot name the protocol constant. `crossover-core` holds a
+/// test that the two are equal, so they cannot drift.
+///
+/// It lives here because the bound has to bite **at the source**, not only
+/// where the engine checks it: a provider learns an item's size before it
+/// copies the bytes (`GlobalSize` on Windows), and an item past this
+/// ceiling can never be synchronized (FR-3.6). Copying 512 MiB out of the
+/// OS clipboard so the layer above can discard it would be a self-inflicted
+/// allocation spike with a machine-global lock held. A provider that meets
+/// an oversized item therefore reports **absent** — the trait's meaning for
+/// "nothing this backend represents" — after logging the size (never the
+/// content, FR-7.4).
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Raster formats a [`ClipboardContent::Image`] may carry (ADR 0014).
 ///
@@ -143,6 +167,11 @@ pub type ClipboardListener = Box<dyn Fn() + Send + Sync>;
 pub trait ClipboardProvider: Send + Sync {
     /// Read the current content, or `Ok(None)` if the clipboard is empty
     /// or holds nothing this backend represents.
+    ///
+    /// "Nothing this backend represents" includes an image larger than
+    /// [`MAX_CLIPBOARD_IMAGE_BYTES`]: it is refused *before* its bytes are
+    /// copied, logged by size alone, and reported absent rather than
+    /// truncated (FR-3.6).
     ///
     /// # Errors
     ///

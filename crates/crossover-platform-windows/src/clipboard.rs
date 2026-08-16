@@ -25,26 +25,83 @@
 //! Text is `CF_UNICODETEXT` (Windows synthesizes it from `CF_TEXT`
 //! automatically), converted UTF-16 ↔ UTF-8 at this boundary.
 //!
-//! **Scope, deliberately: text only.** [`ClipboardProvider`] is typed
-//! since ADR 0014, but the raster half of it belongs to that ADR's
-//! *platform* slice: `CF_DIB` reading and writing, format selection, and
-//! the DIB header handling all land there, behind this same trait. Until
-//! then this backend reports an image clipboard as absent on read and
-//! refuses an image on write with a permanent, non-retryable error — the
-//! honest answers, and the reason `FeatureFlags::ADVERTISED` stays empty
-//! (docs/PROTOCOL.md §3.1).
+//! # Images (ADR 0014's platform slice)
+//!
+//! **`CF_DIB`, verbatim.** The blob `GetClipboardData(CF_DIB)` hands back —
+//! `BITMAPINFOHEADER`, colour table/masks, pixels — travels exactly as it
+//! is. Nothing here transcodes, compresses, or re-encodes; the ADR's whole
+//! image story is "the source's own raster bytes, byte-identical".
+//!
+//! **Synthesis is relied on, not reimplemented.** A source that publishes
+//! only `CF_BITMAP` or `CF_DIBV5` still answers a `CF_DIB` request:
+//! Windows synthesizes the missing member of that family on demand, and
+//! `IsClipboardFormatAvailable` reports synthesized formats as available.
+//! So one availability probe plus one `GetClipboardData` covers all three,
+//! and Crossover never converts pixels itself — the conversion is the OS's,
+//! written once and correct for every source.
+//!
+//! **Precedence when the clipboard holds both: text wins.** Mixed content
+//! is common (Excel, Word, and browsers publish `CF_UNICODETEXT` alongside
+//! a rendered `CF_DIB`), and the transaction carries exactly one type, so
+//! this is a real choice:
+//!
+//! - The image in a mixed item is nearly always a *rendering* of the text —
+//!   the user copied cells or a formatted selection, and text is what they
+//!   mean to paste. Sending the picture instead would be a silent
+//!   downgrade: text pastes into anything, the DIB into far less.
+//! - Text is byte-identical at a fraction of the size (FR-3.2 costs
+//!   nothing here, and FR-3.6's ceiling is never approached).
+//! - The case ADR 0014 exists for — a screenshot or a Snipping Tool
+//!   capture — publishes **no** text at all, so image-first would buy that
+//!   case nothing while degrading every mixed one.
+//! - It is also the behaviour that already shipped and soaked: text-only
+//!   reads mean this slice adds a capability without changing any existing
+//!   item's outcome.
+//!
+//! One carve-out, because precedence must not become suppression: the text
+//! has to be **non-empty** to win. A source publishing a zero-length
+//! `CF_UNICODETEXT` beside a picture would otherwise propagate `""` and
+//! blank the peer's clipboard — strictly worse than sending either
+//! content. An empty text with no image behind it is unchanged.
+//!
+//! **The bytes are canonicalized to the DIB's own length.** `GlobalSize`
+//! reports the *allocation*, which may be larger than the bitmap inside
+//! it, and trailing allocator slack is not part of the image. Worse, it
+//! would make a round trip unstable: loop prevention keys on the content
+//! hash (FR-3.3), so bytes that grow by a few pad bytes each time they
+//! cross the clipboard would read back as *new* content after our own
+//! write. So the header — and only the header — is parsed, to compute the
+//! blob's logical length; the result is a prefix of what the OS gave us,
+//! never a re-encode, and anything unrecognized falls back to the whole
+//! blob verbatim.
+//!
+//! **On write**, `Dib` installs as `CF_DIB` and Windows synthesizes
+//! `CF_BITMAP`/`CF_DIBV5`/`CF_PALETTE` for applications that want those.
+//! `Png` installs verbatim under the registered `"PNG"` clipboard format —
+//! honest for a source that had only PNG, with the documented limitation
+//! that Windows synthesizes nothing from it, so `CF_DIB`-only applications
+//! see an empty clipboard. `Jpeg` has no comparable convention and is
+//! refused permanently rather than guessed at. No format is transcoded
+//! into another (ADR 0014); this build's Windows sender emits `Dib`, so the
+//! other two arise only from a future non-Windows peer.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crossover_platform::{ClipboardContent, ClipboardError, ClipboardListener, ClipboardProvider};
+use crossover_platform::{
+    ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
+    MAX_CLIPBOARD_IMAGE_BYTES,
+};
 use windows::Win32::Foundation::GlobalFree;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, RemoveClipboardFormatListener, SetClipboardData,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    RemoveClipboardFormatListener, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
+use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE, MSG, PostMessageW,
     TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE,
@@ -121,36 +178,44 @@ impl Drop for WindowsClipboard {
 }
 
 impl ClipboardProvider for WindowsClipboard {
-    /// Reads `CF_UNICODETEXT` only.
+    /// Reads `CF_UNICODETEXT`, else `CF_DIB` (ADR 0014).
     ///
-    /// **ADR 0014 platform slice**: raster formats (`CF_DIB` first) are
-    /// not read yet, so a clipboard holding only an image reads as
-    /// *absent* — which is the trait's documented meaning for "nothing
-    /// this backend represents", not a failure. The engine above is
-    /// already chunk-capable; `FeatureFlags::ADVERTISED` stays empty
-    /// until this function can genuinely return an image, so a peer is
-    /// never told this build can do what it cannot.
+    /// Text first, deliberately: a clipboard holding both is holding a
+    /// rendering of its own text, and the transaction carries one type.
+    /// The reasoning is on the module.
+    ///
+    /// **Non-empty** text, precisely. A source may publish a zero-length
+    /// `CF_UNICODETEXT` beside a picture, and letting that win would
+    /// propagate `""` — blanking the peer's clipboard instead of sending
+    /// the image, which is worse than either content type. So an empty
+    /// text representation steps aside for an image, and only for an
+    /// image: an empty clipboard with no picture behind it still reads
+    /// exactly as it always has.
+    ///
+    /// An image past [`MAX_CLIPBOARD_IMAGE_BYTES`] reads as *absent* —
+    /// the trait's meaning for "nothing this backend represents" — and is
+    /// refused before its bytes are copied, never truncated (FR-3.6).
+    ///
+    /// Both probes happen inside one open, so the precedence above is
+    /// decided from a single clipboard state ([`read_current`]).
     fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
-        Ok(read_unicode_text()?.map(ClipboardContent::Text))
+        read_current(MAX_CLIPBOARD_IMAGE_BYTES)
     }
 
-    /// Writes `CF_UNICODETEXT` only.
+    /// Writes `CF_UNICODETEXT`, `CF_DIB`, or the registered `"PNG"`
+    /// format — each verbatim, none transcoded into another (ADR 0014).
     ///
-    /// **ADR 0014 platform slice**: an image cannot be installed yet, and
-    /// says so as [`ClipboardError::Unsupported`] — the type will never
-    /// work here, which is a different message for the origin than a
-    /// clipboard that is merely busy or broken. It closes the transaction
-    /// with an honest verdict rather than a silent stall or a pretended
-    /// success (FR-3.2, NFR-3).
+    /// `Jpeg` is refused as [`ClipboardError::Unsupported`]: permanent, so
+    /// the engine does not retry it, and distinguishable by the origin
+    /// from a clipboard that is merely busy or broken (FR-3.2, NFR-3). An
+    /// image past [`MAX_CLIPBOARD_IMAGE_BYTES`] is refused the same way,
+    /// mirroring the ceiling the read path enforces.
     fn write(&self, content: &ClipboardContent) -> Result<(), ClipboardError> {
         match content {
             ClipboardContent::Text(text) => write_unicode_text(text),
-            ClipboardContent::Image { format, .. } => Err(ClipboardError::Unsupported {
-                reason: format!(
-                    "this build cannot install {format:?} clipboard images \
-                     (ADR 0014 platform slice not yet implemented)"
-                ),
-            }),
+            ClipboardContent::Image { format, bytes } => {
+                write_image(*format, bytes, MAX_CLIPBOARD_IMAGE_BYTES)
+            }
         }
     }
 
@@ -163,15 +228,78 @@ impl ClipboardProvider for WindowsClipboard {
     }
 }
 
-/// Read `CF_UNICODETEXT`, or `None` when the clipboard holds no text.
-fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
+/// Decide text-versus-image from **one** clipboard state.
+///
+/// Both probes run under a single `OpenClipboard`, deliberately. Opening
+/// twice would let the clipboard change in between, and the precedence
+/// rule would then be applied to a pair of states that never existed
+/// together: text read as absent from the old contents, an image found in
+/// the new ones, and an image synchronized while the source's clipboard
+/// actually held text. That window is exactly what a user creates by
+/// copying twice in quick succession, and mixed-content precedence is the
+/// part of this backend a human is asked to confirm by eye
+/// (docs/SOAK.md, Phase 7 hardware validation), so it should not be
+/// deciding across two different clipboards.
+///
+/// It costs nothing in lock time for the common case: non-empty text
+/// returns without ever probing `CF_DIB`, so only a clipboard that is
+/// image-or-empty is examined twice under the one open.
+fn read_current(max_image_bytes: usize) -> Result<Option<ClipboardContent>, ClipboardError> {
+    let mut raw_image = None;
+    let mut oversized = None;
+    // Held to the probes and the copies. The UTF-16 decode, the
+    // canonicalization, and the refusal log all run below, once this
+    // guard has dropped and the machine-global lock is free.
+    let units = {
+        let open = OpenGuard::open()?;
+        match probe_unicode_text(&open)? {
+            Some(units) if !units.is_empty() => Some(units),
+            empty_or_absent => {
+                match probe_dib(&open, max_image_bytes)? {
+                    DibProbe::Raw(blob) => raw_image = Some(blob),
+                    DibProbe::TooLarge { byte_count } => oversized = Some(byte_count),
+                    DibProbe::Absent => {}
+                }
+                empty_or_absent
+            }
+        }
+    };
+
+    if let Some(byte_count) = oversized {
+        tracing::warn!(
+            byte_count,
+            max_bytes = max_image_bytes,
+            "clipboard image exceeds the maximum; not synchronized"
+        );
+    }
+    if let Some(blob) = raw_image {
+        return Ok(Some(ClipboardContent::Image {
+            format: ClipboardImageFormat::Dib,
+            bytes: canonical_dib(blob),
+        }));
+    }
+    // An oversized image is *absent*, which leaves an empty text
+    // representation beside it reading as it always has.
+    Ok(units.map(|units| ClipboardContent::Text(String::from_utf16_lossy(&units))))
+}
+
+/// Probe `CF_UNICODETEXT` on the already-open clipboard, yielding its
+/// UTF-16 units, or `None` when the clipboard holds no text.
+///
+/// Takes the open guard rather than opening: the caller decides precedence
+/// across this and [`probe_dib`], and that decision is only meaningful if
+/// both saw the same clipboard ([`read_current`]).
+///
+/// Units rather than a `String` for the same reason [`probe_dib`] returns
+/// [`DibProbe::Raw`]: the decode allocates, and for a multi-megabyte item
+/// that is not cheap, so the caller runs it once the clipboard is closed.
+fn probe_unicode_text(_open: &OpenGuard) -> Result<Option<Vec<u16>>, ClipboardError> {
     // SAFETY: no arguments; checks format availability only.
     if unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)) }.is_err() {
         return Ok(None); // empty clipboard or no text representation
     }
 
-    let open = OpenGuard::open()?;
-    // SAFETY: the clipboard is open (guard); the returned handle is
+    // SAFETY: the clipboard is open (caller's guard); the returned handle is
     // owned by the clipboard, not by us. Everything between here and
     // the explicit drop below is the critical section — keep it to
     // the bytes and nothing else.
@@ -189,8 +317,28 @@ fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
     }
 
     let hglobal = HGLOBAL(handle.0);
-    // SAFETY: `hglobal` came from GetClipboardData while the clipboard
-    // is open; GlobalLock pins it and yields the base pointer.
+    // SAFETY: `hglobal` came from GetClipboardData while the clipboard is
+    // open. GlobalSize reads the block's size without locking or copying
+    // it; it reports 0 for an invalid or discarded block.
+    let size = unsafe { GlobalSize(hglobal) };
+    if size == 0 {
+        // Not an empty string — a zero-byte block cannot hold even the
+        // terminator an empty `CF_UNICODETEXT` is made of, so this is a
+        // block that went away, not a clipboard holding "".
+        return Ok(None);
+    }
+    // The terminator scan below is bounded by the block, not by trust.
+    // `CF_UNICODETEXT` is null-terminated UTF-16 *by contract*, but the
+    // producer is any application on the machine and this process cannot
+    // verify that it obeyed: an unterminated block would send the scan
+    // off the end of the allocation — undefined behaviour, its trigger
+    // chosen by whatever else is running. `GlobalSize` is the only bound
+    // available, so the scan stops there and an unterminated block reads
+    // as its whole contents rather than reading past them.
+    let max_units = size / 2; // whole UTF-16 units; a stray odd byte is not one
+
+    // SAFETY: `hglobal` is a live clipboard block; GlobalLock pins it and
+    // yields the base pointer.
     let ptr = unsafe { GlobalLock(hglobal) }.cast::<u16>();
     if ptr.is_null() {
         // Same churn window as above: the block can vanish with its
@@ -199,96 +347,500 @@ fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
             reason: "GlobalLock on clipboard data failed".to_owned(),
         });
     }
-    // SAFETY: CF_UNICODETEXT is null-terminated UTF-16 by contract;
-    // scan for the terminator, then copy the units out. Only the copy
-    // happens under the clipboard lock — the UTF-16 → String
-    // conversion (which allocates, and for a multi-megabyte item is
-    // not cheap) happens after releasing, so Crossover is not the
-    // reason another application's clipboard call fails.
+    // SAFETY: `max_units` UTF-16 units starting at `ptr` are within this
+    // block, as GlobalSize reported and GlobalLock pinned, so both the
+    // scan and the copy stay inside it. The copy is the only work under
+    // the clipboard lock — the UTF-16 → String conversion is the caller's,
+    // run once the clipboard is closed, so Crossover is not the reason
+    // another application's clipboard call fails.
     let units: Vec<u16> = unsafe {
-        let mut len = 0usize;
-        while *ptr.add(len) != 0 {
-            len += 1;
-        }
+        let len = terminated_len(ptr, max_units);
         std::slice::from_raw_parts(ptr, len).to_vec()
     };
     // SAFETY: balances the successful GlobalLock above. GlobalUnlock
     // reports "no longer locked" as an error-shaped success; ignore.
     let _ = unsafe { GlobalUnlock(hglobal) };
-    drop(open);
 
-    Ok(Some(String::from_utf16_lossy(&units)))
+    Ok(Some(units))
+}
+
+/// Units before the null terminator, scanning at most `max_units`.
+///
+/// The bound is the whole point. `CF_UNICODETEXT` is null-terminated *by
+/// contract*, but its producer is any application on the machine and this
+/// process cannot verify it obeyed; an unterminated block would otherwise
+/// send the scan off the end of the allocation — undefined behaviour whose
+/// trigger is another program's bug. `GlobalSize` is the only bound
+/// available, so an unterminated block reads as its whole contents rather
+/// than as whatever follows it in memory.
+///
+/// Windows makes this hard to reach in practice — it normalizes an
+/// unterminated `CF_UNICODETEXT` into a terminated block of the same byte
+/// length, dropping the final character, so a block installed through the
+/// clipboard comes back terminated whatever the producer wrote. That is
+/// observed behaviour of one Windows version, not a documented guarantee,
+/// and it says nothing about a block from a delayed-render producer, so
+/// the bound stays. `the_terminator_scan_stops_at_the_bound` proves it
+/// over fixtures, which is the only place the unterminated case is
+/// reachable.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of up to `max_units` `u16`s.
+unsafe fn terminated_len(ptr: *const u16, max_units: usize) -> usize {
+    let mut len = 0usize;
+    // SAFETY: the caller guarantees `max_units` readable units, and `len`
+    // never reaches past that bound before the loop stops.
+    while len < max_units && unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    len
+}
+
+/// What a `CF_DIB` probe found.
+///
+/// "Too large" is a variant rather than a log line inside the probe
+/// because the probe runs with the clipboard open: `tracing` under the
+/// machine-global lock can block on a subscriber's I/O, and every other
+/// application's clipboard call blocks behind it. The caller reports it
+/// after the guard drops.
+enum DibProbe {
+    /// No raster representation, or a block that came back empty.
+    Absent,
+    /// Present, but past the ceiling — refused whole, never truncated.
+    TooLarge { byte_count: usize },
+    /// Present and inside the ceiling, exactly as the block held it.
+    /// Still to be canonicalized — [`canonical_dib`] is header
+    /// arithmetic the caller runs once the clipboard is closed.
+    Raw(Vec<u8>),
+}
+
+/// Probe `CF_DIB` on the already-open clipboard.
+///
+/// Takes the open guard rather than opening, so this and
+/// [`read_unicode_text`] see one clipboard state — see [`read_current`].
+///
+/// `max_bytes` is a parameter rather than a constant read inline so the
+/// refusal path is testable without fabricating a 64 MiB clipboard item;
+/// production always passes [`MAX_CLIPBOARD_IMAGE_BYTES`].
+///
+/// The ceiling is checked from `GlobalSize` **before** the block is locked
+/// or a byte is copied (NFR-1): an oversized item can never be
+/// synchronized, so copying it out of the OS clipboard — with the
+/// machine-global lock held — would be an allocation spike bought for
+/// nothing.
+///
+/// Note what that compares: `GlobalSize` is the *allocation*, which may be
+/// rounded up past the bitmap inside it, so an image whose logical length
+/// is a hair under the ceiling can be refused for its allocation being
+/// over it. Deliberate, and the right direction to err — the check has to
+/// happen before anything is copied, and the logical length is only
+/// knowable after. The headroom absorbs it: the ceiling is 64 MiB and the
+/// worst realistic capture, a dual-4K span, is 63.3 MiB
+/// (docs/PROTOCOL.md §8), so roughly 0.7 MiB of rounding is tolerated
+/// before the distinction could ever matter.
+fn probe_dib(_open: &OpenGuard, max_bytes: usize) -> Result<DibProbe, ClipboardError> {
+    // SAFETY: no arguments; checks format availability only. Synthesized
+    // formats count as available, which is exactly what makes this one
+    // probe cover CF_BITMAP and CF_DIBV5 sources too.
+    if unsafe { IsClipboardFormatAvailable(u32::from(CF_DIB.0)) }.is_err() {
+        return Ok(DibProbe::Absent); // empty clipboard, or no raster representation
+    }
+
+    // SAFETY: the clipboard is open (caller's guard); the returned handle stays
+    // owned by the clipboard, never by us. Ownership can churn between
+    // our open and this call, which surfaces as an error here and is
+    // retryable contention, not a fault (R-5).
+    let handle =
+        unsafe { GetClipboardData(u32::from(CF_DIB.0)) }.map_err(|e| ClipboardError::Busy {
+            reason: format!("GetClipboardData(CF_DIB) failed (ownership churn?): {e}"),
+        })?;
+    if handle.is_invalid() {
+        return Ok(DibProbe::Absent);
+    }
+
+    let hglobal = HGLOBAL(handle.0);
+    // SAFETY: `hglobal` came from GetClipboardData while the clipboard is
+    // open. GlobalSize reads the block's size without locking or copying
+    // it, which is what lets the bound below be enforced before any
+    // allocation. It reports 0 for an invalid or discarded block.
+    let size = unsafe { GlobalSize(hglobal) };
+    if size == 0 {
+        return Ok(DibProbe::Absent);
+    }
+    if size > max_bytes {
+        // Graceful refusal, never a truncated image — and reported, not
+        // logged here, so the caller can close the clipboard first.
+        return Ok(DibProbe::TooLarge { byte_count: size });
+    }
+
+    // SAFETY: `hglobal` is a live clipboard block; GlobalLock pins it and
+    // yields its base pointer.
+    let ptr = unsafe { GlobalLock(hglobal) }.cast::<u8>();
+    if ptr.is_null() {
+        // Same churn window as above: the block can vanish with its
+        // owner. Retryable.
+        return Err(ClipboardError::Busy {
+            reason: "GlobalLock on clipboard image failed".to_owned(),
+        });
+    }
+    // SAFETY: `size` bytes starting at `ptr` are exactly this block, as
+    // GlobalSize reported and GlobalLock pinned. The copy is the only
+    // work under the machine-global lock — the header parse that
+    // canonicalizes the length is left to the caller, which runs it once
+    // the clipboard is closed, so Crossover is not the reason another
+    // application's paste fails (FR-3.1a).
+    let blob = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+    // SAFETY: balances the successful GlobalLock above. GlobalUnlock
+    // reports "no longer locked" as an error-shaped success; ignore.
+    let _ = unsafe { GlobalUnlock(hglobal) };
+
+    Ok(DibProbe::Raw(blob))
 }
 
 /// Replace the clipboard with `text` as `CF_UNICODETEXT`.
 fn write_unicode_text(text: &str) -> Result<(), ClipboardError> {
-    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let byte_len = utf16.len() * 2;
+    // UTF-16LE with the terminator `CF_UNICODETEXT` requires, built
+    // straight into bytes: a `str` never encodes to more UTF-16 units
+    // than it has bytes, so one allocation covers it and the block that
+    // reaches the clipboard is a plain copy of this one.
+    let mut encoded = Vec::with_capacity((text.len() + 1) * 2);
+    for unit in text.encode_utf16().chain(std::iter::once(0)) {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    install_formats(&[(u32::from(CF_UNICODETEXT.0), &encoded)])
+}
 
-    // Allocate and fill the block BEFORE taking the clipboard. None
-    // of this needs the lock, and for a multi-megabyte item the copy
-    // is long enough that holding it here made other applications'
-    // clipboard calls fail outright (found in the two-machine soak).
-    // SAFETY: allocating a movable global block for the clipboard.
-    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) }.map_err(|e| {
-        ClipboardError::Unavailable {
-            reason: format!("GlobalAlloc failed: {e}"),
-        }
-    })?;
-    // SAFETY: `hglobal` is ours and unlocked; lock, copy the UTF-16
-    // (exactly `utf16.len()` units fit by construction), unlock. On
-    // any failure before the system takes ownership we free it.
-    unsafe {
-        let ptr = GlobalLock(hglobal).cast::<u16>();
-        if ptr.is_null() {
-            let _ = GlobalFree(Some(hglobal));
-            return Err(ClipboardError::Unavailable {
-                reason: "GlobalLock on fresh allocation failed".to_owned(),
+/// Replace the clipboard with an image, verbatim in the format it arrived
+/// in (ADR 0014: no transcoding, here least of all).
+///
+/// `max_bytes` mirrors the read path's ceiling onto the write path, and is
+/// a parameter for the same reason [`probe_dib`]'s is: so the refusal is
+/// provable without a 64 MiB fixture. Production passes
+/// [`MAX_CLIPBOARD_IMAGE_BYTES`].
+///
+/// Nothing should reach here oversized — an inbound image is checked
+/// against the same bound before its reassembly buffer is allocated
+/// (`crossover_protocol::clipboard`), which is where the bound has to bite
+/// for NFR-1. This is the backstop for a caller that is not the session:
+/// it fails closed rather than handing Win32 an allocation the rest of the
+/// system was promised it would never see.
+///
+/// Type is judged before size, deliberately. An oversized JPEG is refused
+/// for being a JPEG, because that is the durable answer — it will never
+/// install at any size — where "too big" invites a smaller retry that
+/// would also fail.
+fn write_image(
+    format: ClipboardImageFormat,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<(), ClipboardError> {
+    let clipboard_format = match format {
+        ClipboardImageFormat::Dib => u32::from(CF_DIB.0),
+        // Registered, not predefined: the de-facto interchange name that
+        // browsers and image editors publish and accept. Windows
+        // synthesizes nothing from it, so a PNG-only clipboard is
+        // invisible to CF_DIB-only applications — accepted knowingly,
+        // because the alternative would be transcoding.
+        ClipboardImageFormat::Png => registered_format(w!("PNG"))?,
+        // No comparable Windows convention exists for JPEG on the
+        // clipboard. Refusing permanently is the honest answer: the
+        // origin learns the type will never install here, rather than
+        // watching a retry budget expire (NFR-3).
+        ClipboardImageFormat::Jpeg => {
+            return Err(ClipboardError::Unsupported {
+                reason: "Windows has no clipboard format for verbatim JPEG; \
+                         this build does not transcode (ADR 0014)"
+                    .to_owned(),
             });
         }
-        std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr, utf16.len());
-        let _ = GlobalUnlock(hglobal);
+    };
+    if bytes.len() > max_bytes {
+        // Permanent for this item, like an unsupported type: no retry
+        // makes it smaller, and the origin is owed the wall it hit rather
+        // than an expiring retry budget (NFR-3). The size is named; the
+        // pixels never are (FR-7.4).
+        return Err(ClipboardError::Unsupported {
+            reason: format!(
+                "image is {} bytes, past the {max_bytes}-byte clipboard ceiling",
+                bytes.len()
+            ),
+        });
+    }
+    install_formats(&[(clipboard_format, bytes)])
+}
+
+/// Resolve (registering on first use) a named clipboard format.
+fn registered_format(name: windows::core::PCWSTR) -> Result<u32, ClipboardError> {
+    // SAFETY: `name` is a static null-terminated wide literal. The call
+    // is idempotent — a name already registered returns its existing id —
+    // and returns 0 on failure.
+    let id = unsafe { RegisterClipboardFormatW(name) };
+    if id == 0 {
+        return Err(ClipboardError::Unavailable {
+            reason: "RegisterClipboardFormatW failed".to_owned(),
+        });
+    }
+    Ok(id)
+}
+
+/// Replace the clipboard contents with one block per `(format, bytes)`.
+///
+/// The single place the Win32 ownership rules are honoured, because they
+/// are the part that leaks or double-frees if restated: a block belongs to
+/// us until `SetClipboardData` **succeeds** for it, and to the system
+/// forever after.
+///
+/// Several formats exist as one call rather than several because
+/// `SetClipboardData` only works inside the same open that called
+/// `EmptyClipboard` — a second open cannot add to what the first
+/// installed. Production installs one format at a time; the shape is what
+/// makes a mixed clipboard testable, and what a future paste-compatibility
+/// change would build on.
+fn install_formats(items: &[(u32, &[u8])]) -> Result<(), ClipboardError> {
+    // Allocate and fill every block BEFORE taking the clipboard. None of
+    // this needs the lock, and for a multi-megabyte item the copy is long
+    // enough that holding it here made other applications' clipboard calls
+    // fail outright (found in the two-machine soak).
+    let mut blocks: Vec<(u32, HGLOBAL)> = Vec::with_capacity(items.len());
+    for (format, bytes) in items {
+        match alloc_block(bytes) {
+            Ok(hglobal) => blocks.push((*format, hglobal)),
+            Err(error) => {
+                free_blocks(&blocks);
+                return Err(error);
+            }
+        }
     }
 
-    // The critical section starts here and holds only two calls.
+    // The critical section starts here and holds only the clipboard calls.
     let _open = match OpenGuard::open() {
         Ok(guard) => guard,
         Err(error) => {
-            // SAFETY: the system never took ownership; the block is
-            // still ours to free.
-            unsafe {
-                let _ = GlobalFree(Some(hglobal));
-            }
+            free_blocks(&blocks);
             return Err(error);
         }
     };
 
     // SAFETY: the clipboard is open (guard).
     if let Err(e) = unsafe { EmptyClipboard() } {
-        // SAFETY: ownership never transferred; free our block.
-        unsafe {
-            let _ = GlobalFree(Some(hglobal));
-        }
+        free_blocks(&blocks); // ownership never transferred
         return Err(ClipboardError::Busy {
             reason: format!("EmptyClipboard failed (ownership churn?): {e}"),
         });
     }
-    // SAFETY: the clipboard is open (guard). On success the system
-    // takes ownership of `hglobal` and we must never free it; on
-    // failure ownership stays with us, which the error arm handles.
-    let stored = unsafe { SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(hglobal.0))) };
-    if let Err(e) = stored {
-        // SAFETY: on failure the system did NOT take ownership, so
-        // freeing here is correct and avoids the leak the previous
-        // version accepted.
-        unsafe {
-            let _ = GlobalFree(Some(hglobal));
+
+    for (index, (format, hglobal)) in blocks.iter().enumerate() {
+        // SAFETY: the clipboard is open (guard). On success the system
+        // takes ownership of the block and we must never free it; on
+        // failure ownership stays with us, which the error arm handles.
+        if let Err(e) = unsafe { SetClipboardData(*format, Some(HANDLE(hglobal.0))) } {
+            // Everything before `index` now belongs to the system; only
+            // the blocks from here on are still ours to free.
+            free_blocks(&blocks[index..]);
+            return Err(ClipboardError::Busy {
+                reason: format!("SetClipboardData failed (ownership churn?): {e}"),
+            });
         }
-        return Err(ClipboardError::Busy {
-            reason: format!("SetClipboardData failed (ownership churn?): {e}"),
-        });
     }
     Ok(())
+}
+
+/// Allocate a movable global block holding a copy of `bytes`, ready to be
+/// handed to the clipboard.
+fn alloc_block(bytes: &[u8]) -> Result<HGLOBAL, ClipboardError> {
+    if bytes.is_empty() {
+        // GlobalAlloc(0) yields a block that cannot be locked, so this
+        // would surface later as a confusing lock failure. The layers
+        // above already reject empty items; say so plainly here.
+        return Err(ClipboardError::Unavailable {
+            reason: "refusing to install an empty clipboard block".to_owned(),
+        });
+    }
+    // GMEM_ZEROINIT is not decoration. `GlobalAlloc` may return a block
+    // larger than the requested size, `GlobalSize` reports that larger
+    // size, and the read path copies all of it — so without zeroing,
+    // reading back a block Crossover itself installed would copy
+    // uninitialized bytes through a `&[u8]`, which the abstract machine
+    // calls undefined even though canonicalization then discards them.
+    // Zeroing costs nothing measurable and makes any slack deterministic,
+    // which the round-trip stability the loop guard rests on can only
+    // benefit from.
+    // SAFETY: allocating a zeroed movable global block for the clipboard.
+    let hglobal =
+        unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) }.map_err(|e| {
+            ClipboardError::Unavailable {
+                reason: format!("GlobalAlloc failed: {e}"),
+            }
+        })?;
+    // SAFETY: `hglobal` is ours and unlocked; lock it, copy exactly the
+    // `bytes.len()` bytes it was allocated for, unlock. On failure before
+    // the system takes ownership we free it rather than leak.
+    unsafe {
+        let ptr = GlobalLock(hglobal).cast::<u8>();
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hglobal));
+            return Err(ClipboardError::Unavailable {
+                reason: "GlobalLock on fresh allocation failed".to_owned(),
+            });
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+        let _ = GlobalUnlock(hglobal);
+    }
+    Ok(hglobal)
+}
+
+/// Free blocks the system never took ownership of.
+fn free_blocks(blocks: &[(u32, HGLOBAL)]) {
+    for (_, hglobal) in blocks {
+        // SAFETY: each block came from GlobalAlloc here and has not been
+        // accepted by SetClipboardData, so it is still ours to free.
+        unsafe {
+            let _ = GlobalFree(Some(*hglobal));
+        }
+    }
+}
+
+/// Size of the `BITMAPINFOHEADER` that opens every `CF_DIB` blob. The
+/// larger V4/V5 headers belong to `CF_DIBV5`; Windows' synthesis hands
+/// `CF_DIB` requests this one.
+const BITMAPINFOHEADER_BYTES: u32 = 40;
+
+// `biCompression` values, from wingdi.h. Only the arithmetic each implies
+// is used; no pixel data is ever examined.
+const BI_RGB: u32 = 0;
+const BI_RLE8: u32 = 1;
+const BI_RLE4: u32 = 2;
+const BI_BITFIELDS: u32 = 3;
+const BI_JPEG: u32 = 4;
+const BI_PNG: u32 = 5;
+const BI_ALPHABITFIELDS: u32 = 6;
+
+/// Trim allocator slack from a `CF_DIB` blob, or keep it whole.
+///
+/// Verbatim means *the bitmap*, and a global block may be larger than the
+/// bitmap it carries. Trimming it is not cosmetic: loop prevention (FR-3.3)
+/// keys on the content hash, so a blob that gained pad bytes on every hop
+/// would read back as new content after Crossover's own write — a clipboard
+/// sync loop, which is release-blocking. Truncating to the header's own
+/// arithmetic makes the round trip a fixed point instead.
+///
+/// Conservative by construction: anything the header does not describe
+/// confidently, or any computed length the blob is too short for, keeps
+/// the blob exactly as the OS gave it. The failure mode is therefore "a
+/// few unused bytes travel", never "a valid image is cut short".
+fn canonical_dib(mut blob: Vec<u8>) -> Vec<u8> {
+    if let Some(logical) = dib_logical_len(&blob) {
+        blob.truncate(logical);
+    }
+    blob
+}
+
+/// The logical byte length of a `CF_DIB` blob: header + colour
+/// table/masks + pixel data, per the `BITMAPINFOHEADER` contract.
+///
+/// `None` means "do not trust this" — an unrecognized header, implausible
+/// dimensions, or arithmetic the blob cannot satisfy — and the caller then
+/// keeps the whole blob. Nothing here reads a single pixel; the fields
+/// consumed are the geometry ones that fix the layout.
+fn dib_logical_len(blob: &[u8]) -> Option<usize> {
+    if le_u32(blob, 0)? != BITMAPINFOHEADER_BYTES {
+        return None; // not a BITMAPINFOHEADER-shaped DIB
+    }
+    let width = le_i32(blob, 4)?;
+    let height = le_i32(blob, 8)?;
+    let planes = le_u16(blob, 12)?;
+    let bit_count = le_u16(blob, 14)?;
+    let compression = le_u32(blob, 16)?;
+    let size_image = u64::from(le_u32(blob, 20)?);
+    let clr_used = u64::from(le_u32(blob, 32)?);
+
+    // Plausibility, not validation: a DIB whose geometry we cannot trust
+    // is one whose length we must not compute.
+    if planes != 1 || width <= 0 || height == 0 {
+        return None;
+    }
+    if !matches!(bit_count, 1 | 4 | 8 | 16 | 24 | 32) {
+        return None;
+    }
+
+    // What sits between the header and the pixels. At <= 8 bpp that is a
+    // palette (biClrUsed entries, or the full 2^bpp when it is zero); at
+    // higher depths it is the bit-field masks, plus any optimization
+    // palette biClrUsed still claims. Over-counting here is safe: the
+    // total simply fails the length check below and the blob stays whole.
+    let table = if bit_count <= 8 {
+        let entries = if clr_used == 0 {
+            1u64 << bit_count
+        } else {
+            clr_used
+        };
+        if entries > 256 {
+            return None;
+        }
+        entries * 4
+    } else {
+        let masks = match compression {
+            BI_BITFIELDS => 12,
+            BI_ALPHABITFIELDS => 16,
+            _ => 0,
+        };
+        masks + clr_used * 4
+    };
+
+    let pixels = match compression {
+        BI_RGB | BI_BITFIELDS | BI_ALPHABITFIELDS => {
+            // Rows are padded to a 4-byte boundary; height may be
+            // negative for a top-down DIB, which changes the row order,
+            // not the size. `biSizeImage` is allowed to be 0 for
+            // uncompressed data, and is allowed to be larger than the
+            // strict minimum — take whichever is bigger so a producer
+            // that padded the buffer is not cut short.
+            let stride = (u64::from(width.unsigned_abs()) * u64::from(bit_count)).div_ceil(32) * 4;
+            let rows = u64::from(height.unsigned_abs());
+            stride.checked_mul(rows)?.max(size_image)
+        }
+        // Compressed payloads have no computable size: `biSizeImage` is
+        // the only statement of it, and is mandatory here.
+        BI_RLE4 | BI_RLE8 | BI_JPEG | BI_PNG => {
+            if size_image == 0 {
+                return None;
+            }
+            size_image
+        }
+        _ => return None, // an encoding this code does not model
+    };
+
+    let total = u64::from(BITMAPINFOHEADER_BYTES)
+        .checked_add(table)?
+        .checked_add(pixels)?;
+    let total = usize::try_from(total).ok()?;
+    // A blob shorter than its own header claims is either malformed or
+    // beyond this model; either way, hand it back untouched.
+    (total <= blob.len()).then_some(total)
+}
+
+/// Little-endian field readers. Bounds-checked, so a truncated blob is
+/// `None` rather than a panic (NFR-1: malformed input never panics).
+fn le_u16(blob: &[u8], at: usize) -> Option<u16> {
+    blob.get(at..at + 2)?
+        .try_into()
+        .ok()
+        .map(u16::from_le_bytes)
+}
+
+fn le_u32(blob: &[u8], at: usize) -> Option<u32> {
+    blob.get(at..at + 4)?
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)
+}
+
+fn le_i32(blob: &[u8], at: usize) -> Option<i32> {
+    blob.get(at..at + 4)?
+        .try_into()
+        .ok()
+        .map(i32::from_le_bytes)
 }
 
 /// RAII for `OpenClipboard`/`CloseClipboard`. Open failure is `Busy`:
@@ -424,24 +976,39 @@ mod tests {
         }))
     }
 
-    /// The typed boundary's honest state in this slice (ADR 0014): an
-    /// image write is refused permanently, not retried and not silently
-    /// swallowed, so the origin gets a real verdict. Touches no clipboard
-    /// lock at all — the refusal happens before any Win32 call — so this
-    /// case is immune to the contention the others live with.
+    /// Probe `CF_DIB` on its own, in the order production uses it: open,
+    /// probe, close, *then* canonicalize (`read_current` keeps the header
+    /// arithmetic out of the machine-global lock). `None` covers both
+    /// "no image" and "refused for size" — which is what the trait-level
+    /// read reports for either, and what these tests assert against.
+    fn probe_dib(max_bytes: usize) -> Result<Option<Vec<u8>>, ClipboardError> {
+        let probe = {
+            let open = super::OpenGuard::open()?;
+            super::probe_dib(&open, max_bytes)?
+        };
+        Ok(match probe {
+            super::DibProbe::Raw(blob) => Some(super::canonical_dib(blob)),
+            super::DibProbe::Absent | super::DibProbe::TooLarge { .. } => None,
+        })
+    }
+
+    /// JPEG has no Windows clipboard convention, and ADR 0014 forbids
+    /// transcoding it into one that does. The refusal must be
+    /// `Unsupported`, not `Busy` and not `Unavailable`: retrying will
+    /// never make it work, and the origin is owed "this type never
+    /// installs here" rather than "try again later" (NFR-3). Touches no
+    /// clipboard lock at all — the refusal happens before any Win32 call —
+    /// so this case is immune to the contention the others live with.
     #[test]
-    fn image_writes_are_refused_until_the_platform_slice_lands() {
+    fn jpeg_images_are_refused_permanently_rather_than_transcoded() {
         use crossover_platform::{ClipboardContent, ClipboardImageFormat};
 
         let clipboard = WindowsClipboard::new().unwrap();
         let refusal = clipboard.write(&ClipboardContent::Image {
-            format: ClipboardImageFormat::Dib,
+            format: ClipboardImageFormat::Jpeg,
             bytes: vec![0u8; 64],
         });
         match refusal {
-            // Unsupported, not Busy and not Unavailable: retrying will not
-            // make this build grow a DIB writer, and the origin is owed
-            // "this type never works here" rather than "try again later".
             Err(ClipboardError::Unsupported { reason }) => {
                 assert!(
                     reason.contains("ADR 0014"),
@@ -449,6 +1016,84 @@ mod tests {
                 );
             }
             other => panic!("expected a permanent refusal, got {other:?}"),
+        }
+    }
+
+    /// The ceiling mirrored onto the write path. An oversized image is
+    /// refused *before* `install_formats`, so nothing reaches Win32 and no
+    /// clipboard lock is taken — the same permanent `Unsupported` the read
+    /// path's absence corresponds to, rather than a `Busy` the engine
+    /// would retry until its budget expired (NFR-3).
+    #[test]
+    fn an_image_over_the_ceiling_is_refused_rather_than_installed() {
+        use crossover_platform::ClipboardImageFormat;
+
+        let picture = dib(8, 8);
+        match super::write_image(ClipboardImageFormat::Dib, &picture, picture.len() - 1) {
+            Err(ClipboardError::Unsupported { reason }) => {
+                assert!(
+                    reason.contains(&picture.len().to_string()),
+                    "the diagnostic must name the size it refused: {reason}"
+                );
+            }
+            other => panic!("an oversized image must be refused, got {other:?}"),
+        }
+        // The same bytes under a ceiling that admits them still install,
+        // so the check bounds the size and nothing else.
+        let _serial = clipboard_lock();
+        with_retry(|| super::write_image(ClipboardImageFormat::Dib, &picture, picture.len()))
+            .unwrap();
+    }
+
+    /// Type is judged before size: an oversized JPEG is refused for being
+    /// a JPEG. "Too big" would invite a smaller retry that must also fail,
+    /// where the type refusal is the durable answer (NFR-3).
+    #[test]
+    fn an_oversized_unsupported_type_is_refused_for_its_type() {
+        use crossover_platform::ClipboardImageFormat;
+
+        match super::write_image(ClipboardImageFormat::Jpeg, &[0u8; 64], 8) {
+            Err(ClipboardError::Unsupported { reason }) => assert!(
+                reason.contains("ADR 0014"),
+                "the type refusal must win over the size one: {reason}"
+            ),
+            other => panic!("expected a permanent refusal, got {other:?}"),
+        }
+    }
+
+    /// The terminator scan is bounded by the block, not by trust in the
+    /// application that produced it: an unterminated `CF_UNICODETEXT` must
+    /// stop at `GlobalSize` rather than read past the allocation.
+    ///
+    /// Fixtures rather than the real clipboard, of necessity — Windows
+    /// normalizes an unterminated block into a terminated one on the way
+    /// through (measured: a 26-unit unterminated block reads back as 25
+    /// units and a terminator), so the case this bound exists for cannot
+    /// be staged through the OS. Owned `Vec`s put it in reach.
+    #[test]
+    fn the_terminator_scan_stops_at_the_bound() {
+        let terminated: Vec<u16> = vec![b'h'.into(), b'i'.into(), 0, b'?'.into()];
+        // SAFETY: every call below reads within its own live allocation.
+        unsafe {
+            // The ordinary case: the terminator ends it, short of the bound.
+            assert_eq!(super::terminated_len(terminated.as_ptr(), 4), 2);
+
+            // Unterminated: the bound ends it, and nothing past it is read.
+            let unterminated: Vec<u16> = vec![b'h'.into(), b'i'.into()];
+            assert_eq!(super::terminated_len(unterminated.as_ptr(), 2), 2);
+
+            // The bound wins even with a terminator beyond it.
+            assert_eq!(super::terminated_len(terminated.as_ptr(), 1), 1);
+
+            // A block that is nothing but its terminator is empty text,
+            // which is the case `empty_text_steps_aside_for_an_image`
+            // depends on telling apart from absent.
+            let empty: Vec<u16> = vec![0];
+            assert_eq!(super::terminated_len(empty.as_ptr(), 1), 0);
+
+            // A zero bound reads nothing at all, which is what a block too
+            // small to hold one unit must produce.
+            assert_eq!(super::terminated_len(terminated.as_ptr(), 0), 0);
         }
     }
 
@@ -647,5 +1292,759 @@ mod tests {
             with_retry(|| clipboard.read_text()).unwrap().as_deref(),
             Some("second instance")
         );
+    }
+
+    // ---- images (ADR 0014 platform slice) --------------------------------
+
+    /// A minimal, well-formed 32-bpp `BI_RGB` DIB: a 40-byte
+    /// `BITMAPINFOHEADER`, no colour table, `width * height * 4` pixel
+    /// bytes with a recognizable pattern. Bottom-up (positive height),
+    /// which is what a Windows screen capture produces.
+    fn dib(width: i32, height: i32) -> Vec<u8> {
+        let pixel_bytes = usize::try_from(width * height * 4).expect("test dimensions");
+        let mut blob = Vec::with_capacity(40 + pixel_bytes);
+        blob.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        blob.extend_from_slice(&width.to_le_bytes()); // biWidth
+        blob.extend_from_slice(&height.to_le_bytes()); // biHeight
+        blob.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        blob.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+        blob.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+        blob.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage (0 is legal)
+        blob.extend_from_slice(&2835i32.to_le_bytes()); // biXPelsPerMeter
+        blob.extend_from_slice(&2835i32.to_le_bytes()); // biYPelsPerMeter
+        blob.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        blob.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        blob.extend((0..pixel_bytes).map(|i| u8::try_from(i % 251).unwrap_or(0)));
+        blob
+    }
+
+    /// FR-3.2 for images: what comes back off the clipboard is what went
+    /// on, byte for byte. Verbatim transfer is the entire ADR 0014 image
+    /// story, and it starts here — a backend that re-encoded on the way in
+    /// or out would break it before the wire ever saw the bytes.
+    #[test]
+    fn an_image_round_trips_through_the_real_clipboard_verbatim() {
+        use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        let image = ClipboardContent::Image {
+            format: ClipboardImageFormat::Dib,
+            bytes: dib(16, 16),
+        };
+        with_retry(|| clipboard.write(&image)).unwrap();
+        let read_back = with_retry(|| clipboard.read()).unwrap();
+        assert!(
+            read_back.as_ref() == Some(&image),
+            "the image did not survive the clipboard verbatim (read back {:?} bytes)",
+            read_back
+                .as_ref()
+                .map(crossover_platform::ClipboardContent::byte_len)
+        );
+    }
+
+    /// **A clipboard sync loop is release-blocking.** Loop prevention
+    /// (FR-3.3) works by content hash: the engine remembers what it
+    /// applied and suppresses the notification its own write provokes.
+    /// That only holds if reading back an installed image yields the
+    /// *identical* bytes — one pad byte of difference and the hash misses,
+    /// the read looks like fresh local content, and it is offered straight
+    /// back to the peer that sent it.
+    ///
+    /// So this test pins the exact property the suppression depends on:
+    /// our own write notifies us, and the read that follows is
+    /// byte-identical and stable across repeats.
+    #[test]
+    fn an_installed_image_reads_back_identical_so_own_writes_cannot_loop() {
+        use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&notifications);
+        clipboard
+            .set_change_listener(Some(Box::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })))
+            .unwrap();
+
+        let bytes = dib(24, 18);
+        let image = ClipboardContent::Image {
+            format: ClipboardImageFormat::Dib,
+            bytes: bytes.clone(),
+        };
+        with_retry(|| clipboard.write(&image)).unwrap();
+
+        // The write does provoke a notification — the contract term
+        // `ClipboardProvider` documents, and the reason suppression is
+        // needed at all.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while notifications.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "no change notification within 5s of our own image write"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Twice: the round trip must be a fixed point, not merely equal
+        // once. An unstable length would loop on the second hop instead
+        // of the first.
+        for attempt in 1..=2 {
+            match with_retry(|| clipboard.read()).unwrap() {
+                Some(ClipboardContent::Image {
+                    format: ClipboardImageFormat::Dib,
+                    bytes: read_back,
+                }) => assert!(
+                    read_back == bytes,
+                    "read {} back {} bytes, wrote {} — the content hash would miss \
+                     and the item would be offered back to its own origin",
+                    attempt,
+                    read_back.len(),
+                    bytes.len()
+                ),
+                other => panic!(
+                    "an installed image must read back as an image, got {:?}",
+                    other.map(|c| c.byte_len())
+                ),
+            }
+        }
+    }
+
+    /// Mixed content, the Excel/Word/browser case: the clipboard holds
+    /// both `CF_UNICODETEXT` and `CF_DIB`, and exactly one type may
+    /// travel. Text wins — the image in a mixed item is a rendering of the
+    /// text, and text pastes into strictly more places (module docs). The
+    /// image being genuinely present is asserted too, so this proves a
+    /// *choice* rather than an absence.
+    #[test]
+    fn text_wins_when_the_clipboard_holds_both_text_and_an_image() {
+        use crossover_platform::ClipboardContent;
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        let text = "cells copied from a spreadsheet";
+        let mut utf16 = Vec::new();
+        for unit in text.encode_utf16().chain(std::iter::once(0)) {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        let picture = dib(12, 9);
+        with_retry(|| {
+            super::install_formats(&[
+                (
+                    u32::from(windows::Win32::System::Ole::CF_UNICODETEXT.0),
+                    &utf16,
+                ),
+                (u32::from(windows::Win32::System::Ole::CF_DIB.0), &picture),
+            ])
+        })
+        .unwrap();
+
+        match with_retry(|| clipboard.read()).unwrap() {
+            Some(ClipboardContent::Text(read_back)) => assert_eq!(read_back, text),
+            other => panic!(
+                "mixed content must read as text, got {:?}",
+                other.map(|c| c.byte_len())
+            ),
+        }
+        // The image really was there: precedence, not absence.
+        assert_eq!(
+            with_retry(|| probe_dib(super::MAX_CLIPBOARD_IMAGE_BYTES))
+                .unwrap()
+                .map(|b| b.len()),
+            Some(picture.len()),
+            "the mixed clipboard was supposed to hold an image as well"
+        );
+    }
+
+    /// Precedence must not become suppression. A `CF_UNICODETEXT` that is
+    /// nothing but its terminator reads as `Some("")`, and letting that
+    /// win over a picture beside it would propagate an empty string —
+    /// **blanking the peer's clipboard** instead of sending the image,
+    /// which is worse than either content type. The carve-out is narrow:
+    /// only an image displaces empty text, and an empty clipboard with no
+    /// picture behind it must read exactly as it always has.
+    #[test]
+    fn empty_text_steps_aside_for_an_image_but_nothing_else() {
+        use crossover_platform::ClipboardContent;
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        let terminator_only = 0u16.to_le_bytes(); // an empty CF_UNICODETEXT
+        let picture = dib(10, 6);
+        with_retry(|| {
+            super::install_formats(&[
+                (
+                    u32::from(windows::Win32::System::Ole::CF_UNICODETEXT.0),
+                    &terminator_only,
+                ),
+                (u32::from(windows::Win32::System::Ole::CF_DIB.0), &picture),
+            ])
+        })
+        .unwrap();
+
+        match with_retry(|| clipboard.read()).unwrap() {
+            Some(ClipboardContent::Image { bytes, .. }) => assert_eq!(bytes, picture),
+            other => panic!(
+                "empty text must not mask an image, got {:?}",
+                other.map(|c| c.byte_len())
+            ),
+        }
+
+        // No image behind it: unchanged behaviour, empty text reads as
+        // empty text rather than becoming absent.
+        with_retry(|| {
+            super::install_formats(&[(
+                u32::from(windows::Win32::System::Ole::CF_UNICODETEXT.0),
+                &terminator_only,
+            )])
+        })
+        .unwrap();
+        assert_eq!(
+            with_retry(|| clipboard.read()).unwrap(),
+            Some(ClipboardContent::Text(String::new()))
+        );
+    }
+
+    /// FR-3.6 at the source. An image past the ceiling is refused where it
+    /// is cheapest to refuse — from `GlobalSize`, before the block is
+    /// locked or a byte copied — and reported as *absent*, never
+    /// truncated. The ceiling is a parameter so the refusal is provable
+    /// without putting a 64 MiB item on a live desktop's clipboard.
+    #[test]
+    fn an_image_over_the_ceiling_reads_as_absent_rather_than_truncated() {
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        let picture = dib(16, 16);
+        with_retry(|| {
+            super::install_formats(&[(u32::from(windows::Win32::System::Ole::CF_DIB.0), &picture)])
+        })
+        .unwrap();
+
+        // A ceiling below the item: absent, and specifically not an error
+        // and not a short read.
+        assert_eq!(
+            with_retry(|| probe_dib(picture.len() - 1)).unwrap(),
+            None,
+            "an oversized image must read as absent"
+        );
+        // The same item under the real ceiling: present and whole.
+        assert_eq!(
+            with_retry(|| probe_dib(super::MAX_CLIPBOARD_IMAGE_BYTES))
+                .unwrap()
+                .map(|b| b.len()),
+            Some(picture.len())
+        );
+        // And the trait-level read agrees with the ceiling it applies.
+        assert!(with_retry(|| clipboard.read()).unwrap().is_some());
+    }
+
+    /// PNG installs verbatim under the registered `"PNG"` format —
+    /// nothing is transcoded (ADR 0014). The documented limitation is
+    /// asserted rather than left implicit: Windows synthesizes no `CF_DIB`
+    /// from it, so `read` (which prefers `CF_DIB`) sees nothing, and a
+    /// `CF_DIB`-only application would see an empty clipboard.
+    #[test]
+    fn png_installs_under_the_registered_png_format_and_synthesizes_nothing() {
+        use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+        use windows::Win32::System::DataExchange::{
+            IsClipboardFormatAvailable, RegisterClipboardFormatW,
+        };
+        use windows::core::w;
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        // Not a real PNG, and deliberately so: this backend never parses
+        // image bytes, so any non-empty blob exercises the same path.
+        let bytes = b"\x89PNG\r\n\x1a\n not really a png, verbatim regardless".to_vec();
+        with_retry(|| {
+            clipboard.write(&ClipboardContent::Image {
+                format: ClipboardImageFormat::Png,
+                bytes: bytes.clone(),
+            })
+        })
+        .unwrap();
+
+        // SAFETY: registering a name is idempotent and returns the
+        // existing id; the availability probe takes no clipboard lock.
+        let (png_format, available) = unsafe {
+            let id = RegisterClipboardFormatW(w!("PNG"));
+            (id, IsClipboardFormatAvailable(id).is_ok())
+        };
+        assert_ne!(png_format, 0, "the PNG clipboard format did not register");
+        assert!(available, "PNG bytes were not installed under \"PNG\"");
+
+        // The limitation, pinned so it cannot be forgotten: no CF_DIB is
+        // synthesized from a registered PNG, so this build's own reader
+        // reports the clipboard as holding nothing it represents.
+        assert_eq!(
+            with_retry(|| probe_dib(super::MAX_CLIPBOARD_IMAGE_BYTES)).unwrap(),
+            None,
+            "Windows unexpectedly synthesized CF_DIB from PNG; \
+             the write path's documented caveat needs revisiting"
+        );
+    }
+
+    // ---- DIB length canonicalization (pure; no clipboard involved) --------
+
+    #[test]
+    fn the_canonical_length_of_a_well_formed_dib_is_its_whole_blob() {
+        let blob = dib(8, 4);
+        assert_eq!(super::dib_logical_len(&blob), Some(blob.len()));
+        assert_eq!(super::canonical_dib(blob.clone()), blob);
+    }
+
+    /// The property the no-loop test depends on, isolated: allocator slack
+    /// past the pixels is dropped, and dropping it is *idempotent*, so a
+    /// blob that has crossed the clipboard once does not change again.
+    #[test]
+    fn canonicalization_drops_allocator_slack_and_is_a_fixed_point() {
+        let exact = dib(8, 4);
+        let mut padded = exact.clone();
+        padded.extend_from_slice(&[0xAB; 13]); // what GlobalSize may report
+
+        let trimmed = super::canonical_dib(padded);
+        assert_eq!(trimmed, exact, "slack past the pixels must not travel");
+        assert_eq!(
+            super::canonical_dib(trimmed.clone()),
+            trimmed,
+            "canonicalization must be a fixed point or the round trip drifts"
+        );
+    }
+
+    /// Palette and bit-field layouts, where the bytes between header and
+    /// pixels are not zero. Getting these wrong in the *truncating*
+    /// direction would corrupt an image, so each is pinned.
+    #[test]
+    fn the_canonical_length_covers_palette_and_bitfield_layouts() {
+        // 8 bpp, implicit 256-entry palette, 4-byte-aligned rows.
+        let mut paletted = Vec::new();
+        paletted.extend_from_slice(&40u32.to_le_bytes());
+        paletted.extend_from_slice(&5i32.to_le_bytes()); // width 5 → stride 8
+        paletted.extend_from_slice(&3i32.to_le_bytes());
+        paletted.extend_from_slice(&1u16.to_le_bytes());
+        paletted.extend_from_slice(&8u16.to_le_bytes());
+        paletted.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        paletted.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage
+        paletted.extend_from_slice(&[0u8; 8]); // pels-per-meter
+        paletted.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed = 0 → 256
+        paletted.extend_from_slice(&0u32.to_le_bytes());
+        let expected = 40 + 256 * 4 + 8 * 3;
+        paletted.resize(expected + 7, 0); // + slack
+        assert_eq!(super::dib_logical_len(&paletted), Some(expected));
+
+        // 16 bpp BI_BITFIELDS: three DWORD masks sit before the pixels.
+        let mut masked = Vec::new();
+        masked.extend_from_slice(&40u32.to_le_bytes());
+        masked.extend_from_slice(&4i32.to_le_bytes());
+        masked.extend_from_slice(&(-2i32).to_le_bytes()); // top-down
+        masked.extend_from_slice(&1u16.to_le_bytes());
+        masked.extend_from_slice(&16u16.to_le_bytes());
+        masked.extend_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+        masked.extend_from_slice(&0u32.to_le_bytes());
+        masked.extend_from_slice(&[0u8; 8]);
+        masked.extend_from_slice(&0u32.to_le_bytes());
+        masked.extend_from_slice(&0u32.to_le_bytes());
+        let expected = 40 + 12 + 8 * 2; // masks + stride(4×16bpp = 8) × 2 rows
+        masked.resize(expected + 3, 0);
+        assert_eq!(super::dib_logical_len(&masked), Some(expected));
+    }
+
+    /// Conservative in the only direction that matters: anything this code
+    /// cannot model confidently keeps the blob whole. Over-including a few
+    /// bytes is harmless; cutting a valid image short is not.
+    #[test]
+    fn anything_unmodelled_keeps_the_blob_whole() {
+        // A V5 header (CF_DIBV5 shape) — not what CF_DIB hands back.
+        let mut v5 = dib(4, 4);
+        v5[0..4].copy_from_slice(&124u32.to_le_bytes());
+        assert_eq!(super::dib_logical_len(&v5), None);
+        assert_eq!(super::canonical_dib(v5.clone()), v5);
+
+        // Too short to hold a header at all.
+        assert_eq!(super::dib_logical_len(&[0u8; 12]), None);
+        assert_eq!(super::dib_logical_len(&[]), None);
+
+        // Dimensions that claim far more than the blob holds.
+        let mut liar = dib(4, 4);
+        liar[4..8].copy_from_slice(&40_000i32.to_le_bytes());
+        assert_eq!(super::dib_logical_len(&liar), None);
+        assert_eq!(super::canonical_dib(liar.clone()), liar);
+
+        // A compressed encoding with no declared size cannot be measured.
+        let mut rle = dib(4, 4);
+        rle[16..20].copy_from_slice(&1u32.to_le_bytes()); // BI_RLE8
+        rle[20..24].copy_from_slice(&0u32.to_le_bytes()); // biSizeImage = 0
+        assert_eq!(super::dib_logical_len(&rle), None);
+    }
+
+    /// A `BITMAPINFOHEADER` with every field under the test's control, so
+    /// the fuzz corpus can reach the arithmetic instead of bouncing off
+    /// the first field check.
+    #[derive(Clone, Copy)]
+    struct Header {
+        size: u32,
+        width: i32,
+        height: i32,
+        planes: u16,
+        bit_count: u16,
+        compression: u32,
+        size_image: u32,
+        clr_used: u32,
+    }
+
+    impl Header {
+        /// The 40 bytes, always — `size` is the *declared* header size,
+        /// which is a field like any other and may disagree.
+        fn bytes(self) -> Vec<u8> {
+            let mut out = Vec::with_capacity(40);
+            out.extend_from_slice(&self.size.to_le_bytes());
+            out.extend_from_slice(&self.width.to_le_bytes());
+            out.extend_from_slice(&self.height.to_le_bytes());
+            out.extend_from_slice(&self.planes.to_le_bytes());
+            out.extend_from_slice(&self.bit_count.to_le_bytes());
+            out.extend_from_slice(&self.compression.to_le_bytes());
+            out.extend_from_slice(&self.size_image.to_le_bytes());
+            out.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+            out.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+            out.extend_from_slice(&self.clr_used.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+            out
+        }
+    }
+
+    /// The DIB length, computed independently of the implementation:
+    /// textbook row-stride arithmetic, written out longhand, for the
+    /// uncompressed layouts only. A cross-check, not a mirror — if the
+    /// production arithmetic is refactored into agreement with itself but
+    /// out of agreement with the format, this disagrees.
+    fn textbook_len(h: Header) -> Option<usize> {
+        if h.size != 40 || h.planes != 1 || h.width <= 0 || h.height == 0 {
+            return None;
+        }
+        let table = match h.bit_count {
+            1 | 4 | 8 => {
+                let entries = if h.clr_used == 0 {
+                    1usize << h.bit_count
+                } else {
+                    usize::try_from(h.clr_used).ok()?
+                };
+                if entries > 256 {
+                    return None;
+                }
+                entries * 4
+            }
+            16 | 24 | 32 => {
+                let masks = match h.compression {
+                    3 => 12,
+                    6 => 16,
+                    _ => 0,
+                };
+                masks + usize::try_from(h.clr_used).ok()? * 4
+            }
+            _ => return None,
+        };
+        if !matches!(h.compression, 0 | 3 | 6) {
+            return None; // compressed payloads are not computable
+        }
+        let row_bits = usize::try_from(h.width).ok()? * usize::from(h.bit_count);
+        let stride = row_bits.div_ceil(32) * 4;
+        let pixels = (stride * usize::try_from(h.height.unsigned_abs()).ok()?)
+            .max(usize::try_from(h.size_image).ok()?);
+        Some(40 + table + pixels)
+    }
+
+    /// What one corpus case exercised, so the caller can prove the corpus
+    /// reaches the code rather than assuming it.
+    struct CaseOutcome {
+        /// The blob was longer than its canonical form: the trimming path
+        /// ran.
+        trimmed: bool,
+        /// The canonical form describes itself completely, so the loop
+        /// guard property applies to it.
+        self_describing: bool,
+    }
+
+    /// The four properties, asserted over one blob. Extracted so the
+    /// corpus generator stays readable; every assertion names the
+    /// iteration, so a failure is reproducible from the seed.
+    fn assert_canonical_properties(blob: &[u8], header: Header, iteration: u32) -> CaseOutcome {
+        // 1 + 2: no panic, and the result is a prefix — never grown,
+        // never rewritten.
+        let once = super::canonical_dib(blob.to_vec());
+        assert!(
+            once.len() <= blob.len() && once.as_slice() == &blob[..once.len()],
+            "canonicalization must return a prefix (iteration {iteration})"
+        );
+
+        // 3: idempotent.
+        assert_eq!(
+            super::canonical_dib(once.clone()),
+            once,
+            "canonicalization is not idempotent (iteration {iteration})"
+        );
+
+        // Cross-check: the independent formula must agree wherever it has
+        // an opinion and the blob is long enough to satisfy it.
+        if let Some(expected) = textbook_len(header)
+            && expected <= blob.len()
+        {
+            assert_eq!(
+                super::dib_logical_len(blob),
+                Some(expected),
+                "the implementation and the textbook formula disagree \
+                 (iteration {iteration})"
+            );
+        }
+
+        // 4: the loop guard, over blobs that describe themselves.
+        let self_describing = super::dib_logical_len(&once).is_some();
+        if self_describing {
+            for pad in [1usize, 7, 32] {
+                let mut padded = once.clone();
+                padded.resize(padded.len() + pad, 0);
+                assert_eq!(
+                    super::canonical_dib(padded),
+                    once,
+                    "allocator slack changed the canonical form — our own write \
+                     would read back as new content and loop (iteration {iteration})"
+                );
+            }
+        }
+
+        CaseOutcome {
+            trimmed: once.len() < blob.len(),
+            self_describing,
+        }
+    }
+
+    /// **The properties the loop guard rests on, over a corpus that
+    /// actually reaches the arithmetic.**
+    ///
+    /// The predecessor of this test fed unstructured random bytes, which
+    /// meant every single case died on the first field check (a random
+    /// `u32` is `40` with probability 2⁻³²) and none of the geometry
+    /// arithmetic below it ever ran — a refactor of that arithmetic would
+    /// have sailed through green. So the corpus is built from headers
+    /// instead of from noise, and the test asserts it measurably reaches
+    /// the trimming path rather than trusting that it does.
+    ///
+    /// Four properties, over both a *coherent* corpus (blobs sized to
+    /// their own geometry, plus slack) and a *hostile* one (fields chosen
+    /// to fight the arithmetic — zero and absurd depths, every
+    /// compression, palette counts either side of 256, extreme and
+    /// negative dimensions, header sizes from every `BITMAPINFO` variant):
+    ///
+    /// 1. no panic on anything (NFR-1: these bytes are network-influenced,
+    ///    since a peer's image is installed, read back, and canonicalized);
+    /// 2. the output is always a *prefix* — never grown, never rewritten;
+    /// 3. canonicalization is idempotent;
+    /// 4. **the loop guard itself**: for a blob that describes itself
+    ///    completely, appending allocator slack cannot change the result.
+    ///    That is the fixed point FR-3.3 needs — our own write reads back
+    ///    identical, so its content hash matches and the item is not
+    ///    offered back to the peer that sent it.
+    ///
+    /// Property 4 is stated over self-describing blobs on purpose, and the
+    /// exclusion is honest rather than convenient: a blob *shorter* than
+    /// its own header claims is kept whole (conservative, so a valid image
+    /// is never cut short), and appending enough bytes can complete it, so
+    /// its canonical form legitimately changes. Reaching that needs a
+    /// malformed source DIB *and* allocator rounding large enough to close
+    /// the gap, and even then it costs one extra bounce and then settles —
+    /// the completed blob is self-describing, so the next hop is stable.
+    /// It is not an unbounded loop, and the test says which set it covers.
+    #[test]
+    fn dib_length_arithmetic_holds_over_a_corpus_that_reaches_it() {
+        const HEADER_SIZES: [u32; 6] = [12, 40, 52, 56, 108, 124];
+        const WIDTHS: [i32; 12] = [0, 1, 2, 3, 5, 16, 64, 1024, 3840, 7680, i32::MAX, i32::MIN];
+        const HEIGHTS: [i32; 10] = [0, 1, 2, 3, 16, 1080, 2160, -1, -16, i32::MIN];
+        const PLANES: [u16; 4] = [0, 1, 2, u16::MAX];
+        const BIT_COUNTS: [u16; 10] = [0, 1, 2, 4, 8, 16, 24, 32, 48, 64];
+        const COMPRESSIONS: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, u32::MAX];
+        const SIZE_IMAGES: [u32; 6] = [0, 1, 64, 4096, 1 << 20, u32::MAX];
+        const CLR_USEDS: [u32; 6] = [0, 1, 255, 256, 257, u32::MAX];
+        const SLACKS: [usize; 6] = [0, 1, 3, 8, 16, 64];
+
+        // Deterministic, so a failure is reproducible from the seed alone.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pick = |len: usize, r: u64| usize::try_from(r % len as u64).unwrap_or(0);
+
+        let mut trimmed = 0usize; // property-4 evidence
+        let mut modelled = 0usize; // headers the arithmetic accepted
+
+        for iteration in 0..40_000u32 {
+            // Half the corpus is coherent — sized to its own geometry, so
+            // the trimming path is genuinely reached — and half is
+            // hostile, sized independently of what the header claims.
+            let coherent = iteration % 2 == 0;
+            let r = [
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+            ];
+            let header = if coherent {
+                Header {
+                    size: 40,
+                    width: [1, 2, 3, 5, 16, 64, 127, 256][pick(8, r[0])],
+                    height: [1, 2, 3, 16, 64, -1, -16, -64][pick(8, r[1])],
+                    planes: 1,
+                    bit_count: [1, 4, 8, 16, 24, 32][pick(6, r[2])],
+                    compression: [0, 3, 6][pick(3, r[3])],
+                    size_image: [0, 0, 0, 16][pick(4, r[4])],
+                    clr_used: [0, 0, 1, 16, 255, 256][pick(6, r[5])],
+                }
+            } else {
+                Header {
+                    size: HEADER_SIZES[pick(HEADER_SIZES.len(), r[0])],
+                    width: WIDTHS[pick(WIDTHS.len(), r[1])],
+                    height: HEIGHTS[pick(HEIGHTS.len(), r[2])],
+                    planes: PLANES[pick(PLANES.len(), r[3])],
+                    bit_count: BIT_COUNTS[pick(BIT_COUNTS.len(), r[4])],
+                    compression: COMPRESSIONS[pick(COMPRESSIONS.len(), r[5])],
+                    size_image: SIZE_IMAGES[pick(SIZE_IMAGES.len(), r[6])],
+                    clr_used: CLR_USEDS[pick(CLR_USEDS.len(), r[7])],
+                }
+            };
+            let slack = SLACKS[pick(SLACKS.len(), next())];
+
+            let mut blob = header.bytes();
+            if coherent {
+                // Grow to exactly what an independent reading of the
+                // format says this geometry needs, then add slack.
+                if let Some(len) = textbook_len(header)
+                    && len <= 1 << 20
+                {
+                    blob.resize(len, 0x5A);
+                }
+            } else {
+                let body = [0usize, 4, 40, 111, 1024, 4096][pick(6, next())];
+                blob.resize(40 + body, 0x5A);
+            }
+            blob.resize(blob.len() + slack, 0xAB);
+
+            let outcome = assert_canonical_properties(&blob, header, iteration);
+            trimmed += usize::from(outcome.trimmed);
+            modelled += usize::from(outcome.self_describing);
+        }
+
+        // Without this the test could silently regress into the shape it
+        // replaced: green, and never once past the first field check.
+        assert!(
+            trimmed > 1_000,
+            "the corpus barely reached the trimming path ({trimmed} trims); \
+             it is not testing the arithmetic"
+        );
+        assert!(
+            modelled > 1_000,
+            "too few self-describing blobs ({modelled}) to pin the loop guard"
+        );
+        eprintln!("structured DIB corpus: {trimmed} trims, {modelled} self-describing");
+
+        // Unstructured noise still must not panic — cheap, and the old
+        // test's one genuine contribution.
+        for len in 0..200usize {
+            let blob: Vec<u8> = (0..len)
+                .map(|_| u8::try_from(next() & 0xFF).unwrap_or(0))
+                .collect();
+            let out = super::canonical_dib(blob.clone());
+            assert_eq!(out.as_slice(), &blob[..out.len()]);
+        }
+    }
+
+    // ---- manual hardware validation (ADR 0014, docs/TESTING.md) ----------
+
+    /// **Manual.** Copy a real screenshot before running: press
+    /// `Win+Shift+S`, snip any region, then
+    /// `cargo test -p crossover-platform-windows -- --ignored
+    /// manual_a_real_snip`.
+    ///
+    /// Automated tests can only fabricate a DIB; this asserts that what
+    /// the Snipping Tool actually publishes is read as an image, is inside
+    /// the ceiling, and canonicalizes to a stable length (two consecutive
+    /// reads agree). It is the source-side half of the owner's
+    /// hardware-validation checklist.
+    #[test]
+    #[ignore = "manual: requires a real screenshot on the clipboard (Win+Shift+S)"]
+    fn manual_a_real_snip_is_read_as_a_stable_image() {
+        use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        let first = with_retry(|| clipboard.read()).unwrap();
+        let Some(ClipboardContent::Image {
+            format: ClipboardImageFormat::Dib,
+            bytes,
+        }) = first
+        else {
+            panic!("no image on the clipboard: take a snip with Win+Shift+S first");
+        };
+        assert!(bytes.len() <= super::MAX_CLIPBOARD_IMAGE_BYTES);
+        eprintln!("snip read as {} bytes of CF_DIB", bytes.len());
+
+        let again = with_retry(|| clipboard.read()).unwrap();
+        assert!(
+            again
+                == Some(ClipboardContent::Image {
+                    format: ClipboardImageFormat::Dib,
+                    bytes,
+                }),
+            "consecutive reads of the same snip disagreed"
+        );
+    }
+
+    /// **Manual.** Run it, then paste (`Ctrl+V`) into Paint, Word, and a
+    /// browser compose box, and confirm the gradient appears in each.
+    ///
+    /// It installs a recognizable 320×200 image and leaves it on the
+    /// clipboard. Automation can prove the bytes round-trip through Win32;
+    /// only a human can confirm that third-party applications accept what
+    /// this backend installs, which is the destination-side half of the
+    /// owner's checklist.
+    #[test]
+    #[ignore = "manual: leaves an image on the clipboard for a human to paste"]
+    fn manual_an_installed_image_pastes_into_other_applications() {
+        use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+
+        let (width, height) = (320i32, 200i32);
+        let mut bytes = dib(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let at = 40 + usize::try_from(y * width + x).expect("in range") * 4;
+                bytes[at] = u8::try_from(x * 255 / width).unwrap_or(0); // blue
+                bytes[at + 1] = u8::try_from(y * 255 / height).unwrap_or(0); // green
+                bytes[at + 2] = 0x40; // red
+                bytes[at + 3] = 0xFF; // alpha, ignored by BI_RGB
+            }
+        }
+        with_retry(|| {
+            clipboard.write(&ClipboardContent::Image {
+                format: ClipboardImageFormat::Dib,
+                bytes: bytes.clone(),
+            })
+        })
+        .unwrap();
+        eprintln!("a 320x200 blue/green gradient is on the clipboard; paste it now");
     }
 }

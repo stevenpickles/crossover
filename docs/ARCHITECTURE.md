@@ -134,6 +134,53 @@ Guidelines:
   practical. Platform quirks (hook timeout budgets, clipboard retry,
   DPI mapping — see SPECIFICATION.md §6) are handled *inside*
   `crossover-platform-windows`, surfacing as normalized events/errors.
+- `ClipboardProvider` on Windows handles two content types, each in the
+  OS's own representation (ADR 0014, and the rules that fall out of it are
+  written up on `crossover-platform-windows::clipboard`):
+  - **Read** prefers `CF_UNICODETEXT`, then `CF_DIB`. Windows *synthesizes*
+    the DIB family (`CF_BITMAP` ↔ `CF_DIB` ↔ `CF_DIBV5`) on demand and
+    reports synthesized formats as available, so one probe plus one
+    `GetClipboardData` covers every raster source and Crossover converts no
+    pixels itself.
+  - **Text wins on a mixed clipboard** (Excel, Word, browsers publish both).
+    A transaction carries one type; the image in a mixed item is a
+    rendering of its text, text pastes into strictly more places, and the
+    case ADR 0014 exists for — a screenshot — carries no text at all, so
+    the choice costs that case nothing. Both probes run under **one**
+    `OpenClipboard`: precedence decided across two opens could be applied
+    to a pair of clipboard states that never coexisted (text absent in the
+    first, an image found in the second), which is exactly what copying
+    twice in quick succession produces. Non-empty text returns without
+    probing `CF_DIB`, so the single open costs no extra lock time in the
+    common case.
+  - **Only copies happen under the clipboard lock.** It is machine-global,
+    so the UTF-16 decode and the DIB canonicalization — both of which
+    allocate — are handed back to the caller and run once it is closed.
+  - **The ceiling bites at the source.** `GlobalSize` gives the blob's size
+    before it is locked or copied, so an image past
+    `MAX_CLIPBOARD_IMAGE_BYTES` is reported *absent* rather than copied out
+    of the OS clipboard for a layer above to discard (FR-3.6, NFR-1). The
+    ceiling is mirrored into `crossover-platform` — which may carry no
+    dependencies — and a `crossover-core` test holds the mirror to the
+    protocol's value.
+  - **Bytes are canonicalized to the DIB's own length**, computed from the
+    `BITMAPINFOHEADER` alone and never from pixels. Not cosmetics: loop
+    prevention keys on the content hash, so trailing allocator slack that
+    varied per hop would make Crossover's own write read back as new
+    content — a sync loop, which is release-blocking. Anything the header
+    does not describe confidently keeps the blob whole, so the failure mode
+    is "a few unused bytes travel", never a truncated image.
+  - **Write** installs `CF_DIB` verbatim (Windows synthesizes the rest of
+    the family for pasting applications) and PNG verbatim under the
+    registered `"PNG"` format, with the known limitation that nothing is
+    synthesized from PNG. Nothing is ever transcoded between formats. The
+    same ceiling is mirrored onto this path as a backstop — the bound that
+    matters for NFR-1 is the one applied before an inbound image's
+    reassembly buffer is allocated, so nothing should arrive here
+    oversized, and a caller that is not the session fails closed rather
+    than reaching Win32. Type is judged before size, so an oversized JPEG
+    is refused for being a JPEG: the durable answer, where "too big"
+    invites a smaller retry that must also fail.
 - `InputCapture` on Windows is backed by two mechanisms rather than one
   (ADR 0007): low-level hooks, because only they can suppress an event
   locally, and Raw Input, because only it reports unaccelerated,
@@ -241,9 +288,11 @@ transaction left there would go on deciding conflict races (FR-3.5).
 writes a `ClipboardContent` (text or image-with-format); every raster
 format concern — `CF_DIB` and the rest — lives behind it in
 `crossover-platform-*`, and core names no OS clipboard format (NFR-4). The
-platform crate keeps its no-dependency rule, so its image-format tag is a
-deliberate mirror of the protocol's, reconciled by one wildcard-free
-mapping in `crossover-core::clipboard`.
+platform crate keeps its no-dependency rule, so its image-format tag and
+its image size ceiling are deliberate mirrors of the protocol's, reconciled
+by one wildcard-free mapping and one equality assertion in
+`crossover-core::clipboard`. §4 records what the Windows side of that
+boundary actually does.
 
 ### 5.3 Connection lifecycle
 
