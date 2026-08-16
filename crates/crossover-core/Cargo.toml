@@ -1,0 +1,30 @@
+[package]
+name = "crossover-core"
+version = "0.1.0"
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossover-platform = { workspace = true }
+crossover-protocol = { workspace = true }
+crossover-security = { workspace = true }
+
+# The net module (docs/ARCHITECTURE.md §3.1: networking folded into
+# core::net until a second transport appears). State machines stay pure;
+# I/O is confined to net.
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+crossover-platform = { workspace = true, features = ["fakes"] }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,103 @@
+# Tagged releases — docs/ROADMAP.md, packaging/README.md.
+#
+# A tag is the only trigger. The build refuses to call itself a release
+# unless the source agrees: `apps/build_identity.rs` asserts the tag matches
+# the workspace version and that the worktree is clean, so a mistagged or
+# dirty release fails here rather than shipping a binary that misreports
+# itself.
+#
+# The artifacts come from scripts/build.ps1 — the same script a maintainer
+# runs locally and the same one the CI `package` job runs — so a release is
+# not a special build path that only executes on release day.
+#
+# No third-party action publishes the release: `gh` is already installed on
+# the runner, and the repository pins actions by SHA precisely because every
+# action is supply chain.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      # Creating the release and uploading its assets.
+      contents: write
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history and tags: the build derives its identity from them,
+          # and a shallow clone cannot see the tag it is building.
+          fetch-depth: 0
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2
+        with:
+          tool: cargo-deny
+
+      # The full gate, deliberately: this is the one build where paying for
+      # the checks again is obviously worth it, and the artifacts and the
+      # verification then come from a single run rather than two.
+      - name: Build every deliverable
+        shell: pwsh
+        run: .\scripts\build.ps1
+
+      - name: Check the tag against the build
+        shell: pwsh
+        run: |
+          $manifest = Get-Content dist\artifacts.json -Raw | ConvertFrom-Json
+          $expected = "${{ github.ref_name }}".TrimStart('v')
+          if ($manifest.buildVersion -ne $expected) {
+              throw "tag ${{ github.ref_name }} but the binaries report $($manifest.buildVersion)"
+          }
+          if ($manifest.build.channel -ne 'release') {
+              throw "tagged build identifies as '$($manifest.build.channel)', not 'release'"
+          }
+          "Releasing $($manifest.buildVersion) from $($manifest.build.git_commit)"
+
+      # The changelog entry for this version is the release body, so the
+      # notes and the repository cannot drift apart.
+      - name: Extract the changelog entry
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($version))\]" |
+              Select-Object -First 1).LineNumber
+          if (-not $start) { throw "CHANGELOG.md has no entry for $version" }
+          $rest = $lines[$start..($lines.Count - 1)]
+          $next = ($rest | Select-String -Pattern '^## ' | Select-Object -First 1).LineNumber
+          $body = if ($next) { $rest[0..($next - 2)] } else { $rest }
+          # Link definitions are markdown plumbing, invisible when rendered
+          # and confusing in a plain-text notification; trailing blanks are
+          # just noise.
+          $body = @($body | Where-Object { $_ -notmatch '^\[[^\]]+\]:\s*http' })
+          while ($body.Count -gt 0 -and [string]::IsNullOrWhiteSpace($body[-1])) {
+              $body = $body[0..($body.Count - 2)]
+          }
+          Set-Content -Path release-notes.md -Value $body -Encoding utf8
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            --title "Crossover ${{ github.ref_name }}" `
+            --notes-file release-notes.md `
+            (Get-ChildItem dist -File | ForEach-Object { $_.FullName })

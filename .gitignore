@@ -1,0 +1,8 @@
+/target
+
+# Soak / diagnostic run logs — machine-specific, not artifacts
+soak*.log
+crossover-*.log
+
+# Local distribution bundles built by hand (packaging/README.md).
+/dist

@@ -1,0 +1,43 @@
+[package]
+name = "crossover"
+version = "0.1.0"
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+crossover-core = { workspace = true }
+crossover-platform = { workspace = true }
+# Depended on for all targets: off Windows it compiles as an empty shell
+# with no-op stubs (and pulls in no `windows` crate — that is Windows-gated
+# inside it), so the composition root can call platform hooks such as
+# `set_process_dpi_awareness` / `restore_system_cursors` unconditionally.
+crossover-platform-windows = { workspace = true }
+crossover-protocol = { workspace = true }
+crossover-security = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+# `test-util` for tokio's paused clock: the periodic metrics schedule is
+# about *when* something happens, and testing that against a real clock
+# would mean a test that sleeps for a quarter of an hour. A dev dependency,
+# so the shipped binary is unchanged.
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+# Windows-only: compile the app icon into crossover.exe (build.rs). A build
+# dependency, so it never enters the runtime graph.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[lints]
+workspace = true

@@ -1,0 +1,212 @@
+# Tri-OS CI gate — docs/TESTING.md §2, docs/ROADMAP.md Phase 0 exit criteria.
+#
+# Runs the four required checks on Windows, Linux, and macOS so that
+# platform-independent crates can never silently grow an OS-specific
+# dependency (NFR-4). The toolchain version is deliberately absent here:
+# rustup auto-installs the version pinned in rust-toolchain.toml, keeping a
+# single source of truth for the toolchain.
+#
+# Third-party actions are pinned to full commit SHAs (supply-chain hygiene,
+# consistent with the dependency policy in docs/ARCHITECTURE.md §7).
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main, "feature/**"]
+  schedule:
+    # A new advisory can land against unchanged code, so the dependency
+    # audit needs a heartbeat rather than only running on pushes.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: ci (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # An OS-specific failure should not mask results on the other OSes.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint (warnings denied)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+  # The deliverables, built by the same script a maintainer runs locally
+  # (scripts/build.ps1) — one code path, so a CI artifact and a hand-built one
+  # are the same thing. It waits on the gate above rather than repeating it:
+  # fmt/clippy/test already ran on this commit, on Windows among others, and
+  # artifacts.json records that the script's own checks were skipped so a
+  # skipped check can never read as a passed one.
+  package:
+    name: package (windows)
+    runs-on: windows-latest
+    needs: ci
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history and tags: the version a binary reports counts commits
+          # since the last release tag, which a shallow clone cannot see.
+          fetch-depth: 0
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Build every deliverable
+        shell: pwsh
+        run: .\scripts\build.ps1 -SkipChecks
+
+      - name: Upload the deliverables
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crossover-windows-x64
+          path: dist
+          retention-days: 14
+
+  # Dependency policy (deny.toml, docs/ARCHITECTURE.md §7): RustSec
+  # advisories, license compatibility, and source provenance. This one
+  # DOES gate — unlike coverage, a vulnerable or unmaintained dependency
+  # is a defect with a known fix, and the whole point is to hear about it
+  # before shipping rather than after. It runs on one OS because the
+  # dependency graph it inspects is the workspace's, not a platform's.
+  dependencies:
+    name: dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2
+        with:
+          tool: cargo-deny
+
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny --all-features check
+
+  # Coverage is reported, never gated: a percentage threshold rewards
+  # tests written to move a number. The HTML artifact makes "what is
+  # actually exercised" reviewable per change, which is the useful
+  # question (docs/TESTING.md §2). Windows because the platform crate's
+  # real-OS code only compiles and runs there — the leg with the most
+  # coverage to lose.
+  coverage:
+    name: coverage
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Install llvm-tools (instrumentation)
+        run: rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --workspace --html
+          cargo llvm-cov report --summary-only > coverage-summary.txt
+          type coverage-summary.txt
+
+      - name: Summarize in the job page
+        shell: bash
+        run: |
+          {
+            echo '### Coverage'
+            echo '```'
+            tail -n 25 coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the browsable report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-html
+          path: |
+            target/llvm-cov/html
+            coverage-summary.txt
+          retention-days: 14
+
+  # Short fuzz runs on every change (docs/TESTING.md §1.3): arbitrary
+  # network bytes must never panic the parsers. Extended runs are a later,
+  # scheduled concern; this catches regressions cheaply. One OS suffices —
+  # the parsers are platform-independent by construction.
+  fuzz-smoke:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      - name: Install nightly toolchain (sanitizer builds)
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Fuzz every parser briefly
+        # --target is explicit because cargo-fuzz defaults to its OWN
+        # compile-time triple, and the prebuilt binary is musl-linked —
+        # which would build the fuzz targets for musl, where ASan rejects
+        # the statically linked CRT.
+        run: |
+          for target in frame_decoder hello pairing_start pairing_confirm \
+                        clipboard_data clipboard_chunk clipboard_control input; do
+            cargo +nightly fuzz run "$target" \
+              --target x86_64-unknown-linux-gnu \
+              -- -max_total_time=20 -print_final_stats=1
+          done

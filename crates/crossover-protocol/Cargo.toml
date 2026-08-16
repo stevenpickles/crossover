@@ -1,0 +1,27 @@
+[package]
+name = "crossover-protocol"
+version = "0.1.0"
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No I/O, platform, or network dependencies: the protocol crate must stay
+# independently testable without sockets (docs/ARCHITECTURE.md §3). Pure
+# helper crates such as thiserror are acceptable.
+[dependencies]
+# Wire payload encoding per ADR 0001; serde stays an implementation detail
+# of this crate and does not leak across crate boundaries.
+postcard = { workspace = true }
+serde = { workspace = true }
+# Clipboard item hash verification at decode (ADR 0005).
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
