@@ -543,6 +543,7 @@ pub async fn run(
             result.context("waiting for Ctrl-C")?;
             println!("Shutting down.");
         }
+        () = log_metrics_periodically(&metrics) => {}
         () = console_loop(&control_events) => {
             // The user typed a quit command (or stdin closed with one).
             println!("Shutting down.");
@@ -591,6 +592,48 @@ fn close_live_sessions(registry: &SessionRegistry, metrics: &Metrics) {
     }
 }
 
+/// How often a running session writes its statistics to the log.
+///
+/// A soak lasting days is a few hundred records — nothing against a rolling
+/// file — and fine-grained enough to place a degradation in time rather
+/// than only learning it happened.
+const METRICS_LOG_INTERVAL: Duration = Duration::from_mins(15);
+
+/// Write the statistics to the log every [`METRICS_LOG_INTERVAL`], forever.
+///
+/// The shutdown dump is the *only* record a run leaves otherwise, and it is
+/// written after the run loop returns — so a worker that is killed rather
+/// than asked to stop leaves nothing at all, which is precisely how an
+/// unattended run under the service usually ends (`Stop-Service` terminates
+/// it, ADR 0011). Writing periodically means the numbers survive however the
+/// run ends, and turns a single figure into a series: successive records
+/// difference into "what happened during that stretch".
+///
+/// Never returns; it lives in the run loop's `select!` and is dropped with
+/// everything else at shutdown.
+async fn log_metrics_periodically(metrics: &Metrics) {
+    let mut tick = metrics_interval();
+    loop {
+        tick.tick().await;
+        metrics.snapshot().log(true);
+    }
+}
+
+/// The schedule those records keep.
+///
+/// `interval_at` rather than `interval`, because the latter fires
+/// immediately and a snapshot of a session that has done nothing yet is
+/// noise. `Delay` on a missed tick, so a loop that stalls does not repay the
+/// debt as a burst of identical records once it recovers.
+fn metrics_interval() -> tokio::time::Interval {
+    let mut tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + METRICS_LOG_INTERVAL,
+        METRICS_LOG_INTERVAL,
+    );
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick
+}
+
 /// Dump the run's statistics on shutdown (FR-7.3): the human-readable
 /// block to stdout, then the same numbers as one structured record for
 /// log post-processing. Always on shutdown, by design — no flag to
@@ -599,7 +642,7 @@ fn print_execution_metrics(metrics: &Metrics) {
     let report = metrics.snapshot();
     println!();
     println!("{report}");
-    report.log();
+    report.log(false);
 }
 
 /// Start the outbound role if an address was given: a supervised session
@@ -1866,6 +1909,35 @@ mod tests {
             report.total_connected_ms
         );
         assert_eq!(report.longest_session_ms, report.total_connected_ms);
+    }
+
+    /// A run that has just started has nothing worth recording, and
+    /// `tokio::time::interval` fires immediately by default — so the first
+    /// record has to be a full interval away, not at startup.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_periodic_record_waits_a_full_interval() {
+        use std::time::Duration;
+
+        use super::{METRICS_LOG_INTERVAL, metrics_interval};
+
+        let mut tick = metrics_interval();
+        assert!(
+            tokio::time::timeout(
+                METRICS_LOG_INTERVAL
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("the interval is longer than a second"),
+                tick.tick(),
+            )
+            .await
+            .is_err(),
+            "the first record fired before a full interval had passed"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), tick.tick())
+                .await
+                .is_ok(),
+            "the first record never arrived"
+        );
     }
 
     #[tokio::test]

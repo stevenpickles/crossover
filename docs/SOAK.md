@@ -860,6 +860,19 @@ With both machines running (Phase 5/6 setup), on machine A:
    bulk frame already in flight, which is what ADR 0013 and ADR 0014's
    chunking jointly bound. Record both numbers in the run's notes.
 
+   **You do not have to quit to get them.** The same figures are written to
+   `~/.crossover/logs` every 15 minutes while the run continues, so a
+   service-launched soak leaves them behind however it ends — including
+   `Stop-Service`, which terminates the worker outright and skips the
+   shutdown block entirely (ADR 0011). Interim records are marked, and every
+   field is cumulative, so the interval containing the big transfer is the
+   one where the maximum steps up:
+
+   ```powershell
+   Select-String 'execution metrics' "$env:USERPROFILE\.crossover\logs\crossover.*.log" |
+     ForEach-Object { $_.Line -replace '.*(interim=\S+).*(input_queue_max_us=\S+).*', '$1 $2' }
+   ```
+
    **What good looks like:** a mean in the tens of microseconds, and a
    maximum in single-digit milliseconds. A maximum in the *hundreds* of
    milliseconds means interactive frames queued behind bulk — the lane

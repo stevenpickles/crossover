@@ -619,8 +619,15 @@ pub struct Report {
 impl Report {
     /// Emit the snapshot as one structured `tracing` record (`snake_case`
     /// fields), for log post-processing alongside the human block.
-    pub fn log(&self) {
+    ///
+    /// `interim` marks a record taken while the run is still going, so a
+    /// reader can tell a periodic sample from the final one. Every field is
+    /// cumulative in both cases: successive records are differenced to see
+    /// what a stretch of the run did, and a running maximum simply steps up
+    /// at the record where it happened.
+    pub fn log(&self, interim: bool) {
         tracing::info!(
+            interim,
             frames_sent = self.frames_sent,
             frames_received = self.frames_received,
             bytes_sent = self.bytes_sent,
