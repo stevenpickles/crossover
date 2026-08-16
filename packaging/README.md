@@ -105,6 +105,39 @@ Artifacts). Push with:
 choco push crossover.<version>.nupkg -s <feed-url> --api-key <key>
 ```
 
+## Releasing, and the bump that has to follow it
+
+A release is cut on a `release/vX.Y.Z` branch off `dev`: audit the
+documentation, write the `CHANGELOG.md` entry, PR into `main`, tag `main`,
+then PR the branch back into `dev`. The tag triggers
+`.github/workflows/release.yml`, which builds with `scriptsuild.ps1` and
+publishes the artifacts with the changelog entry as the release notes.
+
+**Then bump `version` in the workspace `Cargo.toml` straight away.** This is
+not bookkeeping — leaving it alone breaks upgrades, silently:
+
+A development build names itself `<version>-dev.N.g<commit>`, and SemVer
+ranks a pre-release *below* the release it prefixes. So while the workspace
+still says `0.1.0` after `v0.1.0` ships, every build made is
+`0.1.0-dev.N` — a pre-release of the version already installed. Chocolatey
+correctly refuses it as a downgrade, `choco upgrade` reports the machine is
+already current, and testing the next build means `--force` or an uninstall.
+
+Bumping to `0.2.0` right after the release makes those builds `0.2.0-dev.N`,
+which sorts above `0.1.0` and below the eventual `0.2.0`. Both channels then
+behave:
+
+```powershell
+choco upgrade crossover -y -s <source>          # stays on 0.1.0
+choco upgrade crossover -y --pre -s <source>    # takes 0.2.0-dev.N
+```
+
+The version lives in one place — `[workspace.package]` in the root
+`Cargo.toml` — and every crate inherits it. That is deliberate: the build
+stamps each binary from its own crate version, so two manifests drifting
+apart would ship a `crossover.exe` and a `crossover-svc.exe` claiming
+different versions.
+
 ### The upgrade lock, handled
 
 A running service holds `crossover-svc.exe`, and its worker holds

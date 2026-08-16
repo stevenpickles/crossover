@@ -296,7 +296,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossover"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossover-platform",
  "crossover-protocol",
@@ -332,14 +332,14 @@ dependencies = [
 
 [[package]]
 name = "crossover-platform"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "crossover-platform-windows"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossover-platform",
  "tracing",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "postcard",
  "proptest",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-security"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossover-platform",
  "ed25519-dalek",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-svc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossover-platform-windows",
  "tracing-subscriber",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-test-peer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossover-core",

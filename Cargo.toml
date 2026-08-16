@@ -15,6 +15,19 @@ exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
+# One version for every crate, bumped once per release. Kept here rather
+# than repeated in eight manifests because `build_identity.rs` reads each
+# crate's own CARGO_PKG_VERSION: if the two binaries ever disagreed, they
+# would report different versions and the packaging script's consistency
+# check would reject the build — a drift that is easy to create and
+# tedious to diagnose.
+#
+# Bumped immediately *after* a release, not before the next one. A build
+# made after v0.1.0 shipped is `0.2.0-dev.N`, which sorts above 0.1.0, so it
+# installs as an upgrade; leaving it at 0.1.0 would make every development
+# build a *pre-release of the version already installed* and therefore
+# un-upgradeable.
+version = "0.2.0"
 # Nothing here is published to crates.io: this is one application in one
 # repository, and the crate split exists for internal boundaries
 # (docs/ARCHITECTURE.md §3), not distribution. Declaring it prevents an
