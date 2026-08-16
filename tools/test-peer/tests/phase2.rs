@@ -22,8 +22,8 @@ use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::{ClipboardFailure, ClipboardOp, InMemoryClipboard};
 use crossover_protocol::clipboard::{
     ApplyResult, ChunkOutcome, ChunkReassembly, ClipboardAccept, ClipboardApplied, ClipboardChunk,
-    ClipboardData, ClipboardMeta, ClipboardOffer, ContentType, ImageFormat, MAX_CHUNK_BYTES,
-    chunk_content, content_hash,
+    ClipboardData, ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
+    ImageFormat, MAX_CHUNK_BYTES, chunk_content, content_hash,
 };
 use crossover_protocol::hello::{FeatureFlags, MessageType};
 use crossover_test_peer::{TestConnection, TestNode};
@@ -184,6 +184,34 @@ async fn recv_typed(conn: &mut TestConnection, expected: MessageType) -> Vec<u8>
     })
     .await
     .expect("timed out waiting for a frame")
+}
+
+/// Assert the app sends nothing but keepalives for `window`.
+///
+/// "Zero payload bytes moved" is a statement about what does *not* appear
+/// on the wire, so proving it means watching the wire stay quiet rather
+/// than inspecting engine state.
+async fn expect_quiet(conn: &mut TestConnection, window: Duration) {
+    let unexpected = timeout(window, async {
+        loop {
+            let frame = conn.recv_frame().await.unwrap();
+            if frame.message_type == MessageType::Ping.wire() {
+                conn.send_frame(MessageType::Pong.wire(), 998, &[])
+                    .await
+                    .unwrap();
+                continue;
+            }
+            return frame;
+        }
+    })
+    .await;
+    if let Ok(frame) = unexpected {
+        panic!(
+            "expected no further traffic, got message type {} carrying {} bytes",
+            frame.message_type,
+            frame.payload.len()
+        );
+    }
 }
 
 /// Peer→app: an inline item lands on the app's clipboard and the ack
@@ -460,6 +488,87 @@ async fn a_local_image_is_offered_and_streamed_to_the_peer() {
     )
     .await
     .unwrap();
+}
+
+/// The payoff the offer round exists for (ADR 0014), and the Phase 7 exit
+/// criterion attached to it: an image crosses **once**. Re-offering content
+/// the app already holds costs one offer and one decline — no accept, no
+/// chunks, no payload bytes — instead of megabytes.
+///
+/// The engine has a unit test for the *decision*. What only a real session
+/// can show is that nothing followed the decline onto the wire, which is
+/// the half the criterion is actually about.
+#[tokio::test]
+async fn an_image_that_already_matches_is_declined_with_no_bytes_behind_it() {
+    use crossover_platform::ClipboardImageFormat;
+
+    let (side, mut conn) =
+        connected_pair_with(FeatureFlags::ALL, FeatureFlags::CHUNKED_CLIPBOARD).await;
+
+    // Pay the full cost once: the app copies a snip and streams it out.
+    let bytes = snip_bytes(MAX_CHUNK_BYTES * 2 + 5);
+    side.clipboard
+        .set_image_locally(ClipboardImageFormat::Dib, bytes.clone());
+
+    let payload = recv_typed(&mut conn, MessageType::ClipboardOffer).await;
+    let offer = ClipboardOffer::decode_payload(&payload).unwrap();
+    conn.send_frame(
+        MessageType::ClipboardAccept.wire(),
+        3,
+        &ClipboardAccept { id: offer.meta.id }
+            .encode_payload()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut reassembly = ChunkReassembly::begin(offer.meta).unwrap();
+    let streamed = loop {
+        let payload = recv_typed(&mut conn, MessageType::ClipboardChunk).await;
+        let chunk = ClipboardChunk::decode_payload(&payload).unwrap();
+        match reassembly.accept(&chunk).unwrap() {
+            ChunkOutcome::More => {}
+            ChunkOutcome::Complete(bytes) => break bytes,
+        }
+    };
+    assert_eq!(streamed, bytes);
+    conn.send_frame(
+        MessageType::ClipboardApplied.wire(),
+        4,
+        &ClipboardApplied {
+            id: offer.meta.id,
+            result: ApplyResult::Applied,
+        }
+        .encode_payload()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Now the peer copies that same image and offers it back — the
+    // re-paste. Same content, so the same hash; a new transaction id,
+    // because it is a new transaction.
+    let repeat = image_meta(0xBB, 9, &bytes);
+    assert_eq!(repeat.content_hash, offer.meta.content_hash);
+    conn.send_frame(
+        MessageType::ClipboardOffer.wire(),
+        5,
+        &ClipboardOffer { meta: repeat }.encode_payload().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let payload = recv_typed(&mut conn, MessageType::ClipboardDecline).await;
+    let decline = ClipboardDecline::decode_payload(&payload).unwrap();
+    assert_eq!(decline.id, repeat.id);
+    assert_eq!(
+        decline.reason,
+        DeclineReason::AlreadyHave,
+        "a re-offered image must be recognised, not re-transferred"
+    );
+
+    // The assertion the criterion is really made of: nothing follows.
+    expect_quiet(&mut conn, Duration::from_millis(400)).await;
 }
 
 /// The honesty rule, end to end (docs/PROTOCOL.md §3.1). The app side

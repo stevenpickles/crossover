@@ -13,11 +13,18 @@
 > to park the driver, the first real evidence on how `MAX_DEFERRED_EVENTS`
 > is sized).
 >
-> Two of the three exit criteria for the images half remain open: **hash-dedup
-> is not yet demonstrated** (a re-paste moving zero payload bytes), and the
-> input-latency guarantee under a saturating transfer is proven
-> *structurally* by the hermetic suite but has never been **measured** on
-> hardware, which is what the criterion asks for. Files/folders
+> **Hash-dedup is demonstrated** (feature/116): over a real session, an
+> image the receiver already holds costs one offer and one decline —
+> `AlreadyHave`, then silence on the wire — instead of megabytes. The engine
+> already decided this correctly; what was missing was proof that nothing
+> followed the decline onto the wire, which is the half the criterion is
+> about.
+>
+> One exit criterion for the images half remains open: the input-latency
+> guarantee under a saturating transfer is proven *structurally* by the
+> hermetic suite (frame order, deliberately never a stopwatch) but has never
+> been **measured**, which is what the criterion asks for — and there is no
+> input-latency metric to measure it with. Files/folders
 > ([ADR 0015](adr/0015-spooled-virtual-file-paste.md), still Proposed) is the
 > second sub-milestone and is not started.
 >
