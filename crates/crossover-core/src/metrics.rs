@@ -216,6 +216,14 @@ pub struct Metrics {
     input_queue_latency_count: AtomicU64,
     input_queue_latency_total_us: AtomicU64,
     input_queue_latency_max_us: AtomicU64,
+    // The same wait, split at the moment the writer picks the frame up.
+    // Waiting in the lane and waiting for the socket to accept the bytes
+    // have different causes and different fixes, and a single figure cannot
+    // tell them apart — which is the whole reason for measuring both.
+    input_lane_latency_total_us: AtomicU64,
+    input_lane_latency_max_us: AtomicU64,
+    input_write_latency_total_us: AtomicU64,
+    input_write_latency_max_us: AtomicU64,
 
     // ---- control & input ----
     control_gained: AtomicU64,
@@ -360,13 +368,29 @@ impl Metrics {
     /// running mean and maximum rather than a distribution — the guarantee
     /// is a bound, which the maximum states directly, and aggregating with
     /// atomics keeps the input path lock-free.
-    pub fn record_input_queue_latency(&self, micros: u32) {
+    ///
+    /// Recorded in two halves, because they fail for different reasons and
+    /// are fixed differently. `lane_us` is the wait before the writer picked
+    /// the frame up — the writer was busy with something else, which is what
+    /// a dedicated writer task would remove. `write_us` is how long the
+    /// socket took to accept these few dozen bytes — backpressure or the
+    /// link itself, which no amount of local scheduling improves.
+    pub fn record_input_queue_latency(&self, lane_us: u32, write_us: u32) {
+        let total = u64::from(lane_us) + u64::from(write_us);
         self.input_queue_latency_count
             .fetch_add(1, Ordering::Relaxed);
         self.input_queue_latency_total_us
-            .fetch_add(u64::from(micros), Ordering::Relaxed);
+            .fetch_add(total, Ordering::Relaxed);
         self.input_queue_latency_max_us
-            .fetch_max(u64::from(micros), Ordering::Relaxed);
+            .fetch_max(total, Ordering::Relaxed);
+        self.input_lane_latency_total_us
+            .fetch_add(u64::from(lane_us), Ordering::Relaxed);
+        self.input_lane_latency_max_us
+            .fetch_max(u64::from(lane_us), Ordering::Relaxed);
+        self.input_write_latency_total_us
+            .fetch_add(u64::from(write_us), Ordering::Relaxed);
+        self.input_write_latency_max_us
+            .fetch_max(u64::from(write_us), Ordering::Relaxed);
     }
 
     /// A completed clipboard round-trip latency, on the originating
@@ -478,6 +502,22 @@ impl Metrics {
             clipboard_abandoned: load(&self.clipboard_abandoned),
             clipboard_deferred_peak: load(&self.clipboard_deferred_peak),
             clipboard_latency_dropped: load(&self.clipboard_latency_dropped),
+            input_lane_avg_us: {
+                let n = load(&self.input_queue_latency_count);
+                (n > 0).then(|| {
+                    u32::try_from(load(&self.input_lane_latency_total_us) / n).unwrap_or(u32::MAX)
+                })
+            },
+            input_lane_max_us: (load(&self.input_queue_latency_count) > 0)
+                .then(|| u32::try_from(load(&self.input_lane_latency_max_us)).unwrap_or(u32::MAX)),
+            input_write_avg_us: {
+                let n = load(&self.input_queue_latency_count);
+                (n > 0).then(|| {
+                    u32::try_from(load(&self.input_write_latency_total_us) / n).unwrap_or(u32::MAX)
+                })
+            },
+            input_write_max_us: (load(&self.input_queue_latency_count) > 0)
+                .then(|| u32::try_from(load(&self.input_write_latency_max_us)).unwrap_or(u32::MAX)),
             input_queue_avg_us: {
                 let n = load(&self.input_queue_latency_count);
                 (n > 0).then(|| {
@@ -574,8 +614,19 @@ pub struct Report {
     pub clipboard_deferred_peak: u64,
     /// Latency samples dropped past the retention cap.
     pub clipboard_latency_dropped: u64,
+    /// Mean time an input frame waited *before the writer took it* (µs) —
+    /// the writer was busy with something else.
+    pub input_lane_avg_us: Option<u32>,
+    /// Worst lane wait (µs).
+    pub input_lane_max_us: Option<u32>,
+    /// Mean time the socket took to accept an input frame (µs) —
+    /// backpressure or the link, not scheduling.
+    pub input_write_avg_us: Option<u32>,
+    /// Worst write wait (µs).
+    pub input_write_max_us: Option<u32>,
     /// Mean input queue-to-wire latency (µs), if any input flowed. The
-    /// ADR 0013 guarantee, as a number rather than an ordering.
+    /// ADR 0013 guarantee, as a number rather than an ordering. The sum of
+    /// the two halves above.
     pub input_queue_avg_us: Option<u32>,
     /// Worst input queue-to-wire latency (µs) — the one a saturating bulk
     /// transfer would inflate if the lane split stopped working.
@@ -658,6 +709,10 @@ impl Report {
             control_denied = self.control_denied,
             capture_losses = self.capture_losses,
             input_queue_avg_us = self.input_queue_avg_us,
+            input_lane_avg_us = self.input_lane_avg_us,
+            input_lane_max_us = self.input_lane_max_us,
+            input_write_avg_us = self.input_write_avg_us,
+            input_write_max_us = self.input_write_max_us,
             input_queue_max_us = self.input_queue_max_us,
             input_queue_samples = self.input_queue_samples,
             input_events_sent = self.input_events_sent,
@@ -672,6 +727,50 @@ impl Report {
 
     /// The clipboard block of the shutdown report: one summary line, plus
     /// the sub-lines that only mean something when they happened.
+    /// The input block: volume, then the ADR 0013 guarantee as a number.
+    fn write_input(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "  input:      {} events sent ({} keys), {} events received ({} keys)",
+            self.input_events_sent,
+            self.key_events_sent,
+            self.input_events_received,
+            self.key_events_received,
+        )?;
+        // The ADR 0013 guarantee as a number. Printed only when input
+        // actually flowed, and last, so the line a soak is looking for is
+        // the one at the bottom of the block.
+        let (Some(avg), Some(max)) = (self.input_queue_avg_us, self.input_queue_max_us) else {
+            return Ok(());
+        };
+        writeln!(
+            f,
+            "                queue-to-wire avg {}, max {} (over {} frames)",
+            human_micros(avg),
+            human_micros(max),
+            self.input_queue_samples,
+        )?;
+        // Which half it was. Waiting for the writer and waiting for the
+        // socket have different causes and different remedies, so a reading
+        // that cannot tell them apart cannot be acted on.
+        match (
+            self.input_lane_avg_us,
+            self.input_lane_max_us,
+            self.input_write_avg_us,
+            self.input_write_max_us,
+        ) {
+            (Some(lane_avg), Some(lane_max), Some(write_avg), Some(write_max)) => write!(
+                f,
+                "                  waiting for the writer avg {}, max {}; for the socket avg {}, max {}",
+                human_micros(lane_avg),
+                human_micros(lane_max),
+                human_micros(write_avg),
+                human_micros(write_max),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     fn write_clipboard(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
@@ -806,27 +905,7 @@ impl fmt::Display for Report {
                 self.capture_losses
             )?;
         }
-        writeln!(
-            f,
-            "  input:      {} events sent ({} keys), {} events received ({} keys)",
-            self.input_events_sent,
-            self.key_events_sent,
-            self.input_events_received,
-            self.key_events_received,
-        )?;
-        // The ADR 0013 guarantee as a number. Printed only when input
-        // actually flowed, and last, so the line a soak is looking for is
-        // the one at the bottom of the block.
-        match (self.input_queue_avg_us, self.input_queue_max_us) {
-            (Some(avg), Some(max)) => write!(
-                f,
-                "                queue-to-wire avg {}, max {} (over {} frames)",
-                human_micros(avg),
-                human_micros(max),
-                self.input_queue_samples,
-            ),
-            _ => Ok(()),
-        }
+        self.write_input(f)
     }
 }
 
@@ -945,8 +1024,8 @@ mod tests {
     fn input_queue_latency_reaches_the_report_at_a_readable_scale() {
         let metrics = Metrics::new();
         metrics.record_sent(11, 40); // an InputBatch, so the line is earned
-        for micros in [40, 60, 2_500] {
-            metrics.record_input_queue_latency(micros);
+        for (lane, write) in [(30, 10), (40, 20), (2_000, 500)] {
+            metrics.record_input_queue_latency(lane, write);
         }
 
         let rendered = metrics.snapshot().to_string();
@@ -957,6 +1036,26 @@ mod tests {
         );
         assert!(rendered.contains("2.5ms"), "a slow wait in ms: {rendered}");
         assert!(rendered.contains("over 3 frames"), "{rendered}");
+    }
+
+    /// The whole point of the split is attribution, so a wait that is all
+    /// socket must not read as a wait for the writer, and vice versa.
+    #[test]
+    fn each_half_of_the_wait_is_attributed_to_its_own_cause() {
+        let stalled_writer = Metrics::new();
+        stalled_writer.record_sent(11, 40);
+        stalled_writer.record_input_queue_latency(300_000, 50);
+        let report = stalled_writer.snapshot();
+        assert_eq!(report.input_lane_max_us, Some(300_000));
+        assert_eq!(report.input_write_max_us, Some(50));
+        assert_eq!(report.input_queue_max_us, Some(300_050));
+
+        let stalled_socket = Metrics::new();
+        stalled_socket.record_sent(11, 40);
+        stalled_socket.record_input_queue_latency(50, 300_000);
+        let report = stalled_socket.snapshot();
+        assert_eq!(report.input_lane_max_us, Some(50));
+        assert_eq!(report.input_write_max_us, Some(300_000));
     }
 
     /// A run with no input says nothing rather than printing empty columns.

@@ -336,15 +336,23 @@ impl SessionWriter {
     /// matters under traffic nobody is waiting on. Saturates rather than
     /// wrapping — a wait past an hour is already a catastrophe, and the
     /// exact figure would not change the reading.
-    pub fn record_input_queue_latency(&self, message_type: u16, queued_at: Instant) {
+    pub fn record_input_queue_latency(
+        &self,
+        message_type: u16,
+        queued_at: Instant,
+        taken_at: Instant,
+    ) {
         let Some(metrics) = &self.metrics else {
             return;
         };
         if FrameClass::of(message_type) != FrameClass::Input {
             return;
         }
-        let micros = u32::try_from(queued_at.elapsed().as_micros()).unwrap_or(u32::MAX);
-        metrics.record_input_queue_latency(micros);
+        let micros = |span: Duration| u32::try_from(span.as_micros()).unwrap_or(u32::MAX);
+        metrics.record_input_queue_latency(
+            micros(taken_at.saturating_duration_since(queued_at)),
+            micros(taken_at.elapsed()),
+        );
     }
 
     /// Facts about this session.

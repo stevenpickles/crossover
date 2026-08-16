@@ -873,6 +873,24 @@ With both machines running (Phase 5/6 setup), on machine A:
      ForEach-Object { $_.Line -replace '.*(interim=\S+).*(input_queue_max_us=\S+).*', '$1 $2' }
    ```
 
+   **Record the link type with the numbers.** ADR 0013's chunk-size
+   arithmetic assumes wired 2.5 GbE; a figure taken over WiFi is measuring a
+   different thing, and the 2026-08-16 reading (mean 1.94 ms, max 309.8 ms)
+   was wireless. A reading without its link is not comparable to anything.
+
+   The block also attributes the wait:
+
+   ```
+                 queue-to-wire avg 1.9ms, max 309.8ms (over 7571 frames)
+                   waiting for the writer avg 1.2ms, max 305.0ms; for the socket avg 0.7ms, max 12.3ms
+   ```
+
+   **Waiting for the writer** means the frame sat while the writer was busy
+   with something else — bulk in flight, which a dedicated writer task would
+   fix. **Waiting for the socket** means these few dozen bytes themselves
+   took that long to be accepted — backpressure or the link, which no local
+   scheduling improves. Which half dominates decides what to do about it.
+
    **What good looks like:** a mean in the tens of microseconds, and a
    maximum in single-digit milliseconds. A maximum in the *hundreds* of
    milliseconds means interactive frames queued behind bulk — the lane
