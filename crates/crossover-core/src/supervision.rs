@@ -447,6 +447,17 @@ pub async fn run_session(
                             Some(&mut write_health),
                         )
                         .await;
+                        // Measured here rather than at dequeue: the wait an
+                        // input frame actually suffers includes the writer
+                        // being busy with a bulk frame already in flight,
+                        // which is the other half of what ADR 0013 and
+                        // 0014's chunking jointly bound.
+                        if result.is_ok() {
+                            writer.record_input_queue_latency(
+                                frame.message_type,
+                                frame.queued_at,
+                            );
+                        }
                         // Dropping the frame returns its Background byte
                         // budget, so the lane only refills once the bytes
                         // are actually out of our hands.

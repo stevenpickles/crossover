@@ -35,6 +35,7 @@
 //! answers `Pong` from the dispatch path.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
@@ -330,6 +331,29 @@ pub fn budgeted_channel<T>(
 // The two-lane outbound path
 // ---------------------------------------------------------------------------
 
+/// A frame sitting in a lane, carrying when it was handed over.
+///
+/// The timestamp rides with the frame rather than being taken at the
+/// writer, because the wait it measures is the queueing itself — the exact
+/// thing a saturating Background transfer is not allowed to lengthen for
+/// interactive traffic (ADR 0013).
+#[derive(Debug)]
+struct Pending {
+    message_type: u16,
+    payload: Vec<u8>,
+    queued_at: Instant,
+}
+
+impl Pending {
+    fn now(message_type: u16, payload: Vec<u8>) -> Self {
+        Self {
+            message_type,
+            payload,
+            queued_at: Instant::now(),
+        }
+    }
+}
+
 /// One frame on its way to the writer, with the class it was scheduled as
 /// and (for Background) the byte budget it still holds. Dropping it after
 /// the write returns that budget to the lane.
@@ -342,25 +366,31 @@ pub struct OutboundFrame {
     /// The lane it came from — diagnostics and tests; the writer treats
     /// every frame the same once scheduled.
     pub priority: SendPriority,
+    /// When the producer handed this frame over. The writer measures
+    /// against it to report how long interactive traffic waited for the
+    /// wire — the ADR 0013 guarantee, as a number.
+    pub queued_at: Instant,
     _hold: Option<BudgetHold>,
 }
 
 impl OutboundFrame {
-    fn high(message_type: u16, payload: Vec<u8>) -> Self {
+    fn high(queued: Pending) -> Self {
         Self {
-            message_type,
-            payload,
+            message_type: queued.message_type,
+            payload: queued.payload,
             priority: SendPriority::High,
+            queued_at: queued.queued_at,
             _hold: None,
         }
     }
 
-    fn background(budgeted: Budgeted<(u16, Vec<u8>)>) -> Self {
-        let ((message_type, payload), hold) = budgeted.into_parts();
+    fn background(budgeted: Budgeted<Pending>) -> Self {
+        let (queued, hold) = budgeted.into_parts();
         Self {
-            message_type,
-            payload,
+            message_type: queued.message_type,
+            payload: queued.payload,
             priority: SendPriority::Background,
+            queued_at: queued.queued_at,
             _hold: Some(hold),
         }
     }
@@ -371,8 +401,8 @@ impl OutboundFrame {
 /// the moment a frame is handed over.
 #[derive(Debug, Clone)]
 pub struct OutboundSender {
-    high: mpsc::Sender<(u16, Vec<u8>)>,
-    background: BudgetedSender<(u16, Vec<u8>)>,
+    high: mpsc::Sender<Pending>,
+    background: BudgetedSender<Pending>,
 }
 
 impl OutboundSender {
@@ -390,12 +420,14 @@ impl OutboundSender {
         match SendPriority::of(message_type) {
             SendPriority::High => self
                 .high
-                .send((message_type, payload))
+                .send(Pending::now(message_type, payload))
                 .await
                 .map_err(|_| OutboundClosed),
             SendPriority::Background => {
                 let bytes = payload.len();
-                self.background.send((message_type, payload), bytes).await
+                self.background
+                    .send(Pending::now(message_type, payload), bytes)
+                    .await
             }
         }
     }
@@ -410,16 +442,16 @@ impl OutboundSender {
         match SendPriority::of(message_type) {
             SendPriority::High => self
                 .high
-                .try_send((message_type, payload))
+                .try_send(Pending::now(message_type, payload))
                 .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full((_, queued))
-                    | mpsc::error::TrySendError::Closed((_, queued)) => queued,
+                    mpsc::error::TrySendError::Full(queued)
+                    | mpsc::error::TrySendError::Closed(queued) => queued.payload,
                 }),
             SendPriority::Background => {
                 let bytes = payload.len();
                 self.background
-                    .try_send((message_type, payload), bytes)
-                    .map_err(|(_, queued)| queued)
+                    .try_send(Pending::now(message_type, payload), bytes)
+                    .map_err(|queued| queued.payload)
             }
         }
     }
@@ -483,8 +515,8 @@ async fn drain_high_first<T>(
 /// priority real.
 #[derive(Debug)]
 pub struct OutboundReceiver {
-    high: mpsc::Receiver<(u16, Vec<u8>)>,
-    background: BudgetedReceiver<(u16, Vec<u8>)>,
+    high: mpsc::Receiver<Pending>,
+    background: BudgetedReceiver<Pending>,
     high_closed: bool,
     background_closed: bool,
 }
@@ -504,7 +536,7 @@ impl OutboundReceiver {
         )
         .await?;
         Some(match lane {
-            Lane::High((message_type, payload)) => OutboundFrame::high(message_type, payload),
+            Lane::High(queued) => OutboundFrame::high(queued),
             Lane::Background(budgeted) => OutboundFrame::background(budgeted),
         })
     }
@@ -680,6 +712,34 @@ pub fn command_lanes() -> (CommandSender, CommandReceiver) {
 
 #[cfg(test)]
 mod tests {
+    /// The stamp has to be taken when the producer hands the frame over,
+    /// not when the writer picks it up — otherwise a frame that waited
+    /// behind a bulk backlog would report no wait at all, which is the one
+    /// reading that must never be wrong.
+    #[tokio::test]
+    async fn a_frame_reports_the_time_it_spent_waiting() {
+        use std::time::Duration;
+
+        use crossover_protocol::hello::MessageType;
+
+        let (tx, mut rx) = super::outbound_channel();
+        tx.send(MessageType::InputBatch.wire(), b"moved".to_vec())
+            .await
+            .unwrap();
+
+        // Held in the lane, exactly as a saturated writer would hold it.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let frame = rx.recv().await.expect("a queued frame");
+        // A lower bound: sleeping longer can only make this larger, so a
+        // loaded runner cannot flake it.
+        assert!(
+            frame.queued_at.elapsed() >= Duration::from_millis(30),
+            "a frame held for 30ms reported {:?}",
+            frame.queued_at.elapsed()
+        );
+    }
+
     use std::time::Duration;
 
     use tokio::time::timeout;

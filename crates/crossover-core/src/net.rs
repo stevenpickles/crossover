@@ -14,7 +14,7 @@
 //! `CONNECTING → AUTHENTICATING → NEGOTIATING → ESTABLISHED`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -27,7 +27,7 @@ use crossover_protocol::hello::{FeatureFlags, Hello, MessageType, OsFamily};
 use crossover_protocol::version::{MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionRange};
 use crossover_protocol::{FrameDecoder, ProtocolError, RawFrame, encode_frame, negotiate};
 
-use crate::metrics::Metrics;
+use crate::metrics::{FrameClass, Metrics};
 use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TlsError, TrustStore,
     certificate_spki_fingerprint, client_tls_config, server_tls_config,
@@ -328,6 +328,25 @@ pub struct SessionWriter {
 }
 
 impl SessionWriter {
+    /// Record how long an *input* frame waited between being queued and
+    /// reaching the wire (ADR 0013).
+    ///
+    /// Only input: the guarantee is about interactive responsiveness, and
+    /// timing keepalives or bulk chunks here would bury the number that
+    /// matters under traffic nobody is waiting on. Saturates rather than
+    /// wrapping — a wait past an hour is already a catastrophe, and the
+    /// exact figure would not change the reading.
+    pub fn record_input_queue_latency(&self, message_type: u16, queued_at: Instant) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        if FrameClass::of(message_type) != FrameClass::Input {
+            return;
+        }
+        let micros = u32::try_from(queued_at.elapsed().as_micros()).unwrap_or(u32::MAX);
+        metrics.record_input_queue_latency(micros);
+    }
+
     /// Facts about this session.
     #[must_use]
     pub fn info(&self) -> &SessionInfo {
