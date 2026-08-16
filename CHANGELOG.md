@@ -94,6 +94,15 @@ a `NUL` stderr.
 - **No automatic updates.** Upgrading means installing the new package.
 - **Images are capped at 64 MiB** and oversized captures are skipped with a
   log line rather than transferred.
+- **Input latency under a saturating bulk transfer does not meet its own
+  criterion.** Measured on hardware over **WiFi**: mean 1.94 ms, worst case
+  309.8 ms, against a design expectation of tens of microseconds and
+  single-digit milliseconds. Input still preempts bulk *between* frames as
+  designed, but a frame already being written blocks the session loop until
+  the socket accepts it, and on a contended wireless link that can be a
+  third of a second. Wired is untested and the arithmetic in ADR 0013
+  assumed 2.5 GbE. Nothing is dropped or stuck; a large transfer can make
+  the pointer feel less immediate than it does at rest.
 - A worker has been seen not exiting after a clean shutdown; the cause is
   unidentified, but a stuck message pump can no longer wedge the process —
   it is named in a warning and detached.

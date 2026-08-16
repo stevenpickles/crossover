@@ -20,15 +20,40 @@
 > followed the decline onto the wire, which is the half the criterion is
 > about.
 >
-> **Input latency is now measurable** (feature/117): every input frame is
-> timed from the moment it is handed to the send path to the moment it
-> reaches the wire — queueing plus the writer's wait behind a bulk frame in
-> flight, which is what ADR 0013 and ADR 0014's chunking jointly bound. The
-> mean and maximum land in the shutdown block, and the hermetic suite
-> asserts the measurement happens *under saturation* without asserting a
-> bound a loaded CI runner could miss. **The criterion is met when the
-> number is taken on hardware**: docs/SOAK.md step 5 says how, and what good
-> looks like. Files/folders
+> **Input latency was measured, and it does not meet the criterion.**
+> Instrumented in feature/117 — every input frame timed from the moment it
+> is handed to the send path to the moment it reaches the wire — and read on
+> hardware 2026-08-16 during a saturating image transfer (~127 MiB sent,
+> 7,571 input frames timed):
+>
+> | | measured | expected |
+> |---|---|---|
+> | mean | **1.94 ms** | tens of µs |
+> | max | **309.8 ms** | single-digit ms |
+>
+> ADR 0013 costed a 64 KiB chunk at "0.21 ms of 2.5 GbE, so one chunk of
+> worst-case input delay stays sub-millisecond". The measured mean already
+> breaks that, and the maximum is three orders of magnitude past it.
+>
+> **Two caveats on the reading, neither of which rescues it.** The link was
+> **WiFi**, not the wired 2.5 GbE the arithmetic assumed, so airtime and
+> retransmission are in the number; a wired re-measurement is the
+> apples-to-apples test of the ADR's claim. And the figure deliberately
+> spans both the wait for the writer *and* the wait for the socket, so it
+> does not yet say which dominates — feature/118 splits it, and the next run
+> will attribute it.
+>
+> The mechanism is already documented rather than newly discovered:
+> [ARCHITECTURE.md](ARCHITECTURE.md) §5.4 records that the session loop
+> polls nothing while a write is pending, names "moving the writer to its
+> own task" as the fix that "would remove the freeze entirely", and defers
+> it as needing an ADR of its own. This measurement is the evidence that the
+> deferral now has a cost worth pricing. `clipboard_deferred_peak` also went
+> non-zero (1) for the first time, so the Background lane genuinely backed
+> up.
+>
+> Nothing here is unsafe or stuck; it is responsiveness under a saturating
+> bulk transfer, on a link that was never the design target. Files/folders
 > ([ADR 0015](adr/0015-spooled-virtual-file-paste.md), still Proposed) is the
 > second sub-milestone and is not started.
 >
