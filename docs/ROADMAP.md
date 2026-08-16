@@ -434,11 +434,24 @@ after images, given the added security surface.
 **Goal:** prove the architecture is genuinely portable.
 
 Deliverables: `crossover-platform-macos` and `crossover-platform-linux`
-(created now, not before — [ARCHITECTURE.md](ARCHITECTURE.md) §3.1), with a
-risk catalogue per platform written before implementation (macOS:
-accessibility permissions, event taps, pasteboard, Keychain; Linux:
-X11/Wayland split, clipboard ownership semantics, injection permissions,
-secret-service). Rich-clipboard image/file support (Phase 7) carries over here
+(created now, not before — [ARCHITECTURE.md](ARCHITECTURE.md) §3.1). The
+risk catalogues this phase requires **before** implementation are written:
+[platform-risks-macos.md](platform-risks-macos.md) (M-1..M-10) and
+[platform-risks-linux.md](platform-risks-linux.md) (L-1..L-9).
+
+Two findings from writing them change how the phase should start:
+
+- **L-1 decides the Linux port's shape.** Wayland prohibits global input
+  capture and injection by design; the sanctioned routes are compositor
+  portals whose coverage varies. Verify that on current GNOME and KDE
+  *before* any Linux code, because the answer is either "a port" or "X11
+  today, Wayland when the portals are ready".
+- **M-5 and L-9 agree that `CF_DIB` is the outlier.** Neither macOS nor
+  Linux clipboards understand it, and PNG is the plausible interchange
+  format. Deciding that touches the wire, so it wants an ADR rather than a
+  quiet choice inside a platform crate — and it contradicts this phase's
+  own premise that rich clipboard "carries over as new implementations of
+  the clipboard trait, not new protocol design". Rich-clipboard image/file support (Phase 7) carries over here
 as new implementations of the clipboard trait, not new protocol design.
 
 Exit criteria: core feature set works Windows↔Windows, Windows↔macOS,

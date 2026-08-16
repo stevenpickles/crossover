@@ -79,6 +79,8 @@ names the commit it came from and admits to uncommitted edits.
 | [docs/TESTING.md](docs/TESTING.md) | Testing strategy and Definition of Done |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Development phases and exit criteria |
 | [docs/adr/](docs/adr/README.md) | Architectural decision records |
+| [docs/platform-risks-macos.md](docs/platform-risks-macos.md) | What a macOS port will fight, catalogued before it exists |
+| [docs/platform-risks-linux.md](docs/platform-risks-linux.md) | The same for Linux, where the X11/Wayland split decides the shape |
 
 Vulnerability reporting: [SECURITY.md](SECURITY.md).
 
