@@ -835,8 +835,10 @@ ceiling buys reach and spends responsiveness.
   stamp Mark-of-the-Web on the pasted file across the Explorer versions we care
   about, or whether the marking is only reliable on the spool copy. A
   verify-at-implementation item, not a design fork.
-- **Clipboard History (Win+V) and Cloud Clipboard**, per the clipboard-
-  integration section: whether the history service renders `CFSTR_FILECONTENTS`
+- ~~**Clipboard History (Win+V) and Cloud Clipboard.**~~ Settled below: the
+  file item is excluded (F16), text and images are disclosed rather than
+  suppressed. The behavioural half remains verify-before-ship, per the
+  clipboard-integration section: whether the history service renders `CFSTR_FILECONTENTS`
   at copy time (which would defeat delayed rendering), whether
   `CanIncludeInClipboardHistory` and
   `ExcludeClipboardContentFromMonitorProcessing` reliably keep the item out of
@@ -900,6 +902,33 @@ It also produced one rule the ADR did not state: the commit waits for the
 *write* of the final chunk to be confirmed, not merely for the hash to
 verify, since an entry promoted ahead of its own last bytes would be
 registered before it was whole.
+
+### Clipboard History and Cloud Clipboard: exclude the item, disclose the rest
+
+The ADR listed this as one open question. It is two, and they have different
+answers (maintainer, 2026-08-17).
+
+**The file item is excluded from both**, and the deciding reason is not the
+cloud one the ADR leads with — it is that a history entry for a virtual file
+list is *a promise that cannot be kept*. The render callback can only be
+answered by this process holding this spool entry, and the object dies with
+the worker while the entry is collected when the clipboard moves on. A
+retained Win+V entry would therefore fail on paste, later, with no diagnostic
+from us. "No entry" beats "an entry that breaks", and that argument holds
+whatever the cloud service does. Recorded as SECURITY.md **F16**. The two
+behavioural questions the ADR raised are unchanged and still verify-before-ship:
+whether history renders `CFSTR_FILECONTENTS` at copy time, and whether the
+opt-out formats are honoured on the supported builds.
+
+**Text and images are left alone.** Crossover sets no exclusion formats on any
+write today, so a user with Cloud Clipboard enabled has already been syncing
+peer-delivered *text* to their Microsoft account — a larger surface than files
+and one that predates this ADR. Suppressing it would silently break Win+V for
+ordinary synchronized text, which is a real usability loss and a surprising
+one, and invariant 7 is a claim about what Crossover introduces rather than
+about the user's own OS features. So the gap is closed by naming it — in
+invariant 7, in the threat table as T22, and in the README — rather than by
+overriding a setting the user chose.
 
 ### What is deliberately not here yet
 
