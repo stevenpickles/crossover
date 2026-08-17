@@ -1,7 +1,7 @@
 # 0015. Files and folders spool internally and paste as virtual files
 
-Status: Proposed (Phase 7 — design captured 2026-08-11, model revised
-2026-08-12, not yet scheduled)
+Status: Accepted (design captured 2026-08-11, model revised 2026-08-12,
+open forks settled and accepted 2026-08-17)
 Date: 2026-08-12
 
 ## Context

@@ -63,8 +63,8 @@
 >
 > Nothing here is unsafe or stuck; it is responsiveness under a saturating
 > bulk transfer, on a link that was never the design target. Files/folders
-> ([ADR 0015](adr/0015-spooled-virtual-file-paste.md), still Proposed) is the
-> second sub-milestone and is not started.
+> ([ADR 0015](adr/0015-spooled-virtual-file-paste.md), **Accepted**
+> 2026-08-17) is the second sub-milestone and is where the work goes next.
 >
 > Phase 6 (Windows Prototype Hardening) closed 2026-08-14: the multi-day
 > unattended soak — the last exit criterion — ran 2026-08-11 → 2026-08-14
