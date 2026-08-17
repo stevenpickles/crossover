@@ -102,8 +102,19 @@ addresses.
   peer, existing records included, and only an explicit user grant turns it on
   (invariant 8, §7). A trust store written before file transfer existed reads
   back as `file_receive: false`; no migration may enable it.
-- `crossover peers` lists the store; `crossover peers remove <device-id>`
-  revokes (a `show` subcommand can come later). Removal revokes
+- The at-rest blob is versioned, and the version selects the decoder *before*
+  anything is decoded. `file_receive` arrived with format version 2; version 1
+  keeps a frozen decoder of its own, whose upgrade sets the flag to a literal
+  `false`. This is not optional carefulness: the store is postcard-encoded, so
+  fields are positional with no names and no defaults, and decoding a version-1
+  record against the current record shifts every field after the fourth
+  permission byte — the byte that would be read as `file_receive` is the
+  remembered-address count. An appended field would therefore either lose the
+  store or grant a filesystem write nobody consented to.
+- `crossover peers` lists the store, including each peer's file permission;
+  `crossover peers remove <device-id>` revokes trust entirely, and
+  `crossover peers allow-files <device-id>` / `deny-files <device-id>` grant and
+  withdraw `file_receive` (a `show` subcommand can come later). Removal revokes
   authorization immediately (FR-1.4): future connections are rejected (the
   store is re-read on every accept/attempt), and active sessions from that
   identity are terminated within the running process's trust-store poll

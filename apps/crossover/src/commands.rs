@@ -158,6 +158,17 @@ pub fn peers_list() -> anyhow::Result<()> {
             peer.last_connected_unix()
                 .map_or_else(|| "never".to_owned(), age)
         );
+        // Printed for every peer, granted or not: a permission you can
+        // only see when it is on is one you cannot audit (ADR 0015 —
+        // this is the grant that reaches the filesystem).
+        println!(
+            "      send files:     {}",
+            if peer.may_receive_files() {
+                "ALLOWED"
+            } else {
+                "not allowed"
+            }
+        );
         if !peer.remembered_addresses().is_empty() {
             println!(
                 "      addresses:      {}",
@@ -167,6 +178,63 @@ pub fn peers_list() -> anyhow::Result<()> {
     }
     println!();
     println!("Revoke a peer with `crossover peers remove <device-id>`.");
+    println!(
+        "Let a peer send you files with `crossover peers allow-files <device-id>` \
+         (`deny-files` to withdraw)."
+    );
+    Ok(())
+}
+
+/// `crossover peers allow-files <device-id>` / `peers deny-files <device-id>`
+///
+/// The only path that changes `file_receive`, and it takes a device id the
+/// user typed on the receiving machine. Nothing on the wire reaches here:
+/// pairing does not grant the permission and a peer cannot ask for it
+/// (docs/SECURITY.md invariant 8, ADR 0015).
+pub fn peers_set_file_receive(device_id: Uuid, allowed: bool) -> anyhow::Result<()> {
+    let storage = open_secure_storage()?;
+    let mut store = TrustStore::load(&*storage).context("loading trust store")?;
+
+    let Some(previous) = store.set_file_receive(device_id, allowed) else {
+        anyhow::bail!("no trusted peer with device id {device_id}; `crossover peers` lists them");
+    };
+    let name = store
+        .find_by_peer_id(device_id)
+        .map_or_else(String::new, |peer| peer.device_name().to_owned());
+
+    if previous == allowed {
+        println!(
+            "\"{name}\" ({device_id}) may {}send you files; nothing changed.",
+            if allowed { "already " } else { "already not " }
+        );
+        return Ok(());
+    }
+    store.save(&*storage).context("persisting trust store")?;
+    // A permission change on the filesystem-write surface belongs in the
+    // log as well as on the terminal: it is the record of who consented to
+    // what, and when (NFR-3).
+    tracing::info!(
+        peer = %device_id,
+        file_receive = allowed,
+        "file-receive permission changed"
+    );
+
+    if allowed {
+        println!(
+            "\"{name}\" ({device_id}) may now send you files. Offers from other \
+             peers are still refused."
+        );
+        println!(
+            "Withdraw it with `crossover peers deny-files {device_id}`; revoking \
+             trust entirely removes it too."
+        );
+    } else {
+        println!(
+            "\"{name}\" ({device_id}) may no longer send you files. Further offers \
+             are refused; anything already delivered stays where it landed \
+             (ADR 0015)."
+        );
+    }
     Ok(())
 }
 

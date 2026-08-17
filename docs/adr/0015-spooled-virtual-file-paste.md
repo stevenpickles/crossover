@@ -665,10 +665,22 @@ NFR-4.
   Wayland clipboard models, and the drop folder is the standing fallback
   candidate there. Neither is designed in this ADR.
 - **Schema addition in one persisted store:** `PeerPermissions` gains
-  `file_receive`. Additive and optional, so existing files keep loading, and
-  reading an older store yields `false`. **The config file gains nothing** —
-  the drop-folder key is not introduced, which is one fewer persisted surface
-  than the previous draft.
+  `file_receive`, and reading an older store yields `false`. **Implementation
+  correction (2026-08-17):** this ADR originally called that addition "additive
+  and optional, so existing files keep loading". It is not. The trust store is
+  postcard-encoded, so its fields are positional with no names and no defaults;
+  appending the flag shifts every field of an existing record after the fourth
+  permission byte, and the byte that lands where the new flag is read is the
+  length prefix of `remembered_addresses` — `1`, i.e. *granted*, for any peer
+  with a remembered address. The realistic outcome is a store that fails to
+  load; the unacceptable one is a store that loads with a filesystem-write
+  permission the user never gave. So the at-rest **format version moves to 2**,
+  the version byte selects the decoder before any decoding happens, and version
+  1 keeps a frozen decoder whose upgrade writes `file_receive: false` as a
+  literal. The user-visible consequence is unchanged — old stores load, with the
+  permission off — but it is a versioned migration, not a free field. **The
+  config file gains nothing** — the drop-folder key is not introduced, which is
+  one fewer persisted surface than the previous draft.
 - **A new sender-only dependency** (a zip *writer*). Nothing in the workspace
   gains an archive *reader*, so the supply-chain and parsing surface is
   write-path only.
