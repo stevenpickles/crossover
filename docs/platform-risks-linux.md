@@ -1,7 +1,7 @@
 # Known platform risks — Linux
 
 Written **before** `crossover-platform-linux` exists, as
-[ROADMAP.md](ROADMAP.md) Phase 8 requires, in the same spirit as
+[ROADMAP.md](ROADMAP.md) Phase 9 requires, in the same spirit as
 [SPECIFICATION.md](SPECIFICATION.md) §6 for Windows.
 
 **Every entry here is a hypothesis until it runs on real desktops**, and
@@ -188,5 +188,5 @@ Wayland session that cannot capture input makes L-6 and L-7 moot and turns
 the port into "X11 today, Wayland when the portals are ready".
 
 **Verify L-1 before writing any Linux code**, on current GNOME and KDE. The
-answer determines whether Phase 8's Linux half is a port or a research
+answer determines whether Phase 9's Linux half is a port or a research
 project, and that is worth knowing before a crate exists.

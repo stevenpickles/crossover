@@ -92,6 +92,21 @@
 > [ADR 0012](adr/0012-elevated-worker-integrity.md)), and Windows packaging —
 > were validated on hardware as they landed.
 >
+> **Sequencing (2026-08-16):** after Phase 7's files half, the next phase is
+> **dynamic display topology with a drag-and-drop editor** — maintainer
+> decision. Cross-platform validation moves to Phase 9 and productization to
+> Phase 10. The reasoning is that two Windows machines sharing a keyboard and
+> mouse *well* are worth more than three platforms sharing one adequately,
+> and that the topology model is far easier to change before three platform
+> crates depend on it than after. The macOS and Linux risk catalogues written
+> for the old Phase 8 keep their value and simply wait
+> ([platform-risks-macos.md](platform-risks-macos.md),
+> [platform-risks-linux.md](platform-risks-linux.md)).
+>
+> Accepted ADRs that name "Phase 8" meaning cross-platform are left as
+> written — they are immutable, and ADR 0014 already annotates the same
+> drift from the previous re-sequencing.
+>
 > **Sequencing (2026-08-11):** after Phase 6, **rich clipboard (images and
 > files) is scheduled before cross-platform validation** — maintainer decision.
 > The hard part of rich clipboard is platform-neutral (prioritization, chunked
@@ -429,7 +444,65 @@ The hermetic stress and fault-injection suites extend to cover chunked transfers
 and the priority guarantee. Files/folders may run as a second sub-milestone
 after images, given the added security surface.
 
-## Phase 8 — Cross-Platform Validation
+## Phase 8 — Dynamic Display Topology
+
+**Goal:** replace "which side is this machine on" with an arrangement the
+user draws. Monitors from both machines appear in one editor and are dragged
+into the layout they physically sit in, and edge crossing follows from that
+geometry instead of from a flag.
+
+Re-sequenced ahead of cross-platform by maintainer decision (2026-08-16):
+two Windows machines that share a keyboard and mouse well are worth more
+than three platforms that share one adequately, and the topology model is
+easier to change before three platform crates depend on it than after.
+
+What exists today is the floor this replaces. `--left` / `--right` declares
+a two-machine left–right pair (ADR 0009); a machine with several monitors is
+treated as **one desktop**, so the crossing edge is the outer edge of the
+whole desktop rather than a seam between monitors
+([SOAK.md](SOAK.md) records that as an honest limitation); and feature/107
+made the topology re-read at runtime when displays change, which this phase
+builds on rather than repeats.
+
+Deliverables:
+
+1. **A topology model that is a layout, not a side.** Both machines'
+   monitors placed in one shared coordinate space, with edges derived from
+   adjacency. This supersedes ADR 0009's side model and therefore needs an
+   ADR of its own — the crossing *mechanism* (fractional position, negotiated
+   transfer) is expected to survive; what changes is where edges come from.
+2. **Per-monitor edges.** Dragging individual monitors only means something
+   if a seam between two of one machine's monitors can differ from its outer
+   edge, which the current "one desktop" treatment cannot express.
+3. **An arrangement both machines agree on.** One layout describes two
+   machines, so ownership, editing, and disagreement have to be answered:
+   who holds it, how it reaches the peer, and what happens when they differ.
+   If it travels over the session, it is protocol work and needs the ADR to
+   say so.
+4. **Persistence** in the versioned startup configuration, replacing the
+   `side` setting rather than sitting beside it.
+5. **The editor itself** — monitors shown to scale, dragged, snapped. This
+   is the project's first GUI and needs a **UI toolkit decision recorded as
+   an ADR** (a core library choice, per `adr/README.md`), including where it
+   runs: the worker is a headless service-launched process (ADR 0011), so an
+   editor is a separate user-session surface, not a mode of the worker.
+
+Exit criteria:
+
+- A layout drawn in the editor produces crossings that match it, including a
+  seam between two monitors of the same machine and a corner where three
+  monitors meet.
+- Mixed DPI and mixed resolution behave: a pointer leaving a 4K monitor at
+  40% of its edge arrives at 40% of the adjacent edge, whatever the scaling.
+- A display added, removed, or rearranged at runtime updates the layout
+  without a restart and without a stuck cursor (the feature/107 property,
+  now with more to get wrong).
+- The arrangement survives restart, and two machines that disagree resolve
+  observably rather than silently mis-crossing.
+- No regression in seamless transfer's existing guarantees: control returns
+  at the reverse edge, no stuck keys, no cursor left hidden.
+
+## Phase 9 — Cross-Platform Validation
 
 **Goal:** prove the architecture is genuinely portable.
 
@@ -452,18 +525,21 @@ Two findings from writing them change how the phase should start:
   (Proposed): the receiver advertises what it can install, the sender
   produces it by converting its own local content, and a receiver never
   decodes what a peer sent — which keeps an image decoder off the path that
-  handles hostile input. Windows-to-Windows stays verbatim DIB. Rich-clipboard image/file support (Phase 7) carries over here
-as new implementations of the clipboard trait, not new protocol design.
+  handles hostile input. Windows-to-Windows stays verbatim DIB.
+
+Rich-clipboard image and file support (Phase 7) carries over here as new
+implementations of the clipboard trait, not new protocol design.
 
 Exit criteria: core feature set works Windows↔Windows, Windows↔macOS,
 Windows↔Linux, macOS↔macOS, Linux↔Linux — and macOS↔Linux requires no
 protocol changes.
 
-## Phase 9 — Productization
+## Phase 10 — Productization
 
 Potential work, each item gated on preserving the security and clipboard
-reliability requirements: tray application, graphical configuration and
-topology editor, peer discovery, >2 peers, further rich clipboard formats
+reliability requirements: tray application, graphical configuration (the
+*topology* editor moved to Phase 8), peer discovery, >2 peers, further rich
+clipboard formats
 (e.g. HTML), drag-and-drop, software updates, diagnostics UI, optional
 secure WAN operation.
 

@@ -10,7 +10,7 @@ source clipboard's own raster format, verbatim** — no transcode, no codec,
 no compression. On Windows that format is `CF_DIB`, and between two Windows
 machines it works: the bytes the OS gave us are the bytes the peer installs.
 
-The Phase 8 risk catalogues broke that assumption from both sides.
+The cross-platform risk catalogues broke that assumption from both sides.
 [M-5](../platform-risks-macos.md) and [L-9](../platform-risks-linux.md)
 independently found that **nothing outside Windows understands `CF_DIB`**:
 macOS pasteboards deal in `public.tiff` and `public.png`, X11 advertises
