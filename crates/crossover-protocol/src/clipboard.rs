@@ -2301,6 +2301,38 @@ mod tests {
             }
         }
 
+        /// The same, for the stream a file rides: arbitrary sequences
+        /// never panic, a refusal leaves no trace, and — the property
+        /// only this type has — the accounting never runs ahead of the
+        /// item, so what a caller wrote can never exceed what was
+        /// declared.
+        #[test]
+        fn arbitrary_file_chunk_sequences_never_panic(
+            declared in 1u64..300_000,
+            chunks in proptest::collection::vec(
+                (0u32..8, proptest::collection::vec(any::<u8>(), 0..70_000)),
+                0..8,
+            ),
+        ) {
+            let meta = ClipboardMeta {
+                content_length: declared,
+                ..file_meta(b"unused")
+            };
+            let Ok(mut stream) = ChunkStream::begin(meta) else { return Ok(()); };
+            for (index, payload) in chunks {
+                let chunk = ClipboardChunk { id: meta.id, index, payload };
+                let (bytes_before, plan_before) = (stream.received_bytes(), stream.plan());
+                if stream.accept(&chunk).is_err() {
+                    // A rejection leaves no trace: nothing counted, and no
+                    // plan fixed by a chunk that was refused.
+                    prop_assert_eq!(stream.received_bytes(), bytes_before);
+                    prop_assert_eq!(stream.plan(), plan_before);
+                    break; // fail closed: the transfer is over
+                }
+                prop_assert!(stream.received_bytes() <= declared);
+            }
+        }
+
         /// Arbitrary bytes never panic the chunk decoder, and anything
         /// that decodes survives a re-encode unchanged.
         #[test]
