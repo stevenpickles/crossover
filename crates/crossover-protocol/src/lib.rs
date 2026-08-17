@@ -17,7 +17,7 @@ pub mod version;
 pub use clipboard::{
     ApplyResult, ChunkOutcome, ChunkPlan, ChunkReassembly, ClipboardAccept, ClipboardApplied,
     ClipboardChunk, ClipboardData, ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType,
-    DeclineReason, ImageFormat,
+    DeclineReason, FileDescriptor, ImageFormat,
 };
 pub use control::{ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason};
 pub use file_name::{FileNameError, validate_file_name};

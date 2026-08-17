@@ -1052,7 +1052,12 @@ mod tests {
         rig.events
             .send(frame(
                 MessageType::ClipboardOffer,
-                ClipboardOffer { meta }.encode_payload().unwrap(),
+                ClipboardOffer {
+                    meta,
+                    descriptor: None,
+                }
+                .encode_payload()
+                .unwrap(),
             ))
             .await
             .unwrap();
@@ -1225,7 +1230,12 @@ mod tests {
         events
             .send(frame(
                 MessageType::ClipboardOffer,
-                ClipboardOffer { meta }.encode_payload().unwrap(),
+                ClipboardOffer {
+                    meta,
+                    descriptor: None,
+                }
+                .encode_payload()
+                .unwrap(),
             ))
             .await
             .unwrap();

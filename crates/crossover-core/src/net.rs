@@ -661,7 +661,9 @@ mod tests {
     use crossover_protocol::{ProtocolError, encode_frame};
     use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore, TrustedPeer};
 
-    use super::{LocalNode, SessionError, SessionListener, SessionOptions, connect};
+    use super::{
+        LocalNode, PROTOCOL_VERSION, SessionError, SessionListener, SessionOptions, connect,
+    };
 
     struct Node {
         identity: DeviceIdentity,
@@ -729,8 +731,8 @@ mod tests {
 
         // Both sides agree on the current version and name the peer they
         // authenticated by fingerprint and Hello metadata.
-        assert_eq!(client_session.info().protocol_version, 2);
-        assert_eq!(server_session.info().protocol_version, 2);
+        assert_eq!(client_session.info().protocol_version, PROTOCOL_VERSION);
+        assert_eq!(server_session.info().protocol_version, PROTOCOL_VERSION);
         assert_eq!(
             client_session.info().peer_fingerprint,
             b.certified.fingerprint()
@@ -893,6 +895,7 @@ mod tests {
                 content_length: 4096,
                 content_hash: content_hash(b"a snip"),
             },
+            descriptor: None,
         };
         assert!(matches!(
             client
