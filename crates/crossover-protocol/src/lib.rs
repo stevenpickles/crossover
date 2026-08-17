@@ -7,6 +7,7 @@
 
 pub mod clipboard;
 pub mod control;
+pub mod file_name;
 pub mod framing;
 pub mod hello;
 pub mod input;
@@ -19,6 +20,7 @@ pub use clipboard::{
     DeclineReason, ImageFormat,
 };
 pub use control::{ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason};
+pub use file_name::{FileNameError, validate_file_name};
 pub use framing::{FrameDecoder, RawFrame, encode_frame};
 pub use hello::{FeatureFlags, Hello, MessageType, OsFamily};
 pub use input::{InputBatch, ReleaseAllInput, WireButton, WireInputEvent};
