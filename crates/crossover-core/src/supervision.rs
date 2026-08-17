@@ -540,9 +540,19 @@ pub async fn run_session(
 /// useless. This carries the history that catches that.
 #[derive(Debug, Default)]
 struct WriteHealth {
-    /// Start of the current unbroken run of stalling writes, if any.
-    stalling_since: Option<Instant>,
-    /// When the last write finished, to tell a *stall* from a quiet spell.
+    /// How much stalling the outbound direction is currently carrying — a
+    /// leaky bucket, not a run. Slow writes fill it; time spent not stalling
+    /// drains it.
+    ///
+    /// A *run* was the obvious measure and the wrong one: any single brisk
+    /// write cleared it, so a peer alternating one slow write with one fast
+    /// one stalled the session indefinitely without ever being disconnected
+    /// (docs/ARCHITECTURE.md §5.4 recorded this as an open residual). What
+    /// matters is the share of time the link spends unusable, and a bucket
+    /// measures that without needing a window to be defined or stored.
+    stalled: Duration,
+    /// When the last write finished, so the gap to the next one can be
+    /// credited as time *not* stalling.
     last_write_end: Option<Instant>,
 }
 
@@ -560,36 +570,38 @@ impl WriteHealth {
         keepalive: &KeepaliveConfig,
     ) -> Result<(), DisconnectReason> {
         // A quiet spell is not a stall: with nothing queued there was nothing
-        // to be held up, so an older stall record is stale evidence.
+        // to be held up. Crediting the gap drains the bucket, so an idle
+        // session recovers fully and a token pause between stalls recovers
+        // only what it was worth.
         //
         // The gap is measured to this write's *start*, not its end. Measuring
-        // to the end would fold the write's own duration into the "idle" gap,
-        // so a slow write would clear the very stall run it belongs to — and
-        // a peer stalling every write with a token pause between them would
-        // reset the bound forever.
-        if self
-            .last_write_end
-            .is_some_and(|end| started.duration_since(end) >= keepalive.timeout())
-        {
-            self.stalling_since = None;
+        // to the end would credit the write's own duration as idle time, so a
+        // slow write would pay down the very debt it is creating.
+        if let Some(end) = self.last_write_end {
+            self.stalled = self
+                .stalled
+                .saturating_sub(started.saturating_duration_since(end));
         }
         self.last_write_end = Some(finished);
 
-        if finished.duration_since(started) < keepalive.interval() {
-            self.stalling_since = None;
-            return Ok(());
+        let elapsed = finished.saturating_duration_since(started);
+        if elapsed >= keepalive.interval() {
+            // Slower than the keepalive interval is not throughput; charge
+            // the whole write, since none of that time was usable.
+            self.stalled = self.stalled.saturating_add(elapsed);
+        } else {
+            // A brisk write is evidence of a working link, worth exactly the
+            // time it took — not an amnesty for everything before it.
+            self.stalled = self.stalled.saturating_sub(elapsed);
         }
-        let stalling_since = *self.stalling_since.get_or_insert(started);
-        let stalling_for = finished.duration_since(stalling_since);
-        if stalling_for < keepalive.timeout() {
+
+        if self.stalled < keepalive.timeout() {
             return Ok(());
         }
         Err(DisconnectReason::Transport {
             reason: format!(
-                "outbound writes have been stalling continuously for {}s (every frame \
-                 slower than the {}s keepalive interval); the peer is consuming too \
-                 slowly for the session to be usable",
-                stalling_for.as_secs_f32(),
+                "outbound writes have spent {}s stalling with too little healthy                  throughput to make it up (a write slower than the {}s keepalive                  interval counts as stalling); the peer is consuming too slowly for                  the session to be usable",
+                self.stalled.as_secs_f32(),
                 keepalive.interval().as_secs_f32()
             ),
         })
@@ -612,17 +624,19 @@ impl WriteHealth {
 /// 1. **No single write may exceed `keepalive.timeout`.** This catches a
 ///    peer that has frozen outright. A cancelled write leaves the TLS stream
 ///    mid-record and unusable, so expiry is necessarily fatal, not a retry.
-/// 2. **Application writes may not stall continuously for longer than
+/// 2. **Stalling may not outweigh healthy throughput by more than
 ///    `keepalive.timeout`.** A write slower than `keepalive.interval` counts
-///    as stalling; any faster write clears the run. This is what catches the
-///    trickle — one frame accepted just inside the per-write deadline,
-///    forever — which bound 1 alone waves through.
+///    as stalling and charges its whole duration; every other interval —
+///    brisk writes and idle gaps alike — pays that debt back. This is what
+///    catches the trickle that bound 1 waves through, *and* the peer that
+///    alternates one slow write with one brisk one to keep a continuity
+///    measure permanently reset.
 ///
 /// `health` is `None` for keepalive frames. A `Ping` is a dozen bytes and
 /// fits in any window that is open at all, so it is no evidence of usable
 /// throughput: it must neither count as a stall nor clear one. A genuinely
-/// idle spell — no write at all for longer than the timeout — does clear the
-/// run, because an empty outbound queue is health, not a stalled one.
+/// idle spell — no write at all — does pay the debt down, because an empty
+/// outbound queue is health, not a stalled one.
 ///
 /// What this deliberately does **not** provide is a responsive loop during a
 /// write; see docs/ARCHITECTURE.md §5.4.
@@ -876,30 +890,57 @@ mod tests {
         let Err(DisconnectReason::Transport { reason }) = verdict else {
             panic!("a trickling peer was not cut off: {verdict:?}");
         };
-        assert!(reason.contains("stalling continuously"), "{reason}");
+        assert!(reason.contains("stalling"), "{reason}");
     }
 
-    /// One healthy write is enough to say the link recovered; the run of
-    /// stalls must start over rather than accumulate across good periods.
+    /// The evasion a continuity measure could not see, and the reason this
+    /// bound is a duty cycle: a peer alternating one slow write with one
+    /// brisk one used to reset the run forever and stall the session
+    /// indefinitely without ever being disconnected
+    /// (docs/ARCHITECTURE.md §5.4 carried it as an open residual).
+    ///
+    /// A millisecond of throughput buys a millisecond of forgiveness, not an
+    /// amnesty, so the debt still climbs and the session still ends.
     #[test]
-    fn a_single_brisk_write_clears_the_stall_run() {
+    fn alternating_one_slow_write_with_one_brisk_one_does_not_evade_the_bound() {
         let mut health = super::WriteHealth::default();
         let mut at = tokio::time::Instant::now();
-        // Two slow writes: a run of 12 s, still inside the 15 s bound.
-        for _ in 0..2 {
+
+        for round in 0..3 {
             let finished = at + Duration::from_secs(6);
+            let verdict = health.record(at, finished, &keepalive());
+            at = finished;
+
+            if let Err(DisconnectReason::Transport { reason }) = verdict {
+                assert!(round >= 2, "cut off too early, in round {round}: {reason}");
+                return;
+            }
+
+            // The token of "health" that used to wipe the slate.
+            let finished = at + Duration::from_millis(1);
             assert!(health.record(at, finished, &keepalive()).is_ok());
             at = finished;
         }
-        // Recovery.
-        let finished = at + Duration::from_millis(1);
+        panic!("a peer alternating stalls with brisk writes was never cut off");
+    }
+
+    /// Forgiveness has to be real, or a link that hiccups once and then
+    /// works for a minute would be killed by ancient history.
+    #[test]
+    fn healthy_throughput_pays_off_an_earlier_stall() {
+        let mut health = super::WriteHealth::default();
+        let at = tokio::time::Instant::now();
+
+        // One bad write, most of the way to the bound.
+        let finished = at + Duration::from_secs(14);
         assert!(health.record(at, finished, &keepalive()).is_ok());
-        at = finished;
-        // The next slow write starts a fresh run, so it is not fatal.
-        let finished = at + Duration::from_secs(6);
+
+        // A minute of nothing to send: the debt is paid.
+        let at = finished + Duration::from_mins(1);
+        let finished = at + Duration::from_secs(14);
         assert!(
             health.record(at, finished, &keepalive()).is_ok(),
-            "the stall run survived a healthy write"
+            "a recovered link was still carrying its old debt"
         );
     }
 
