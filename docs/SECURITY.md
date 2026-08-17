@@ -178,7 +178,7 @@ Physical attackers with local admin on either machine are likewise out of scope.
 ## 7. Received files (the filesystem-write surface)
 
 Phase 7 file transfer ([ADR 0015](adr/0015-spooled-virtual-file-paste.md),
-Proposed) is the first capability that lets a remote peer cause a **write to
+Accepted) is the first capability that lets a remote peer cause a **write to
 the local filesystem**. Every other subsystem consumes network input into
 memory and the OS clipboard; this one creates objects on disk that outlive the
 session, so it carries its own invariants (F1–F15) on top of §1. They apply to
@@ -190,6 +190,14 @@ field influences. They reach a user-visible location only when the operating
 system's paste mechanism, executing the user's own gesture, copies them out of
 a completed spool entry — Crossover advertises a virtual file list and the
 shell performs that write.
+
+**Implemented so far** (feature/126–128): the protected spool and its
+handle-only boundary (F15), the `file_receive` grant (F1), and the whole
+receiving path from offer to verified entry — F3, F5, F6, F7, F8, and
+F12's byte and entry axes. **Not yet**: the virtual file list itself, and
+with it F4's descriptor construction, F10, F13's ownership check, F14's
+render, and F12's age backstop. Until that lands `FILE_CLIPBOARD` is not
+advertised, so no conforming peer sends a file at all.
 
 1. **F1 — Consent before bytes.** No file transfer is accepted from a peer
    whose trust-store record does not carry `file_receive` (§4). The check runs
@@ -280,10 +288,16 @@ shell performs that write.
 7. **F7 — A cap breached mid-transfer aborts and cleans up.** Bytes actually
    written are counted against the same caps, so a sender that under-declares
    is cut off at the limit rather than trusted: the receiver stops writing,
-   deletes its partial spool artifact, reports the reason (NFR-3), and — because
-   exceeding a declared length is a protocol violation — terminates the session
-   fail-closed (invariant 1). No partial entry survives, and none is ever
-   registered as advertisable.
+   deletes its partial spool artifact, and reports the reason (NFR-3). The
+   breach is a protocol violation and is charged as one — which ends the
+   session once the peer makes a habit of it, on
+   [PROTOCOL.md](PROTOCOL.md) §7's graduated rule, rather than on the
+   first frame. That is the same handling every malformed chunk already
+   receives, and the reason it is graduated is written there: a single
+   violation must not be able to kill a healthy session over an in-flight
+   tail. What is *not* graduated is the effect on the transfer itself — it
+   is over at the first bad chunk. No partial entry survives, and none is
+   ever registered as advertisable.
 8. **F8 — Nothing incomplete is ever advertisable.** Payload bytes are written
    to a temporary name inside the spool, flushed, and verified against the
    offered length and hash; only then is the entry renamed atomically and
@@ -316,8 +330,9 @@ shell performs that write.
     **contents** of a received file are never logged, on the same footing as
     clipboard contents (invariant 6).
 12. **F12 — The spool is bounded, and shrinking it is observable.** Retention is
-    capped on three axes — total bytes, entry count, and entry age — each a
-    named constant. The byte cap is enforced **by evicting at admission, not by
+    capped on three axes — total bytes (`MAX_SPOOL_BYTES`), entry count
+    (`MAX_SPOOL_ENTRIES`), and entry age (`SPOOL_SWEEP_TTL`, the backstop
+    behind the clipboard-lifetime rule) — each a named constant. The byte cap is enforced **by evicting at admission, not by
     testing feasibility at admission and evicting later**: before an offer is
     accepted the receiver evicts oldest-first until the incoming length fits and
     then reserves that length against the in-flight partial, so the cap is the

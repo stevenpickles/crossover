@@ -165,6 +165,15 @@ are binding; "should" requirements are strong defaults changeable by ADR.
 - **FR-3.2** A synchronization operation succeeds only when the destination
   operating-system clipboard has been updated — not when bytes were written
   to a socket. Success must be acknowledged end to end.
+  **Files read this one step earlier, and deliberately**
+  ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)): a file item
+  succeeds (`ApplyResult::Stored`) when the receiver has verified it and
+  registered it in its spool, because what reaches the destination
+  clipboard is a *promise* of the bytes rather than the bytes, and what
+  follows — whether the user ever pastes, and where — is the user's
+  gesture, not a synchronization outcome. The requirement's substance is
+  unchanged: the acknowledgement still states a fact about the
+  destination, and still never about a socket write.
 - **FR-3.3** Synchronization must not loop: a peer applying a remote clipboard
   item must recognize the resulting local clipboard change as that item and
   must not re-send it.

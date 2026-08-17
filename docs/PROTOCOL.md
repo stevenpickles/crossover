@@ -261,7 +261,7 @@ A -> B   ClipboardOffer     { id, content_type: File, content_length,
                                             entry_count, original_bytes } }
 B -> A   ClipboardAccept | ClipboardDecline   // NotPermitted, InvalidName,
                                               // InsufficientSpace, TooLarge,
-                                              // NotReady
+                                              // NotReady, UnsupportedType
 A -> B   ClipboardChunk × n                   // written through to B's spool
 B -> A   ClipboardApplied   { id, result: Stored | StorageFailed }
 ```
@@ -288,6 +288,17 @@ Rules specific to files:
   refuses this type outright.
 - **No `AlreadyHave` for files**: a spool entry may have been evicted, so
   the receiver cannot honestly claim to already have one.
+- **Each refusal means something different**, and a sender may act on the
+  difference: `NotPermitted` is a grant the user can give
+  (`crossover peers allow-files`); `UnsupportedType` is a receiver with no
+  spool at all, which no permission will change; `InsufficientSpace` is
+  this machine's free space or spool budget; `TooLarge` is the item's own
+  ceiling; `NotReady` is a statement about now.
+- **A newer offer supersedes a file transfer in flight**, exactly as it
+  does for any other inbound item: the sending peer holds one outbound
+  transaction, so a second offer means it has already abandoned the first,
+  and the receiver deletes the partial and admits the new item rather than
+  declining it. No verdict is owed for the abandoned one.
 
 Rules specific to the chunked flow:
 

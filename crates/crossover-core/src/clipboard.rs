@@ -40,9 +40,10 @@ use uuid::Uuid;
 
 use crossover_platform::{ClipboardContent, ClipboardImageFormat};
 use crossover_protocol::clipboard::{
-    ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ChunkOutcome, ChunkPlan, ChunkReassembly,
+    ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ChunkOutcome, ChunkPlan, ChunkReassembly, ChunkStream,
     ClipboardAccept, ClipboardApplied, ClipboardChunk, ClipboardData, ClipboardDecline,
-    ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, ImageFormat, content_hash,
+    ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, FileDescriptor, ImageFormat,
+    StreamOutcome, content_hash,
 };
 use crossover_protocol::hello::MessageType;
 
@@ -91,6 +92,42 @@ const MAX_CLIPBOARD_VIOLATIONS: u32 = 8;
 /// *volume* of that logging is the peer's to choose, so a machine left in
 /// debug logging can have its log growth driven from the far end.
 const RECENT_TRANSFER_MEMORY: usize = 4;
+
+/// Total bytes the spool may hold (ADR 0015).
+///
+/// A backstop rather than a working limit: an entry lives only while the
+/// clipboard still offers what it backs, so a healthy machine holds one.
+/// It bounds what a peer can leave on this machine's disk if that rule
+/// ever fails to fire — which is what a bound is for.
+///
+/// Counted against **at admission**, including the in-flight partial,
+/// rather than after completion. Testing feasibility at admission but
+/// only evicting on completion would let one more transfer write its
+/// partial alongside an already-full spool, so the honest peak would have
+/// been `MAX_SPOOL_BYTES + MAX_CLIPBOARD_FILE_BYTES` — reserving up front
+/// makes this figure the true ceiling.
+pub const MAX_SPOOL_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// How many completed entries the spool retains before the oldest is
+/// evicted to admit a new one (ADR 0015). The second backstop, on count
+/// rather than bytes: many small files must not become many entries.
+pub const MAX_SPOOL_ENTRIES: usize = 16;
+
+/// Headroom required on the spool volume beyond the offered length
+/// before a file transfer is accepted (ADR 0015).
+///
+/// The margin is the point: filling a user's system volume to the last
+/// byte is a fault of its own, worse than the refusal that avoids it, and
+/// the refusal is one frame the origin can act on (FR-3.6).
+pub const MIN_FREE_SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// In-flight file transfers per session (ADR 0015).
+///
+/// Structural rather than checked: the engine holds `Option<FileTransfer>`,
+/// so a second transfer cannot exist to be counted. Stated as a constant
+/// because it is a bound the ADR names, and asserted by the test that a
+/// superseding offer leaves exactly one partial behind.
+pub const MAX_CONCURRENT_FILE_TRANSFERS: usize = 1;
 
 /// Clipboard engine tuning. Grouped because all three knobs are timing
 /// policy, and tests need to shrink them without pretending the
@@ -344,6 +381,115 @@ pub enum Action {
         /// Operator-facing diagnostic naming what the peer did.
         reason: String,
     },
+    /// Reserve room for an offered file and create the partial it streams
+    /// into, then report back via [`ClipboardEngine::on_file_admitted`]
+    /// (ADR 0015).
+    ///
+    /// The offer is answered by *that* reply and not before: a receiver
+    /// that accepted first and discovered the volume was full afterwards
+    /// would have spent the sender's bytes to learn what one frame could
+    /// have said.
+    AdmitFile {
+        /// Transaction id the reply must reference.
+        id: Uuid,
+        /// The partial's name in the spool. Ours, never the peer's.
+        entry: String,
+        /// Offered length: what the free-space check is against, and what
+        /// the spool budget reserves.
+        byte_len: u64,
+    },
+    /// Append one verified-in-sequence chunk to the open partial, then
+    /// call [`ClipboardEngine::on_file_chunk_written`] — or
+    /// [`ClipboardEngine::on_file_write_failed`] if it did not land.
+    ///
+    /// The payload is judged before it gets here (`ChunkStream`), so what
+    /// this writes is always a prefix of a conforming transfer.
+    WriteFileChunk {
+        /// Which transfer the bytes belong to.
+        id: Uuid,
+        /// The bytes, moved rather than copied out of the chunk frame.
+        payload: Vec<u8>,
+    },
+    /// Promote the verified partial to a spool entry and report back via
+    /// [`ClipboardEngine::on_file_committed`]. The rename is the moment
+    /// the bytes become advertisable, and it happens only after the hash
+    /// and the length have both verified.
+    CommitFile {
+        /// Which transfer completed.
+        id: Uuid,
+        /// The partial's name.
+        from: String,
+        /// The entry name it takes once it is the offered item.
+        to: String,
+    },
+    /// Close the open partial for `id` and unlink it. Best-effort and
+    /// idempotent: no reply, because there is no decision left to make —
+    /// **nothing partially received is ever registered** (ADR 0015).
+    AbortFile {
+        /// Which transfer is being abandoned.
+        id: Uuid,
+        /// The partial to remove.
+        entry: String,
+    },
+    /// Unlink a completed spool entry the budget has evicted (ADR 0015).
+    EvictSpoolEntry {
+        /// The entry to remove.
+        entry: String,
+    },
+}
+
+/// Whether peer files may be received at all, and if not, why not.
+///
+/// Three states rather than a boolean, because the two refusals are
+/// different answers to the origin and it acts on them differently: a
+/// build with no protected spool will never take a file, while a peer
+/// without the `file_receive` grant is one `crossover peers allow-files`
+/// away (NFR-3). The engine is sans-io and holds no trust store, so the
+/// application supplies this and refreshes it as the store changes; the
+/// default is the closed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileReceive {
+    /// No protected spool on this platform or in this run: files cannot
+    /// be received here at all. The default, so a build that never wires
+    /// a spool refuses by construction rather than by remembering to.
+    #[default]
+    Unsupported,
+    /// The peer has not been granted `file_receive` (ADR 0015,
+    /// SECURITY.md invariant 8). Default-off, and never granted by
+    /// pairing.
+    Denied,
+    /// Granted: offers are judged on their merits.
+    Allowed,
+}
+
+/// Why the spool refused to admit a transfer (the driver's answer to
+/// [`Action::AdmitFile`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileRefusal {
+    /// The volume has less than the offered length plus
+    /// [`MIN_FREE_SPACE_MARGIN_BYTES`] free.
+    InsufficientSpace,
+    /// The spool could not be reserved or opened. A statement about now,
+    /// not about the item.
+    Storage,
+}
+
+/// A verified file resting in the spool (ADR 0015).
+///
+/// The peer's name is here, as metadata, and **not** on the filesystem:
+/// the entry is named by a locally generated id, and `descriptor` is what
+/// a paste will present to the shell once the platform half exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpooledFile {
+    /// The entry's bare name in the spool root.
+    pub entry: String,
+    /// What the sender said the item is — a validated name, and whether
+    /// it is an archive it built.
+    pub descriptor: FileDescriptor,
+    /// Verified byte length of the entry.
+    pub byte_len: u64,
+    /// Verified content hash, as offered.
+    pub content_hash: [u8; 32],
 }
 
 /// An inbound clipboard message, decoded by the driver.
@@ -466,6 +612,58 @@ impl Outbound {
     }
 }
 
+/// Where an inbound file transfer has got to (ADR 0015).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileState {
+    /// The spool has been asked for room and a partial to write into.
+    /// The offer is unanswered until it replies.
+    Admitting,
+    /// Accepted; chunks are being written through.
+    Streaming,
+    /// Every chunk has been accepted and the item's hash has verified.
+    /// The last write is still in flight — the commit waits for it,
+    /// because an entry must never be promoted ahead of its own bytes.
+    Verified,
+    /// The partial is being promoted to an entry.
+    Committing,
+}
+
+/// An inbound file transfer, written through to the spool rather than
+/// held (ADR 0015).
+///
+/// The memory here is the whole commitment: accounting, a descriptor, and
+/// an id. The bytes are on their way to disk and are never in this
+/// struct — which is what lets a file be four times the size an image is
+/// allowed to be.
+#[derive(Debug)]
+struct FileTransfer {
+    stream: ChunkStream,
+    descriptor: FileDescriptor,
+    /// Locally generated, and the reason the peer's name never becomes a
+    /// filesystem name on this machine (ADR 0015).
+    entry_id: Uuid,
+    state: FileState,
+    started: Instant,
+}
+
+impl FileTransfer {
+    fn id(&self) -> Uuid {
+        self.stream.meta().id
+    }
+
+    /// The partial: created exclusively, deleted on any outcome but a
+    /// verified completion.
+    fn part_name(&self) -> String {
+        format!("{}.part", self.entry_id)
+    }
+
+    /// The name the partial takes once — and only once — it is the item
+    /// that was offered.
+    fn entry_name(&self) -> String {
+        format!("{}.bin", self.entry_id)
+    }
+}
+
 /// Inbound write-with-retry state.
 #[derive(Debug)]
 struct PendingWrite {
@@ -500,6 +698,19 @@ pub struct ClipboardEngine {
     /// states as singular. A newer accepted offer replaces it, which is
     /// the same supersession rule `expecting_data` has always had.
     reassembly: Option<ChunkReassembly>,
+    /// The inbound *file* transfer being written through to the spool
+    /// (ADR 0015). At most one, like the reassembly beside it — and for a
+    /// stronger reason: this one holds an open partial on disk, and
+    /// `MAX_CONCURRENT_FILE_TRANSFERS` is that `Option`.
+    file: Option<FileTransfer>,
+    /// Whether peer files may be received here at all. Supplied by the
+    /// application from the trust store; closed until it says otherwise.
+    file_receive: FileReceive,
+    /// Verified spool entries, oldest first — the eviction order and the
+    /// spool's byte budget, both computed from entries this engine put
+    /// there rather than from whatever is in the directory. Bounded by
+    /// [`MAX_SPOOL_ENTRIES`].
+    spooled: VecDeque<SpooledFile>,
     /// Ids of chunked transfers recently finished or abandoned, so their
     /// in-flight tail is recognized as the benign race it is rather than
     /// charged to the violation budget.
@@ -548,6 +759,9 @@ impl ClipboardEngine {
             outbound: None,
             expecting_data: None,
             reassembly: None,
+            file: None,
+            file_receive: FileReceive::default(),
+            spooled: VecDeque::new(),
             recent_transfers: VecDeque::new(),
             outbound_generation: 0,
             inbound_generation: 0,
@@ -638,6 +852,158 @@ impl ClipboardEngine {
         // whatever we just read is the content worth sending: transmit
         // it directly.
         self.start_outbound(meta, bytes)
+    }
+
+    /// Set whether peer files may be received (ADR 0015).
+    ///
+    /// The application owns this: it holds the trust store and knows
+    /// whether a protected spool was opened, neither of which a sans-io
+    /// engine can see. It is a *policy input*, re-supplied whenever the
+    /// answer changes, so withdrawing `file_receive` stops the next
+    /// transfer without waiting for a reconnect. In flight transfers are
+    /// deliberately left alone: the bytes are already arriving into a
+    /// partial that will be deleted or verified either way, and there is
+    /// nothing for a half-applied revocation to protect.
+    pub fn set_file_receive(&mut self, receive: FileReceive) {
+        if self.file_receive != receive {
+            tracing::info!(policy = ?receive, "file receive policy changed");
+        }
+        self.file_receive = receive;
+    }
+
+    /// Verified files resting in the spool, oldest first.
+    ///
+    /// The receiving half ends here for now: an entry is spooled and
+    /// registered, and the platform half that offers it to the OS
+    /// clipboard as a virtual file list is the next slice of ADR 0015.
+    #[must_use]
+    pub fn spooled_files(&self) -> impl ExactSizeIterator<Item = &SpooledFile> {
+        self.spooled.iter()
+    }
+
+    /// The spool answered [`Action::AdmitFile`]: the offer can now be
+    /// accepted or declined with a reason that is actually true.
+    pub fn on_file_admitted(&mut self, id: Uuid, outcome: Result<(), FileRefusal>) -> Vec<Action> {
+        if !self
+            .file
+            .as_ref()
+            .is_some_and(|transfer| transfer.id() == id && transfer.state == FileState::Admitting)
+        {
+            tracing::debug!(clipboard_id = %id, "admission result for no pending file transfer; ignoring");
+            return Vec::new();
+        }
+        match outcome {
+            Ok(()) => {
+                if let Some(transfer) = self.file.as_mut() {
+                    transfer.state = FileState::Streaming;
+                }
+                vec![Action::Send(OutboundMessage::Accept(ClipboardAccept {
+                    id,
+                }))]
+            }
+            Err(refusal) => {
+                let Some(transfer) = self.file.take() else {
+                    return Vec::new();
+                };
+                self.remember_transfer(id);
+                self.record(Metrics::record_file_declined);
+                let reason = match refusal {
+                    FileRefusal::InsufficientSpace => DeclineReason::InsufficientSpace,
+                    // A spool that could not be opened may work for the
+                    // next item; it is not a statement about this one.
+                    FileRefusal::Storage => DeclineReason::NotReady,
+                };
+                tracing::warn!(
+                    clipboard_id = %id,
+                    byte_count = transfer.stream.meta().content_length,
+                    reason = ?reason,
+                    "declining a file offer the spool would not admit"
+                );
+                decline(id, reason)
+            }
+        }
+    }
+
+    /// One chunk reached the spool. Only the last one has anything left
+    /// to do: promote the partial, now that its final bytes are durable.
+    pub fn on_file_chunk_written(&mut self, id: Uuid) -> Vec<Action> {
+        let Some(transfer) = self.file.as_mut() else {
+            return Vec::new();
+        };
+        if transfer.id() != id || transfer.state != FileState::Verified {
+            return Vec::new();
+        }
+        transfer.state = FileState::Committing;
+        vec![Action::CommitFile {
+            id,
+            from: transfer.part_name(),
+            to: transfer.entry_name(),
+        }]
+    }
+
+    /// A chunk did not reach the spool. Local failure, not peer
+    /// misbehaviour: the partial goes and the origin is told the truth.
+    pub fn on_file_write_failed(&mut self, id: Uuid) -> Vec<Action> {
+        if self.file.as_ref().is_none_or(|t| t.id() != id) {
+            return Vec::new();
+        }
+        self.abort_file("the spool write failed", true)
+    }
+
+    /// The partial was promoted — or was not. This is where a peer file
+    /// becomes something this machine holds.
+    pub fn on_file_committed(&mut self, id: Uuid, stored: bool) -> Vec<Action> {
+        if !self
+            .file
+            .as_ref()
+            .is_some_and(|transfer| transfer.id() == id && transfer.state == FileState::Committing)
+        {
+            return Vec::new();
+        }
+        if !stored {
+            return self.abort_file("the verified partial could not be registered", true);
+        }
+        let Some(transfer) = self.file.take() else {
+            return Vec::new();
+        };
+        let meta = transfer.stream.meta();
+        self.remember_transfer(id);
+        // Layer three of ADR 0015's loop prevention, and close to inert on
+        // Windows by design: a virtual file list is never read back as
+        // bytes, so no hash is ever computed for it to match. It costs one
+        // insert and earns its place for a platform where delivered
+        // content *is* re-read as ordinary bytes — a drop-folder fallback
+        // would put this guard straight back in the firing line.
+        self.remember_applied(meta.content_hash);
+        let spooled = SpooledFile {
+            entry: transfer.entry_name(),
+            descriptor: transfer.descriptor,
+            byte_len: meta.content_length,
+            content_hash: meta.content_hash,
+        };
+        self.record(|m| m.record_file_stored(spooled.byte_len));
+        tracing::info!(
+            clipboard_id = %id,
+            byte_count = spooled.byte_len,
+            spool_entry = %spooled.entry,
+            archived = spooled.descriptor.archived,
+            entry_count = spooled.descriptor.entry_count,
+            elapsed_ms = elapsed_ms(transfer.started),
+            result = "stored",
+            "peer file verified and spooled"
+        );
+        // The name is user data (SECURITY.md invariant 6): debug only,
+        // never the info line, and never the content at any level.
+        tracing::debug!(
+            clipboard_id = %id,
+            file_name = %spooled.descriptor.file_name,
+            "spooled file name"
+        );
+        self.spooled.push_back(spooled);
+        vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
+            id,
+            result: ApplyResult::Stored,
+        }))]
     }
 
     /// A decoded clipboard message arrived from the peer.
@@ -745,6 +1111,10 @@ impl ClipboardEngine {
         self.outbound = None;
         self.expecting_data = None;
         self.reassembly = None;
+        // A partial from before the gap belongs to a transaction no
+        // longer in flight; it is deleted rather than adopted by the new
+        // session (ADR 0015: nothing partially received is registered).
+        let mut actions = self.abort_file("session re-established", false);
         self.recent_transfers.clear();
         // A fresh session gets a fresh violation budget: the counter
         // bounds one peer's misbehaviour on one connection, not a
@@ -754,7 +1124,8 @@ impl ClipboardEngine {
         // disconnected, and re-reading routes through the normal dedup
         // (and then through the debounce, like any other observation).
         self.current_local_hash = None;
-        vec![Action::ReadClipboard]
+        actions.push(Action::ReadClipboard);
+        actions
     }
 
     /// The session dropped: in-flight transaction state is meaningless
@@ -785,7 +1156,10 @@ impl ClipboardEngine {
                 "inbound chunked transfer abandoned: session lost"
             );
         }
-        Vec::new()
+        // Not nothing, for a file: the partial is on disk, and the peer
+        // being gone is exactly why it must not be left there. No verdict
+        // travels — there is nobody to tell.
+        self.abort_file("session lost", false)
     }
 
     /// A transfer deadline came due (ADR 0014).
@@ -848,6 +1222,10 @@ impl ClipboardEngine {
                         id: reassembly,
                         result: ApplyResult::ContentRejected,
                     })));
+                }
+                if self.file.is_some() {
+                    self.record(Metrics::record_clipboard_abandoned);
+                    actions.extend(self.abort_file("deadline", true));
                 }
                 actions
             }
@@ -1018,7 +1396,14 @@ impl ClipboardEngine {
                 reason,
             }))];
         }
-        if self.current_local_hash == Some(offer.meta.content_hash) {
+        // No `AlreadyHave` for files (docs/PROTOCOL.md §5). The hash this
+        // would compare against describes what is on the *clipboard*, and
+        // a spooled entry is not that: claiming to hold a file already
+        // would decline an offer this machine may no longer be able to
+        // paste, which is a worse answer than moving the bytes again.
+        if !offer.meta.content_type.needs_file_descriptor()
+            && self.current_local_hash == Some(offer.meta.content_hash)
+        {
             // Already holding identical content: a sync success with zero
             // payload bytes moved (ADR 0005) — and for a chunked item that
             // is the whole point of offering it, since a re-pasted snip
@@ -1040,6 +1425,12 @@ impl ClipboardEngine {
             );
         }
         self.abandon_reassembly("superseded by a newer offer");
+        let mut superseded = self.abort_file("superseded by a newer offer", false);
+
+        if offer.meta.content_type.needs_file_descriptor() {
+            superseded.extend(self.on_file_offer(offer));
+            return superseded;
+        }
 
         if offer.meta.content_type.is_chunked() {
             // The receiver's memory commitment is decided here and nowhere
@@ -1049,12 +1440,11 @@ impl ClipboardEngine {
             match ChunkReassembly::begin(offer.meta) {
                 Ok(reassembly) => {
                     self.reassembly = Some(reassembly);
-                    return vec![
-                        Action::Send(OutboundMessage::Accept(ClipboardAccept {
-                            id: offer.meta.id,
-                        })),
-                        self.arm_timeout(TransferScope::Inbound),
-                    ];
+                    superseded.push(Action::Send(OutboundMessage::Accept(ClipboardAccept {
+                        id: offer.meta.id,
+                    })));
+                    superseded.push(self.arm_timeout(TransferScope::Inbound));
+                    return superseded;
                 }
                 Err(error) => {
                     // Declined, not dropped: a typed answer closes the
@@ -1067,21 +1457,235 @@ impl ClipboardEngine {
                         error = %error,
                         "declining a chunked offer this side cannot buffer"
                     );
-                    return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
-                        id: offer.meta.id,
-                        reason: DeclineReason::NotReady,
-                    }))];
+                    superseded.extend(decline(offer.meta.id, DeclineReason::NotReady));
+                    return superseded;
                 }
             }
         }
 
         self.expecting_data = Some(offer.meta);
-        vec![
-            Action::Send(OutboundMessage::Accept(ClipboardAccept {
-                id: offer.meta.id,
-            })),
-            self.arm_timeout(TransferScope::Inbound),
-        ]
+        superseded.push(Action::Send(OutboundMessage::Accept(ClipboardAccept {
+            id: offer.meta.id,
+        })));
+        superseded.push(self.arm_timeout(TransferScope::Inbound));
+        superseded
+    }
+
+    /// A file offer (ADR 0015): permission, then room, then a partial to
+    /// write into — and only then an answer.
+    ///
+    /// Every refusal is a typed decline naming which gate closed, because
+    /// the origin acts on them differently and a silent drop is the
+    /// failure NFR-3 forbids.
+    fn on_file_offer(&mut self, offer: &ClipboardOffer) -> Vec<Action> {
+        let meta = offer.meta;
+        let Some(descriptor) = offer.descriptor.clone() else {
+            // Unreachable past the parser — a file offer without a
+            // descriptor is malformed and never decodes — so this is the
+            // defensive half of that rule, answered rather than asserted.
+            self.record(Metrics::record_file_declined);
+            return decline(meta.id, DeclineReason::InvalidName);
+        };
+        match self.file_receive {
+            FileReceive::Unsupported => {
+                tracing::warn!(
+                    clipboard_id = %meta.id,
+                    "declining a file offer: this build has no spool to receive files into"
+                );
+                self.record(Metrics::record_file_declined);
+                return decline(meta.id, DeclineReason::UnsupportedType);
+            }
+            FileReceive::Denied => {
+                // Operator-visible, not debug: a peer offering files to a
+                // machine that has not granted it is exactly the event the
+                // permission exists to make visible (SECURITY.md).
+                tracing::warn!(
+                    clipboard_id = %meta.id,
+                    origin_peer = %meta.origin,
+                    byte_count = meta.content_length,
+                    "declining a file offer: this peer has no file-receive grant \
+                     (`crossover peers allow-files`)"
+                );
+                self.record(Metrics::record_file_declined);
+                return decline(meta.id, DeclineReason::NotPermitted);
+            }
+            FileReceive::Allowed => {}
+        }
+        // The spool's own ceiling, distinct from the item's: an offer no
+        // spool could ever hold is refused before any room is made for it.
+        if meta.content_length > MAX_SPOOL_BYTES {
+            tracing::warn!(
+                clipboard_id = %meta.id,
+                byte_count = meta.content_length,
+                max = MAX_SPOOL_BYTES,
+                "declining a file offer larger than the whole spool budget"
+            );
+            self.record(Metrics::record_file_declined);
+            return decline(meta.id, DeclineReason::TooLarge);
+        }
+        let stream = match ChunkStream::begin(meta) {
+            Ok(stream) => stream,
+            Err(error) => {
+                // Defensive: the offer decoded, so its meta already
+                // validated. Answered rather than dropped all the same.
+                tracing::warn!(
+                    clipboard_id = %meta.id,
+                    error = %error,
+                    "declining a file offer that cannot be streamed"
+                );
+                self.record(Metrics::record_file_declined);
+                return decline(meta.id, DeclineReason::NotReady);
+            }
+        };
+
+        // Room is made *before* the partial is created, and the partial
+        // counts against the budget from the moment it exists, so
+        // MAX_SPOOL_BYTES is the true ceiling rather than the ceiling plus
+        // one transfer (ADR 0015).
+        let mut actions = self.make_room_for(meta.content_length);
+        let transfer = FileTransfer {
+            stream,
+            descriptor,
+            entry_id: Uuid::new_v4(),
+            state: FileState::Admitting,
+            started: Instant::now(),
+        };
+        let entry = transfer.part_name();
+        tracing::debug!(
+            clipboard_id = %meta.id,
+            byte_count = meta.content_length,
+            spool_entry = %entry,
+            "admitting a file offer to the spool"
+        );
+        self.file = Some(transfer);
+        actions.push(Action::AdmitFile {
+            id: meta.id,
+            entry,
+            byte_len: meta.content_length,
+        });
+        // Armed now rather than on acceptance: an admission that never
+        // comes back must cost a bounded amount of time too.
+        actions.push(self.arm_timeout(TransferScope::Inbound));
+        actions
+    }
+
+    /// Evict completed entries, oldest first, until this transfer fits
+    /// inside both spool bounds (ADR 0015).
+    ///
+    /// Eviction is real rather than hypothetical: entries go before the
+    /// transfer is admitted, not after it completes. Every removal is
+    /// logged, because content leaving the spool is a diagnosable event
+    /// and never a silent tidy-up (NFR-3).
+    fn make_room_for(&mut self, needed: u64) -> Vec<Action> {
+        let mut actions = Vec::new();
+        while !self.spooled.is_empty()
+            && (self.spooled.len() >= MAX_SPOOL_ENTRIES
+                || self.spooled_bytes().saturating_add(needed) > MAX_SPOOL_BYTES)
+        {
+            let Some(evicted) = self.spooled.pop_front() else {
+                break;
+            };
+            tracing::info!(
+                spool_entry = %evicted.entry,
+                byte_count = evicted.byte_len,
+                needed,
+                "evicting the oldest spool entry to make room for an incoming file"
+            );
+            actions.push(Action::EvictSpoolEntry {
+                entry: evicted.entry,
+            });
+        }
+        actions
+    }
+
+    /// What the registered entries occupy. The in-flight partial is not
+    /// counted here because there is never one when this is called: a
+    /// transfer is admitted only when no other holds the slot.
+    fn spooled_bytes(&self) -> u64 {
+        self.spooled
+            .iter()
+            .fold(0u64, |total, entry| total.saturating_add(entry.byte_len))
+    }
+
+    /// Abandon the in-flight file transfer: delete the partial, register
+    /// nothing, and (when the peer is still owed an answer) say so.
+    ///
+    /// The one exit every failure takes — a bad chunk, a failed write, a
+    /// deadline, a lost session, a superseding offer — so "nothing
+    /// partially received is ever registered" is a property of one
+    /// function rather than of five call sites remembering to.
+    fn abort_file(&mut self, why: &str, answer: bool) -> Vec<Action> {
+        let Some(transfer) = self.file.take() else {
+            return Vec::new();
+        };
+        let id = transfer.id();
+        self.remember_transfer(id);
+        self.record(Metrics::record_file_failed);
+        tracing::warn!(
+            clipboard_id = %id,
+            byte_count = transfer.stream.received_bytes(),
+            declared_bytes = transfer.stream.meta().content_length,
+            spool_entry = %transfer.part_name(),
+            reason = why,
+            result = "abandoned",
+            "file transfer abandoned; the partial is deleted and nothing is registered"
+        );
+        let mut actions = vec![Action::AbortFile {
+            id,
+            entry: transfer.part_name(),
+        }];
+        if answer {
+            actions.push(Action::Send(OutboundMessage::Applied(ClipboardApplied {
+                id,
+                result: ApplyResult::StorageFailed,
+            })));
+        }
+        actions
+    }
+
+    /// Route a chunk into the in-flight file transfer, judging it before
+    /// any of it is written.
+    fn accept_file_chunk(&mut self, chunk: &ClipboardChunk) -> Vec<Action> {
+        let Some(transfer) = self.file.as_mut() else {
+            return Vec::new();
+        };
+        let id = transfer.id();
+        if transfer.state != FileState::Streaming {
+            // Chunks for a transfer this side has not accepted, or has
+            // already finished streaming. Not the benign in-flight tail
+            // `recent_transfers` covers: this id is live, and the peer is
+            // sending ahead of its own answer.
+            let mut actions = self.abort_file("chunks outside the accepted window", true);
+            actions
+                .extend(self.record_violation("clipboard file chunk outside the accepted window"));
+            return actions;
+        }
+        match transfer.stream.accept(chunk) {
+            Ok(StreamOutcome::More) => vec![Action::WriteFileChunk {
+                id,
+                payload: chunk.payload.clone(),
+            }],
+            Ok(StreamOutcome::Final) => {
+                // Verified, but not yet complete: the entry is promoted
+                // when these last bytes are actually in the spool.
+                transfer.state = FileState::Verified;
+                vec![Action::WriteFileChunk {
+                    id,
+                    payload: chunk.payload.clone(),
+                }]
+            }
+            Err(error) => {
+                tracing::debug!(
+                    clipboard_id = %id,
+                    chunk_index = chunk.index,
+                    error = %error,
+                    "malformed file chunk; abandoning the transfer"
+                );
+                let mut actions = self.abort_file("malformed chunk", true);
+                actions.extend(self.record_violation("malformed clipboard file chunk"));
+                actions
+            }
+        }
     }
 
     fn on_peer_accept(&mut self, id: Uuid) -> Vec<Action> {
@@ -1242,6 +1846,9 @@ impl ClipboardEngine {
             .is_some_and(|r| r.meta().id == chunk.id)
         {
             return self.accept_chunk(chunk);
+        }
+        if self.file.as_ref().is_some_and(|f| f.id() == chunk.id) {
+            return self.accept_file_chunk(chunk);
         }
         if self.recent_transfers.contains(&chunk.id) {
             tracing::debug!(
@@ -1464,6 +2071,14 @@ impl ClipboardEngine {
     }
 }
 
+/// One typed refusal, as the single action it always is.
+fn decline(id: Uuid, reason: DeclineReason) -> Vec<Action> {
+    vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
+        id,
+        reason,
+    }))]
+}
+
 /// The chunk at `index`, sliced straight out of the retained item buffer.
 ///
 /// `None` when the index is past the transfer or the buffer does not
@@ -1557,15 +2172,16 @@ mod tests {
     use crossover_platform::{ClipboardContent, ClipboardImageFormat};
     use crossover_protocol::clipboard::{
         ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardAccept, ClipboardApplied, ClipboardChunk,
-        ClipboardData, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, ImageFormat,
-        MAX_CHUNK_BYTES, chunk_content, content_hash,
+        ClipboardData, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, FileDescriptor,
+        ImageFormat, MAX_CHUNK_BYTES, chunk_content, content_hash,
     };
 
     use std::time::Duration;
 
     use super::{
-        Action, ClipboardConfig, ClipboardEngine, InboundMessage, OutboundMessage, RetryPolicy,
-        TransferScope, WriteFailure,
+        Action, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, InboundMessage,
+        MAX_CONCURRENT_FILE_TRANSFERS, MAX_SPOOL_BYTES, MAX_SPOOL_ENTRIES, OutboundMessage,
+        RetryPolicy, TransferScope, WriteFailure,
     };
 
     fn engine(origin_fill: u8) -> ClipboardEngine {
@@ -1944,6 +2560,17 @@ mod tests {
                         | Action::ScheduleTransferTimeout { .. } => {}
                         Action::TerminateSession { reason } => {
                             panic!("conforming engines must not terminate: {reason}")
+                        }
+                        // Text-only hosts: a spool action here would mean
+                        // the engine invented a file transfer from a text
+                        // copy, which is worth failing on rather than
+                        // absorbing into a wildcard.
+                        spool @ (Action::AdmitFile { .. }
+                        | Action::WriteFileChunk { .. }
+                        | Action::CommitFile { .. }
+                        | Action::AbortFile { .. }
+                        | Action::EvictSpoolEntry { .. }) => {
+                            panic!("a text transaction asked for spool work: {spool:?}")
                         }
                     }
                 }
@@ -2952,6 +3579,535 @@ mod tests {
             crossover_platform::MAX_CLIPBOARD_IMAGE_BYTES,
             MAX_CLIPBOARD_IMAGE_BYTES,
             "the platform boundary's ceiling drifted from the protocol's"
+        );
+    }
+
+    // ---- files (ADR 0015) ----
+
+    fn file_meta(bytes: &[u8], sequence: u64) -> ClipboardMeta {
+        ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xBB; 16]),
+            sequence,
+            content_type: ContentType::File,
+            content_length: bytes.len() as u64,
+            content_hash: content_hash(bytes),
+        }
+    }
+
+    fn file_offer(meta: ClipboardMeta, name: &str) -> ClipboardOffer {
+        ClipboardOffer {
+            meta,
+            descriptor: Some(FileDescriptor {
+                file_name: name.to_owned(),
+                archived: false,
+                entry_count: 1,
+                original_bytes: meta.content_length,
+            }),
+        }
+    }
+
+    /// An engine configured as the application configures one when a
+    /// protected spool is open and the peer holds the grant.
+    fn granted(origin_fill: u8) -> ClipboardEngine {
+        let mut engine = engine(origin_fill);
+        engine.set_file_receive(FileReceive::Allowed);
+        engine
+    }
+
+    fn admission_of(actions: &[Action]) -> (Uuid, String, u64) {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                Action::AdmitFile {
+                    id,
+                    entry,
+                    byte_len,
+                } => Some((*id, entry.clone(), *byte_len)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected an admission, got {actions:?}"))
+    }
+
+    fn written_chunk(actions: &[Action]) -> Vec<u8> {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                Action::WriteFileChunk { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a spool write, got {actions:?}"))
+    }
+
+    fn aborted_entry(actions: &[Action]) -> String {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                Action::AbortFile { entry, .. } => Some(entry.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected an abort, got {actions:?}"))
+    }
+
+    fn declined_reason(actions: &[Action]) -> DeclineReason {
+        match sent(actions).as_slice() {
+            [OutboundMessage::Decline(decline)] => decline.reason,
+            other => panic!("expected exactly one decline, got {other:?}"),
+        }
+    }
+
+    fn verdict(actions: &[Action]) -> ApplyResult {
+        match sent(actions).as_slice() {
+            [OutboundMessage::Applied(applied)] => applied.result,
+            other => panic!("expected exactly one verdict, got {other:?}"),
+        }
+    }
+
+    /// Drive a whole inbound file transfer the way the driver does:
+    /// admission, one confirmed write per chunk, then the commit. Returns
+    /// the actions the commit produced and everything the spool was asked
+    /// to write.
+    fn receive_file(
+        engine: &mut ClipboardEngine,
+        name: &str,
+        bytes: &[u8],
+        sequence: u64,
+    ) -> (Vec<Action>, Vec<u8>, String) {
+        let meta = file_meta(bytes, sequence);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, name)));
+        let (id, part, byte_len) = admission_of(&offered);
+        assert_eq!(id, meta.id);
+        assert_eq!(byte_len, bytes.len() as u64);
+        assert!(
+            sent(&offered).is_empty(),
+            "nothing is answered until the spool has taken the transfer: {offered:?}"
+        );
+
+        let accepted = engine.on_file_admitted(id, Ok(()));
+        assert!(
+            matches!(sent(&accepted).as_slice(), [OutboundMessage::Accept(_)]),
+            "an admitted offer is accepted: {accepted:?}"
+        );
+
+        let mut spooled = Vec::new();
+        let mut after_write = Vec::new();
+        for chunk in chunk_content(id, bytes).unwrap() {
+            let taken = engine.on_peer_message(InboundMessage::Chunk(chunk));
+            spooled.extend_from_slice(&written_chunk(&taken));
+            after_write = engine.on_file_chunk_written(id);
+        }
+
+        let (from, to) = after_write
+            .iter()
+            .find_map(|action| match action {
+                Action::CommitFile { from, to, .. } => Some((from.clone(), to.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the last write should commit, got {after_write:?}"));
+        assert_eq!(from, part, "the commit promotes the partial it was given");
+        (engine.on_file_committed(id, true), spooled, to)
+    }
+
+    /// The whole receiving path: nothing is answered before the spool has
+    /// room, the bytes are written through rather than buffered, and the
+    /// entry appears only once the item has verified.
+    #[test]
+    fn a_granted_file_is_streamed_to_the_spool_and_registered() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(200_000);
+
+        let (closed, spooled, entry) = receive_file(&mut engine, "quarterly.pdf", &bytes, 1);
+
+        assert_eq!(verdict(&closed), ApplyResult::Stored);
+        assert_eq!(spooled, bytes, "the spool receives the item, byte for byte");
+        let registered: Vec<&super::SpooledFile> = engine.spooled_files().collect();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].entry, entry);
+        assert_eq!(registered[0].byte_len, bytes.len() as u64);
+        assert_eq!(registered[0].content_hash, content_hash(&bytes));
+        assert_eq!(registered[0].descriptor.file_name, "quarterly.pdf");
+    }
+
+    /// The peer's name is metadata and never a filesystem name: the entry
+    /// is ours, and the descriptor carries theirs (ADR 0015).
+    #[test]
+    fn the_peers_name_never_becomes_the_entry_name() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(4096);
+
+        let meta = file_meta(&bytes, 1);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, "report.pdf")));
+        let (_, part, _) = admission_of(&offered);
+        let stem = part
+            .strip_suffix(".part")
+            .unwrap_or_else(|| panic!("a partial is named <id>.part: {part}"));
+        assert!(
+            !part.contains("report"),
+            "the partial is named after the peer's file: {part}"
+        );
+        assert!(
+            Uuid::parse_str(stem).is_ok(),
+            "the partial is not named by a locally generated id: {part}"
+        );
+
+        let (_, _, entry) = receive_file(&mut engine, "report.pdf", &bytes, 2);
+        assert!(
+            entry
+                .strip_suffix(".bin")
+                .is_some_and(|stem| Uuid::parse_str(stem).is_ok()),
+            "an entry is named <id>.bin: {entry}"
+        );
+        assert!(!entry.contains("report"), "{entry}");
+    }
+
+    /// Default-off, and the two refusals are different answers: no grant
+    /// is a permission the user can give, no spool never will be.
+    #[test]
+    fn a_file_offer_is_refused_without_a_grant_or_a_spool() {
+        let bytes = image_bytes(4096);
+
+        // The engine's own default, before anything configures it.
+        let mut fresh = engine(0xAA);
+        let offered = fresh.on_peer_message(InboundMessage::Offer(file_offer(
+            file_meta(&bytes, 1),
+            "payload.exe",
+        )));
+        assert_eq!(declined_reason(&offered), DeclineReason::UnsupportedType);
+        assert!(
+            !offered
+                .iter()
+                .any(|a| matches!(a, Action::AdmitFile { .. })),
+            "a refused offer must not touch the spool: {offered:?}"
+        );
+
+        let mut denied = engine(0xAA);
+        denied.set_file_receive(FileReceive::Denied);
+        let offered = denied.on_peer_message(InboundMessage::Offer(file_offer(
+            file_meta(&bytes, 1),
+            "payload.exe",
+        )));
+        assert_eq!(declined_reason(&offered), DeclineReason::NotPermitted);
+        assert_eq!(denied.spooled_files().len(), 0);
+    }
+
+    /// Withdrawing the grant stops the next transfer without waiting for
+    /// a reconnect — the reason `set_file_receive` is a policy input
+    /// rather than a constructor argument.
+    #[test]
+    fn withdrawing_the_grant_refuses_the_next_offer() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(4096);
+        let (closed, _, _) = receive_file(&mut engine, "first.bin", &bytes, 1);
+        assert_eq!(verdict(&closed), ApplyResult::Stored);
+
+        engine.set_file_receive(FileReceive::Denied);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(
+            file_meta(&bytes, 2),
+            "second.bin",
+        )));
+        assert_eq!(declined_reason(&offered), DeclineReason::NotPermitted);
+        // Already-delivered entries stay: revocation stops the next
+        // transfer, it does not reach back into the spool (ADR 0015, T20).
+        assert_eq!(engine.spooled_files().len(), 1);
+    }
+
+    /// The admission answer is what decides the offer, and each refusal
+    /// keeps its own meaning on the wire (NFR-3).
+    #[test]
+    fn an_admission_refusal_declines_with_the_reason_that_is_true() {
+        for (refusal, expected) in [
+            (
+                FileRefusal::InsufficientSpace,
+                DeclineReason::InsufficientSpace,
+            ),
+            (FileRefusal::Storage, DeclineReason::NotReady),
+        ] {
+            let mut engine = granted(0xAA);
+            let bytes = image_bytes(4096);
+            let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(
+                file_meta(&bytes, 1),
+                "big.zip",
+            )));
+            let (id, _, _) = admission_of(&offered);
+            let refused = engine.on_file_admitted(id, Err(refusal));
+            assert_eq!(declined_reason(&refused), expected);
+            assert_eq!(engine.spooled_files().len(), 0);
+
+            // The slot is free again: the next offer is judged on its own
+            // merits rather than inheriting a refusal.
+            let next = engine.on_peer_message(InboundMessage::Offer(file_offer(
+                file_meta(&bytes, 2),
+                "next.zip",
+            )));
+            admission_of(&next);
+        }
+    }
+
+    /// An item no spool could hold is refused before room is made for it.
+    /// Unreachable through the wire today — `MAX_CLIPBOARD_FILE_BYTES` is
+    /// the smaller ceiling — and kept because the spool budget is the one
+    /// a receiver may lower (ADR 0015).
+    #[test]
+    fn an_offer_larger_than_the_whole_spool_budget_is_refused() {
+        let mut engine = granted(0xAA);
+        let mut meta = file_meta(b"pretend", 1);
+        meta.content_length = MAX_SPOOL_BYTES + 1;
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, "huge.zip")));
+        assert_eq!(declined_reason(&offered), DeclineReason::TooLarge);
+    }
+
+    /// Content that is not what was offered never becomes an entry: the
+    /// partial is deleted, the origin is told, and the peer is charged a
+    /// violation (docs/PROTOCOL.md §7).
+    #[test]
+    fn a_corrupted_file_transfer_registers_nothing() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(200_000);
+        let meta = file_meta(&bytes, 1);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, "doc.pdf")));
+        let (id, part, _) = admission_of(&offered);
+        engine.on_file_admitted(id, Ok(()));
+
+        let mut chunks = chunk_content(id, &bytes).unwrap();
+        let taken = engine.on_peer_message(InboundMessage::Chunk(chunks[0].clone()));
+        written_chunk(&taken);
+        engine.on_file_chunk_written(id);
+
+        // The tail of the item, with one byte of it changed: every length
+        // still reconciles, so only the hash can catch this.
+        let last = chunks.len() - 1;
+        chunks[last].payload[0] ^= 0xFF;
+        for chunk in &chunks[1..] {
+            let outcome = engine.on_peer_message(InboundMessage::Chunk(chunk.clone()));
+            if !outcome.is_empty()
+                && outcome
+                    .iter()
+                    .any(|a| matches!(a, Action::AbortFile { .. }))
+            {
+                assert_eq!(aborted_entry(&outcome), part);
+                assert_eq!(verdict(&outcome), ApplyResult::StorageFailed);
+                assert_eq!(engine.spooled_files().len(), 0);
+                return;
+            }
+            engine.on_file_chunk_written(id);
+        }
+        panic!("a tampered transfer completed");
+    }
+
+    /// A write that does not land ends the transfer as surely as a bad
+    /// chunk does — and it is *this* machine's fault, so the origin hears
+    /// it without the peer being charged anything.
+    #[test]
+    fn a_failed_spool_write_abandons_the_transfer() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(200_000);
+        let meta = file_meta(&bytes, 1);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, "doc.pdf")));
+        let (id, part, _) = admission_of(&offered);
+        engine.on_file_admitted(id, Ok(()));
+        let chunks = chunk_content(id, &bytes).unwrap();
+        engine.on_peer_message(InboundMessage::Chunk(chunks[0].clone()));
+
+        let failed = engine.on_file_write_failed(id);
+        assert_eq!(aborted_entry(&failed), part);
+        assert_eq!(verdict(&failed), ApplyResult::StorageFailed);
+        assert_eq!(engine.spooled_files().len(), 0);
+    }
+
+    /// The rename is the moment bytes become an entry, so a rename that
+    /// fails registers nothing and says so.
+    #[test]
+    fn a_commit_that_fails_registers_nothing() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(4096);
+        let meta = file_meta(&bytes, 1);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, "doc.pdf")));
+        let (id, part, _) = admission_of(&offered);
+        engine.on_file_admitted(id, Ok(()));
+        for chunk in chunk_content(id, &bytes).unwrap() {
+            engine.on_peer_message(InboundMessage::Chunk(chunk));
+            engine.on_file_chunk_written(id);
+        }
+
+        let failed = engine.on_file_committed(id, false);
+        assert_eq!(aborted_entry(&failed), part);
+        assert_eq!(verdict(&failed), ApplyResult::StorageFailed);
+        assert_eq!(engine.spooled_files().len(), 0);
+    }
+
+    /// A partial must not outlive the transaction that created it, and a
+    /// peer that is gone is owed no verdict.
+    #[test]
+    fn a_lost_session_deletes_the_partial_without_answering() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(200_000);
+        let meta = file_meta(&bytes, 1);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, "doc.pdf")));
+        let (id, part, _) = admission_of(&offered);
+        engine.on_file_admitted(id, Ok(()));
+        engine.on_peer_message(InboundMessage::Chunk(
+            chunk_content(id, &bytes).unwrap()[0].clone(),
+        ));
+
+        let lost = engine.on_session_lost();
+        assert_eq!(aborted_entry(&lost), part);
+        assert!(sent(&lost).is_empty(), "nobody is there to tell: {lost:?}");
+        assert_eq!(engine.spooled_files().len(), 0);
+    }
+
+    /// A transfer that stops halfway costs a bounded amount of disk for a
+    /// bounded time: the deadline deletes the partial and closes the
+    /// origin's transaction (ADR 0014's bound, ADR 0015's surface).
+    #[test]
+    fn the_deadline_abandons_a_stalled_file_transfer() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(200_000);
+        let meta = file_meta(&bytes, 1);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, "doc.pdf")));
+        let (id, part, _) = admission_of(&offered);
+        let generation = offered
+            .iter()
+            .find_map(|action| match action {
+                Action::ScheduleTransferTimeout {
+                    scope: TransferScope::Inbound,
+                    generation,
+                    ..
+                } => Some(*generation),
+                _ => None,
+            })
+            .expect("an admitted transfer is armed with a deadline");
+        engine.on_file_admitted(id, Ok(()));
+
+        let expired = engine.on_transfer_timeout(TransferScope::Inbound, generation);
+        assert_eq!(aborted_entry(&expired), part);
+        assert_eq!(verdict(&expired), ApplyResult::StorageFailed);
+    }
+
+    /// One transfer at a time (`MAX_CONCURRENT_FILE_TRANSFERS`), and the
+    /// superseded one leaves nothing behind: the peer holds a single
+    /// outbound transaction, so a second offer means the first is already
+    /// abandoned at its origin.
+    #[test]
+    fn a_newer_offer_supersedes_a_file_transfer_and_deletes_its_partial() {
+        assert_eq!(MAX_CONCURRENT_FILE_TRANSFERS, 1);
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(200_000);
+        let first = file_meta(&bytes, 1);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(first, "first.pdf")));
+        let (id, part, _) = admission_of(&offered);
+        engine.on_file_admitted(id, Ok(()));
+        engine.on_peer_message(InboundMessage::Chunk(
+            chunk_content(id, &bytes).unwrap()[0].clone(),
+        ));
+
+        let second = file_meta(&bytes, 2);
+        let superseding =
+            engine.on_peer_message(InboundMessage::Offer(file_offer(second, "second.pdf")));
+        assert_eq!(aborted_entry(&superseding), part);
+        let (next_id, next_part, _) = admission_of(&superseding);
+        assert_eq!(next_id, second.id);
+        assert_ne!(next_part, part, "a new transfer gets a new partial");
+        assert!(
+            sent(&superseding).is_empty(),
+            "the abandoned transfer's origin has already dropped it: {superseding:?}"
+        );
+    }
+
+    /// Chunks for a transfer this side has not accepted are neither
+    /// written nor tolerated: the partial goes and the peer is charged.
+    #[test]
+    fn chunks_ahead_of_the_acceptance_abandon_the_transfer() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(4096);
+        let meta = file_meta(&bytes, 1);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, "doc.pdf")));
+        let (id, part, _) = admission_of(&offered);
+
+        // No `on_file_admitted` yet: the offer is still unanswered.
+        let early = engine.on_peer_message(InboundMessage::Chunk(
+            chunk_content(id, &bytes).unwrap()[0].clone(),
+        ));
+        assert!(
+            !early
+                .iter()
+                .any(|a| matches!(a, Action::WriteFileChunk { .. })),
+            "a chunk arriving before the accept must not be written: {early:?}"
+        );
+        assert_eq!(aborted_entry(&early), part);
+        assert_eq!(verdict(&early), ApplyResult::StorageFailed);
+    }
+
+    /// The spool holds a bounded number of entries, and room is made
+    /// *before* the transfer that needs it — oldest first, and every
+    /// eviction is an action the driver can actually perform.
+    #[test]
+    fn the_entry_budget_evicts_the_oldest_to_admit_a_new_file() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(1024);
+        let mut entries = Vec::new();
+        for sequence in 0..MAX_SPOOL_ENTRIES as u64 {
+            let (_, _, entry) = receive_file(&mut engine, "doc.pdf", &bytes, sequence);
+            entries.push(entry);
+        }
+        assert_eq!(engine.spooled_files().len(), MAX_SPOOL_ENTRIES);
+
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(
+            file_meta(&bytes, 99),
+            "one-more.pdf",
+        )));
+        let evicted: Vec<String> = offered
+            .iter()
+            .filter_map(|action| match action {
+                Action::EvictSpoolEntry { entry } => Some(entry.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            evicted,
+            vec![entries[0].clone()],
+            "exactly the oldest entry makes way"
+        );
+        assert_eq!(engine.spooled_files().len(), MAX_SPOOL_ENTRIES - 1);
+    }
+
+    /// Files never take the `AlreadyHave` shortcut: a spool entry is not
+    /// what the clipboard holds, so claiming to have one would refuse an
+    /// offer this machine may no longer be able to paste
+    /// (docs/PROTOCOL.md §5).
+    #[test]
+    fn a_file_offer_is_never_declined_as_already_held() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(4096);
+
+        // Put that exact content on the local clipboard first, which for
+        // an image would produce an `AlreadyHave` decline.
+        copy_image(&mut engine, bytes.clone());
+        engine.on_session_lost();
+
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(
+            file_meta(&bytes, 9),
+            "doc.pdf",
+        )));
+        admission_of(&offered);
+    }
+
+    /// A file that completes goes into the applied-hash memory like any
+    /// other delivered item (ADR 0015's third loop-prevention layer), so a
+    /// platform that re-reads delivered content as bytes cannot echo it
+    /// back to the peer that sent it.
+    #[test]
+    fn a_stored_file_is_remembered_as_applied_content() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(4096);
+        let (closed, _, _) = receive_file(&mut engine, "doc.pdf", &bytes, 1);
+        assert_eq!(verdict(&closed), ApplyResult::Stored);
+
+        // Reading those same bytes back off the local clipboard must not
+        // start an outbound transaction.
+        let echoed = copy_image(&mut engine, bytes);
+        assert!(
+            sent(&echoed).is_empty(),
+            "delivered content was offered back to its origin: {echoed:?}"
         );
     }
 }

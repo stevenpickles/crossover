@@ -1093,6 +1093,215 @@ impl ChunkReassembly {
     }
 }
 
+/// What a chunk did to a [`ChunkStream`].
+///
+/// Both variants mean "this payload is admissible — write it". The
+/// difference is what follows the write, and the caller must not act on
+/// [`StreamOutcome::Final`] before the write is durable: the item is only
+/// complete once the last payload is where it is going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// Accepted; more chunks are expected.
+    More,
+    /// The final chunk, and the item's `content_hash` verified over every
+    /// payload accepted: what has been handed out *is* the offered item.
+    Final,
+}
+
+/// Accounts for a chunked item written straight through instead of
+/// buffered (ADR 0015) — the file receiver's counterpart to
+/// [`ChunkReassembly`].
+///
+/// Same rules, same reject list, one difference that is the whole point:
+/// payloads are never retained. The caller writes each accepted payload
+/// to its own sink and this type keeps only what proves the result is the
+/// offered item — a running hash, a running length, and the next expected
+/// index. The receiver's commitment is therefore O(chunk), not O(item),
+/// which is what lets a file be 256 MiB while an image is capped at the
+/// 64 MiB a machine must actually hold (docs/PROTOCOL.md §5).
+///
+/// **A chunk is judged before it is written, never after.** `accept`
+/// returns before the caller writes, so a payload that fails any check
+/// never reaches the sink at all — the sink's contents are always a
+/// prefix of a conforming transfer, and a rejected transfer leaves a
+/// partial that is deleted rather than a partial that is corrupt.
+///
+/// Pure accounting — no I/O, no platform, no clock — so every rejection
+/// path is reachable in a unit test (docs/ARCHITECTURE.md §3).
+#[derive(Debug)]
+pub struct ChunkStream {
+    meta: ClipboardMeta,
+    plan: Option<ChunkPlan>,
+    /// Running digest over every payload accepted so far. The item's
+    /// `content_hash` is verified against it when the last chunk lands —
+    /// the same guarantee [`ChunkReassembly`] gives, obtained without
+    /// keeping the bytes.
+    digest: Sha256,
+    received: u64,
+    next_index: u32,
+    complete: bool,
+}
+
+impl ChunkStream {
+    /// Begin streaming the offered item.
+    ///
+    /// Validates `meta` — crucially the declared length against the
+    /// per-type maximum — before the caller commits any resource to it
+    /// (NFR-1). Nothing is allocated here: the whole point of this type
+    /// is that the item's size buys it no memory.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] if the meta is invalid or if the type
+    /// does not travel as chunks.
+    pub fn begin(meta: ClipboardMeta) -> Result<Self, ProtocolError> {
+        meta.validate()?;
+        if !meta.content_type.is_chunked() {
+            return Err(ProtocolError::Malformed {
+                reason: format!("{:?} items do not travel as chunks", meta.content_type),
+            });
+        }
+        Ok(Self {
+            meta,
+            plan: None,
+            digest: Sha256::new(),
+            received: 0,
+            next_index: 0,
+            complete: false,
+        })
+    }
+
+    /// The item being streamed.
+    #[must_use]
+    pub const fn meta(&self) -> ClipboardMeta {
+        self.meta
+    }
+
+    /// Bytes handed out for writing so far.
+    #[must_use]
+    pub const fn received_bytes(&self) -> u64 {
+        self.received
+    }
+
+    /// The plan, once chunk 0 has fixed the sender's chunk size.
+    #[must_use]
+    pub const fn plan(&self) -> Option<ChunkPlan> {
+        self.plan
+    }
+
+    /// Take one chunk, judging it against the transfer before any of it
+    /// is written.
+    ///
+    /// The reject list is [`ChunkReassembly::accept`]'s, unchanged: a
+    /// chunk for a different item; an index that is not exactly the next
+    /// one; a chunk after the transfer completed; a first chunk implying
+    /// a plan that does not reconcile with the offered length; any chunk
+    /// whose length is not the exact length its position requires — which
+    /// is what makes the running total incapable of passing the declared
+    /// length, so the receiver never trusts the sender to stop.
+    /// Completion additionally requires the running length to equal the
+    /// declared one and the item's `content_hash` to verify.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] for every case above.
+    pub fn accept(&mut self, chunk: &ClipboardChunk) -> Result<StreamOutcome, ProtocolError> {
+        chunk.validate()?;
+        if self.complete {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk {} for item {} arrived after the transfer completed",
+                    chunk.index, self.meta.id
+                ),
+            });
+        }
+        if chunk.id != self.meta.id {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk for item {} during the transfer of {}",
+                    chunk.id, self.meta.id
+                ),
+            });
+        }
+        if chunk.index != self.next_index {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk index {} out of sequence; expected {}",
+                    chunk.index, self.next_index
+                ),
+            });
+        }
+
+        // Chunk 0 fixes the sender's chunk size, and with it the whole
+        // plan — reconciled against the offered length before a byte of
+        // it is admitted. Computed here but **not stored yet**: a
+        // rejection must leave no trace, and storing before the checks
+        // below would let a refused chunk decide how the rest of the
+        // transfer is measured.
+        let plan = if let Some(plan) = self.plan {
+            plan
+        } else {
+            let Ok(chunk_bytes) = u32::try_from(chunk.payload.len()) else {
+                return Err(ProtocolError::Malformed {
+                    reason: "chunk payload length is not representable".to_owned(),
+                });
+            };
+            ChunkPlan::derive(self.meta.content_length, chunk_bytes)?
+        };
+
+        let Some(expected) = plan.chunk_len(chunk.index) else {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk index {} is past the {}-chunk transfer",
+                    chunk.index,
+                    plan.chunk_count()
+                ),
+            });
+        };
+        if chunk.payload.len() as u64 != u64::from(expected) {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk {} carries {} bytes; the plan requires exactly {expected}",
+                    chunk.index,
+                    chunk.payload.len()
+                ),
+            });
+        }
+
+        // Accepted: only now does any of it become state, and only the
+        // accounting — the payload itself belongs to the caller's sink.
+        self.plan = Some(plan);
+        self.digest.update(&chunk.payload);
+        self.received = self.received.saturating_add(chunk.payload.len() as u64);
+        self.next_index = self.next_index.saturating_add(1);
+        if self.next_index < plan.chunk_count() {
+            return Ok(StreamOutcome::More);
+        }
+
+        // Every declared byte has been handed out. Verify the item's
+        // identity before the caller is allowed to treat the sink's
+        // contents as the item.
+        if self.received != self.meta.content_length {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "streamed {} bytes for a declared length of {}",
+                    self.received, self.meta.content_length
+                ),
+            });
+        }
+        let digest: [u8; 32] = std::mem::replace(&mut self.digest, Sha256::new())
+            .finalize()
+            .into();
+        if digest != self.meta.content_hash {
+            return Err(ProtocolError::Malformed {
+                reason: format!("streamed content hash mismatch for item {}", self.meta.id),
+            });
+        }
+        self.complete = true;
+        Ok(StreamOutcome::Final)
+    }
+}
+
 /// The capability a peer must have advertised before this frame may be
 /// sent to it (docs/PROTOCOL.md §3.1), from the frame alone.
 ///
@@ -1238,11 +1447,11 @@ mod tests {
 
     use super::{
         ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ChunkOutcome, ChunkPlan, ChunkReassembly,
-        ClipboardAccept, ClipboardApplied, ClipboardChunk, ClipboardData, ClipboardDecline,
-        ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, FileDescriptor, ImageFormat,
-        MAX_CHUNK_BYTES, MAX_CHUNK_BYTES_U32, MAX_CHUNK_COUNT, MAX_CLIPBOARD_FILE_BYTES,
-        MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_TEXT_BYTES,
-        chunk_content, content_hash,
+        ChunkStream, ClipboardAccept, ClipboardApplied, ClipboardChunk, ClipboardData,
+        ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
+        FileDescriptor, ImageFormat, MAX_CHUNK_BYTES, MAX_CHUNK_BYTES_U32, MAX_CHUNK_COUNT,
+        MAX_CLIPBOARD_FILE_BYTES, MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
+        MAX_CLIPBOARD_TEXT_BYTES, StreamOutcome, chunk_content, content_hash,
     };
     use crate::ProtocolError;
     use crate::file_name::MAX_FILE_NAME_BYTES;
@@ -2092,6 +2301,38 @@ mod tests {
             }
         }
 
+        /// The same, for the stream a file rides: arbitrary sequences
+        /// never panic, a refusal leaves no trace, and — the property
+        /// only this type has — the accounting never runs ahead of the
+        /// item, so what a caller wrote can never exceed what was
+        /// declared.
+        #[test]
+        fn arbitrary_file_chunk_sequences_never_panic(
+            declared in 1u64..300_000,
+            chunks in proptest::collection::vec(
+                (0u32..8, proptest::collection::vec(any::<u8>(), 0..70_000)),
+                0..8,
+            ),
+        ) {
+            let meta = ClipboardMeta {
+                content_length: declared,
+                ..file_meta(b"unused")
+            };
+            let Ok(mut stream) = ChunkStream::begin(meta) else { return Ok(()); };
+            for (index, payload) in chunks {
+                let chunk = ClipboardChunk { id: meta.id, index, payload };
+                let (bytes_before, plan_before) = (stream.received_bytes(), stream.plan());
+                if stream.accept(&chunk).is_err() {
+                    // A rejection leaves no trace: nothing counted, and no
+                    // plan fixed by a chunk that was refused.
+                    prop_assert_eq!(stream.received_bytes(), bytes_before);
+                    prop_assert_eq!(stream.plan(), plan_before);
+                    break; // fail closed: the transfer is over
+                }
+                prop_assert!(stream.received_bytes() <= declared);
+            }
+        }
+
         /// Arbitrary bytes never panic the chunk decoder, and anything
         /// that decodes survives a re-encode unchanged.
         #[test]
@@ -2450,6 +2691,147 @@ mod tests {
         assert!(ContentType::File.is_chunked());
         assert!(matches!(
             ChunkReassembly::begin(file_meta(b"a document")),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Feed every chunk into a stream, collecting what the caller would
+    /// have written. The bytes come back out of the *caller's* sink, never
+    /// out of the stream — which is the difference being tested.
+    fn stream_through(
+        meta: ClipboardMeta,
+        chunks: &[ClipboardChunk],
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let mut stream = ChunkStream::begin(meta)?;
+        let mut sink: Vec<u8> = Vec::new();
+        let mut last = StreamOutcome::More;
+        for chunk in chunks {
+            last = stream.accept(chunk)?;
+            sink.extend_from_slice(&chunk.payload);
+        }
+        assert_eq!(last, StreamOutcome::Final, "the last chunk must complete");
+        assert_eq!(stream.received_bytes(), meta.content_length);
+        Ok(sink)
+    }
+
+    /// The happy path, over more than one chunk: what the caller wrote is
+    /// the offered item, proved by a hash the stream computed without ever
+    /// holding the bytes.
+    #[test]
+    fn a_streamed_file_verifies_without_being_buffered() {
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let meta = file_meta(&content);
+        let chunks = chunk_content(ITEM, &content).unwrap();
+        assert!(chunks.len() > 1, "the fixture must span several chunks");
+        assert_eq!(stream_through(meta, &chunks).unwrap(), content);
+    }
+
+    /// The one type `ChunkReassembly` refuses is the one this exists for,
+    /// and the two agree on everything else about what may be streamed.
+    #[test]
+    fn a_stream_takes_the_types_a_reassembly_does_and_the_file_type_too() {
+        assert!(ChunkStream::begin(file_meta(b"a document")).is_ok());
+        assert!(ChunkStream::begin(image_meta(b"raster")).is_ok());
+
+        let text = ClipboardMeta {
+            content_type: ContentType::Utf8Text,
+            ..file_meta(b"not chunked")
+        };
+        assert!(matches!(
+            ChunkStream::begin(text),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        let oversized = ClipboardMeta {
+            content_length: (MAX_CLIPBOARD_FILE_BYTES as u64) + 1,
+            ..file_meta(b"unused")
+        };
+        assert!(matches!(
+            ChunkStream::begin(oversized),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Content that is not what was offered never completes: the final
+    /// chunk is refused, so the caller deletes its partial rather than
+    /// registering bytes nobody vouched for.
+    #[test]
+    fn a_stream_refuses_content_that_is_not_the_offered_item() {
+        let content = b"the document that was offered".to_vec();
+        let chunks = chunk_content(ITEM, &content).unwrap();
+        let lying = ClipboardMeta {
+            content_hash: content_hash(b"something else entirely"),
+            ..file_meta(&content)
+        };
+        let mut stream = ChunkStream::begin(lying).unwrap();
+        assert!(matches!(
+            stream.accept(&chunks[0]),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Every fail-closed rule of the reassembly holds here too, and each
+    /// one fires *before* the payload would have been written.
+    #[test]
+    fn a_stream_rejects_out_of_sequence_short_and_late_chunks() {
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 241) as u8).collect();
+        let meta = file_meta(&content);
+        let chunks = chunk_content(ITEM, &content).unwrap();
+
+        // A gap: chunk 1 without chunk 0.
+        let mut stream = ChunkStream::begin(meta).unwrap();
+        assert!(matches!(
+            stream.accept(&chunks[1]),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        assert_eq!(stream.received_bytes(), 0, "a refusal writes nothing");
+
+        // A repeat.
+        let mut stream = ChunkStream::begin(meta).unwrap();
+        assert_eq!(stream.accept(&chunks[0]).unwrap(), StreamOutcome::More);
+        assert!(matches!(
+            stream.accept(&chunks[0]),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // A chunk that is not the length its position requires: the check
+        // that stops a running total from ever passing the declared one.
+        let mut stream = ChunkStream::begin(meta).unwrap();
+        let short = ClipboardChunk {
+            id: ITEM,
+            index: 0,
+            payload: chunks[0].payload[..chunks[0].payload.len() - 1].to_vec(),
+        };
+        assert_eq!(stream.accept(&chunks[0]).unwrap(), StreamOutcome::More);
+        let mut fresh = ChunkStream::begin(meta).unwrap();
+        assert_eq!(fresh.accept(&short).unwrap(), StreamOutcome::More);
+        assert!(
+            matches!(
+                fresh.accept(&chunks[1]),
+                Err(ProtocolError::Malformed { .. })
+            ),
+            "a plan derived from a short chunk 0 cannot admit a full chunk 1"
+        );
+
+        // A chunk for another item.
+        let mut stream = ChunkStream::begin(meta).unwrap();
+        let foreign = ClipboardChunk {
+            id: Uuid::from_u128(0xfeed),
+            index: 0,
+            payload: chunks[0].payload.clone(),
+        };
+        assert!(matches!(
+            stream.accept(&foreign),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // A tail after completion.
+        let mut stream = ChunkStream::begin(meta).unwrap();
+        for chunk in &chunks {
+            stream.accept(chunk).unwrap();
+        }
+        assert!(matches!(
+            stream.accept(&chunks[0]),
             Err(ProtocolError::Malformed { .. })
         ));
     }

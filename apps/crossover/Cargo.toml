@@ -32,6 +32,9 @@ uuid = { workspace = true }
 # would mean a test that sleeps for a quarter of an hour. A dev dependency,
 # so the shipped binary is unchanged.
 [dev-dependencies]
+# The in-memory secure storage the trust-policy tests read a trust store
+# out of, without touching the machine's real one.
+crossover-platform = { workspace = true, features = ["fakes"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 # Windows-only: compile the app icon into crossover.exe (build.rs). A build

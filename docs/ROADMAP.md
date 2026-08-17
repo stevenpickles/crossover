@@ -64,7 +64,28 @@
 > Nothing here is unsafe or stuck; it is responsiveness under a saturating
 > bulk transfer, on a link that was never the design target. Files/folders
 > ([ADR 0015](adr/0015-spooled-virtual-file-paste.md), **Accepted**
-> 2026-08-17) is the second sub-milestone and is where the work goes next.
+> 2026-08-17) is the second sub-milestone and is where the work is now.
+>
+> **The receiving half is built** (2026-08-17). A peer file is admitted
+> against permission, free space and the spool budget *before* the offer is
+> answered, streamed through to the spool a chunk at a time — memory stays
+> O(chunk), which is why a file may be 256 MiB where an image is capped at
+> 64 — verified against the offered hash and length, and promoted to an
+> entry only then. Every other outcome deletes the partial and registers
+> nothing. The engine stayed sans-io: it decides, and the driver performs
+> the four spool operations and reports back, so the guarantees are unit
+> tests over an action list rather than filesystem fixtures. The
+> `file_receive` grant reaches a running worker through the poll that
+> already re-reads the trust store for revocation.
+>
+> **What remains is the half the user can see**: the virtual file list
+> (`CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS` through an `IDataObject`
+> on its own STA thread), the entry-lifetime rule that depends on observing
+> the clipboard move on, the sender side (`CF_HDROP` and folder zipping),
+> and only then advertising `FILE_CLIPBOARD`. Until that bit is advertised
+> no conforming peer sends a file, so the path built here is exercised by
+> tests alone — deliberately, since the alternative is spooling deliveries
+> nothing can yet paste.
 >
 > Phase 6 (Windows Prototype Hardening) closed 2026-08-14: the multi-day
 > unattended soak — the last exit criterion — ran 2026-08-11 → 2026-08-14
