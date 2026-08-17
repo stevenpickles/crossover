@@ -139,10 +139,21 @@ struct PairArgs {
     bind: Option<String>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, PartialEq, Eq, Subcommand)]
 enum PeersAction {
     /// Revoke a trusted peer by device id (`crossover peers` lists them).
     Remove {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+    },
+    /// Let a trusted peer send you files. Off for every peer until you run
+    /// this: pairing does not grant it (ADR 0015).
+    AllowFiles {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+    },
+    /// Withdraw a peer's permission to send you files.
+    DenyFiles {
         /// The peer's device id (UUID).
         device_id: Uuid,
     },
@@ -311,6 +322,12 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Peers { action } => match action {
             None => commands::peers_list(),
             Some(PeersAction::Remove { device_id }) => commands::peers_remove(device_id),
+            Some(PeersAction::AllowFiles { device_id }) => {
+                commands::peers_set_file_receive(device_id, true)
+            }
+            Some(PeersAction::DenyFiles { device_id }) => {
+                commands::peers_set_file_receive(device_id, false)
+            }
         },
         Command::Status => commands::status(&storage::resolve_device_name(cli.name)),
         Command::Config => commands::config_show(),
@@ -329,6 +346,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use uuid::Uuid;
 
     use super::{Cli, Command, PeersAction, ServiceAction};
 
@@ -381,6 +399,47 @@ mod tests {
 
         // A non-UUID id is rejected at parse time.
         assert!(Cli::try_parse_from(["crossover", "peers", "remove", "not-a-uuid"]).is_err());
+    }
+
+    #[test]
+    fn file_permission_is_granted_and_withdrawn_by_dedicated_verbs() {
+        let id: Uuid = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8".parse().unwrap();
+        for (args, expected) in [
+            (
+                ["crossover", "peers", "allow-files", &id.to_string()],
+                PeersAction::AllowFiles { device_id: id },
+            ),
+            (
+                ["crossover", "peers", "deny-files", &id.to_string()],
+                PeersAction::DenyFiles { device_id: id },
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Peers {
+                action: Some(action),
+            } = cli.command
+            else {
+                panic!("expected peers action for {args:?}");
+            };
+            assert_eq!(action, expected);
+        }
+
+        // Each verb names exactly one peer: no bare form that could act on
+        // every peer at once, and no id that is not a device id (ADR 0015 —
+        // the grant is explicit and per peer).
+        assert!(Cli::try_parse_from(["crossover", "peers", "allow-files"]).is_err());
+        assert!(Cli::try_parse_from(["crossover", "peers", "deny-files"]).is_err());
+        assert!(Cli::try_parse_from(["crossover", "peers", "allow-files", "all"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "crossover",
+                "peers",
+                "allow-files",
+                &id.to_string(),
+                &id.to_string(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
