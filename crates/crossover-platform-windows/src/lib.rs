@@ -34,6 +34,8 @@ pub mod service;
 #[cfg(windows)]
 pub mod service_daemon;
 #[cfg(windows)]
+pub mod spool;
+#[cfg(windows)]
 pub mod stdio;
 // Pure watchdog logic (ADR 0011), deliberately not Windows-gated so it is
 // compiled and unit-tested on every CI OS even though only the Windows daemon
@@ -62,6 +64,8 @@ pub use secure_storage::DpapiSecureStorage;
 pub use service::WindowsServiceManager;
 #[cfg(windows)]
 pub use service_daemon::run_service_daemon;
+#[cfg(windows)]
+pub use spool::WindowsSpoolStorage;
 #[cfg(windows)]
 pub use stdio::ensure_standard_streams;
 pub use worker_supervisor::{SessionId, WorkerAction, WorkerSupervisor, WorkerSupervisorConfig};
