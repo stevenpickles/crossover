@@ -110,14 +110,25 @@ Rules, all of them deliberate:
 | Bit | Name | Meaning |
 |-----|------|---------|
 | 0 | `CHUNKED_CLIPBOARD` | The peer can receive `ContentType::Image` items offered and streamed as `ClipboardChunk` messages, reassemble them, and install the result (ADR 0014) |
+| 1 | `FILE_CLIPBOARD` | The peer can receive `ContentType::File` items — an offer carrying a `FileDescriptor`, then the blob as `ClipboardChunk` messages — spool the result, and offer it to its own clipboard as a virtual file (ADR 0015) |
+
+Bit 1 is deliberately **not** a widening of bit 0. A peer that implements
+ADR 0014 and not ADR 0015 advertises bit 0 and has no `File` discriminant,
+and an un-negotiated content type is fatal to its decode rather than
+skippable — so files need a bit of their own or they would kill exactly
+the sessions they were supposed to enrich.
 
 `FeatureFlags::ADVERTISED` is what this build actually sends, and it is
-`ALL` — bit 0 set — since ADR 0014's platform slice. Every layer of the
-promise is real: the wire carries chunked items, the clipboard engine
-offers, streams, reassembles, verifies and installs them, and
-`crossover-platform-windows` reads and writes `CF_DIB` on the actual OS
-clipboard. Advertising is a promise to **handle**, and the last step that
-could not be honoured is implemented, so the promise is honest.
+**bit 0 only** — not `ALL`. Bit 0 has been advertised since ADR 0014's
+platform slice, and every layer of that promise is real: the wire carries
+chunked items, the clipboard engine offers, streams, reassembles, verifies
+and installs them, and `crossover-platform-windows` reads and writes
+`CF_DIB` on the actual OS clipboard. Bit 1's wire types exist (ADR 0015's
+protocol slice), but the receiving half — the `file_receive` grant, the
+bounded spool, and the virtual file list on the OS clipboard — does not,
+and advertising is a promise to **handle**, not a statement of intent to
+send. The bit is set by the slice that makes it true, which is a
+deliberate one-line edit against a test that asserts today's answer.
 
 The flip is **wire-visible**: the `Hello` a peer receives now carries
 `supported_features = 1` where it carried `0`. That is why the golden
@@ -139,6 +150,14 @@ constant, so each suite states the negotiation it depends on.
 This is the route chosen over another hard version-floor bump (the v1 → v2
 option ADR 0014 weighed): the base-protocol wire layouts are unchanged, so
 a peer without the bit keeps synchronizing text with one that has it.
+
+A feature bit is not a substitute for a version bump, and ADR 0015 is
+where the difference shows. Bit 1 gates a new *content type*, which only
+travels after both sides advertise; but the same ADR appends
+`Option<FileDescriptor>` to `ClipboardOffer`, and that byte is on **every**
+offer of every type, negotiated or not. No bit can hide it from a peer
+that predates it, so files are the v2 → **v3** bump, while images needed
+none.
 
 ## 4. Message classes
 
@@ -216,8 +235,8 @@ B -> A   ClipboardApplied
 ```
 
 Offered **and chunked** flow (ADR 0014), for content types that cannot
-ride a single frame — `ContentType::Image` today, up to
-`MAX_CLIPBOARD_IMAGE_BYTES` = 64 MiB:
+ride a single frame — `ContentType::Image`, up to
+`MAX_CLIPBOARD_IMAGE_BYTES` = 64 MiB, and `ContentType::File` below:
 
 ```
 A -> B   ClipboardOffer     { id, content_type, content_length, content_hash }
@@ -231,6 +250,44 @@ A -> B   ClipboardChunk     { id, index: n-1, payload }
 B        reassembles, verifies content_hash, writes OS clipboard
 B -> A   ClipboardApplied
 ```
+
+Files (ADR 0015) ride that same flow, up to `MAX_CLIPBOARD_FILE_BYTES` =
+256 MiB, with one addition on the offer:
+
+```
+A -> B   ClipboardOffer     { id, content_type: File, content_length,
+                              content_hash,
+                              descriptor: { file_name, archived,
+                                            entry_count, original_bytes } }
+B -> A   ClipboardAccept | ClipboardDecline   // NotPermitted, InvalidName,
+                                              // InsufficientSpace, TooLarge,
+                                              // NotReady
+A -> B   ClipboardChunk × n                   // written through to B's spool
+B -> A   ClipboardApplied   { id, result: Stored | StorageFailed }
+```
+
+Rules specific to files:
+
+- **One clipboard item is one blob**: a single file verbatim, or one zip
+  archive the *sender* built from a folder or a multi-entry selection.
+  Nothing in Crossover reads an archive, on either machine.
+- **The offer carries a descriptor, and only a file offer does.** A file
+  offer without one, a descriptor on any other type, an `entry_count` of
+  zero or past `MAX_CLIPBOARD_FILE_ENTRIES`, a multi-entry blob that
+  claims not to be an archive, or an unarchived item whose
+  `original_bytes` disagree with `content_length` are all malformed.
+- **`file_name` is validated at decode**, by the rules in ADR 0015 —
+  reject, never repair. It is the one field of a file transfer that
+  reaches a shell (`FILEDESCRIPTORW.cFileName`), so a name that does not
+  conform makes its offer malformed and no descriptor carrying it ever
+  exists. The rejection names the fault and never the name, which is user
+  data.
+- **File content is chunked but never buffered.** The receiver writes
+  chunks through to its spool as they arrive, so its commitment is
+  O(chunk) rather than O(item); the in-memory reassembly used for images
+  refuses this type outright.
+- **No `AlreadyHave` for files**: a spool entry may have been evicted, so
+  the receiver cannot honestly claim to already have one.
 
 Rules specific to the chunked flow:
 
@@ -373,8 +430,11 @@ Rules, all fail-closed:
 | Frame body maximum | 4 MiB + 64 KiB (ADR 0005): one maximum *text* item plus envelope per frame. Unchanged by chunking (ADR 0014) — larger content is split, never carried whole, because one giant frame is exactly what cannot be preempted (ADR 0013) |
 | Max clipboard text / inline threshold | 4 MiB / 64 KiB (ADR 0005), named constants in `crossover-protocol` |
 | Max clipboard image | 64 MiB, `MAX_CLIPBOARD_IMAGE_BYTES` (ADR 0014) — see below |
+| Max clipboard file | 256 MiB, `MAX_CLIPBOARD_FILE_BYTES` (ADR 0015). Bounds the wire and the receiver's spool, **not** its memory: file chunks are written through as they arrive |
+| Max archive entries | 256, `MAX_CLIPBOARD_FILE_ENTRIES` (ADR 0015) — entries one archived item may pack |
+| Max file name | 255 bytes, `MAX_FILE_NAME_BYTES` (NTFS's per-component limit) and 259 UTF-16 units, `MAX_FILE_NAME_UTF16_UNITS` (`FILEDESCRIPTORW.cFileName` is `WCHAR[260]`). Both checked, so raising either cannot silently overrun a fixed-size Win32 buffer |
 | Chunk payload maximum | 64 KiB, `MAX_CHUNK_BYTES` (ADR 0014) — a *maximum*, not a fixed size; see below |
-| Chunk count maximum | 1024, `MAX_CHUNK_COUNT` = `MAX_CLIPBOARD_IMAGE_BYTES` ÷ `MAX_CHUNK_BYTES`. Derived, and compile-time asserted against the two constants it comes from |
+| Chunk count maximum | 4096, `MAX_CHUNK_COUNT` = `MAX_CLIPBOARD_FILE_BYTES` ÷ `MAX_CHUNK_BYTES` — the largest chunked type over the largest chunk. Derived, and compile-time asserted against every chunked type's ceiling. Raising it does not raise what a transfer may cost: a plan must reconcile exactly with the offered length, which is bounded per type |
 | Keepalive interval / timeout | 5 s / 15 s defaults in `crossover-core::supervision` |
 
 **Chunk size is the sender's to choose.** `MAX_CHUNK_BYTES` bounds a chunk;
