@@ -10,12 +10,24 @@ use crate::ProtocolError;
 ///
 /// v2 (Phase 5): the control-transfer messages carry a normalized edge
 /// crossing position (ADR 0009), an incompatible layout change from v1.
-pub const PROTOCOL_VERSION: u16 = 2;
+///
+/// v3 (Phase 7): `ClipboardOffer` carries an optional `FileDescriptor`
+/// (ADR 0015). Unlike ADR 0014's additions — a new message type and an
+/// appended enum variant, both reachable only after a feature bit is
+/// negotiated — this one appends a field to a message that already
+/// travels, so *every* offer gains a byte and no feature bit can hide it
+/// from a peer that predates the change. A v2 peer would read the extra
+/// byte as trailing data and fail the payload, which by
+/// docs/PROTOCOL.md §7 is fatal to the session. The bump turns that into
+/// a clean, diagnosable refusal at `Hello` instead.
+pub const PROTOCOL_VERSION: u16 = 3;
 
-/// The lowest protocol version this build accepts. v1's control messages
-/// cannot be decoded by v2 (added fields), and there are no deployed v1
-/// peers, so v2 is the floor rather than a compatibility burden.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 2;
+/// The lowest protocol version this build accepts. Each bump has been an
+/// incompatible layout change (v1's control messages cannot be decoded by
+/// v2; v2's offers cannot be decoded by v3), and peers are deployed in
+/// lockstep, so the floor tracks the ceiling rather than carrying
+/// compatibility code for a version nobody runs.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 3;
 
 /// An inclusive range of supported protocol versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
