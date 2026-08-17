@@ -53,6 +53,70 @@ pub fn open_clipboard_provider()
     }
 }
 
+/// Open the protected spool peer files are received into (ADR 0015), and
+/// sweep whatever a previous run left in it.
+///
+/// Never fatal, and never fails the run: a spool that cannot be opened
+/// means **file receive is off for this run** and everything else works
+/// exactly as before. It is also never repaired by deleting what is
+/// there — deleting whatever sits at the spool path is precisely the
+/// operation SECURITY.md F15 defends against, so the diagnostic names the
+/// path and leaves it to the user.
+///
+/// The sweep is unconditional and part of opening: entries from a previous
+/// run cannot correspond to the current clipboard, so nothing from before
+/// this process is reachable, and an unpasted delivery does not survive a
+/// restart by construction rather than by intention (ADR 0015).
+#[must_use]
+pub fn open_spool() -> Option<std::sync::Arc<dyn crossover_platform::SpoolStorage>> {
+    #[cfg(windows)]
+    {
+        use crossover_platform::SpoolStorage;
+
+        let spool = match crossover_platform_windows::WindowsSpoolStorage::in_default_location() {
+            Ok(spool) => spool,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "file receive is disabled for this run; text and images are unaffected"
+                );
+                eprintln!("File receive is disabled for this run: {error}");
+                return None;
+            }
+        };
+        match spool.sweep() {
+            Ok(report) => {
+                if !report.removed.is_empty() || !report.retained.is_empty() {
+                    tracing::info!(
+                        removed = report.removed.len(),
+                        removed_bytes = report.removed_bytes,
+                        retained = report.retained.len(),
+                        "swept the spool of a previous run's entries"
+                    );
+                }
+                if !report.retained.is_empty() {
+                    // Something in the spool root is not ours to remove —
+                    // a planted directory, or an entry held open. Worth a
+                    // warning: nothing else writes there (F15).
+                    tracing::warn!(
+                        retained = ?report.retained,
+                        "objects remain in the spool root after the startup sweep"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%error, "the spool could not be swept at startup"),
+        }
+        Some(std::sync::Arc::new(spool))
+    }
+    #[cfg(not(windows))]
+    {
+        // No protected spool off Windows yet, and no unprotected fallback:
+        // ADR 0015 leaves the Linux answer open, and an ordinary directory
+        // would void the guarantee the spool exists to make.
+        None
+    }
+}
+
 /// Open the platform display-info provider (primary-display geometry and
 /// cursor position, ADR 0009).
 ///

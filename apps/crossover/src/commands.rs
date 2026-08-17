@@ -20,9 +20,9 @@ use crossover_core::supervision::{
 };
 use crossover_core::{
     ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
-    FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics, OutboundSender, SeamlessInputs,
-    SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology, clipboard_sync,
-    edge_detect, input_control, outbound_channel,
+    FileReceive, FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics, OutboundSender,
+    SeamlessInputs, SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology,
+    clipboard_sync, edge_detect, input_control, outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
@@ -38,7 +38,7 @@ use crossover_security::{
 use crate::console::{self, ConsoleCommand};
 use crate::storage::{
     open_clipboard_provider, open_cursor_mask, open_display, open_input, open_secure_storage,
-    open_service_manager,
+    open_service_manager, open_spool,
 };
 
 /// One ceremony's allowance, listener and connector alike. Generous
@@ -555,9 +555,13 @@ pub async fn run(
     // Clipboard sync: one driver for the peer relationship; sessions of
     // either role feed it and carry its frames.
     let provider = open_clipboard_provider()?;
+    // The spool is opened (and swept) once per run. `None` means this run
+    // cannot receive files at all — never a fallback to an unprotected
+    // directory, which would void the guarantee it exists to make.
+    let spool = open_spool();
     let (sync_driver, sync_events, sync_commands) = clipboard_sync(
         provider,
-        None,
+        spool.clone(),
         identity.device_id(),
         ClipboardConfig::new(),
         Some(Arc::clone(&metrics)),
@@ -569,18 +573,22 @@ pub async fn run(
     // and (in seamless mode) the edge detector.
     let (control_events, control_commands) = setup_input_control(side, &metrics, no_cursor_mask)?;
 
-    // Session lifecycle and frames fan out to both drivers.
-    let fanout = SessionFanout {
-        sync: sync_events,
-        control: control_events.clone(),
-        metrics: Some(Arc::clone(&metrics)),
-    };
-
     // Every live session, keyed by id, so the mux can route control and
     // input frames to the exact session the engine named and broadcast
     // clipboard frames to all.
     let registry: SessionRegistry =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Session lifecycle and frames fan out to both drivers.
+    let policy_events = sync_events.clone();
+    let fanout = SessionFanout {
+        sync: sync_events,
+        control: control_events.clone(),
+        metrics: Some(Arc::clone(&metrics)),
+        storage: Arc::clone(&storage),
+        registry: Arc::clone(&registry),
+        spool_open: spool.is_some(),
+    };
 
     // Both drivers emit the same SessionCommands; merge them into the two
     // priority lanes the mux drains independently (ADR 0013).
@@ -634,8 +642,9 @@ pub async fn run(
             &registry,
             &metrics,
         ) => {}
-        // Enforce revocation on live sessions, not just new ones (ADR 0010).
-        () = enforce_revocations(&storage, &registry) => {}
+        // Act on trust-store edits made while this run is up: revocation
+        // (ADR 0010) and the file-receive grant (ADR 0015).
+        () = apply_trust_changes(&storage, &registry, &policy_events, spool.is_some()) => {}
     }
     if let Some(handle) = &handle {
         handle.shutdown();
@@ -756,6 +765,15 @@ struct SessionFanout {
     sync: mpsc::Sender<SyncEvent>,
     control: mpsc::Sender<InputControlEvent>,
     metrics: Option<Arc<Metrics>>,
+    /// Where the `file_receive` grant is read from when a session comes up
+    /// or goes away (ADR 0015). The store on disk, not a cached copy: it
+    /// is edited by a *different* process (`crossover peers allow-files`).
+    storage: Arc<dyn SecureStorage>,
+    /// Live sessions, so the grant is judged over every peer that could
+    /// send a file rather than only the one that just connected.
+    registry: SessionRegistry,
+    /// Whether this run has a spool at all.
+    spool_open: bool,
 }
 
 impl SessionFanout {
@@ -789,6 +807,10 @@ impl SessionFanout {
             InputControlEvent::SessionEstablished { session },
         )
         .await;
+        // Immediately, not on the next poll: a file copied in the first
+        // seconds of a session would otherwise be refused for a permission
+        // the user has actually granted.
+        self.publish_file_policy().await;
     }
 
     async fn lost(&self, session: Uuid) {
@@ -797,6 +819,15 @@ impl SessionFanout {
             InputControlEvent::SessionLost { session },
         )
         .await;
+        self.publish_file_policy().await;
+    }
+
+    /// Tell the clipboard driver what the trust store currently says about
+    /// receiving files.
+    async fn publish_file_policy(&self) {
+        let live = live_peer_fingerprints(&self.registry);
+        let policy = file_receive_policy(self.spool_open, &*self.storage, &live);
+        let _ = self.sync.send(SyncEvent::FileReceivePolicy(policy)).await;
     }
 
     async fn frame(&self, session: Uuid, frame: crossover_protocol::RawFrame) {
@@ -1233,6 +1264,54 @@ fn revoked_session_ids(live: &[(Uuid, SpkiFingerprint)], trust: &TrustStore) -> 
         .collect()
 }
 
+/// Fingerprints of every peer with a live session — everyone who could
+/// send this machine a file right now.
+fn live_peer_fingerprints(registry: &SessionRegistry) -> Vec<SpkiFingerprint> {
+    registry_lock(registry)
+        .values()
+        .map(|route| route.peer_fingerprint)
+        .collect()
+}
+
+/// Whether peer files may be received right now (ADR 0015).
+///
+/// Fail-closed at every step, and deliberately judged over **all** live
+/// peers rather than one: clipboard sync is session-agnostic (FR-5.4), so
+/// the engine cannot tell which peer an offer came from, and a permission
+/// that cannot be attributed must not be granted. With one peer — the
+/// two-machine scope — this is simply that peer's grant; with two, an
+/// ungranted peer closes the door for both, which is the honest answer
+/// until the clipboard engine becomes session-aware.
+///
+/// A store that will not load is `Denied` rather than an error: the
+/// revocation poll has the same policy, and a transient read failure must
+/// never *open* a write surface.
+fn file_receive_policy(
+    spool_open: bool,
+    storage: &dyn SecureStorage,
+    live: &[SpkiFingerprint],
+) -> FileReceive {
+    if !spool_open {
+        return FileReceive::Unsupported;
+    }
+    if live.is_empty() {
+        return FileReceive::Denied;
+    }
+    let Ok(trust) = TrustStore::load(storage) else {
+        return FileReceive::Denied;
+    };
+    let granted = live.iter().all(|fingerprint| {
+        trust
+            .find_by_fingerprint(*fingerprint)
+            .is_some_and(TrustedPeer::may_receive_files)
+    });
+    if granted {
+        FileReceive::Allowed
+    } else {
+        FileReceive::Denied
+    }
+}
+
 /// Terminate one session on revocation: fire an inbound session's kill
 /// switch, or shut the outbound supervisor down (its one peer is now
 /// untrusted, so stopping reconnection to it is correct). The normal
@@ -1248,12 +1327,25 @@ fn terminate_on_revocation(route: &SessionRoute) {
     }
 }
 
-/// Enforce revocation on *active* sessions (ADR 0010): periodically reload
-/// the trust store and terminate any live session whose peer is no longer
-/// trusted. New connections are already rejected by the per-accept/attempt
-/// trust read; this closes the active-session half of SECURITY.md §4 / T6.
+/// Act on trust-store changes made while the process runs. Two jobs, one
+/// re-read, because they are the same question asked of the same file.
+///
+/// **Revocation on *active* sessions** (ADR 0010): terminate any live
+/// session whose peer is no longer trusted. New connections are already
+/// rejected by the per-accept/attempt trust read; this closes the
+/// active-session half of SECURITY.md §4 / T6.
+///
+/// **File receive** (ADR 0015): `crossover peers deny-files` runs in
+/// another process, so withdrawing the grant reaches a running worker
+/// here — within one poll, and without waiting for a reconnect.
+///
 /// Never returns — runs as a branch of the foreground select.
-async fn enforce_revocations(storage: &Arc<dyn SecureStorage>, registry: &SessionRegistry) {
+async fn apply_trust_changes(
+    storage: &Arc<dyn SecureStorage>,
+    registry: &SessionRegistry,
+    sync: &mpsc::Sender<SyncEvent>,
+    spool_open: bool,
+) {
     let mut ticker = tokio::time::interval(REVOCATION_POLL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1271,6 +1363,15 @@ async fn enforce_revocations(storage: &Arc<dyn SecureStorage>, registry: &Sessio
             .iter()
             .map(|(id, route)| (*id, route.peer_fingerprint))
             .collect();
+        let fingerprints: Vec<SpkiFingerprint> =
+            live.iter().map(|(_, fingerprint)| *fingerprint).collect();
+        let _ = sync
+            .send(SyncEvent::FileReceivePolicy(file_receive_policy(
+                spool_open,
+                &**storage,
+                &fingerprints,
+            )))
+            .await;
         for id in revoked_session_ids(&live, &trust) {
             // Remove and terminate under the same intent; the session's own
             // teardown also removes by id (a harmless no-op) and fans out
@@ -2069,6 +2170,12 @@ mod tests {
             sync: sync_tx,
             control: control_tx,
             metrics: None,
+            // No peer is trusted in this rig, so the file-receive policy
+            // it publishes is the closed one — which is all this test
+            // needs from it, since it is about teardown, not files.
+            storage: Arc::new(crossover_platform::fakes::InMemorySecureStorage::new()),
+            registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            spool_open: false,
         };
 
         // The clipboard driver, in miniature: a serial loop that turns each
@@ -2162,6 +2269,12 @@ mod tests {
             sync: sync_tx,
             control: control_tx,
             metrics: None,
+            // No peer is trusted in this rig, so the file-receive policy
+            // it publishes is the closed one — which is all this test
+            // needs from it, since it is about teardown, not files.
+            storage: Arc::new(crossover_platform::fakes::InMemorySecureStorage::new()),
+            registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            spool_open: false,
         };
 
         // Back the clipboard driver's channel right up; nothing drains it.
@@ -2205,5 +2318,71 @@ mod tests {
         assert_eq!(age(now - 200_000), "2d ago");
         // A future timestamp (clock skew) saturates instead of panicking.
         assert_eq!(age(now + 500), "just now");
+    }
+
+    /// The one gate on the filesystem-write surface that this binary owns
+    /// (ADR 0015, SECURITY.md invariant 8). Every step of it fails closed,
+    /// and the two refusals stay distinguishable.
+    #[test]
+    fn file_receive_is_granted_only_when_every_live_peer_holds_the_grant() {
+        use crossover_platform::fakes::InMemorySecureStorage;
+        use crossover_security::{TrustStore, TrustedPeer};
+
+        use super::{FileReceive, file_receive_policy};
+
+        fn fingerprint(fill: u8) -> crossover_security::SpkiFingerprint {
+            crossover_security::SpkiFingerprint::from([fill; 32])
+        }
+
+        let storage = InMemorySecureStorage::new();
+        let mut trust = TrustStore::default();
+        let mut granted =
+            TrustedPeer::new(Uuid::from_bytes([1; 16]), "granted", fingerprint(1)).unwrap();
+        granted.set_file_receive(true);
+        let ungranted =
+            TrustedPeer::new(Uuid::from_bytes([2; 16]), "ungranted", fingerprint(2)).unwrap();
+        trust.add_peer(granted).unwrap();
+        trust.add_peer(ungranted).unwrap();
+        trust.save(&storage).unwrap();
+
+        // No spool: permanent, and distinct from "not permitted" — the
+        // origin learns files will never travel here, not that a grant
+        // would fix it.
+        assert_eq!(
+            file_receive_policy(false, &storage, &[fingerprint(1)]),
+            FileReceive::Unsupported
+        );
+        // Nobody connected: nothing to grant to.
+        assert_eq!(
+            file_receive_policy(true, &storage, &[]),
+            FileReceive::Denied
+        );
+        // The granted peer, alone.
+        assert_eq!(
+            file_receive_policy(true, &storage, &[fingerprint(1)]),
+            FileReceive::Allowed
+        );
+        // Default-off: a trusted peer is not a permitted one.
+        assert_eq!(
+            file_receive_policy(true, &storage, &[fingerprint(2)]),
+            FileReceive::Denied
+        );
+        // The case the rule exists for: clipboard sync cannot tell which
+        // peer an offer came from, so one ungranted peer closes the door
+        // for both rather than lending the other's permission.
+        assert_eq!(
+            file_receive_policy(true, &storage, &[fingerprint(1), fingerprint(2)]),
+            FileReceive::Denied
+        );
+        // An unknown fingerprint is not a grant either.
+        assert_eq!(
+            file_receive_policy(true, &storage, &[fingerprint(9)]),
+            FileReceive::Denied
+        );
+        // A store that will not load must never open the surface.
+        assert_eq!(
+            file_receive_policy(true, &InMemorySecureStorage::new(), &[fingerprint(1)]),
+            FileReceive::Denied
+        );
     }
 }
