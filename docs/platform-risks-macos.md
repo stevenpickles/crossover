@@ -1,7 +1,7 @@
 # Known platform risks — macOS
 
 Written **before** `crossover-platform-macos` exists, as
-[ROADMAP.md](ROADMAP.md) Phase 8 requires. The point is to know what the
+[ROADMAP.md](ROADMAP.md) Phase 9 requires. The point is to know what the
 port will fight before deciding how to build it, in the same spirit as
 [SPECIFICATION.md](SPECIFICATION.md) §6 for Windows.
 
@@ -96,7 +96,7 @@ verbatim. On Windows that is `CF_DIB`. macOS pasteboards deal in
 `ContentType::Image(ImageFormat::Dib)` arriving at a Mac is unrenderable.
 
 This is the one risk in this document that may reach **beyond the platform
-crate**, which is precisely what Phase 8 says should not happen ("new
+crate**, which is precisely what Phase 9 says should not happen ("new
 implementations of the clipboard trait, not new protocol design").
 
 - **Threatens:** cross-platform image interop; possibly `ContentType`.

@@ -294,7 +294,7 @@ that touch them:
   conflict with hooks. Initial scope may exclude these; the limitation must
   be documented.
 
-macOS and Linux risks are now catalogued, ahead of the ports as Phase 8
+macOS and Linux risks are now catalogued, ahead of the ports as Phase 9
 requires: [platform-risks-macos.md](platform-risks-macos.md) and
 [platform-risks-linux.md](platform-risks-linux.md). They are written from
 documented platform behaviour rather than measurement, so each risk carries

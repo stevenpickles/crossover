@@ -64,13 +64,13 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0012](0012-elevated-worker-integrity.md) | Worker runs at high integrity, launched with the user's elevated linked token, so it can drive elevated windows | Accepted |
 | [0013](0013-interactive-over-bulk-prioritization.md) | Interactive input takes wire priority over bulk transfers (Phase 7) | Accepted |
 | [0014](0014-chunked-rich-clipboard-transfer.md) | Chunked rich-clipboard transfer: images first, native format verbatim (Phase 7) | Accepted |
-| [0015](0015-spooled-virtual-file-paste.md) | Files/folders transfer: eager transfer to a bounded internal spool, pasted as a virtual file list, sender-zipped archives, per-peer permission (Phase 7) | Proposed |
-| [0016](0016-image-interchange-format.md) | Image interchange: the receiver names the format, the sender produces it; PNG is the baseline and receivers never decode (Phase 8) | Proposed |
+| [0015](0015-spooled-virtual-file-paste.md) | Files/folders transfer: eager transfer to a bounded internal spool, pasted as a virtual file list, sender-zipped archives, per-peer permission (Phase 7) | Accepted |
+| [0016](0016-image-interchange-format.md) | Image interchange: the receiver names the format, the sender produces it; PNG is the baseline and receivers never decode (cross-platform) | Proposed |
 
 ## Known decisions awaiting an ADR
 
 None outstanding. The files/folders **filesystem-write surface** sketched in
-0014 is now designed in [0015](0015-spooled-virtual-file-paste.md) (Proposed) —
+0014 is now designed in [0015](0015-spooled-virtual-file-paste.md) (Accepted) —
 eager verified transfer into a bounded internal spool, disposed of by pasting a
 virtual file list, superseding the drop-folder model 0014 sketched and 0015's
 own first draft carried — with the matching threat-model additions in
@@ -82,8 +82,9 @@ pairing mechanism (0002), identity credential (0003), default port (0004),
 clipboard transaction flow (0005), Windows input capture (0007), and keyboard
 key representation (0008); 0006 was raised by evidence rather than deferred.
 ADRs 0013 and 0014 are **Accepted** — the Phase 7 rich-clipboard direction is
-ratified after a drift-check against the current code. ADR 0015 is **Proposed**
-— files/folders transfer stays gated on its ratification.
+ratified after a drift-check against the current code. ADR 0015 is **Accepted** as of
+2026-08-17: its design forks were settled when files was scheduled, and
+implementation is no longer gated on ratification.
 
 New entries belong here when a decision is identified but not yet made,
 so that the gap is visible rather than implicit.

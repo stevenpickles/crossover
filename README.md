@@ -18,7 +18,7 @@ larger workstation, without weakening the security boundary between them.
 > images**, the latter carried verbatim and validated over a multi-hour
 > two-machine soak. Files and folders are designed
 > ([ADR 0015](docs/adr/0015-spooled-virtual-file-paste.md)) and not yet
-> built; macOS and Linux come in Phase 8. The
+> built; macOS and Linux come later (Phase 9). The
 > [roadmap](docs/ROADMAP.md) carries the authoritative current-phase marker.
 
 ## What it does
@@ -37,9 +37,12 @@ larger workstation, without weakening the security boundary between them.
 - Files and folders on the clipboard — designed
   ([ADR 0015](docs/adr/0015-spooled-virtual-file-paste.md)), not built
 - macOS and Linux — the platform boundary exists and the core compiles on
-  all three, but only the Windows implementations are written (Phase 8)
+  all three, but only the Windows implementations are written (Phase 9)
+- Arbitrary monitor arrangements — today a machine is declared `--left` or
+  `--right` and its monitors are treated as one desktop; a drag-and-drop
+  editor is Phase 8
 - More than two machines, a tray application, discovery, or auto-update
-  (Phase 9)
+  (Phase 10)
 - Code-signed binaries, so SmartScreen will warn on first run
 
 Target today: two Windows machines on a LAN. Implementation language: Rust.
