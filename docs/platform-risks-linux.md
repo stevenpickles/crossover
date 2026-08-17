@@ -176,8 +176,8 @@ from the macOS side, and the two agree: **PNG is the plausible
 cross-platform interchange format**, and `CF_DIB` is the outlier.
 
 - **Threatens:** cross-platform image interop.
-- **Decide once, for both platforms**, and if the answer changes the wire it
-  needs an ADR rather than a platform-crate decision.
+- **Drafted once, for both platforms:**
+  [ADR 0016](adr/0016-image-interchange-format.md) (Proposed).
 
 ---
 
