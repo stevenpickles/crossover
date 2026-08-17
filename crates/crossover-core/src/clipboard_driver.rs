@@ -26,14 +26,14 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crossover_platform::{ClipboardError, ClipboardProvider};
+use crossover_platform::{ClipboardError, ClipboardProvider, SpoolError, SpoolStorage};
 use crossover_protocol::RawFrame;
 use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
 use crossover_protocol::hello::MessageType;
 
 use crate::clipboard::{
-    Action, ClipboardConfig, ClipboardEngine, InboundMessage, OutboundMessage, TransferScope,
-    WriteFailure,
+    Action, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, InboundMessage,
+    MIN_FREE_SPACE_MARGIN_BYTES, OutboundMessage, TransferScope, WriteFailure,
 };
 use crate::command::{FrameTarget, SessionCommand};
 use crate::metrics::Metrics;
@@ -114,6 +114,15 @@ pub enum SyncEvent {
         /// Which transfer it belongs to; a stale one is a no-op.
         generation: u64,
     },
+    /// Whether peer files may be received (ADR 0015), as the application
+    /// currently reads the trust store.
+    ///
+    /// An event rather than construction-time configuration because the
+    /// answer changes while the process runs: `crossover peers deny-files`
+    /// happens in another process, and the running one re-reads the store
+    /// on its revocation poll. Sending the policy in stops the *next*
+    /// transfer without waiting for a reconnect.
+    FileReceivePolicy(FileReceive),
 }
 
 /// The clipboard sync driver. Create with [`clipboard_sync`], then spawn
@@ -121,6 +130,15 @@ pub enum SyncEvent {
 pub struct ClipboardSyncDriver {
     engine: ClipboardEngine,
     provider: Arc<dyn ClipboardProvider>,
+    /// The protected spool peer files are written into (ADR 0015), or
+    /// `None` where this build has none. `None` is not a degraded mode:
+    /// the engine is told file receive is unsupported and every offer is
+    /// refused, because an unprotected fallback would void the security
+    /// claim the spool exists to make.
+    spool: Option<Arc<dyn SpoolStorage>>,
+    /// The open partial of the transfer in flight, keyed by transaction.
+    /// One at a time, because the engine admits one at a time.
+    file_write: Option<(Uuid, std::fs::File)>,
     events_rx: mpsc::Receiver<SyncEvent>,
     events_tx: mpsc::Sender<SyncEvent>,
     commands_tx: CommandSender,
@@ -154,6 +172,7 @@ pub struct ClipboardSyncDriver {
 /// be silent sync failure (NFR-3).
 pub fn clipboard_sync(
     provider: Arc<dyn ClipboardProvider>,
+    spool: Option<Arc<dyn SpoolStorage>>,
     origin: Uuid,
     config: ClipboardConfig,
     metrics: Option<Arc<Metrics>>,
@@ -181,6 +200,8 @@ pub fn clipboard_sync(
     let driver = ClipboardSyncDriver {
         engine: ClipboardEngine::with_metrics(origin, config, metrics.clone()),
         provider,
+        spool,
+        file_write: None,
         events_rx,
         events_tx: events_tx.clone(),
         commands_tx,
@@ -272,6 +293,19 @@ impl ClipboardSyncDriver {
             SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
             SyncEvent::TransferTimeout { scope, generation } => {
                 self.engine.on_transfer_timeout(scope, generation)
+            }
+            SyncEvent::FileReceivePolicy(policy) => {
+                // Clamped, not merely forwarded: without a spool there is
+                // nowhere for a file to go, whatever the trust store says.
+                // The permission and the capability are separate answers,
+                // and the closed one wins.
+                let policy = if self.spool.is_some() {
+                    policy
+                } else {
+                    FileReceive::Unsupported
+                };
+                self.engine.set_file_receive(policy);
+                Vec::new()
             }
             SyncEvent::SettleDue(generation) => {
                 if generation == self.settle_generation {
@@ -548,6 +582,185 @@ impl ClipboardSyncDriver {
         )
     }
 
+    /// Reserve room for an offered file and open the partial it streams
+    /// into (ADR 0015).
+    ///
+    /// Space is checked *before* the partial exists, and the margin is
+    /// part of the check: a transfer that would leave the volume with no
+    /// headroom is refused rather than started, because filling a user's
+    /// system volume is a fault of its own and the refusal costs the
+    /// origin one frame (FR-3.6).
+    fn admit_file(&mut self, id: Uuid, entry: &str, byte_len: u64) -> Vec<Action> {
+        let outcome = self.reserve_partial(id, entry, byte_len);
+        self.engine.on_file_admitted(id, outcome)
+    }
+
+    /// The spool half of [`Self::admit_file`]: the checks, and the open
+    /// partial if they all pass.
+    fn reserve_partial(&mut self, id: Uuid, entry: &str, byte_len: u64) -> Result<(), FileRefusal> {
+        let Some(spool) = &self.spool else {
+            return Err(FileRefusal::Storage);
+        };
+        // A partial left open from an earlier transfer would keep a handle
+        // on an entry the engine has already abandoned. Closed here, so
+        // the slot is genuinely free before another is opened.
+        self.file_write = None;
+
+        let free = spool.free_bytes().map_err(|error| {
+            tracing::warn!(error = %error, "spool free space could not be read; refusing the transfer");
+            FileRefusal::Storage
+        })?;
+        let required = byte_len.saturating_add(MIN_FREE_SPACE_MARGIN_BYTES);
+        if free < required {
+            tracing::warn!(
+                clipboard_id = %id,
+                byte_count = byte_len,
+                free_bytes = free,
+                required_bytes = required,
+                "declining a file offer: not enough room on the spool volume"
+            );
+            return Err(FileRefusal::InsufficientSpace);
+        }
+        match spool.create_entry(entry) {
+            Ok(file) => {
+                self.file_write = Some((id, file));
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    clipboard_id = %id,
+                    spool_entry = %entry,
+                    error = %error,
+                    "the spool partial could not be created"
+                );
+                Err(FileRefusal::Storage)
+            }
+        }
+    }
+
+    /// Append one chunk to the open partial. `false` means the transfer
+    /// is over: the engine deletes the partial and answers the origin.
+    fn write_file_chunk(&mut self, id: Uuid, payload: &[u8]) -> Vec<Action> {
+        if self.append_to_partial(id, payload) {
+            self.engine.on_file_chunk_written(id)
+        } else {
+            self.engine.on_file_write_failed(id)
+        }
+    }
+
+    /// The write itself. `false` means the bytes did not land.
+    fn append_to_partial(&mut self, id: Uuid, payload: &[u8]) -> bool {
+        use std::io::Write;
+
+        let Some((open_id, file)) = self.file_write.as_mut() else {
+            tracing::warn!(clipboard_id = %id, "file chunk with no open spool partial");
+            return false;
+        };
+        if *open_id != id {
+            tracing::warn!(clipboard_id = %id, "file chunk for a partial that is not open");
+            return false;
+        }
+        if let Err(error) = file.write_all(payload) {
+            tracing::warn!(clipboard_id = %id, error = %error, "writing to the spool partial failed");
+            return false;
+        }
+        true
+    }
+
+    /// Promote the verified partial to a spool entry.
+    ///
+    /// Flushed and **closed first**: the rename is what makes the bytes
+    /// advertisable, and promoting an entry whose last write is still in a
+    /// buffer would register something that is not yet the item.
+    fn commit_file(&mut self, id: Uuid, from: &str, to: &str) -> Vec<Action> {
+        let stored = self.promote_partial(id, from, to);
+        self.engine.on_file_committed(id, stored)
+    }
+
+    /// The promotion itself. `false` means nothing was registered.
+    fn promote_partial(&mut self, id: Uuid, from: &str, to: &str) -> bool {
+        use std::io::Write;
+
+        let Some(spool) = &self.spool else {
+            return false;
+        };
+        match self.file_write.take() {
+            Some((open_id, mut file)) if open_id == id => {
+                if let Err(error) = file.flush() {
+                    tracing::warn!(clipboard_id = %id, error = %error, "flushing the spool partial failed");
+                    return false;
+                }
+                drop(file);
+            }
+            other => {
+                self.file_write = other;
+                tracing::warn!(clipboard_id = %id, "commit for a partial that is not open");
+                return false;
+            }
+        }
+        match spool.rename_entry(from, to) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    clipboard_id = %id,
+                    spool_entry = %to,
+                    error = %error,
+                    "the verified partial could not be promoted to a spool entry"
+                );
+                false
+            }
+        }
+    }
+
+    /// Close and remove the partial for an abandoned transfer.
+    ///
+    /// Best-effort by design and idempotent underneath (`unlink_entry`
+    /// succeeds on an absent name), because this runs on every failure
+    /// path including ones where the partial was never created.
+    fn abort_file(&mut self, id: Uuid, entry: &str) {
+        if self
+            .file_write
+            .as_ref()
+            .is_some_and(|(open, _)| *open == id)
+        {
+            self.file_write = None; // close before unlinking
+        }
+        let Some(spool) = &self.spool else {
+            return;
+        };
+        // A partial that outlives its transfer is the one thing this path
+        // exists to prevent, so a failure to remove it is a warning rather
+        // than a debug note: it names bytes left on disk that nothing will
+        // now collect until the next startup sweep. `Unsupported` is not
+        // one of those — there is no spool, so there is no partial.
+        match spool.unlink_entry(entry) {
+            Ok(()) | Err(SpoolError::Unsupported) => {}
+            Err(error) => tracing::warn!(
+                clipboard_id = %id,
+                spool_entry = %entry,
+                error = %error,
+                "the abandoned spool partial could not be removed"
+            ),
+        }
+    }
+
+    /// Remove a completed entry the spool budget evicted.
+    fn evict_entry(&mut self, entry: &str) {
+        let Some(spool) = &self.spool else {
+            return;
+        };
+        if let Err(error) = spool.unlink_entry(entry) {
+            // Not fatal and not silent: the engine has already dropped it
+            // from the budget, so the honest record is a warning naming
+            // what is still on disk.
+            tracing::warn!(
+                spool_entry = %entry,
+                error = %error,
+                "evicted spool entry could not be removed"
+            );
+        }
+    }
+
     /// Perform one engine action, queueing whatever it produces.
     ///
     /// Deliberately **one** action, not a drain: see [`Self::run`] for why
@@ -616,6 +829,24 @@ impl ClipboardSyncDriver {
                         .await;
                 });
             }
+            Action::AdmitFile {
+                id,
+                entry,
+                byte_len,
+            } => {
+                let more = self.admit_file(id, &entry, byte_len);
+                self.pending.extend(more);
+            }
+            Action::WriteFileChunk { id, payload } => {
+                let more = self.write_file_chunk(id, &payload);
+                self.pending.extend(more);
+            }
+            Action::CommitFile { id, from, to } => {
+                let more = self.commit_file(id, &from, &to);
+                self.pending.extend(more);
+            }
+            Action::AbortFile { id, entry } => self.abort_file(id, &entry),
+            Action::EvictSpoolEntry { entry } => self.evict_entry(&entry),
             Action::ScheduleSettle { delay } => {
                 // Bump the generation: any timer already in flight becomes
                 // a no-op when it fires, so the debounce restarts without
@@ -645,14 +876,17 @@ mod tests {
     use crossover_platform::fakes::{ClipboardFailure, ClipboardOp, InMemoryClipboard};
     use crossover_protocol::RawFrame;
     use crossover_protocol::clipboard::{
-        ApplyResult, ClipboardApplied, ClipboardData, ContentType,
+        ApplyResult, ClipboardApplied, ClipboardData, ClipboardDecline, ClipboardMeta,
+        ClipboardOffer, ContentType, DeclineReason, FileDescriptor, chunk_content, content_hash,
     };
     use crossover_protocol::hello::MessageType;
 
     use super::{
         EVENT_CHANNEL_CAPACITY, MAX_DEFERRED_EVENTS, SessionCommand, SyncEvent, clipboard_sync,
     };
-    use crate::clipboard::{ClipboardConfig, RetryPolicy};
+    use crossover_platform::SpoolError;
+
+    use crate::clipboard::{ClipboardConfig, FileReceive, RetryPolicy};
     use crate::metrics::Metrics;
 
     struct Rig {
@@ -663,6 +897,10 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_with_spool(None)
+    }
+
+    fn rig_with_spool(spool: Option<Arc<dyn crossover_platform::SpoolStorage>>) -> Rig {
         let clipboard = Arc::new(InMemoryClipboard::new());
         let config = ClipboardConfig {
             retry: RetryPolicy {
@@ -676,6 +914,7 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let (driver, events, commands) = clipboard_sync(
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
+            spool,
             Uuid::from_bytes([0xAA; 16]),
             config,
             Some(Arc::clone(&metrics)),
@@ -1207,6 +1446,7 @@ mod tests {
         let clipboard = Arc::new(InMemoryClipboard::new());
         let (driver, events, mut commands) = clipboard_sync(
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
+            None,
             Uuid::from_bytes([0xAA; 16]),
             ClipboardConfig {
                 // The deadline is the subject here, so it is short — the
@@ -1382,5 +1622,224 @@ mod tests {
             "the {EVENT_CHANNEL_CAPACITY}-deep event channel never filled — a parked \
              driver must push backpressure outwards, not absorb without limit"
         );
+    }
+
+    /// A spool over a real temporary directory, for the one thing the
+    /// engine's own tests cannot show: that the driver's actions actually
+    /// move bytes onto disk and promote them.
+    ///
+    /// Plain `std::fs`, and therefore **not** a spool in the sense F15
+    /// means — no protected descriptor, no handle-relative operation. That
+    /// is exactly why it is `cfg(test)` and lives here rather than beside
+    /// `UnsupportedSpoolStorage`, which refuses precisely so that no
+    /// unprotected implementation can be mistaken for the real one.
+    struct TempSpool(std::path::PathBuf);
+
+    impl TempSpool {
+        fn new() -> Self {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "crossover-driver-spool-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).expect("test spool");
+            Self(dir)
+        }
+
+        fn read(&self, name: &str) -> Vec<u8> {
+            std::fs::read(self.0.join(name)).expect("reading a spool entry")
+        }
+
+        fn names(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.0)
+                .expect("listing")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for TempSpool {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl crossover_platform::SpoolStorage for TempSpool {
+        fn entries(&self) -> Result<Vec<crossover_platform::SpoolEntry>, SpoolError> {
+            Ok(self
+                .names()
+                .into_iter()
+                .map(|name| crossover_platform::SpoolEntry {
+                    len: std::fs::metadata(self.0.join(&name)).map_or(0, |m| m.len()),
+                    name,
+                    is_file: true,
+                })
+                .collect())
+        }
+
+        fn create_entry(&self, name: &str) -> Result<std::fs::File, SpoolError> {
+            crossover_platform::validate_entry_name(name)?;
+            std::fs::File::create_new(self.0.join(name)).map_err(|error| SpoolError::Backend {
+                reason: error.to_string(),
+            })
+        }
+
+        fn open_entry(&self, name: &str) -> Result<std::fs::File, SpoolError> {
+            crossover_platform::validate_entry_name(name)?;
+            std::fs::File::open(self.0.join(name)).map_err(|error| SpoolError::Backend {
+                reason: error.to_string(),
+            })
+        }
+
+        fn unlink_entry(&self, name: &str) -> Result<(), SpoolError> {
+            crossover_platform::validate_entry_name(name)?;
+            match std::fs::remove_file(self.0.join(name)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(SpoolError::Backend {
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        fn rename_entry(&self, from: &str, to: &str) -> Result<(), SpoolError> {
+            crossover_platform::validate_entry_name(from)?;
+            crossover_platform::validate_entry_name(to)?;
+            std::fs::rename(self.0.join(from), self.0.join(to)).map_err(|error| {
+                SpoolError::Backend {
+                    reason: error.to_string(),
+                }
+            })
+        }
+
+        fn free_bytes(&self) -> Result<u64, SpoolError> {
+            Ok(u64::MAX / 2)
+        }
+    }
+
+    fn file_offer(id: Uuid, content: &[u8], name: &str) -> ClipboardOffer {
+        ClipboardOffer {
+            meta: ClipboardMeta {
+                id,
+                origin: Uuid::from_bytes([0xBB; 16]),
+                sequence: 1,
+                content_type: ContentType::File,
+                content_length: content.len() as u64,
+                content_hash: content_hash(content),
+            },
+            descriptor: Some(FileDescriptor {
+                file_name: name.to_owned(),
+                archived: false,
+                entry_count: 1,
+                original_bytes: content.len() as u64,
+            }),
+        }
+    }
+
+    /// End to end through the driver: a peer file arrives as frames, lands
+    /// in the spool as one verified entry, and is acknowledged `Stored`.
+    #[tokio::test]
+    async fn a_peer_file_is_written_through_to_the_spool() {
+        let spool = Arc::new(TempSpool::new());
+        let mut rig = rig_with_spool(Some(
+            Arc::clone(&spool) as Arc<dyn crossover_platform::SpoolStorage>
+        ));
+        rig.events
+            .send(SyncEvent::FileReceivePolicy(FileReceive::Allowed))
+            .await
+            .unwrap();
+
+        let content: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
+        let id = Uuid::new_v4();
+        let offer = file_offer(id, &content, "quarterly.pdf");
+        rig.events
+            .send(frame(
+                MessageType::ClipboardOffer,
+                offer.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected an accept");
+        };
+        assert_eq!(message_type, MessageType::ClipboardAccept.wire());
+
+        for chunk in chunk_content(id, &content).unwrap() {
+            rig.events
+                .send(frame(
+                    MessageType::ClipboardChunk,
+                    chunk.encode_payload().unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let SessionCommand::SendFrame {
+            message_type,
+            payload,
+            ..
+        } = next_command(&mut rig).await
+        else {
+            panic!("expected a verdict");
+        };
+        assert_eq!(message_type, MessageType::ClipboardApplied.wire());
+        let applied = ClipboardApplied::decode_payload(&payload).unwrap();
+        assert_eq!(applied.result, ApplyResult::Stored);
+
+        // One entry, promoted out of its partial, holding exactly what the
+        // peer offered — and no `.part` left behind.
+        let names = spool.names();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(
+            names[0]
+                .strip_suffix(".bin")
+                .is_some_and(|stem| Uuid::parse_str(stem).is_ok()),
+            "a promoted entry is named <id>.bin: {names:?}"
+        );
+        assert_eq!(spool.read(&names[0]), content);
+    }
+
+    /// Without a spool the driver refuses files whatever the trust store
+    /// says, and the refusal is the permanent one: there is nowhere for a
+    /// file to go, so it is not a matter of permission.
+    #[tokio::test]
+    async fn a_driver_without_a_spool_refuses_files_however_it_is_configured() {
+        let mut rig = rig();
+        rig.events
+            .send(SyncEvent::FileReceivePolicy(FileReceive::Allowed))
+            .await
+            .unwrap();
+
+        let content = b"a small document".to_vec();
+        let offer = file_offer(Uuid::new_v4(), &content, "doc.pdf");
+        rig.events
+            .send(frame(
+                MessageType::ClipboardOffer,
+                offer.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let SessionCommand::SendFrame {
+            message_type,
+            payload,
+            ..
+        } = next_command(&mut rig).await
+        else {
+            panic!("expected a decline");
+        };
+        assert_eq!(message_type, MessageType::ClipboardDecline.wire());
+        let decline = ClipboardDecline::decode_payload(&payload).unwrap();
+        assert_eq!(decline.reason, DeclineReason::UnsupportedType);
     }
 }

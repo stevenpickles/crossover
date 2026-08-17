@@ -51,6 +51,7 @@ fn side(origin: u8) -> Side {
     let clipboard = Arc::new(InMemoryClipboard::new());
     let (driver, events, commands) = clipboard_sync(
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
+        None,
         Uuid::from_bytes([origin; 16]),
         ClipboardConfig {
             retry: ClipboardRetryPolicy {

@@ -205,6 +205,16 @@ pub struct Metrics {
     clipboard_conflicts: AtomicU64,
     clipboard_abandoned: AtomicU64,
     clipboard_deferred_peak: AtomicU64,
+    // Files (ADR 0015) are counted apart from clipboard items generally,
+    // because they are the one content type that reaches disk: how many a
+    // peer was allowed to spool, how many were refused before a byte
+    // travelled, and how many failed after being accepted are three
+    // different questions about a write surface, and the run report is
+    // where the answers have to be visible (FR-7.3).
+    clipboard_files_stored: AtomicU64,
+    clipboard_files_declined: AtomicU64,
+    clipboard_files_failed: AtomicU64,
+    clipboard_file_bytes: AtomicU64,
     clipboard_latency_ms: Mutex<Vec<u32>>,
     clipboard_latency_dropped: AtomicU64,
     // Count/total/max rather than a sample vector, because this is the one
@@ -360,6 +370,23 @@ impl Metrics {
     pub fn record_clipboard_conflict(&self) {
         self.clipboard_conflicts.fetch_add(1, Ordering::Relaxed);
     }
+    /// A peer file was verified and registered in the spool (ADR 0015).
+    pub fn record_file_stored(&self, byte_len: u64) {
+        self.clipboard_files_stored.fetch_add(1, Ordering::Relaxed);
+        self.clipboard_file_bytes
+            .fetch_add(byte_len, Ordering::Relaxed);
+    }
+    /// A file offer was refused before any of it travelled — no
+    /// permission, no room, or one already in flight (FR-3.6).
+    pub fn record_file_declined(&self) {
+        self.clipboard_files_declined
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// An accepted file transfer ended with nothing registered: a bad
+    /// chunk, a storage failure, a deadline, or a lost session.
+    pub fn record_file_failed(&self) {
+        self.clipboard_files_failed.fetch_add(1, Ordering::Relaxed);
+    }
     /// How long an input frame waited between being handed to the send
     /// path and reaching the wire, in microseconds.
     ///
@@ -501,6 +528,10 @@ impl Metrics {
             clipboard_conflicts: load(&self.clipboard_conflicts),
             clipboard_abandoned: load(&self.clipboard_abandoned),
             clipboard_deferred_peak: load(&self.clipboard_deferred_peak),
+            clipboard_files_stored: load(&self.clipboard_files_stored),
+            clipboard_files_declined: load(&self.clipboard_files_declined),
+            clipboard_files_failed: load(&self.clipboard_files_failed),
+            clipboard_file_bytes: load(&self.clipboard_file_bytes),
             clipboard_latency_dropped: load(&self.clipboard_latency_dropped),
             input_lane_avg_us: {
                 let n = load(&self.input_queue_latency_count);
@@ -612,6 +643,14 @@ pub struct Report {
     /// Deepest the driver's deferred-event queue got while parked on bulk
     /// backpressure; `0` if it never had to defer.
     pub clipboard_deferred_peak: u64,
+    /// Peer files verified and registered in the spool (ADR 0015).
+    pub clipboard_files_stored: u64,
+    /// File offers refused before any of them travelled.
+    pub clipboard_files_declined: u64,
+    /// Accepted file transfers that registered nothing.
+    pub clipboard_files_failed: u64,
+    /// Bytes of spooled file content accepted from peers.
+    pub clipboard_file_bytes: u64,
     /// Latency samples dropped past the retention cap.
     pub clipboard_latency_dropped: u64,
     /// Mean time an input frame waited *before the writer took it* (µs) —
@@ -701,6 +740,10 @@ impl Report {
             clipboard_loop_suppressed = self.clipboard_loop_suppressed,
             clipboard_latency_dropped = self.clipboard_latency_dropped,
             clipboard_deferred_peak = self.clipboard_deferred_peak,
+            clipboard_files_stored = self.clipboard_files_stored,
+            clipboard_files_declined = self.clipboard_files_declined,
+            clipboard_files_failed = self.clipboard_files_failed,
+            clipboard_file_bytes = self.clipboard_file_bytes,
             latency_p50_ms = self.latency_p50,
             latency_p95_ms = self.latency_p95,
             latency_max_ms = self.latency_max,
@@ -792,6 +835,24 @@ impl Report {
             self.clipboard_conflicts,
             self.clipboard_loop_suppressed,
         )?;
+        // Files are rare by design (ADR 0015), so a run that saw none
+        // says nothing rather than printing three zeroes. A run that saw
+        // any prints all three counts even where some are zero: "4 stored,
+        // 0 refused, 0 failed" is the line an operator needs, and dropping
+        // the zeroes would leave them unable to tell a clean run from an
+        // unreported one.
+        if self.clipboard_files_stored + self.clipboard_files_declined + self.clipboard_files_failed
+            > 0
+        {
+            writeln!(
+                f,
+                "                files: {} stored ({}), {} refused, {} failed",
+                self.clipboard_files_stored,
+                human_bytes(self.clipboard_file_bytes),
+                self.clipboard_files_declined,
+                self.clipboard_files_failed,
+            )?;
+        }
         // A run that never parked on bulk backpressure has nothing to say
         // here, and the block stays short.
         if self.clipboard_deferred_peak > 0 {
@@ -972,6 +1033,9 @@ mod tests {
         metrics.record_clipboard_conflict();
         metrics.record_clipboard_loop_suppressed();
         metrics.record_deferred_depth(7);
+        metrics.record_file_stored(2 * 1024 * 1024);
+        metrics.record_file_declined();
+        metrics.record_file_failed();
 
         let rendered = metrics.snapshot().to_string();
         for expected in [
@@ -984,6 +1048,9 @@ mod tests {
             "1 conflicts",
             "1 own-write loops suppressed",
             "deferred peak 7",
+            "1 stored (2.0 MiB)",
+            "1 refused",
+            "1 failed",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -991,6 +1058,20 @@ mod tests {
 {rendered}"
             );
         }
+    }
+
+    /// Files are rare, so their line is conditional — and a run without
+    /// one must not print a row of zeroes that reads like a fault report.
+    #[test]
+    fn the_file_line_appears_only_when_a_file_transfer_happened() {
+        let metrics = Metrics::new();
+        metrics.record_clipboard_applied();
+        assert!(!metrics.snapshot().to_string().contains("files:"));
+
+        metrics.record_file_declined();
+        let rendered = metrics.snapshot().to_string();
+        assert!(rendered.contains("files: 0 stored"), "{rendered}");
+        assert!(rendered.contains("1 refused"), "{rendered}");
     }
 
     /// The retention note only earns its line when samples were actually

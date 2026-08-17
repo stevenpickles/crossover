@@ -557,6 +557,7 @@ pub async fn run(
     let provider = open_clipboard_provider()?;
     let (sync_driver, sync_events, sync_commands) = clipboard_sync(
         provider,
+        None,
         identity.device_id(),
         ClipboardConfig::new(),
         Some(Arc::clone(&metrics)),
