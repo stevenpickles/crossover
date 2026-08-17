@@ -234,6 +234,29 @@ pub trait SpoolStorage: Send + Sync {
     /// or [`SpoolError::Backend`].
     fn rename_entry(&self, from: &str, to: &str) -> Result<(), SpoolError>;
 
+    /// Bytes this process may still write to the volume the root lives
+    /// on, **as the caller** — quota included where the platform has one.
+    ///
+    /// Answered from the open root handle like everything else here, never
+    /// by re-resolving the configured path (F15).
+    ///
+    /// It exists because admission has to be decided *before* a transfer
+    /// starts rather than discovered partway through it (ADR 0015): a
+    /// receiver that accepted first and ran out of room later would have
+    /// spent the sender's bytes to learn what it could have answered in one
+    /// frame, and would have left a partial behind to prove it. The
+    /// caller's rule is free space against `content_length` plus a margin,
+    /// so the answer is deliberately the *usable* figure and not the
+    /// volume's raw free space.
+    ///
+    /// # Errors
+    ///
+    /// [`SpoolError::Backend`] if the volume cannot be queried, or
+    /// [`SpoolError::Unsupported`] where there is no spool at all. Either
+    /// way the caller declines the transfer: an unknown amount of room is
+    /// not a reason to start writing.
+    fn free_bytes(&self) -> Result<u64, SpoolError>;
+
     /// Remove every entry in the root — the startup purge (ADR 0015: a
     /// virtual file list does not survive the process that published it,
     /// so nothing from a previous run is reachable and reconciling an
@@ -372,6 +395,10 @@ impl SpoolStorage for UnsupportedSpoolStorage {
     fn rename_entry(&self, _from: &str, _to: &str) -> Result<(), SpoolError> {
         Err(SpoolError::Unsupported)
     }
+
+    fn free_bytes(&self) -> Result<u64, SpoolError> {
+        Err(SpoolError::Unsupported)
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +431,9 @@ mod tests {
             spool.rename_entry("a.part", "a.bin"),
             Err(SpoolError::Unsupported)
         ));
+        // Not "no room": no spool. A caller must not read a refusal to
+        // answer as an answer of zero, or of anything else.
+        assert!(matches!(spool.free_bytes(), Err(SpoolError::Unsupported)));
         // The default `sweep` must inherit the refusal rather than
         // reporting an empty, successful sweep of a spool that does not
         // exist — a caller would read that as "nothing left over".
@@ -497,6 +527,10 @@ mod tests {
         }
 
         fn rename_entry(&self, _from: &str, _to: &str) -> Result<(), SpoolError> {
+            Err(SpoolError::Unsupported)
+        }
+
+        fn free_bytes(&self) -> Result<u64, SpoolError> {
             Err(SpoolError::Unsupported)
         }
     }

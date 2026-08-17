@@ -100,6 +100,9 @@ windows = { version = "0.62", features = [
     # preference here — it is what makes the invariant expressible.
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
+    # FILE_FS_FULL_SIZE_INFORMATION: the spool's free-space check, asked of
+    # the volume behind the open root handle rather than of a path (F15).
+    "Wdk_System_SystemServices",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

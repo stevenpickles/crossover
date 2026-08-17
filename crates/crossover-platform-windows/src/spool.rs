@@ -47,10 +47,11 @@ use crossover_platform::{
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation,
-    NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
-    NtSetInformationFile,
+    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileFsFullSizeInformation,
+    FileRenameInformation, NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS,
+    NtCreateFile, NtQueryVolumeInformationFile, NtSetInformationFile,
 };
+use windows::Wdk::System::SystemServices::FILE_FS_FULL_SIZE_INFORMATION;
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_NO_MORE_FILES, HANDLE, HLOCAL, LocalFree, NTSTATUS,
     OBJ_CASE_INSENSITIVE, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -508,6 +509,45 @@ impl SpoolStorage for WindowsSpoolStorage {
             return Err(status_error("renaming a spool entry", to, status));
         }
         Ok(())
+    }
+
+    fn free_bytes(&self) -> Result<u64, SpoolError> {
+        // `GetDiskFreeSpaceExW` takes a *path*, and the spool has none to
+        // give: the root is a handle precisely so nothing re-resolves
+        // `%LOCALAPPDATA%\...` (F15). `NtQueryVolumeInformationFile` asks
+        // the same question of the volume behind an open handle, which is
+        // the only form that keeps the invariant.
+        let mut info = FILE_FS_FULL_SIZE_INFORMATION::default();
+        let mut status_block = IO_STATUS_BLOCK::default();
+        // SAFETY: `info` and `status_block` are live locals, and the
+        // length passed is `info`'s own size, matching the class asked
+        // for; the call writes only within it.
+        let status = unsafe {
+            NtQueryVolumeInformationFile(
+                HANDLE(self.root.as_raw_handle()),
+                &raw mut status_block,
+                (&raw mut info).cast(),
+                u32::try_from(size_of_val(&info)).unwrap_or(0),
+                FileFsFullSizeInformation,
+            )
+        };
+        if status.is_err() {
+            return Err(status_error(
+                "querying spool volume free space",
+                "<root>",
+                status,
+            ));
+        }
+        // `CallerAvailableAllocationUnits`, not `ActualAvailable...`: on a
+        // volume with quotas the two differ, and the honest answer to "may
+        // this transfer be written" is the one that accounts for the quota
+        // this process actually writes under. Saturating throughout — a
+        // volume geometry that overflows u64 is not a reason to panic, and
+        // reporting a smaller figure only ever declines more (NFR-1).
+        let units = u64::try_from(info.CallerAvailableAllocationUnits).unwrap_or(0);
+        Ok(units
+            .saturating_mul(u64::from(info.SectorsPerAllocationUnit))
+            .saturating_mul(u64::from(info.BytesPerSector)))
     }
 }
 
@@ -1041,6 +1081,25 @@ mod tests {
         assert!(names(&spool).is_empty());
         // Idempotent: abort cleanup and eviction may both reach for it.
         spool.unlink_entry("aaaa.part").expect("second unlink");
+    }
+
+    /// Admission needs a number before a transfer starts, and it must
+    /// come from the handle: the volume behind the root, asked without the
+    /// path ever being resolved again (F15).
+    #[test]
+    fn free_space_is_answered_from_the_root_handle() {
+        let sandbox = Sandbox::new();
+        let spool = WindowsSpoolStorage::open_or_create(&sandbox.path("spool")).expect("open");
+
+        let free = spool.free_bytes().expect("querying free space");
+        assert!(
+            free > 0,
+            "a writable temp volume reported no room at all: {free}"
+        );
+        // Repeatable rather than a one-shot reading: admission asks once
+        // per offer, and each answer must be as good as the first.
+        let again = spool.free_bytes().expect("querying free space again");
+        assert!(again > 0);
     }
 
     #[test]
