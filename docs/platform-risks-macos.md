@@ -104,8 +104,9 @@ implementations of the clipboard trait, not new protocol design").
   either peer is non-Windows (the protocol already has a PNG variant);
   convert at the receiving edge; or negotiate a format per session.
   Converting contradicts "verbatim"; negotiating adds protocol surface.
-- **Decide before implementing**, and if the answer changes the wire, it
-  needs an ADR — not a quiet change inside a platform crate.
+- **Drafted:** [ADR 0016](adr/0016-image-interchange-format.md) (Proposed) —
+  PNG as the negotiated baseline, the sender converting from its own local
+  content so a receiver never decodes what a peer sent.
 
 ## M-6 Cursor hiding may be application-scoped
 

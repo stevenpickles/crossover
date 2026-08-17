@@ -448,10 +448,11 @@ Two findings from writing them change how the phase should start:
   today, Wayland when the portals are ready".
 - **M-5 and L-9 agree that `CF_DIB` is the outlier.** Neither macOS nor
   Linux clipboards understand it, and PNG is the plausible interchange
-  format. Deciding that touches the wire, so it wants an ADR rather than a
-  quiet choice inside a platform crate — and it contradicts this phase's
-  own premise that rich clipboard "carries over as new implementations of
-  the clipboard trait, not new protocol design". Rich-clipboard image/file support (Phase 7) carries over here
+  format. Drafted as [ADR 0016](adr/0016-image-interchange-format.md)
+  (Proposed): the receiver advertises what it can install, the sender
+  produces it by converting its own local content, and a receiver never
+  decodes what a peer sent — which keeps an image decoder off the path that
+  handles hostile input. Windows-to-Windows stays verbatim DIB. Rich-clipboard image/file support (Phase 7) carries over here
 as new implementations of the clipboard trait, not new protocol design.
 
 Exit criteria: core feature set works Windows↔Windows, Windows↔macOS,
