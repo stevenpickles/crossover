@@ -13,6 +13,7 @@ pub mod fakes;
 pub mod input;
 pub mod secure_storage;
 pub mod service;
+pub mod spool;
 
 pub use clipboard::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
@@ -26,6 +27,10 @@ pub use input::{
 };
 pub use secure_storage::{SecureStorage, SecureStorageError};
 pub use service::{ServiceError, ServiceManager, ServiceStatus, UnsupportedServiceManager};
+pub use spool::{
+    MAX_SPOOL_ENTRY_NAME_BYTES, MAX_SPOOL_ENUMERATED_OBJECTS, SpoolEntry, SpoolError, SpoolStorage,
+    SpoolSweep, UnsupportedSpoolStorage, validate_entry_name,
+};
 
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =
