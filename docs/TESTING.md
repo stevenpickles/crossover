@@ -86,6 +86,17 @@ repetition (PROTOCOL.md §7). A streaming image is also run through the
 saturation case above, since a chunk being preemptable is the whole reason
 ADR 0014 chunks at all.
 
+File transfers (ADR 0015) reuse that machinery and add the fault the
+others cannot have: one that ends with bytes on **disk**. The engine's
+hermetic tests assert each abandonment path leaves nothing registered and
+the partial deleted — a tampered final chunk, a spool write that fails, a
+rename that fails, a lost session, an expired deadline, a superseding
+offer, and chunks arriving ahead of the acceptance — and the driver test
+runs a whole transfer through a real temporary directory to show the bytes
+land and are promoted. Refusals are asserted by *reason*, not merely as
+refusals: no grant, no spool, no room, and too large are four different
+answers a sender acts on differently (NFR-3).
+
 That last one asserts *structurally*: arrival positions and frame counts,
 never elapsed time. A wall-clock latency bound on a loaded CI runner
 measures the runner, so the guarantee is stated as "everything still queued

@@ -246,6 +246,7 @@ that keeps every buffer singular.
 |-----------|--------|---------|
 | Outbound | `AwaitingAccept` → (`Streaming` for chunked types) → `AwaitingApplied` | the item buffer, until the last chunk is out |
 | Inbound | accepted offer → (`ChunkReassembly` for chunked types) → pending write | the reassembly buffer, until it verifies |
+| Inbound, files | `Admitting` → `Streaming` → `Verified` → `Committing` | an open partial on disk, and accounting — never the bytes |
 
 Chunks are emitted **one at a time**, sliced out of the retained buffer, so
 the sender never materializes the whole split; each becomes its own command
@@ -254,6 +255,27 @@ depends on. On the receiving side the item's `content_hash` is verified over
 the complete reassembly before the OS clipboard is touched, so a torn
 transfer installs nothing (FR-3.2) — and `ClipboardApplied` is still emitted
 only from the write result, never on receipt of the last chunk.
+
+**Files are the one inbound type that is written through rather than
+held** ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)). The engine
+stays sans-io: it holds a `ChunkStream` — the same admission rules as
+`ChunkReassembly`, with a running hash and length instead of a buffer —
+and emits actions the driver performs against a `SpoolStorage`
+(`AdmitFile`, `WriteFileChunk`, `CommitFile`, `AbortFile`,
+`EvictSpoolEntry`), each answered back into the engine exactly as a
+clipboard write's result is. So the sequencing stays testable without a
+filesystem, and three properties hold by construction: a chunk is judged
+before it is written, an offer is answered only once the spool has taken
+the transfer, and every outcome but a verified completion deletes the
+partial and registers nothing. `MAX_CONCURRENT_FILE_TRANSFERS` is the
+`Option` holding that state, not a counter.
+
+Whether files may be received at all is a **policy input**
+(`FileReceive`), supplied by the composition root from the trust store and
+refreshed as it changes, because a sans-io engine can see neither the
+`file_receive` grant nor whether a protected spool was opened. It defaults
+to the closed value, and the driver clamps it closed again when it has no
+spool.
 
 **The memory commitment is deliberate, bounded, and time-bounded — and
 larger than "one buffer".** Each individual slot is singular, but the slots
@@ -265,6 +287,9 @@ of up to `MAX_CLIPBOARD_IMAGE_BYTES` (64 MiB) are simultaneously reachable:
 | `pending_write` | an item is being installed, including across the bounded `Busy` retry schedule |
 | the inbound reassembly | a *newer* offer, accepted while that write is still retrying, streams in |
 | the retained outbound item | a concurrent local copy is offered and awaiting its answer |
+
+A 256 MiB file adds nothing to that figure: its bytes go to the spool a
+chunk at a time and the engine's commitment is O(chunk).
 
 That is **192 MiB**, plus the Background lane's 8 MiB byte budget — about
 **200 MiB** steady-state — and transiently ~264 MiB during a supersession,

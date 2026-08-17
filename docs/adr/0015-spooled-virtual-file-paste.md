@@ -555,8 +555,9 @@ happen.
 
 Every quantity below is network-influenced, is a named constant beside the
 existing `MAX_*` family, and is validated **before allocation or write**
-(NFR-1); every violation returns a typed value, never a panic. Proposed
-defaults, to be ratified when scheduled:
+(NFR-1); every violation returns a typed value, never a panic. **Ratified
+as proposed** when the receiving half was implemented (feature/128); the
+column is now what the code holds, not what it hoped to.
 
 | Constant | Proposed | Bounds |
 |---|---|---|
@@ -565,7 +566,7 @@ defaults, to be ratified when scheduled:
 | `MAX_ARCHIVE_DEPTH` | 32 | Directory recursion depth on the sender |
 | `MAX_FILE_NAME_BYTES` | 255 | Encoded length of the name field, validated at decode and again before the descriptor is built. 255 is NTFS's per-component limit, so a name that cannot be a filename anywhere never enters the system |
 | `MAX_FILE_NAME_UTF16_UNITS` | 259 | The *character* bound F4 requires, in the units that actually matter downstream: `FILEDESCRIPTORW.cFileName` is `WCHAR[260]`, so 259 units plus the NUL is the exact capacity. Both bounds are checked — 255 UTF-8 bytes can encode at most 255 UTF-16 units (all-ASCII worst case), so the byte bound already implies this one today; it is stated and tested separately so that raising either cap cannot silently overrun a fixed-size Win32 buffer |
-| `MAX_CONCURRENT_FILE_TRANSFERS` | 1 | In-flight file transactions per session |
+| `MAX_CONCURRENT_FILE_TRANSFERS` | 1 | In-flight file transactions per session — structural: the engine holds one `Option`, so a second cannot exist to be counted |
 | `MIN_FREE_SPACE_MARGIN_BYTES` | 64 MiB | Headroom required on the spool volume beyond `content_length` |
 | `MAX_SPOOL_BYTES` | 1 GiB | Total spool footprint (above) |
 | `MAX_SPOOL_ENTRIES` | 16 | Retained spool entries (above) |
@@ -851,3 +852,59 @@ ceiling buys reach and spends responsiveness.
 - Whether an oversized selection should offer a graceful fallback (e.g. refuse
   with a message naming the cap and the actual size) beyond the plain typed
   refusal — a diagnostics question, not a design one.
+
+## Decisions taken while implementing the receiving half (2026-08-17)
+
+Three things this ADR specified turned out differently in contact with the
+code. They are recorded here rather than left as drift.
+
+### A second offer supersedes the transfer in flight; it is not declined
+
+The ADR said a second file offer arriving mid-transfer is declined
+`NotReady`. The engine supersedes it instead — the partial is deleted and
+the new item admitted — and the reason is a property of the transaction
+model this ADR inherited rather than a preference.
+
+A peer holds **one** outbound transaction. A second offer therefore means
+it has already abandoned the first at its origin and stopped sending
+chunks for it. Declining the new offer would refuse the user's newest copy
+in order to keep writing a partial nobody is feeding, until the transfer
+deadline expires a minute later. Superseding preserves everything
+`MAX_CONCURRENT_FILE_TRANSFERS` was for — one transfer, one partial, a
+bounded disk commitment — and is the rule every other inbound item already
+follows, so files stop being a special case in the state machine.
+
+### Free space is asked of the volume behind the open handle
+
+Admission needs the volume's free space, and the obvious call
+(`GetDiskFreeSpaceExW`) takes a **path**. The spool deliberately has none
+to give: the root is a handle so that nothing re-resolves
+`%LOCALAPPDATA%\...` (F15). The check therefore goes through
+`NtQueryVolumeInformationFile` on the root handle, and reports the
+*caller-available* figure so a volume quota is answered honestly. This is
+the second place the no-path rule forced the NT layer rather than the Win32
+one, after the relative opens.
+
+### The engine decides, the driver touches the disk
+
+The receiving path is split the way clipboard reads and writes already are:
+the engine (sans-io) owns permission, budget, sequence and abort
+discipline and emits `AdmitFile` / `WriteFileChunk` / `CommitFile` /
+`AbortFile` / `EvictSpoolEntry`; the driver performs them and reports back.
+
+That split is what makes this ADR's guarantees unit-testable without a
+filesystem — "nothing is answered before the spool has taken the transfer",
+"a chunk is judged before it is written", "every outcome but a verified
+completion deletes the partial" are all assertions over an action list.
+It also produced one rule the ADR did not state: the commit waits for the
+*write* of the final chunk to be confirmed, not merely for the hash to
+verify, since an entry promoted ahead of its own last bytes would be
+registered before it was whole.
+
+### What is deliberately not here yet
+
+Entry lifetime — collection when the clipboard moves on, and the
+`SPOOL_SWEEP_TTL` backstop — belongs with the clipboard object that makes
+"the clipboard still offers it" observable, so it lands with the platform
+slice rather than ahead of it. The startup sweep, which needs no such
+observation, is implemented: the spool is purged in full when it is opened.
