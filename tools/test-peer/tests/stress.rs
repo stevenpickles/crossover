@@ -271,9 +271,13 @@ async fn one_update(
         ApplyResult::Superseded => tally.superseded += 1,
         // Every failure is *observable* — the criterion is no SILENT
         // failure. With a healthy fake provider there should be none.
-        ApplyResult::ClipboardUnavailable | ApplyResult::ContentRejected => {
+        ApplyResult::ClipboardUnavailable
+        | ApplyResult::ContentRejected
+        | ApplyResult::StorageFailed => {
             tally.failed += 1;
         }
+        // Text never spools; a file verdict here would be a routing bug.
+        ApplyResult::Stored => panic!("update {i}: a text item reported as stored"),
     }
 
     // Destination-updated is the definition of success (FR-3.2).

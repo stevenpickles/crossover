@@ -65,6 +65,7 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0013](0013-interactive-over-bulk-prioritization.md) | Interactive input takes wire priority over bulk transfers (Phase 7) | Accepted |
 | [0014](0014-chunked-rich-clipboard-transfer.md) | Chunked rich-clipboard transfer: images first, native format verbatim (Phase 7) | Accepted |
 | [0015](0015-spooled-virtual-file-paste.md) | Files/folders transfer: eager transfer to a bounded internal spool, pasted as a virtual file list, sender-zipped archives, per-peer permission (Phase 7) | Accepted |
+| [0017](0017-protocol-version-3.md) | Protocol v3: the file descriptor changes every offer's layout, so the version and its floor both move; no back-compatibility with v2 | Accepted |
 | [0016](0016-image-interchange-format.md) | Image interchange: the receiver names the format, the sender produces it; PNG is the baseline and receivers never decode (cross-platform) | Proposed |
 
 ## Known decisions awaiting an ADR

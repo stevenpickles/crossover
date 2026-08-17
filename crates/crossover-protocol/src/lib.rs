@@ -7,6 +7,7 @@
 
 pub mod clipboard;
 pub mod control;
+pub mod file_name;
 pub mod framing;
 pub mod hello;
 pub mod input;
@@ -16,9 +17,10 @@ pub mod version;
 pub use clipboard::{
     ApplyResult, ChunkOutcome, ChunkPlan, ChunkReassembly, ClipboardAccept, ClipboardApplied,
     ClipboardChunk, ClipboardData, ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType,
-    DeclineReason, ImageFormat,
+    DeclineReason, FileDescriptor, ImageFormat,
 };
 pub use control::{ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason};
+pub use file_name::{FileNameError, validate_file_name};
 pub use framing::{FrameDecoder, RawFrame, encode_frame};
 pub use hello::{FeatureFlags, Hello, MessageType, OsFamily};
 pub use input::{InputBatch, ReleaseAllInput, WireButton, WireInputEvent};

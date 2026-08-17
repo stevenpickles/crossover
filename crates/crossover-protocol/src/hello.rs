@@ -136,26 +136,47 @@ impl FeatureFlags {
     /// it once it genuinely can.
     pub const CHUNKED_CLIPBOARD: Self = Self(1 << 0);
 
+    /// Bit 1 — file clipboard transfer (ADR 0015): the sender may offer
+    /// `ContentType::File` items, carrying a `FileDescriptor` on the
+    /// offer and streaming the blob as [`MessageType::ClipboardChunk`]
+    /// messages. A bit of its own rather than a widening of bit 0,
+    /// because a peer that implements ADR 0014 and not ADR 0015
+    /// advertises bit 0 and has no `File` discriminant: an un-negotiated
+    /// *content type* is not skipped, it fails that peer's payload decode
+    /// and terminates its session (docs/PROTOCOL.md §3.1).
+    ///
+    /// Advertising it means "I can spool a file and offer it to my OS
+    /// clipboard", which is a strictly larger promise than reassembling
+    /// bytes: it involves a permission grant, a disk budget, and a
+    /// virtual-file paste mechanism.
+    pub const FILE_CLIPBOARD: Self = Self(1 << 1);
+
     /// Every bit this protocol version defines.
-    pub const ALL: Self = Self(Self::CHUNKED_CLIPBOARD.0);
+    pub const ALL: Self = Self(Self::CHUNKED_CLIPBOARD.0 | Self::FILE_CLIPBOARD.0);
 
     /// What **this build** advertises in its `Hello`.
     ///
-    /// [`FeatureFlags::ALL`] since ADR 0014's platform slice: every layer
-    /// of the promise is now real. The wire carries chunked images, the
-    /// engine offers, streams, reassembles, verifies and installs them,
-    /// and `crossover-platform-windows` reads and writes `CF_DIB` on the
-    /// actual OS clipboard. Advertising is a promise to *handle*, and the
-    /// last step that could not be honoured — putting a raster format on a
-    /// real clipboard — is implemented.
+    /// Bit 0 only. It is deliberately *not* [`FeatureFlags::ALL`]: the
+    /// file wire types exist (ADR 0015's protocol slice), but the
+    /// receiving half a file offer implies — the `file_receive` grant,
+    /// the bounded spool, and the virtual file list on the OS clipboard —
+    /// does not. Advertising is a promise to **handle**, so the bit stays
+    /// clear until every layer beneath it can honour it, and a peer that
+    /// offers us a file today is answered by nothing being negotiated
+    /// rather than by a transfer we would drop.
     ///
-    /// Flipping it is wire-visible (the `Hello` a peer receives changes)
-    /// and deliberately safe: a feature activates only on the
+    /// Bit 0 has been advertised since ADR 0014's platform slice: every
+    /// layer of *that* promise is real. The wire carries chunked images,
+    /// the engine offers, streams, reassembles, verifies and installs
+    /// them, and `crossover-platform-windows` reads and writes `CF_DIB`
+    /// on the actual OS clipboard.
+    ///
+    /// Flipping a bit is wire-visible (the `Hello` a peer receives
+    /// changes) and deliberately safe: a feature activates only on the
     /// *intersection* of the two advertisements, so a peer that predates
-    /// the bit negotiates it away and is sent nothing new. Nothing about
-    /// the base protocol's layouts changed, so text keeps synchronizing
-    /// with such a peer exactly as before (docs/PROTOCOL.md §3.1).
-    pub const ADVERTISED: Self = Self::ALL;
+    /// the bit negotiates it away and is sent nothing new
+    /// (docs/PROTOCOL.md §3.1).
+    pub const ADVERTISED: Self = Self::CHUNKED_CLIPBOARD;
 
     /// Whether every bit in `feature` is set. `NONE` is contained by
     /// everything, so base-protocol capabilities never need a bit.
@@ -311,14 +332,23 @@ mod tests {
         );
     }
 
-    /// The bit the snapshot above pins, stated as an invariant rather than
-    /// a byte: bit 0 is `CHUNKED_CLIPBOARD`, and it is what this build
-    /// advertises now that every layer beneath it — wire, engine, and the
-    /// Windows `CF_DIB` backend — can honour the promise (ADR 0014).
+    /// The bits the snapshot above pins, stated as an invariant rather
+    /// than a byte: bit 0 is `CHUNKED_CLIPBOARD`, and it is what this
+    /// build advertises now that every layer beneath it — wire, engine,
+    /// and the Windows `CF_DIB` backend — can honour the promise
+    /// (ADR 0014).
+    ///
+    /// Bit 1, `FILE_CLIPBOARD`, is defined but **not** advertised: the
+    /// wire types exist, the spool and the virtual file paste do not, and
+    /// advertising is a promise to handle. This assertion is the one that
+    /// has to be edited — deliberately — by the slice that makes the
+    /// promise true.
     #[test]
-    fn this_build_advertises_chunked_clipboard() {
-        assert_eq!(FeatureFlags::ADVERTISED, FeatureFlags::ALL);
+    fn this_build_advertises_chunked_clipboard_but_not_files() {
+        assert_ne!(FeatureFlags::ADVERTISED, FeatureFlags::ALL);
         assert!(FeatureFlags::ADVERTISED.contains(FeatureFlags::CHUNKED_CLIPBOARD));
+        assert!(!FeatureFlags::ADVERTISED.contains(FeatureFlags::FILE_CLIPBOARD));
+        assert!(FeatureFlags::ALL.contains(FeatureFlags::FILE_CLIPBOARD));
         // And a peer that has never heard of it still gets nothing: the
         // intersection with an empty advertisement is empty.
         assert_eq!(

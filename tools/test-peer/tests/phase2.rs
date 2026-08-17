@@ -391,7 +391,12 @@ async fn an_offered_image_round_trips_over_a_real_session() {
     conn.send_frame(
         MessageType::ClipboardOffer.wire(),
         2,
-        &ClipboardOffer { meta }.encode_payload().unwrap(),
+        &ClipboardOffer {
+            meta,
+            descriptor: None,
+        }
+        .encode_payload()
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -553,7 +558,12 @@ async fn an_image_that_already_matches_is_declined_with_no_bytes_behind_it() {
     conn.send_frame(
         MessageType::ClipboardOffer.wire(),
         5,
-        &ClipboardOffer { meta: repeat }.encode_payload().unwrap(),
+        &ClipboardOffer {
+            meta: repeat,
+            descriptor: None,
+        }
+        .encode_payload()
+        .unwrap(),
     )
     .await
     .unwrap();

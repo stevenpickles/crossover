@@ -60,6 +60,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "clipboard_file_offer"
+path = "fuzz_targets/clipboard_file_offer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "clipboard_control"
 path = "fuzz_targets/clipboard_control.rs"
 test = false

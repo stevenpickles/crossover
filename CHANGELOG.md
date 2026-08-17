@@ -12,6 +12,19 @@ Builds that are not tagged releases identify themselves as such —
 `0.1.0-dev.7.gabc1234` — and say where they came from. Run
 `crossover version` on any binary to see exactly what it is.
 
+## Unreleased
+
+### Changed
+
+- **Wire protocol moves to version 3, and does not accept version 2**
+  ([ADR 0017](docs/adr/0017-protocol-version-3.md)). A file descriptor on the
+  clipboard offer adds a byte to *every* offer, which no feature bit can
+  hide, so **v0.1.0 cannot connect to this build and this build cannot
+  connect to v0.1.0**. Both machines must be upgraded together. The failure
+  is a clean refusal at the handshake naming both version ranges, not a
+  session that dies later; `crossover version` reports the range a build
+  speaks.
+
 ## [0.1.0] — 2026-08-16
 
 The first release. Two Windows machines share one keyboard, mouse, and

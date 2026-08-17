@@ -643,7 +643,7 @@ impl ClipboardEngine {
     /// A decoded clipboard message arrived from the peer.
     pub fn on_peer_message(&mut self, message: InboundMessage) -> Vec<Action> {
         match message {
-            InboundMessage::Offer(offer) => self.on_peer_offer(offer),
+            InboundMessage::Offer(offer) => self.on_peer_offer(&offer),
             InboundMessage::Accept(accept) => self.on_peer_accept(accept.id),
             InboundMessage::Decline(decline) => self.on_peer_decline(&decline),
             InboundMessage::Data(data) => self.on_peer_data(data),
@@ -945,7 +945,12 @@ impl ClipboardEngine {
             started,
         });
         vec![
-            Action::Send(OutboundMessage::Offer(ClipboardOffer { meta })),
+            Action::Send(OutboundMessage::Offer(ClipboardOffer {
+                meta,
+                // No descriptor: this engine stages text and images, and
+                // only a file offer carries one (ADR 0015).
+                descriptor: None,
+            })),
             deadline,
         ]
     }
@@ -1006,7 +1011,7 @@ impl ClipboardEngine {
         self.recent_transfers.push_back(id);
     }
 
-    fn on_peer_offer(&mut self, offer: ClipboardOffer) -> Vec<Action> {
+    fn on_peer_offer(&mut self, offer: &ClipboardOffer) -> Vec<Action> {
         if let Some(reason) = self.conflict_verdict(offer.meta) {
             return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
                 id: offer.meta.id,
@@ -1163,7 +1168,10 @@ impl ClipboardEngine {
                     DeclineReason::AlreadyHave | DeclineReason::Superseded => "converged",
                     DeclineReason::TooLarge
                     | DeclineReason::NotReady
-                    | DeclineReason::UnsupportedType => "declined",
+                    | DeclineReason::UnsupportedType
+                    | DeclineReason::NotPermitted
+                    | DeclineReason::InvalidName
+                    | DeclineReason::InsufficientSpace => "declined",
                 };
                 tracing::info!(
                     clipboard_id = %decline.id,
@@ -1385,6 +1393,11 @@ impl ClipboardEngine {
                     ApplyResult::Superseded => "superseded",
                     ApplyResult::ClipboardUnavailable => "clipboard_unavailable",
                     ApplyResult::ContentRejected => "content_rejected",
+                    // File verdicts (ADR 0015): nothing produces them
+                    // yet, and an unlabelled verdict would be a silent
+                    // one, which NFR-3 forbids.
+                    ApplyResult::Stored => "stored",
+                    ApplyResult::StorageFailed => "storage_failed",
                 };
                 // Round trip measured on this machine's clock alone:
                 // local observation through the destination's verdict
@@ -1515,6 +1528,13 @@ fn from_wire(content_type: ContentType, bytes: Vec<u8>) -> Option<ClipboardConte
             format: platform_format(format),
             bytes,
         },
+        // A file is not platform clipboard *content*: it is spooled and
+        // then offered as a virtual file list (ADR 0015), which is a
+        // different ClipboardProvider call and a different slice. Until
+        // that exists this build never negotiates FILE_CLIPBOARD, so a
+        // file item cannot arrive from a conforming peer — and one that
+        // arrives anyway is refused here rather than mishandled.
+        ContentType::File => return None,
     })
 }
 
@@ -1582,7 +1602,7 @@ mod tests {
 
     fn offer_of(actions: &[Action]) -> ClipboardOffer {
         match sent(actions).as_slice() {
-            [OutboundMessage::Offer(offer)] => *offer,
+            [OutboundMessage::Offer(offer)] => offer.clone(),
             other => panic!("expected exactly one offer, got {other:?}"),
         }
     }
@@ -1629,7 +1649,10 @@ mod tests {
             content_length: bytes.len() as u64,
             content_hash: content_hash(bytes),
         };
-        let mut actions = engine.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        let mut actions = engine.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta,
+            descriptor: None,
+        }));
         for chunk in chunk_content(meta.id, bytes).unwrap() {
             actions.extend(engine.on_peer_message(InboundMessage::Chunk(chunk)));
         }
@@ -1871,7 +1894,10 @@ mod tests {
             content_length: (CLIPBOARD_INLINE_MAX_BYTES + 5) as u64,
             content_hash: content_hash("shared content".as_bytes()),
         };
-        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta,
+            descriptor: None,
+        }));
         match sent(&actions).as_slice() {
             [OutboundMessage::Decline(d)] => {
                 assert!(matches!(
@@ -2314,7 +2340,10 @@ mod tests {
             content_length: bytes.len() as u64,
             content_hash: content_hash(&bytes),
         };
-        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta,
+            descriptor: None,
+        }));
         match sent(&actions).as_slice() {
             [OutboundMessage::Decline(decline)] => {
                 assert_eq!(decline.id, meta.id);
@@ -2466,7 +2495,10 @@ mod tests {
             content_hash: content_hash(&first_bytes),
         };
         let first_chunks = chunk_content(first.id, &first_bytes).unwrap();
-        e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta: first }));
+        e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta: first,
+            descriptor: None,
+        }));
         e.on_peer_message(InboundMessage::Chunk(first_chunks[0].clone()));
 
         // The peer changes its mind and offers something newer.
@@ -2504,7 +2536,10 @@ mod tests {
             content_hash: content_hash(&bytes),
         };
         let chunks = chunk_content(meta.id, &bytes).unwrap();
-        e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta,
+            descriptor: None,
+        }));
         e.on_peer_message(InboundMessage::Chunk(chunks[0].clone()));
         assert!(e.reassembly.is_some());
 
@@ -2549,7 +2584,10 @@ mod tests {
             content_length: bytes.len() as u64,
             content_hash: content_hash(&bytes),
         };
-        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta,
+            descriptor: None,
+        }));
         let Some(Action::ScheduleTransferTimeout { generation, .. }) = actions.iter().find(|a| {
             matches!(
                 a,
@@ -2604,7 +2642,10 @@ mod tests {
             content_length: (CLIPBOARD_INLINE_MAX_BYTES + 1) as u64,
             content_hash: content_hash(b"never sent"),
         };
-        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta,
+            descriptor: None,
+        }));
         assert!(matches!(
             sent(&actions).as_slice(),
             [OutboundMessage::Accept(_)]
@@ -2731,7 +2772,10 @@ mod tests {
                 content_hash: content_hash(&bytes),
             };
             let chunks = chunk_content(meta.id, &bytes).unwrap();
-            e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+            e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+                meta,
+                descriptor: None,
+            }));
             e.on_peer_message(InboundMessage::Chunk(chunks[0].clone()));
 
             let mut bad = chunks[1].clone();
@@ -2843,7 +2887,10 @@ mod tests {
             content_length: bytes.len() as u64,
             content_hash: content_hash(&bytes),
         };
-        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta,
+            descriptor: None,
+        }));
         match sent(&actions).as_slice() {
             [OutboundMessage::Decline(decline)] => {
                 assert_eq!(decline.reason, DeclineReason::Superseded);
@@ -2867,7 +2914,10 @@ mod tests {
             big.clone().into_bytes(),
         );
         let meta = data.meta;
-        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer { meta }));
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta,
+            descriptor: None,
+        }));
         assert!(matches!(
             sent(&actions).as_slice(),
             [OutboundMessage::Accept(_)]
