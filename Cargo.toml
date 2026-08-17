@@ -93,14 +93,27 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 x509-parser = "0.18"
 windows = { version = "0.62", features = [
+    # Wdk_*: NtCreateFile plus OBJECT_ATTRIBUTES, the only Win32 way to
+    # open a file *relative to an already-open directory handle*. The spool
+    # (ADR 0015, SECURITY.md F15) must never re-resolve its root by path,
+    # and CreateFileW has no relative form, so the NT call is not a
+    # preference here — it is what makes the invariant expressible.
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    # SDDL and SetSecurityInfo: the spool root's explicit DACL and
+    # mandatory integrity label (F15).
+    "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
     "Win32_System_DataExchange",
     "Win32_System_Console",
     "Win32_System_Environment",
+    # IO_STATUS_BLOCK, NtCreateFile's out-parameter.
+    "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_RemoteDesktop",
