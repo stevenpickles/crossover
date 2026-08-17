@@ -143,13 +143,27 @@ verified completion is what this ADR revises.
   high-integrity worker deletes from and reads** — an ordinary unprivileged
   local process, not the compromised-machine attacker §6 puts out of scope.
   Three properties close that, and SECURITY.md carries them as **F15**:
-  1. **An explicit security descriptor at creation, not an inherited one:** a
-     DACL granting only the worker's user and the local administrators group,
-     **plus a High mandatory integrity label with no-write-up**, so a
-     medium-integrity process running as the same user can neither replace the
-     directory nor modify an entry. (Where the worker is *not* elevated there is
-     no integrity boundary to cross and the label is inert; the DACL still
-     applies.)
+  1. **An explicit security descriptor, asserted on every open — not merely at
+     creation:** a DACL granting only the worker's user and the local
+     administrators group, **plus a mandatory integrity label with
+     no-write-up**, so a medium-integrity process running as the same user can
+     neither replace the directory nor modify an entry. Two corrections the
+     platform slice (feature/126) forced, both recorded here rather than left
+     in the code:
+     - *At creation* was not enough. Property 2's check — a real directory,
+       not a reparse point — **passes for a root a lower-integrity same-user
+       process pre-created** with a permissive DACL and no label, which is the
+       cheapest attack available and would satisfy the check while providing
+       none of the protection F14's "protected since written" rests on. The
+       descriptor is therefore re-asserted on the verified handle at every
+       open, and a root whose descriptor cannot be asserted is refused rather
+       than used unprotected.
+     - The label is stamped at **the worker's own integrity level, capped at
+       High**, not hard-coded High. Windows refuses a label above the caller's
+       own without `SeRelabelPrivilege`, so a fixed High would make the spool
+       unusable for a non-elevated worker — the case this ADR already
+       describes as the label being inert while the DACL still applies. Now
+       that case is expressed by the level rather than by a failed call.
   2. **Open once, verify, then never re-resolve by path:** the root is opened
      with `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` and
      rejected unless it is a real directory and **not** a reparse point. If it
@@ -439,6 +453,15 @@ before acceptance and again after each completion:
   completed `.bin` entries, and anything else that has appeared there. This
   removes the entire orphan-reconciliation surface and makes the spool's
   contents exactly "what this process received".
+  **Two things the sweep deliberately does not do** (feature/126): it does not
+  recurse, so a *directory* found in the root — a junction included — is
+  reported and left, because a recursive delete from the high-integrity worker
+  through a planted junction is the exact arbitrary-file-delete this design
+  forbids; and it unlinks only names that pass the spool's own strict name
+  rule, so a foreign file planted under a name we would never generate is
+  reported rather than removed. Both cases mean something else is writing to a
+  directory whose descriptor excludes it, which is a warning worth raising and
+  not a tidy-up worth performing silently.
 - **The spool index is in memory only.** Entry id → validated name, length,
   hash, completion time. Nothing about an entry is persisted or trusted across
   restarts, so there is no on-disk metadata format for a peer to influence.
