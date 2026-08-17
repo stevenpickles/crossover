@@ -32,6 +32,21 @@ These hold at all times, in every phase:
 7. **Local first.** No cloud dependency, no external telemetry (FR-7.5).
    Cloud infrastructure is never introduced to solve a local problem without
    explicit ADR-level approval.
+   **What this does not claim, stated plainly:** once content is installed on
+   the destination clipboard, it is subject to that machine's own clipboard
+   settings like any other copy. Windows **Clipboard History** (Win+V) and
+   **Cloud Clipboard** ("sync across your devices", which sends clipboard
+   content to the signed-in Microsoft account) both observe the clipboard, and
+   a user who has enabled them has enabled them for everything — including
+   items Crossover received from a peer. Crossover introduces neither and does
+   not suppress either: they are the user's own OS features acting on the
+   user's own clipboard, and silently overriding that choice would break Win+V
+   for ordinary synchronized text with no explanation. A user who does not
+   want peer content leaving the machine that way turns Cloud Clipboard off in
+   Windows Settings → System → Clipboard. **The one exception is the virtual
+   file list** (§7): it is excluded from both, because an entry that outlives
+   the spool entry or the process behind it is a promise that cannot be kept —
+   see F16.
 8. **Pairing is not permission.** A paired peer holds exactly the capabilities
    its trust-store record grants, and nothing more. Any capability that writes
    to the local filesystem is **off by default**, requires an explicit per-peer
@@ -164,6 +179,7 @@ table:
 | T19 | A virtual file list we placed is read back and offered to the peer, looping the largest payload type in the system | F13: own-object ownership check, applied-hash memory, and the rule that spool paths are never a send source (§7, FR-3.3) |
 | T20 | Clipboard-object lifetime abuse: rendering after the peer's grant is revoked, or a render callback used to reach content of the caller's choosing, or driven in a loop as a local denial of service | F14: rendering resolves an opaque entry id to a registered, complete spool entry only — no path or name from the caller, index 0 only, one render at a time, no network read. Revocation gates *acceptance*, not already-delivered items (§7 F1, and the rejected alternative recorded below) |
 | T21 | Same-user, medium-integrity local process abuses the high-integrity worker's spool: replaces the root with a directory junction to obtain an arbitrary-file delete, or swaps a completed entry's bytes between verification and render | F15: explicit DACL plus High mandatory label (no write-up), root opened and verified as a non-reparse-point directory, every delete performed relative to that handle and never as a path-resolved recursive delete (§7) |
+| T22 | Peer-delivered content leaves the machine through the *destination's own* clipboard features — Windows Clipboard History (Win+V) or Cloud Clipboard sync to a Microsoft account | For the file item, F16: excluded from both, so a promise we cannot keep is never retained and file content never reaches an account. For text and images, **not defended and deliberately so** — they are the user's own OS features acting on their own clipboard, disclosed in invariant 7 and the README rather than silently overridden |
 
 Out of scope (documented, not defended): a fully compromised trusted peer
 machine — a peer you paired with and that is now malicious can do whatever
@@ -417,6 +433,26 @@ advertised, so no conforming peer sends a file at all.
       verified root is ever unlinked, and a directory found *inside* it is
       reported rather than descended into — the sweep has no recursive form to
       misuse.
+16. **F16 — The virtual file list is excluded from Clipboard History and
+    Cloud Clipboard.** The data object carries the
+    `CanIncludeInClipboardHistory` and
+    `ExcludeClipboardContentFromMonitorProcessing` formats, and the reason is
+    a property of the item rather than a policy about clipboards. A file item
+    is a *promise* served by a render callback that only this process, holding
+    this spool entry, can answer: the object dies with the worker, and the
+    entry is collected when the clipboard moves on. A retained history entry
+    would therefore fail on paste, later, with no diagnostic from us because
+    the failure happens inside the shell — "no entry" is a better outcome
+    than "an entry that breaks". Two consequences follow and are checked
+    rather than assumed (ADR 0015): the history service must not render
+    `CFSTR_FILECONTENTS` at copy time, which would pull up to
+    `MAX_CLIPBOARD_FILE_BYTES` with no paste and no user gesture; and cloud
+    sync must not retain the item, which would take peer-delivered file
+    content off the machine — the invariant-7 half of the question, and the
+    reason this is verified on the supported builds before the paste path
+    ships rather than observed afterwards. This exclusion covers the file item
+    only; text and images are left to the user's own settings, as invariant 7
+    records.
 
 ## 8. Security-sensitive code areas
 

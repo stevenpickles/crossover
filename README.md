@@ -29,7 +29,11 @@ larger workstation, without weakening the security boundary between them.
   images carried in the source clipboard's own format, byte for byte
 - All traffic mutually authenticated and encrypted (TLS 1.3); explicit
   pairing with a typed one-time code; local-first — no cloud, no accounts,
-  no external telemetry
+  no external telemetry. Crossover adds no cloud service; what arrives is
+  installed on your clipboard, so your own Windows clipboard settings still
+  apply to it — if **Clipboard History** (Win+V) or **Cloud Clipboard** is on,
+  it is on for synchronized content too. Turn them off in Settings → System →
+  Clipboard if you would rather they were not
 - Runs unattended as a background service, reconnecting on its own
 
 ## What it does not do yet
