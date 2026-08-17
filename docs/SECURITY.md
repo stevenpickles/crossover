@@ -369,16 +369,22 @@ shell performs that write.
     therefore an in-scope attacker here: it is not the compromised-machine or
     local-admin attacker §6 excludes. Three properties, each independently
     load-bearing:
-    - **Explicit security descriptor at creation, never inherited.** The spool
-      root is created with a DACL granting only the worker's user and local
-      administrators, **and a High mandatory integrity label with no-write-up**,
-      so a same-user medium-integrity process can neither replace the directory
-      nor alter an entry inside it. This is also what makes F14's
-      "protected since written" true: without it, an entry's bytes could be
-      swapped after verification and before a render, and the shell would write
-      attacker bytes under a name the user trusts. Where the worker is not
-      elevated there is no integrity boundary to cross and the label is inert;
-      the DACL still applies.
+    - **Explicit security descriptor, asserted on every open and never
+      inherited.** The spool root is created with a DACL granting only the
+      worker's user and local administrators, **and a mandatory integrity label
+      with no-write-up**, so a same-user medium-integrity process can neither
+      replace the directory nor alter an entry inside it. This is also what
+      makes F14's "protected since written" true: without it, an entry's bytes
+      could be swapped after verification and before a render, and the shell
+      would write attacker bytes under a name the user trusts. Asserting the
+      descriptor **at creation alone would not hold**: the reparse-point check
+      below passes for a root a lower-integrity same-user process pre-created
+      with a permissive DACL, so the descriptor is re-applied to the verified
+      handle on every open, and a root that will not take it is refused rather
+      than used unprotected. The label is stamped at the worker's own integrity
+      level capped at High, because Windows refuses a label above the caller's
+      own: where the worker is not elevated there is no integrity boundary to
+      cross and the label is inert, and the DACL still applies.
     - **Opened once and verified, never re-resolved.** The root is opened with
       reparse-point-opening semantics and rejected unless it is a real directory
       and **not** a reparse point. A root that exists and fails the check
@@ -393,7 +399,9 @@ shell performs that write.
       spool was, deleted through by a high-integrity process, is an
       arbitrary-file-delete elevation of privilege: exactly the confused-deputy
       abuse of the worker that T11 asserts is contained. Nothing outside the
-      verified root is ever unlinked.
+      verified root is ever unlinked, and a directory found *inside* it is
+      reported rather than descended into — the sweep has no recursive form to
+      misuse.
 
 ## 8. Security-sensitive code areas
 
