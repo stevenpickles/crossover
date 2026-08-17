@@ -461,12 +461,23 @@ A peer *can* stop it, by driving the cycle above, and killing the session is
 then exactly right: one whose frames are neither dispatched nor answered is
 doing nothing but holding the chain hostage.
 
-Bound 2 catches *continuous* stalling, and a peer that alternates one brisk
-write with one slow one evades it, since the brisk write clears the run —
-per-frame input delay stays inside bound 1's keepalive timeout, which is what
-this section claims, but such a peer is not disconnected; closing that needs
-a duty-cycle measure rather than a continuity one, and it matters less once
-ADR 0014's chunking caps how large a bulk frame can be.
+Bound 2 is a **duty cycle, not a run** — and it had to become one. Measured
+as a continuous run of stalling writes, any single brisk write cleared it, so
+a peer alternating one slow write with one fast one stalled the session
+indefinitely and was never disconnected: per-frame delay stayed inside
+bound 1, and the run never survived long enough to trip bound 2. This section
+carried that as an open residual until it was closed.
+
+What replaced it is a leaky bucket. A write slower than the keepalive
+interval charges its whole duration, because none of that time was usable
+throughput; every other interval — brisk writes and idle gaps alike — pays
+the debt back at the rate it actually earned. The session ends when the
+outstanding debt reaches the keepalive timeout. A continuous stall fills the
+bucket exactly as fast as the old measure did, so nothing that was caught
+before escapes now; alternating brisk writes buy a millisecond of
+forgiveness for a millisecond of throughput rather than an amnesty; and a
+link that hiccups once and then works is forgiven, because a minute of idle
+pays off any debt a single write can create.
 
 What these bounds do **not** do is keep the session loop responsive *during*
 a write. While one is pending the loop still polls nothing else, so a slow
