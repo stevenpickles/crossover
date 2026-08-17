@@ -414,7 +414,8 @@ before acceptance and again after each completion:
 |---|---|---|
 | `MAX_SPOOL_BYTES` | 1 GiB | Total bytes of all spool entries **including any in-flight `.part`**. Exactly four maximum-size (256 MiB) items, and no headroom beyond that by construction — the round number is the point: enough that a normal working session never evicts something the user still wanted, small enough to be an unremarkable footprint in app data. Since files are rare and typically far below the cap, four *maximum-size* items is a floor on how many real ones fit, not a typical count |
 | `MAX_SPOOL_ENTRIES` | 16 | Entries retained. Bounds directory scan, GC cost, and index size independently of item size, so a thousand tiny files cannot accumulate |
-| `SPOOL_ENTRY_TTL` | 24 h | Maximum age of an entry. Peer-controlled bytes should not sit at rest indefinitely for a feature whose whole point is "paste it now" |
+| *(entry lifetime)* | while it is the clipboard | An entry lives exactly as long as the clipboard still offers it. See "Entry lifetime" below — this replaces the age-based TTL the draft proposed |
+| `SPOOL_SWEEP_TTL` | 24 h | **Backstop only.** The age at which an entry is swept even though no clipboard change was ever observed for it — a lost listener, an ownership change we missed. Not the user-visible rule, and not a bound anything should normally reach |
 
 - **Eviction is oldest-completion-first**, applied until all three bounds hold,
   and it is **observable**: every eviction logs the entry id, its age, and the
@@ -545,7 +546,7 @@ defaults, to be ratified when scheduled:
 | `MIN_FREE_SPACE_MARGIN_BYTES` | 64 MiB | Headroom required on the spool volume beyond `content_length` |
 | `MAX_SPOOL_BYTES` | 1 GiB | Total spool footprint (above) |
 | `MAX_SPOOL_ENTRIES` | 16 | Retained spool entries (above) |
-| `SPOOL_ENTRY_TTL` | 24 h | Maximum entry age (above) |
+| `SPOOL_SWEEP_TTL` | 24 h | Backstop age for entries whose clipboard state was never observed (above) |
 
 `MAX_NAME_COLLISION_ATTEMPTS` from the previous draft is **deleted**: nothing
 collides any more. Spool entries are named by locally generated UUID, and
@@ -692,8 +693,11 @@ NFR-4.
   control *and* `Cf` format characters — `U+202E` explicitly — over-length in
   both bytes and UTF-16 units, non-UTF-8) as part of the malformed-input suite,
   asserting that a failing name produces no descriptor at all; a spool-bounds
-  test proving bytes, entries, and TTL are all enforced, that admission reserves
-  before accepting, and that every eviction is logged; a fault-injection test
+  test proving bytes, entries, and the backstop age are all enforced, that
+  admission reserves before accepting, and that every eviction is logged; a
+  **lifetime test** proving an entry is collected when the clipboard moves on,
+  is *not* collected while it is still offered however many times it is
+  pasted, and is never collected out from under a render in flight; a fault-injection test
   proving a truncated or aborted transfer leaves no advertisable entry and no
   orphaned `.part`; a **loop test** proving that placing a virtual file list
   produces zero outbound offers; a startup-purge test; a **junction test**
@@ -712,25 +716,85 @@ NFR-4.
   cleanup — from a high-integrity process, so deletion needed an invariant of
   its own.
 
+## Decisions taken (2026-08-17)
+
+The design forks below were settled by the maintainer when files was
+scheduled as the next work. The remaining items are verify-at-implementation,
+not forks.
+
+### Entry lifetime: while the clipboard still offers it
+
+An entry lives as long as the clipboard holds the item it backs, and is
+collected once the clipboard moves on. **Not** an age-based TTL.
+
+This is a better rule than the 24 h the draft proposed, for the reason the
+draft itself gave away: a TTL is "the only bound that can delete something
+the user was still planning to paste". Tying the lifetime to the clipboard
+removes that failure entirely — an entry can only disappear once the thing
+it backs is no longer on offer, at which point it could not have been pasted
+anyway.
+
+It is also the smaller exposure window. Peer-controlled bytes rest on disk
+for exactly as long as they are useful rather than for a fixed period, which
+is what the TTL was reaching for and misses in both directions: too long for
+an item replaced a minute later, too short for one still wanted tomorrow.
+
+And it composes with the repeatable-paste decision below: within the
+clipboard's lifetime an item may be pasted any number of times, and after it
+there is nothing to paste.
+
+Three things follow, and are requirements rather than notes:
+
+1. **A sweep at startup.** Entries from a previous run cannot correspond to
+   the current clipboard, so they are collected unconditionally on start.
+   This is also what makes "an unpasted item does not survive a worker
+   restart" true by construction rather than by intention.
+2. **A backstop age (`SPOOL_SWEEP_TTL`).** The rule depends on *observing*
+   that the clipboard moved on. A lost listener or a missed ownership change
+   would otherwise strand an entry forever, so an unobserved entry is swept
+   on age as a floor-sweeper — a safety net, not the policy.
+3. **A dependency on Clipboard History exclusion.** If Windows retained our
+   item in history (Win+V), the clipboard "moving on" would not make it
+   unreachable, and collecting the entry would break a history paste. The
+   ADR already requires exclusion from history and cloud sync for
+   invariant-7 reasons; this decision now *also* depends on it, which raises
+   that verify-at-implementation item from ergonomic to load-bearing.
+
+Collection is by handle on the opened spool root, and must not race a render
+already in flight — an entry being read is not collected out from under the
+reader.
+
+### A paste does not consume the entry
+
+As proposed. A render is idempotent, so an item can be pasted into several
+places, which is how a clipboard behaves everywhere else; a
+consume-on-paste rule would make the second paste of the same thing fail,
+which no user expects. With the lifetime rule above, the entry is collected
+when the clipboard moves on rather than lingering.
+
+### `MAX_CLIPBOARD_FILE_BYTES` stays at 256 MiB
+
+As proposed. It covers documents, archives and photo sets — a convenience
+feature, not a file-sync product — and refusals are observable (FR-3.6)
+rather than silent truncation. The measured cost of a saturated Background
+lane (docs/ROADMAP.md, 2026-08-16) argues against raising it: a larger
+ceiling buys reach and spends responsiveness.
+
 ## Open questions (to settle when scheduled)
 
-- **Spool retention values.** `MAX_SPOOL_BYTES` (1 GiB), `MAX_SPOOL_ENTRIES`
-  (16), and `SPOOL_ENTRY_TTL` (24 h) are proposals, and the TTL is the least
-  confident of the three: it is the only bound that can delete something the
-  user was still planning to paste. The maintainer's call on how much app-data
-  disk a rare convenience feature may occupy.
-- **Whether a paste consumes the spool entry.** *Proposed: no* — a render is
-  idempotent and the entry survives until GC, so an item can be pasted into
-  several places. Flagged because it is the one place where "the clipboard
-  holds a file" and "the file exists once" could be argued the other way, and
-  because a consume-on-paste rule would let the spool shrink faster.
+- ~~**Spool retention values.**~~ Settled above: entry lifetime follows the
+  clipboard, with a 24 h backstop for unobserved entries. `MAX_SPOOL_BYTES`
+  (1 GiB) and `MAX_SPOOL_ENTRIES` (16) stand as written — with the lifetime
+  rule there is normally one live entry, so both are backstops rather than
+  working limits.
+- ~~**Whether a paste consumes the spool entry.**~~ Settled above: no.
 - **Whether Linux's fallback is the drop folder.** The X11/Wayland clipboard has
   no promised-file mechanism, so the Phase 8 Linux port either revives the drop
   folder for that platform (a per-platform UX divergence, but the design is
   already written and its threat entries mostly still apply) or ships without
   file receive. Not decided here.
-- Whether `MAX_CLIPBOARD_FILE_BYTES` (256 MiB) is the right ceiling for a rare,
-  convenience-grade transfer — carried over from the previous draft.
+- ~~Whether `MAX_CLIPBOARD_FILE_BYTES` (256 MiB) is the right ceiling.~~
+  Settled above: it stands.
 - Whether `CFSTR_ZONEIDENTIFIER` on the data object actually causes the shell to
   stamp Mark-of-the-Web on the pasted file across the Explorer versions we care
   about, or whether the marking is only reliable on the spool copy. A
