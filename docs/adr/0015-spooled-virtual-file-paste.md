@@ -1003,3 +1003,95 @@ transfer spools and registers, and nothing offers it. That is deliberate
 — the object is worth landing and testing on its own, and `FILE_CLIPBOARD`
 stays unadvertised until the whole path exists, so no conforming peer can
 produce an entry that would sit unoffered.
+
+## Decisions taken while implementing the sending half (2026-08-18)
+
+The blob builder — the piece that turns a `CF_HDROP` selection into one
+offerable blob — settled five things this ADR either left open or stated
+only in passing.
+
+### Archive entries are Stored, never deflated
+
+The ADR says a single file travels verbatim and rejects compressing it
+"for symmetry", but never says what happens to entries *inside* an
+archive. They are stored uncompressed, for three reasons that agree.
+
+ADR 0014's rule is the LAN is faster than any codec would save, and this
+is the same LAN. Compression is the whole reason a zip crate has a
+supply-chain footprint at all — the default feature set pulls aes, bzip2,
+zopfli, lzma, ppmd, xz and zstd — and none of it is built. And it is what
+keeps the byte bound honest: with Stored entries the finished archive is
+the walked content plus a small fixed header per entry, so the cumulative
+byte check performed **during** the walk genuinely bounds the artifact.
+Deflating would make the mid-walk figure an input to a compressor whose
+output size is not known until it is written, which turns "refuse before
+building something oversized" back into "build it and measure".
+
+The cost is stated plainly: a folder of compressible documents travels at
+its full size, and a selection that would have fitted under 256 MiB
+compressed can be refused. That is the same trade images already make.
+
+### The blob is a delete-on-close handle, not a path
+
+The ADR says the archive is built "to a temporary file in the sender's own
+temp directory". The boundary carries an **open handle and no path**, and
+the file is created `FILE_FLAG_DELETE_ON_CLOSE` with `FILE_SHARE_DELETE`.
+
+Cleanup on every refusal path was a requirement, and a `Drop` is the
+obvious way to meet it — but a `Drop` does not run when the process dies
+mid-build, and this build can be a 256 MiB copy. Delete-on-close makes the
+cleanup the operating system's, covering the crash case the ADR did not
+have to think about on the receiving side (the spool has a startup purge
+for exactly this reason; the sender now needs no equivalent). Not exposing
+the path follows the spool's rule for the same reason F15 gives: a caller
+that can name the artifact can keep it, re-resolve it, or hand it
+somewhere else.
+
+### A single file is copied, not streamed from where it sits
+
+The offer's length and hash are fixed before any byte travels, so the
+bytes that travel must be a snapshot. Reading them from the user's own
+file instead would leave a window in which editing or deleting it during
+a transfer changes what the receiver hash-verifies — a failure the user
+could not connect to what they did. One local copy of an item already
+bounded at 256 MiB, on a path this ADR describes as rare, is the cheaper
+half of that trade.
+
+### Depth is counted in archive path components
+
+`MAX_ARCHIVE_DEPTH` had no counting convention. A selected file or folder
+sits at depth 1 and its children at depth 2, so the cap admits a selected
+folder plus 31 levels beneath it. The constant now lives beside its
+sibling caps in `crossover-protocol` — it has no wire field, because
+nothing on the receiving side ever looks inside an archive (F9), but it is
+the same family of bound on what one clipboard item may become.
+
+`MAX_CLIPBOARD_FILE_ENTRIES` counts **directories as well as files**,
+because they are archive entries: an empty folder is written as one so a
+folder's shape survives the round trip, and the count is what bounds the
+archive's central directory.
+
+### The name is derived at the platform boundary and judged above it
+
+`validate_file_name` lives in `crossover-protocol` and a platform crate
+carries no dependencies, so the builder cannot ask whether the name it
+derived from the filesystem conforms. Mirroring the validator would have
+meant two rules for the one string of a file transfer that reaches a
+shell, which is precisely the shape of bug the reject-not-repair design
+exists to avoid.
+
+So the builder reports the name *and where it came from*, and the layer
+that can name both crates applies this ADR's two answers: a name the
+selection gave itself — a file's own name, or `<folder>.zip` — is refused
+when it does not conform, and a name derived from a multi-entry
+selection's parent folder falls back to `files.zip`. The fallback is
+asserted to be a conforming name in its own test, since it is the one
+name with nothing left to fall back to.
+
+Two smaller rules fell out of the walk. A name that is not valid Unicode
+is refused rather than lossily converted, for the same reject-not-repair
+reason. And two entries that would pack under one name refuse the item
+rather than one of them being suffixed: ordinary shell selections come
+from a single folder where the filesystem has already made names unique,
+so this is a pathological clipboard rather than a case worth
+accommodating.

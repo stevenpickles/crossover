@@ -18,6 +18,8 @@ pub mod cursor;
 #[cfg(windows)]
 pub mod display;
 #[cfg(windows)]
+pub mod file_blob;
+#[cfg(windows)]
 pub mod input;
 #[cfg(windows)]
 pub mod keymap;
@@ -54,6 +56,8 @@ pub use clipboard::WindowsClipboard;
 pub use cursor::{WindowsCursorMask, restore_system_cursors};
 #[cfg(windows)]
 pub use display::WindowsDisplayInfo;
+#[cfg(windows)]
+pub use file_blob::WindowsFileBlobBuilder;
 
 /// Restore the default system cursors — a no-op off Windows, where there is
 /// no cursor masking. Called on shutdown so a quit never leaves the cursor

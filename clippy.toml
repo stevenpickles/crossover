@@ -1,0 +1,17 @@
+# Workspace clippy configuration.
+#
+# Nothing in Crossover reads an archive. docs/SECURITY.md F9 states it as a
+# guarantee — "the receiver never enumerates, decompresses, or extracts it"
+# — and ADR 0015 rests the whole zip-slip and decompression-bomb argument
+# on there being no archive parser over untrusted input anywhere in the
+# tree, in a process that runs at high integrity (ADR 0012).
+#
+# The sender needs a zip *writer*, and the crate that provides it also
+# provides a reader. A comment would state the discipline; this enforces
+# it, so a future call site cannot quietly turn a write-only dependency
+# into a parsing surface. Tests that read an archive back to prove the
+# writer produced a real one are the deliberate exception and say so with
+# a local allow.
+disallowed-types = [
+    { path = "zip::read::ZipArchive", reason = "Crossover writes archives and never reads one (docs/SECURITY.md F9); a test proving the writer's output is a real archive may allow this locally" },
+]
