@@ -52,6 +52,7 @@ fn side(origin: u8) -> Side {
     let (driver, events, commands) = clipboard_sync(
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
         None,
+        None,
         Uuid::from_bytes([origin; 16]),
         ClipboardConfig {
             retry: ClipboardRetryPolicy {
