@@ -132,15 +132,36 @@
 > loop prevention is in too — a `CF_HDROP` resolving inside the spool is
 > never staged.
 >
-> **What remains**: advertising `FILE_CLIPBOARD`, and computing the send
-> policy from the negotiated features and the trust store the way
-> `file_receive_policy` already computes its twin. Until that bit is
-> advertised no
-> conforming peer sends a file and this side's send gate stays closed, so
-> the path built so far is exercised by tests alone — deliberately, since
-> the alternative is spooling deliveries nothing can yet paste. One question is answered by a human rather than by
-> CI before the paste path ships: whether Windows honours the
-> history/cloud exclusions the object declares (docs/TESTING.md §1.6).
+> **The sender side is built** (2026-08-18): local `CF_HDROP` observation
+> (feature/133, PR #38), the blob builder (feature/134, PR #39), and the
+> engine's send transaction over it (feature/135, PR #40) — the three
+> paragraphs above.
+>
+> **`FILE_CLIPBOARD` is advertised** (2026-08-18, feature/136). This was the
+> deliberate final act: `FeatureFlags::ADVERTISED` is now `ALL`, so a
+> conforming peer can actually reach either half of the file path instead of
+> negotiating it away. The send policy is computed the way
+> `file_receive_policy` already computes its twin — `SessionRoute` now
+> carries each live session's negotiated features, `file_send_policy` folds
+> them with the trust store's `clipboard_send` grant into
+> `FileSend::{Unsupported, NotNegotiated, Denied, Allowed}`, and it is
+> published at the same two points `file_receive_policy` is: session
+> establishment/loss, and the trust-store revocation poll — so revoking
+> `clipboard_send` reaches a running worker within one poll, exactly as
+> revoking `file_receive` already did.
+>
+> Two things worth being plain about, so this entry does not overstate what
+> landed. **`clipboard_send` is, as of this slice, the first permission this
+> codebase enforces anywhere** — text and images still travel without
+> checking it, unchanged from before; this slice was not scoped to fix that.
+> And **this closes construction, not validation**: the whole file path —
+> offer, blob build, chunked send, spool, verify, virtual-file paste — has
+> been exercised by the test suites only. No two-machine hardware run has
+> moved a real file between the two workstations yet, which is what the
+> phase needs next before files can be called done. One question is still
+> answered by a human rather than by CI before that: whether Windows honours
+> the clipboard-history/cloud exclusions the virtual-file object declares
+> (docs/TESTING.md §1.6) — open, carried forward.
 >
 > Phase 6 (Windows Prototype Hardening) closed 2026-08-14: the multi-day
 > unattended soak — the last exit criterion — ran 2026-08-11 → 2026-08-14

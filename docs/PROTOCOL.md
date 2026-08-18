@@ -119,19 +119,23 @@ skippable — so files need a bit of their own or they would kill exactly
 the sessions they were supposed to enrich.
 
 `FeatureFlags::ADVERTISED` is what this build actually sends, and it is
-**bit 0 only** — not `ALL`. Bit 0 has been advertised since ADR 0014's
+now **`ALL`** — both bits. Bit 0 has been advertised since ADR 0014's
 platform slice, and every layer of that promise is real: the wire carries
 chunked items, the clipboard engine offers, streams, reassembles, verifies
 and installs them, and `crossover-platform-windows` reads and writes
-`CF_DIB` on the actual OS clipboard. Bit 1's wire types exist (ADR 0015's
-protocol slice), but the receiving half — the `file_receive` grant, the
-bounded spool, and the virtual file list on the OS clipboard — does not,
-and advertising is a promise to **handle**, not a statement of intent to
-send. The bit is set by the slice that makes it true, which is a
-deliberate one-line edit against a test that asserts today's answer.
+`CF_DIB` on the actual OS clipboard. Bit 1 joined it in ADR 0015's final
+slice (feature/136): the receiving half — the `file_receive` grant, the
+bounded spool, and the virtual file list on the OS clipboard — landed in
+feature/126–132, and the sending half — local observation, the blob
+builder, and the engine's send transaction — in feature/133–135, so by the
+time the bit flips every layer beneath it can honour the promise.
+Advertising is a promise to **handle**, not a statement of intent to send,
+and it was withheld until both halves were true; the code path itself has
+been exercised only by the test suites so far, with two-machine hardware
+validation of file transfer still outstanding.
 
 The flip is **wire-visible**: the `Hello` a peer receives now carries
-`supported_features = 1` where it carried `0`. That is why the golden
+`supported_features = 3` where it carried `1`. That is why the golden
 `Hello` snapshot pins the byte — a change to the advertisement has to be a
 deliberate edit rather than something a peer discovers first. It is also
 safe by the rules above and by nothing else: a feature activates only on

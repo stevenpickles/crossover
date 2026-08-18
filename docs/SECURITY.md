@@ -224,10 +224,15 @@ selected. The engine transaction over that blob is built too
 grant are judged **before** anything is walked or packed, F13's third
 guard — no path inside the spool root is ever a send source — is
 enforced, and every path that ends the transaction drops the blob, whose
-delete-on-close handle is what removes the artifact. **Not yet**:
-`FILE_CLIPBOARD` is still unadvertised and the application supplies no
-send policy, so the gate is closed in both directions and no file
-travels either way.
+delete-on-close handle is what removes the artifact. **`FILE_CLIPBOARD` is
+now advertised** (feature/136): the application computes `FileSend` the
+same way it computes `file_receive`'s policy — negotiated feature set,
+then trust-store grant, re-published on the same revocation poll — so a
+conforming peer can actually reach both halves. `clipboard_send` is the
+first permission this codebase enforces anywhere; text and images still
+travel without checking it (§4). The path is exercised only by the test
+suites so far — no two-machine hardware validation of file transfer has
+run yet.
 
 1. **F1 — Consent before bytes.** No file transfer is accepted from a peer
    whose trust-store record does not carry `file_receive` (§4). The check runs

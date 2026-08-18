@@ -1220,3 +1220,23 @@ That is the next slice, and it is a small one: advertise the bit, and
 compute `FileSend` from the session's negotiated features and the peer's
 `clipboard_send` grant the way `file_receive_policy` already computes its
 twin.
+
+## FILE_CLIPBOARD is advertised (feature/136, 2026-08-18)
+
+That next slice landed, closing the sender-side construction this ADR
+specifies. `FeatureFlags::ADVERTISED` is now `ALL`; `SessionRoute` carries
+each live session's negotiated features, and `file_send_policy` in
+`apps/crossover/src/commands.rs` computes `FileSend` exactly as planned
+above, published at the same two points `file_receive_policy` is —
+session establishment and loss, and the trust-store revocation poll — so
+revoking `clipboard_send` reaches a running worker within one poll, the
+same way revoking `file_receive` already did.
+
+Two things this closes are worth stating plainly rather than left
+implicit: `clipboard_send` is, as of this slice, the **first** permission
+this codebase enforces anywhere — text and images still travel without
+checking it, which is unchanged from before and is not something this
+slice was scoped to fix. And advertising the bit is validated by the test
+suites only; no two-machine hardware run has exercised a real file
+transfer end to end yet, so this is construction complete, not delivery
+proven (docs/TESTING.md's Definition of Done).
