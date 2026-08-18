@@ -27,6 +27,7 @@
 //! on. [`UnsupportedSpoolStorage`] is that honest nothing.
 
 use std::fs::File;
+use std::path::Path;
 
 use thiserror::Error;
 
@@ -176,6 +177,24 @@ pub struct SpoolSweep {
 /// - Unlinking never recurses. A directory in the root is left alone and
 ///   reported.
 pub trait SpoolStorage: Send + Sync {
+    /// Where the root is, **for comparison and diagnostics only**.
+    ///
+    /// The one caller that needs it is ADR 0015's sender-side loop guard:
+    /// a `CF_HDROP` naming something inside the spool is a copy of what we
+    /// delivered and must never be staged back to the peer (SECURITY.md
+    /// F13). Answering that needs the root's *name*, which is why this
+    /// exists at all.
+    ///
+    /// It is emphatically **not** a way to reach the spool. Every
+    /// operation on this trait goes through the opened handle, and
+    /// re-resolving this path to open, enumerate, or unlink anything is
+    /// the precise bug F15 exists to prevent — a handle-relative delete
+    /// cannot be redirected by a junction planted after the check, and a
+    /// path-resolved one can. `None` where the concept does not apply.
+    fn root_path(&self) -> Option<&Path> {
+        None
+    }
+
     /// Everything currently in the root, enumerated through the open
     /// handle.
     ///
