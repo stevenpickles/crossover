@@ -10,6 +10,7 @@ pub mod cursor;
 pub mod display;
 #[cfg(any(test, feature = "fakes"))]
 pub mod fakes;
+pub mod file_blob;
 pub mod input;
 pub mod secure_storage;
 pub mod service;
@@ -22,6 +23,10 @@ pub use clipboard::{
 };
 pub use cursor::{CursorMask, CursorMaskError, NoopCursorMask};
 pub use display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
+pub use file_blob::{
+    BlobNaming, FileBlob, FileBlobBuilder, FileBlobRefusal, MAX_ARCHIVE_DEPTH,
+    MAX_CLIPBOARD_FILE_BYTES, UnsupportedFileBlobBuilder,
+};
 pub use input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerButton,
     PointerEvent, SCROLL_UNITS_PER_DETENT, hid,
