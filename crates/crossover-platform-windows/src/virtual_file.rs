@@ -1123,7 +1123,8 @@ mod tests {
     use std::io::Write as _;
 
     use crossover_platform::{
-        ClipboardError, ClipboardProvider as _, SpoolStorage, VirtualFile, VirtualFileClipboard,
+        ClipboardContent, ClipboardError, ClipboardProvider as _, SpoolStorage, VirtualFile,
+        VirtualFileClipboard,
     };
     use windows::Win32::System::Com::{
         FORMATETC, IDataObject, IStream, STGMEDIUM, TYMED_HGLOBAL, TYMED_ISTREAM,
@@ -1533,6 +1534,46 @@ mod tests {
         // Withdrawing something we no longer own is a success: the
         // postcondition already holds.
         files.withdraw().expect("withdraw");
+    }
+
+    /// Layer 2 of ADR 0015's loop prevention (feature/133), made concrete:
+    /// the object we place advertises `CFSTR_FILEDESCRIPTORW` and
+    /// `CFSTR_FILECONTENTS`, never `CF_HDROP`, so a plain clipboard read
+    /// finds nothing to report as a file-list observation while it is
+    /// current — independent of the ownership check
+    /// `crossover_core::clipboard_driver` performs before a read is ever
+    /// attempted at all (layer 1, proved above by
+    /// `our_own_offer_is_recognized_until_something_else_copies`).
+    #[test]
+    fn our_own_offer_never_reads_back_as_a_file_list_observation() {
+        let _serial = clipboard_lock();
+        let _ole = Ole::init();
+        let sandbox = Sandbox::new("virtual-file-no-hdrop");
+        let entry = "77777777-0000-1111-2222-333333333333.bin";
+        let spool = spooled(&sandbox, entry, b"a small document");
+
+        let files = WindowsVirtualFiles::new(spool).expect("apartment");
+        offer_with_retry(&files, &offer_of(entry, "doc.pdf", 16));
+        assert!(files.is_current());
+
+        let clipboard = crate::clipboard::WindowsClipboard::new().expect("clipboard");
+        let mut content = None;
+        for attempt in 0..20 {
+            match clipboard.read() {
+                Ok(read) => {
+                    content = read;
+                    break;
+                }
+                Err(ClipboardError::Busy { .. }) if attempt < 19 => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => panic!("reading the clipboard: {error}"),
+            }
+        }
+        assert!(
+            !matches!(content, Some(ClipboardContent::FileList(_))),
+            "our own virtual file object read back as a file-list observation: {content:?}"
+        );
     }
 
     /// Withdrawal empties the clipboard, so a promise is never left
