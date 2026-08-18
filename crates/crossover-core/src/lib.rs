@@ -22,7 +22,7 @@ pub mod supervision;
 pub mod topology;
 
 pub use clipboard::{
-    ClipboardConfig, ClipboardEngine, FileReceive, RetryPolicy as ClipboardRetryPolicy,
+    ClipboardConfig, ClipboardEngine, FileReceive, FileSend, RetryPolicy as ClipboardRetryPolicy,
     SpooledFile, TransferScope, WriteFailure,
 };
 pub use clipboard_driver::{ClipboardSyncDriver, SyncEvent, clipboard_sync};
