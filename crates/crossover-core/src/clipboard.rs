@@ -3055,7 +3055,9 @@ fn inside_spool(root: &Path, path: &Path) -> bool {
                 Component::Prefix(prefix) => {
                     parts.push(prefix.as_os_str().to_string_lossy().to_lowercase());
                 }
-                Component::RootDir => parts.push("\\".to_owned()),
+                // A separator on Windows and illegal in a name on Unix,
+                // so the root marker cannot collide with a real component.
+                Component::RootDir => parts.push("/".to_owned()),
                 Component::Normal(part) => parts.push(part.to_string_lossy().to_lowercase()),
             }
         }
@@ -3166,7 +3168,7 @@ fn clamp_ms(ms: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use uuid::Uuid;
@@ -5371,6 +5373,35 @@ mod tests {
         paths.iter().map(PathBuf::from).collect()
     }
 
+    /// An absolute spool root for *this* platform.
+    ///
+    /// The guard turns on `Path::is_absolute`, which is a per-platform
+    /// question: a Windows path is one undivided component on Unix and
+    /// not absolute there, so a test written in one dialect would assert
+    /// the fallback rather than the rule on the other two OSes the CI
+    /// gate runs.
+    fn spool_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Users\test\AppData\Local\Crossover\spool")
+        } else {
+            PathBuf::from("/home/test/.local/share/crossover/spool")
+        }
+    }
+
+    /// A path somewhere else entirely, absolute on this platform.
+    fn elsewhere(name: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\work").join(name)
+        } else {
+            PathBuf::from("/home/test/work").join(name)
+        }
+    }
+
+    /// The same path, shouted: the comparison must not turn on case.
+    fn shout(path: &Path) -> PathBuf {
+        PathBuf::from(path.to_string_lossy().to_uppercase())
+    }
+
     /// Copy a file selection locally, through the same trigger every
     /// other observation goes through.
     fn copy_files(engine: &mut ClipboardEngine, paths: &[&str]) -> Vec<Action> {
@@ -5690,45 +5721,46 @@ mod tests {
     /// largest payload type in the system (ADR 0015 layer 2, F13).
     #[test]
     fn a_selection_inside_the_spool_is_never_staged() {
+        let root = spool_root();
         let mut engine = sender(0xAA);
-        engine.set_spool_root(Some(PathBuf::from(
-            r"C:\Users\test\AppData\Local\Crossover\spool",
-        )));
+        engine.set_spool_root(Some(root.clone()));
 
-        for inside in [
-            r"C:\Users\test\AppData\Local\Crossover\spool\3f2a.bin",
+        let inside = [
+            root.join("3f2a.bin"),
             // Case is not a distinction the filesystem this guards makes.
-            r"c:\users\test\appdata\local\crossover\SPOOL\3f2a.bin",
+            shout(&root).join("3f2a.bin"),
             // The root itself.
-            r"C:\Users\test\AppData\Local\Crossover\spool",
+            root.clone(),
             // Unjudgeable without resolving it: treated as ours.
-            r"C:\Users\test\AppData\Local\Crossover\spool\..\spool\3f2a.bin",
-            r"spool\3f2a.bin",
-        ] {
-            let actions = copy_files(&mut engine, &[inside]);
+            root.join("..").join("spool").join("3f2a.bin"),
+            PathBuf::from("spool").join("3f2a.bin"),
+        ];
+        for path in inside {
+            let actions =
+                engine.on_local_read(Some(ClipboardContent::FileList(vec![path.clone()])));
             assert!(
                 actions.is_empty(),
-                "{inside} was staged for sending: {actions:?}"
+                "{} was staged for sending: {actions:?}",
+                path.display()
             );
         }
 
         // A sibling directory whose name merely starts the same way is
         // *not* inside it — component-wise, not a string prefix.
-        build_of(&copy_files(
-            &mut engine,
-            &[r"C:\Users\test\AppData\Local\Crossover\spool-backup\note.txt"],
-        ));
+        let sibling = root
+            .parent()
+            .expect("the spool root has a parent")
+            .join("spool-backup")
+            .join("note.txt");
+        build_of(&engine.on_local_read(Some(ClipboardContent::FileList(vec![sibling]))));
 
         // One path inside the spool poisons the whole selection: one
         // clipboard item is one blob, so it cannot be sent minus that
         // entry without sending something the user did not select.
-        let mixed = copy_files(
-            &mut engine,
-            &[
-                r"C:\work\report.pdf",
-                r"C:\Users\test\AppData\Local\Crossover\spool\3f2a.bin",
-            ],
-        );
+        let mixed = engine.on_local_read(Some(ClipboardContent::FileList(vec![
+            elsewhere("report.pdf"),
+            root.join("3f2a.bin"),
+        ])));
         assert!(
             mixed.is_empty(),
             "a partly-ours selection was staged: {mixed:?}"
