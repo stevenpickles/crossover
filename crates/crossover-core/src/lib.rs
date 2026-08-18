@@ -12,6 +12,7 @@ pub mod command;
 pub mod control;
 pub mod control_driver;
 pub mod edge_driver;
+pub mod file_blob;
 pub mod input;
 pub mod metrics;
 pub mod net;
@@ -34,6 +35,7 @@ pub use control_driver::{InputControlDriver, InputControlEvent, SeamlessInputs, 
 pub use edge_driver::{
     CrossingKind, EdgeCrossing, EdgeDetectDriver, EdgeDetector, EdgeMode, edge_detect,
 };
+pub use file_blob::{FALLBACK_ARCHIVE_NAME, wire_file_name};
 pub use input::{
     InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce, coalesce_input, hid,
 };

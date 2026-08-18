@@ -3866,6 +3866,29 @@ mod tests {
         );
     }
 
+    /// The same mirror again, for the two bounds the *sender's* blob
+    /// builder enforces (ADR 0015, feature/134). They are mirrored rather
+    /// than imported for the no-dependencies reason above, and they matter
+    /// more than most: the sender is the only party that can refuse an
+    /// oversized or too-deeply-nested selection before the bytes exist, so
+    /// a platform value that drifted *upward* would build an item the
+    /// receiver is then obliged to decline after it arrived.
+    #[test]
+    fn the_platform_sender_bounds_agree_with_the_protocol() {
+        use crossover_protocol::clipboard::{MAX_ARCHIVE_DEPTH, MAX_CLIPBOARD_FILE_BYTES};
+
+        assert_eq!(
+            crossover_platform::MAX_CLIPBOARD_FILE_BYTES,
+            MAX_CLIPBOARD_FILE_BYTES,
+            "the platform boundary's file-byte ceiling drifted from the protocol's"
+        );
+        assert_eq!(
+            crossover_platform::MAX_ARCHIVE_DEPTH,
+            MAX_ARCHIVE_DEPTH,
+            "the platform boundary's archive-depth ceiling drifted from the protocol's"
+        );
+    }
+
     // ---- files (ADR 0015) ----
 
     fn file_meta(bytes: &[u8], sequence: u64) -> ClipboardMeta {
