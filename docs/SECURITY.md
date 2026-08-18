@@ -369,6 +369,17 @@ advertised, so no conforming peer sends a file at all.
     item's content hash and suppresses a matching outbound offer; and no path
     inside the spool root may ever be staged as a send source. The first fires
     without reading or rendering anything.
+    **Ownership is two conditions, not one**, and the second was added
+    because the first was observed answering wrongly: `OleIsCurrentClipboard`
+    compares against the object OLE last placed, and it still reported "ours"
+    after a plain Win32 `SetClipboardData` in the same process had replaced
+    the clipboard contents — OLE learns of ownership changes through its own
+    window, and a non-OLE write next door does not always tell it. A stale
+    "yes" here is the harmful direction: it would suppress staging a copy the
+    user genuinely made. So the check also requires the clipboard sequence
+    number to be unchanged since the placement, which any update by anyone
+    moves. A race can then only produce a stale *"no"*, which costs one
+    redundant read.
 14. **F14 — Rendering serves registered spool content and nothing else, one at
     a time.** A delayed-render callback resolves an **opaque entry id** to a
     registered, complete spool entry whose bytes were hash-verified against the

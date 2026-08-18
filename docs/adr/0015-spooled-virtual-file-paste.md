@@ -930,10 +930,36 @@ about the user's own OS features. So the gap is closed by naming it — in
 invariant 7, in the threat table as T22, and in the README — rather than by
 overriding a setting the user chose.
 
+### Two findings from the data object (2026-08-17)
+
+**`OleIsCurrentClipboard` is not sufficient on its own.** It answered
+"still ours" after a same-process Win32 `SetClipboardData` had replaced
+the clipboard, which would have made the loop guard suppress a copy the
+user really made. Ownership is therefore the conjunction of that call and
+an unchanged `GetClipboardSequenceNumber` since the placement. Recorded in
+SECURITY.md F13, because the guard's wording claimed more than the API
+delivers.
+
+**The OLE clipboard hands consumers a mediating object.** Asking the
+clipboard's data object for file contents as `TYMED_HGLOBAL` returns
+`DV_E_FORMATETC` without our `GetData` running at all: the intermediary
+answers out-of-enumeration requests itself. The refusal still happens,
+which is what production needs, but the specific codes this ADR
+specifies — `DV_E_TYMED`, `DV_E_LINDEX` — are only observable by calling
+our object directly, which is how they are tested.
+
 ### What is deliberately not here yet
 
 Entry lifetime — collection when the clipboard moves on, and the
-`SPOOL_SWEEP_TTL` backstop — belongs with the clipboard object that makes
-"the clipboard still offers it" observable, so it lands with the platform
-slice rather than ahead of it. The startup sweep, which needs no such
-observation, is implemented: the spool is purged in full when it is opened.
+`SPOOL_SWEEP_TTL` backstop — needs the clipboard object that makes "the
+clipboard still offers it" observable. That object now exists
+(`is_current`), so the rule is the next slice's work rather than a
+dependency waiting on one. The startup sweep, which needs no such
+observation, is already implemented: the spool is purged in full when it
+is opened.
+
+The data object is also **not yet wired to the engine**: a completed
+transfer spools and registers, and nothing offers it. That is deliberate
+— the object is worth landing and testing on its own, and `FILE_CLIPBOARD`
+stays unadvertised until the whole path exists, so no conforming peer can
+produce an entry that would sit unoffered.
