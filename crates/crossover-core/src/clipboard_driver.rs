@@ -26,14 +26,16 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crossover_platform::{ClipboardError, ClipboardProvider, SpoolError, SpoolStorage};
+use crossover_platform::{
+    ClipboardError, ClipboardProvider, SpoolError, SpoolStorage, VirtualFile, VirtualFileClipboard,
+};
 use crossover_protocol::RawFrame;
 use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
 use crossover_protocol::hello::MessageType;
 
 use crate::clipboard::{
     Action, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, InboundMessage,
-    MIN_FREE_SPACE_MARGIN_BYTES, OutboundMessage, TransferScope, WriteFailure,
+    MIN_FREE_SPACE_MARGIN_BYTES, OutboundMessage, SpooledFile, TransferScope, WriteFailure,
 };
 use crate::command::{FrameTarget, SessionCommand};
 use crate::metrics::Metrics;
@@ -107,6 +109,8 @@ pub enum SyncEvent {
     RetryDue(Uuid),
     /// The settle window elapsed (ADR 0006): time to read.
     SettleDue(u64),
+    /// The spool's age backstop came due (ADR 0015).
+    SpoolSweepDue,
     /// A transfer deadline came due (ADR 0014).
     TransferTimeout {
         /// Which half of the transaction machine it covers.
@@ -139,6 +143,11 @@ pub struct ClipboardSyncDriver {
     /// The open partial of the transfer in flight, keyed by transaction.
     /// One at a time, because the engine admits one at a time.
     file_write: Option<(Uuid, std::fs::File)>,
+    /// Where a verified file is offered for paste (ADR 0015), or `None`
+    /// where this build has no such mechanism. Separate from `provider`
+    /// because on Windows it owns an apartment thread of its own, which
+    /// the ADR requires rather than prefers.
+    virtual_files: Option<Arc<dyn VirtualFileClipboard>>,
     events_rx: mpsc::Receiver<SyncEvent>,
     events_tx: mpsc::Sender<SyncEvent>,
     commands_tx: CommandSender,
@@ -173,6 +182,7 @@ pub struct ClipboardSyncDriver {
 pub fn clipboard_sync(
     provider: Arc<dyn ClipboardProvider>,
     spool: Option<Arc<dyn SpoolStorage>>,
+    virtual_files: Option<Arc<dyn VirtualFileClipboard>>,
     origin: Uuid,
     config: ClipboardConfig,
     metrics: Option<Arc<Metrics>>,
@@ -202,6 +212,7 @@ pub fn clipboard_sync(
         provider,
         spool,
         file_write: None,
+        virtual_files,
         events_rx,
         events_tx: events_tx.clone(),
         commands_tx,
@@ -289,17 +300,19 @@ impl ClipboardSyncDriver {
         match event {
             SyncEvent::SessionEstablished => self.engine.on_session_established(),
             SyncEvent::SessionLost => self.engine.on_session_lost(),
-            SyncEvent::LocalChanged => self.engine.on_local_change(),
+            SyncEvent::LocalChanged => self.on_local_change(),
+            SyncEvent::SpoolSweepDue => self.engine.on_spool_sweep_due(),
             SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
             SyncEvent::TransferTimeout { scope, generation } => {
                 self.engine.on_transfer_timeout(scope, generation)
             }
             SyncEvent::FileReceivePolicy(policy) => {
-                // Clamped, not merely forwarded: without a spool there is
-                // nowhere for a file to go, whatever the trust store says.
-                // The permission and the capability are separate answers,
-                // and the closed one wins.
-                let policy = if self.spool.is_some() {
+                // Clamped, not merely forwarded: a file needs somewhere
+                // to land *and* somewhere to be pasted from, and without
+                // both this build cannot deliver one whatever the trust
+                // store says. The permission and the capability are
+                // separate answers, and the closed one wins.
+                let policy = if self.spool.is_some() && self.virtual_files.is_some() {
                     policy
                 } else {
                     FileReceive::Unsupported
@@ -582,6 +595,98 @@ impl ClipboardSyncDriver {
         )
     }
 
+    /// A local clipboard change, judged before it is acted on.
+    ///
+    /// Two things are decided here, and both need an answer the engine
+    /// cannot produce, because both are about an object only the platform
+    /// layer can recognize:
+    ///
+    /// - **Loop prevention** (F13). Our own virtual file list raises a
+    ///   change notification exactly as any write does, and staging it
+    ///   would offer the file straight back to the peer that sent it —
+    ///   FR-3.3's loop, on the largest payload type in the system. Asking
+    ///   whether the clipboard still holds *our* object settles it without
+    ///   reading anything or rendering a byte, which is why this guard
+    ///   fires before the read rather than after it.
+    /// - **Entry lifetime** (ADR 0015). A change that is *not* ours means
+    ///   the clipboard has moved on, so the entry behind the item it was
+    ///   offering can no longer be pasted and is collected.
+    fn on_local_change(&mut self) -> Vec<Action> {
+        if self
+            .virtual_files
+            .as_ref()
+            .is_some_and(|files| files.is_current())
+        {
+            self.record(Metrics::record_clipboard_loop_suppressed);
+            tracing::debug!("clipboard change is our own virtual file list; not staging it");
+            return Vec::new();
+        }
+        let mut actions = self.engine.on_clipboard_moved_on();
+        actions.extend(self.engine.on_local_change());
+        actions
+    }
+
+    /// Offer a verified entry for paste, and report what the clipboard
+    /// said back into the engine.
+    fn offer_file(&mut self, id: Uuid, file: &SpooledFile) -> Vec<Action> {
+        let Some(files) = &self.virtual_files else {
+            // No paste mechanism in this build. The engine deletes the
+            // entry rather than leaving bytes nothing can reach.
+            return self
+                .engine
+                .on_file_offered(id, Err(WriteFailure::UnsupportedType));
+        };
+        let offer = VirtualFile {
+            entry: file.entry.clone(),
+            file_name: file.descriptor.file_name.clone(),
+            byte_len: file.byte_len,
+        };
+        let result = match files.offer(&offer) {
+            Ok(()) => Ok(()),
+            Err(ClipboardError::Busy { reason }) => {
+                tracing::debug!(clipboard_id = %id, error = %reason, "offer busy");
+                self.record(Metrics::record_clipboard_contention);
+                Err(WriteFailure::Busy)
+            }
+            Err(error @ ClipboardError::Unsupported { .. }) => {
+                tracing::warn!(clipboard_id = %id, error = %error, "virtual file paste unsupported");
+                Err(WriteFailure::UnsupportedType)
+            }
+            Err(error) => {
+                tracing::warn!(clipboard_id = %id, error = %error, "offering a file failed");
+                Err(WriteFailure::Unavailable)
+            }
+        };
+        self.engine.on_file_offered(id, result)
+    }
+
+    /// Feed `event` back into the loop after `delay`.
+    ///
+    /// Every timer here has the same shape and the same non-guarantee: a
+    /// task that outlives its reason fires into a no-op, because each
+    /// event carries the generation or the id that makes it stale — so
+    /// nothing has to be cancelled.
+    fn schedule(&self, delay: Duration, event: SyncEvent) {
+        let notify = self.events_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = notify.send(event).await;
+        });
+    }
+
+    /// Take our virtual file list off the clipboard.
+    fn withdraw_file_offer(&self) {
+        let Some(files) = &self.virtual_files else {
+            return;
+        };
+        if let Err(error) = files.withdraw() {
+            // Not fatal: the entry is going regardless, and the worst
+            // case is a promise the shell finds it cannot serve — which
+            // fails observably rather than producing wrong bytes.
+            tracing::warn!(error = %error, "withdrawing the file offer failed");
+        }
+    }
+
     /// Reserve room for an offered file and open the partial it streams
     /// into (ADR 0015).
     ///
@@ -805,11 +910,7 @@ impl ClipboardSyncDriver {
             },
             Action::ScheduleRetry { id, delay } => {
                 self.record(Metrics::record_clipboard_retry);
-                let notify = self.events_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = notify.send(SyncEvent::RetryDue(id)).await;
-                });
+                self.schedule(delay, SyncEvent::RetryDue(id));
             }
             Action::TerminateSession { reason } => {
                 if !self.terminate_session(reason).await {
@@ -820,15 +921,7 @@ impl ClipboardSyncDriver {
                 scope,
                 generation,
                 delay,
-            } => {
-                let notify = self.events_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = notify
-                        .send(SyncEvent::TransferTimeout { scope, generation })
-                        .await;
-                });
-            }
+            } => self.schedule(delay, SyncEvent::TransferTimeout { scope, generation }),
             Action::AdmitFile {
                 id,
                 entry,
@@ -846,18 +939,21 @@ impl ClipboardSyncDriver {
                 self.pending.extend(more);
             }
             Action::AbortFile { id, entry } => self.abort_file(id, &entry),
+            Action::OfferFile { id, file } => {
+                let more = self.offer_file(id, &file);
+                self.pending.extend(more);
+            }
+            Action::WithdrawFileOffer => self.withdraw_file_offer(),
+            Action::ScheduleSpoolSweep { delay } => {
+                self.schedule(delay, SyncEvent::SpoolSweepDue);
+            }
             Action::EvictSpoolEntry { entry } => self.evict_entry(&entry),
             Action::ScheduleSettle { delay } => {
                 // Bump the generation: any timer already in flight becomes
                 // a no-op when it fires, so the debounce restarts without
                 // cancellation bookkeeping.
                 self.settle_generation += 1;
-                let generation = self.settle_generation;
-                let notify = self.events_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = notify.send(SyncEvent::SettleDue(generation)).await;
-                });
+                self.schedule(delay, SyncEvent::SettleDue(self.settle_generation));
             }
         }
         true
@@ -873,7 +969,10 @@ mod tests {
     use tokio::time::timeout;
     use uuid::Uuid;
 
-    use crossover_platform::fakes::{ClipboardFailure, ClipboardOp, InMemoryClipboard};
+    use crossover_platform::VirtualFileClipboard;
+    use crossover_platform::fakes::{
+        ClipboardFailure, ClipboardOp, FakeVirtualFiles, InMemoryClipboard,
+    };
     use crossover_protocol::RawFrame;
     use crossover_protocol::clipboard::{
         ApplyResult, ClipboardApplied, ClipboardData, ClipboardDecline, ClipboardMeta,
@@ -897,10 +996,13 @@ mod tests {
     }
 
     fn rig() -> Rig {
-        rig_with_spool(None)
+        rig_with_spool(None, None)
     }
 
-    fn rig_with_spool(spool: Option<Arc<dyn crossover_platform::SpoolStorage>>) -> Rig {
+    fn rig_with_spool(
+        spool: Option<Arc<dyn crossover_platform::SpoolStorage>>,
+        virtual_files: Option<Arc<dyn VirtualFileClipboard>>,
+    ) -> Rig {
         let clipboard = Arc::new(InMemoryClipboard::new());
         let config = ClipboardConfig {
             retry: RetryPolicy {
@@ -915,6 +1017,7 @@ mod tests {
         let (driver, events, commands) = clipboard_sync(
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
             spool,
+            virtual_files,
             Uuid::from_bytes([0xAA; 16]),
             config,
             Some(Arc::clone(&metrics)),
@@ -1447,6 +1550,7 @@ mod tests {
         let (driver, events, mut commands) = clipboard_sync(
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
             None,
+            None,
             Uuid::from_bytes([0xAA; 16]),
             ClipboardConfig {
                 // The deadline is the subject here, so it is short — the
@@ -1750,9 +1854,11 @@ mod tests {
     #[tokio::test]
     async fn a_peer_file_is_written_through_to_the_spool() {
         let spool = Arc::new(TempSpool::new());
-        let mut rig = rig_with_spool(Some(
-            Arc::clone(&spool) as Arc<dyn crossover_platform::SpoolStorage>
-        ));
+        let files = Arc::new(FakeVirtualFiles::new());
+        let mut rig = rig_with_spool(
+            Some(Arc::clone(&spool) as Arc<dyn crossover_platform::SpoolStorage>),
+            Some(Arc::clone(&files) as Arc<dyn VirtualFileClipboard>),
+        );
         rig.events
             .send(SyncEvent::FileReceivePolicy(FileReceive::Allowed))
             .await
@@ -1807,6 +1913,43 @@ mod tests {
             "a promoted entry is named <id>.bin: {names:?}"
         );
         assert_eq!(spool.read(&names[0]), content);
+
+        // And it is *offered*, which is the difference between bytes on
+        // disk and a delivery: the peer's name reaches the paste
+        // mechanism, while the entry name stays ours.
+        let offers = files.offers();
+        assert_eq!(offers.len(), 1, "{offers:?}");
+        assert_eq!(offers[0].entry, names[0]);
+        assert_eq!(offers[0].file_name, "quarterly.pdf");
+        assert_eq!(offers[0].byte_len, content.len() as u64);
+
+        // Our own offer raised a clipboard change, and staging it would
+        // send the file straight back to the peer that sent it (F13). The
+        // driver recognizes the object and stays quiet — and the entry
+        // survives, because the clipboard has not moved on.
+        rig.events.send(SyncEvent::LocalChanged).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(300), rig.commands.recv())
+                .await
+                .is_err(),
+            "our own file offer was staged back to the peer"
+        );
+        assert_eq!(spool.names().len(), 1);
+
+        // Somebody else copies: the clipboard has moved on, so the entry
+        // behind the item it was offering is collected (ADR 0015).
+        files.moved_on();
+        rig.events.send(SyncEvent::LocalChanged).await.unwrap();
+        for _ in 0..50 {
+            if spool.names().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "the entry outlived the clipboard that offered it: {:?}",
+            spool.names()
+        );
     }
 
     /// Without a spool the driver refuses files whatever the trust store

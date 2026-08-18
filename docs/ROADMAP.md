@@ -93,9 +93,19 @@
 > object answers out-of-enumeration requests before ours does, so the
 > typed refusal codes are asserted against the object directly.
 >
-> **What remains**: wiring the object to the engine so a completed transfer
-> is offered, the entry-lifetime rule (which the object's `is_current` now
-> makes observable), the sender side (`CF_HDROP` and folder zipping), and
+> **The receiving half is complete** (2026-08-18). A completed transfer is
+> now offered: the engine holds the origin's verdict until the entry
+> reaches the clipboard, so `Stored` means the user can paste it rather
+> than that bytes exist somewhere, and an offer that never lands deletes
+> the entry instead of leaving peer bytes nothing advertises. With
+> something on the clipboard to observe, the entry-lifetime rule is real —
+> an entry lives while the clipboard still offers what it backs and is
+> collected the moment it moves on, with the 24-hour age backstop only for
+> the case the rule cannot see. The same observation is what stops our own
+> offer being staged back to the peer that sent it, which no content hash
+> could do: a virtual file list has no bytes to hash.
+>
+> **What remains**: the sender side (`CF_HDROP` and folder zipping), and
 > only then advertising `FILE_CLIPBOARD`. Until that bit is advertised no
 > conforming peer sends a file, so the path built so far is exercised by
 > tests alone — deliberately, since the alternative is spooling deliveries

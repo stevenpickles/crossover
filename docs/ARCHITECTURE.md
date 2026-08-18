@@ -246,7 +246,7 @@ that keeps every buffer singular.
 |-----------|--------|---------|
 | Outbound | `AwaitingAccept` → (`Streaming` for chunked types) → `AwaitingApplied` | the item buffer, until the last chunk is out |
 | Inbound | accepted offer → (`ChunkReassembly` for chunked types) → pending write | the reassembly buffer, until it verifies |
-| Inbound, files | `Admitting` → `Streaming` → `Verified` → `Committing` | an open partial on disk, and accounting — never the bytes |
+| Inbound, files | `Admitting` → `Streaming` → `Verified` → `Committing` → offering | an open partial on disk, and accounting — never the bytes |
 
 Chunks are emitted **one at a time**, sliced out of the retained buffer, so
 the sender never materializes the whole split; each becomes its own command
@@ -270,12 +270,22 @@ the transfer, and every outcome but a verified completion deletes the
 partial and registers nothing. `MAX_CONCURRENT_FILE_TRANSFERS` is the
 `Option` holding that state, not a counter.
 
+A file transfer is not finished when its bytes are: the engine offers the
+verified entry to the platform's paste mechanism and holds the origin's
+verdict until that lands, so `Stored` means *the user can paste this*
+rather than *the bytes are somewhere*. That is also what makes ADR 0015's
+entry-lifetime rule expressible — an entry lives while the clipboard still
+offers what it backs — and the same platform answer serves loop
+prevention, since a virtual file list has no bytes to hash and the
+applied-hash memory has nothing to match on (F13).
+
 Whether files may be received at all is a **policy input**
 (`FileReceive`), supplied by the composition root from the trust store and
 refreshed as it changes, because a sans-io engine can see neither the
 `file_receive` grant nor whether a protected spool was opened. It defaults
-to the closed value, and the driver clamps it closed again when it has no
-spool.
+to the closed value, and the driver clamps it closed again unless it has
+**both** a spool and somewhere to paste from — either alone can accept a
+transfer it cannot deliver.
 
 **The memory commitment is deliberate, bounded, and time-bounded — and
 larger than "one buffer".** Each individual slot is singular, but the slots

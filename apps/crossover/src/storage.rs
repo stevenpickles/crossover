@@ -117,6 +117,48 @@ pub fn open_spool() -> Option<std::sync::Arc<dyn crossover_platform::SpoolStorag
     }
 }
 
+/// Open the mechanism a received file is offered to for pasting (ADR
+/// 0015), served from `spool`.
+///
+/// `None` where this platform has no virtual-file paste, and `None` also
+/// when the spool could not be opened — the two go together, because a
+/// paste mechanism with nothing to serve from is not a capability. File
+/// receive is then reported unsupported rather than accepted and left
+/// unusable.
+#[must_use]
+pub fn open_virtual_files(
+    spool: Option<&std::sync::Arc<dyn crossover_platform::SpoolStorage>>,
+) -> Option<std::sync::Arc<dyn crossover_platform::VirtualFileClipboard>> {
+    let spool = spool?;
+    #[cfg(windows)]
+    {
+        match crossover_platform_windows::WindowsVirtualFiles::new(std::sync::Arc::clone(spool)) {
+            Ok(files) => Some(std::sync::Arc::new(files)),
+            Err(error) => {
+                // Not fatal, and not silent: everything else keeps
+                // working, and file receive turns itself off for the run
+                // rather than accepting transfers nobody could paste.
+                tracing::warn!(
+                    %error,
+                    "virtual file paste is unavailable; file receive is disabled for this run"
+                );
+                eprintln!("File receive is disabled for this run: {error}");
+                None
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // ADR 0015 leaves the Linux answer open (X11 and Wayland have no
+        // promised-file mechanism) and the macOS one unwritten. Reporting
+        // the capability absent is the honest option; a drop folder is a
+        // per-platform decision with its own threat entries, not something
+        // to fall into here.
+        let _ = spool;
+        None
+    }
+}
+
 /// Open the platform display-info provider (primary-display geometry and
 /// cursor position, ADR 0009).
 ///

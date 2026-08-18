@@ -18,6 +18,7 @@ use crate::input::{
 };
 use crate::secure_storage::{SecureStorage, SecureStorageError};
 use crate::service::{ServiceError, ServiceManager, ServiceStatus};
+use crate::virtual_file::{VirtualFile, VirtualFileClipboard};
 
 /// In-memory [`SecureStorage`] with scriptable fault injection.
 #[derive(Debug, Default)]
@@ -1058,5 +1059,92 @@ mod display_tests {
             display.monitors(),
             Err(DisplayError::Unavailable { .. })
         ));
+    }
+}
+
+/// In-memory [`VirtualFileClipboard`]: records what was offered, and lets
+/// a test say whether the clipboard has since moved on.
+///
+/// The two questions this fake answers are the two the real object exists
+/// to answer — *did the offer land* and *is it still ours* — so the
+/// engine's lifetime rule and loop guard are exercisable with no OS
+/// clipboard and no apartment thread.
+#[derive(Debug, Default)]
+pub struct FakeVirtualFiles {
+    offers: Mutex<Vec<VirtualFile>>,
+    current: Mutex<bool>,
+    withdrawals: Mutex<u32>,
+    /// When set, the next offer fails with this error (then clears).
+    fail_next: Mutex<Option<ClipboardError>>,
+}
+
+impl FakeVirtualFiles {
+    /// A fake holding nothing, offering nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything offered so far, oldest first.
+    #[must_use]
+    pub fn offers(&self) -> Vec<VirtualFile> {
+        self.offers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many times the offer has been withdrawn.
+    #[must_use]
+    pub fn withdrawals(&self) -> u32 {
+        *self
+            .withdrawals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Somebody else copied: the clipboard has moved on from our item.
+    pub fn moved_on(&self) {
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    }
+
+    /// Fail the next offer with `error`.
+    pub fn fail_next(&self, error: ClipboardError) {
+        *self
+            .fail_next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(error);
+    }
+}
+
+impl VirtualFileClipboard for FakeVirtualFiles {
+    fn offer(&self, file: &VirtualFile) -> Result<(), ClipboardError> {
+        if let Some(error) = self
+            .fail_next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            return Err(error);
+        }
+        self.offers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(file.clone());
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        Ok(())
+    }
+
+    fn is_current(&self) -> bool {
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn withdraw(&self) -> Result<(), ClipboardError> {
+        *self
+            .withdrawals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        Ok(())
     }
 }

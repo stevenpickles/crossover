@@ -121,6 +121,17 @@ pub const MAX_SPOOL_ENTRIES: usize = 16;
 /// the refusal is one frame the origin can act on (FR-3.6).
 pub const MIN_FREE_SPACE_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How long an entry may sit in the spool without the clipboard ever
+/// being observed to move on (ADR 0015).
+///
+/// A backstop behind the real rule, not the rule itself. An entry lives
+/// while the clipboard still offers what it backs, which depends on
+/// *observing* the clipboard move on; a lost listener or a missed
+/// ownership change would otherwise strand peer bytes on disk forever.
+/// This is the floor-sweeper for that case, and it is deliberately far
+/// longer than any paste a user is still thinking about.
+pub const SPOOL_SWEEP_TTL: Duration = Duration::from_hours(24);
+
 /// In-flight file transfers per session (ADR 0015).
 ///
 /// Structural rather than checked: the engine holds `Option<FileTransfer>`,
@@ -148,6 +159,11 @@ pub struct ClipboardConfig {
     pub transmit_debounce: Duration,
     /// Deadline on a transfer that retains content (ADR 0014).
     pub transfer_timeout: Duration,
+    /// Age backstop for a spool entry whose clipboard was never observed
+    /// to move on (ADR 0015). Configurable for the same reason the others
+    /// are: a test must be able to shrink it without the production
+    /// default pretending to be something else.
+    pub spool_sweep_ttl: Duration,
 }
 
 impl Default for ClipboardConfig {
@@ -164,6 +180,7 @@ impl ClipboardConfig {
             retry: RetryPolicy::default(),
             transmit_debounce: TRANSMIT_DEBOUNCE,
             transfer_timeout: TRANSFER_TIMEOUT,
+            spool_sweep_ttl: SPOOL_SWEEP_TTL,
         }
     }
 }
@@ -436,6 +453,31 @@ pub enum Action {
         /// The entry to remove.
         entry: String,
     },
+    /// Offer a verified entry to the OS paste mechanism as a virtual file
+    /// list, then report back via [`ClipboardEngine::on_file_offered`]
+    /// (ADR 0015).
+    ///
+    /// This is what makes a delivered file reachable at all: until it
+    /// happens the bytes are in the spool and nothing can paste them. It
+    /// replaces whatever the clipboard held, exactly as installing any
+    /// other item does.
+    OfferFile {
+        /// Transaction id the reply must reference.
+        id: Uuid,
+        /// The entry to offer, and what to say about it.
+        file: SpooledFile,
+    },
+    /// Take our virtual file list off the clipboard, because the entry
+    /// behind it is going away. Best-effort: a clipboard that has already
+    /// moved on needs nothing done to it.
+    WithdrawFileOffer,
+    /// Call [`ClipboardEngine::on_spool_sweep_due`] after `delay`: the
+    /// age backstop behind the clipboard-lifetime rule
+    /// ([`SPOOL_SWEEP_TTL`]).
+    ScheduleSpoolSweep {
+        /// How long to wait.
+        delay: Duration,
+    },
 }
 
 /// Whether peer files may be received at all, and if not, why not.
@@ -628,6 +670,23 @@ enum FileState {
     Committing,
 }
 
+/// A verified entry waiting to reach the clipboard.
+///
+/// The transfer is over — the bytes are on disk under their final name —
+/// but the transaction is not: a file nobody can paste is not a delivery,
+/// so the origin's verdict waits for the offer to land (FR-3.2 as ADR
+/// 0015 adapts it).
+#[derive(Debug)]
+struct PendingOffer {
+    id: Uuid,
+    file: SpooledFile,
+    /// Offering takes the machine-global clipboard lock, so it meets the
+    /// same contention every write does and gets the same bounded retry
+    /// (FR-3.4).
+    attempts_made: u32,
+    started: Instant,
+}
+
 /// An inbound file transfer, written through to the spool rather than
 /// held (ADR 0015).
 ///
@@ -706,11 +765,19 @@ pub struct ClipboardEngine {
     /// Whether peer files may be received here at all. Supplied by the
     /// application from the trust store; closed until it says otherwise.
     file_receive: FileReceive,
-    /// Verified spool entries, oldest first — the eviction order and the
-    /// spool's byte budget, both computed from entries this engine put
-    /// there rather than from whatever is in the directory. Bounded by
-    /// [`MAX_SPOOL_ENTRIES`].
-    spooled: VecDeque<SpooledFile>,
+    /// Verified spool entries, oldest first, each with when it was
+    /// registered — the eviction order, the spool's byte budget, and the
+    /// age the [`SPOOL_SWEEP_TTL`] backstop measures. Computed from
+    /// entries this engine put there rather than from whatever is in the
+    /// directory. Bounded by [`MAX_SPOOL_ENTRIES`].
+    spooled: VecDeque<(SpooledFile, Instant)>,
+    /// A verified entry whose offer to the clipboard has not been
+    /// answered yet.
+    offering: Option<PendingOffer>,
+    /// The entry our virtual file list currently advertises, if any. Kept
+    /// so that evicting *that* entry also takes the promise off the
+    /// clipboard rather than leaving one nothing can serve.
+    offered: Option<String>,
     /// Ids of chunked transfers recently finished or abandoned, so their
     /// in-flight tail is recognized as the benign race it is rather than
     /// charged to the violation budget.
@@ -762,6 +829,8 @@ impl ClipboardEngine {
             file: None,
             file_receive: FileReceive::default(),
             spooled: VecDeque::new(),
+            offering: None,
+            offered: None,
             recent_transfers: VecDeque::new(),
             outbound_generation: 0,
             inbound_generation: 0,
@@ -878,7 +947,7 @@ impl ClipboardEngine {
     /// clipboard as a virtual file list is the next slice of ADR 0015.
     #[must_use]
     pub fn spooled_files(&self) -> impl ExactSizeIterator<Item = &SpooledFile> {
-        self.spooled.iter()
+        self.spooled.iter().map(|(file, _)| file)
     }
 
     /// The spool answered [`Action::AdmitFile`]: the offer can now be
@@ -981,29 +1050,170 @@ impl ClipboardEngine {
             byte_len: meta.content_length,
             content_hash: meta.content_hash,
         };
-        self.record(|m| m.record_file_stored(spooled.byte_len));
-        tracing::info!(
+        tracing::debug!(
             clipboard_id = %id,
             byte_count = spooled.byte_len,
             spool_entry = %spooled.entry,
-            archived = spooled.descriptor.archived,
-            entry_count = spooled.descriptor.entry_count,
             elapsed_ms = elapsed_ms(transfer.started),
+            "peer file verified and spooled; offering it to the clipboard"
+        );
+        // No verdict yet. The bytes are on disk under their final name,
+        // but a file nobody can paste is not a delivery — the origin hears
+        // `Stored` when the offer reaches the clipboard, and
+        // `StorageFailed` if it never does.
+        self.offering = Some(PendingOffer {
+            id,
+            file: spooled.clone(),
+            attempts_made: 1,
+            started: transfer.started,
+        });
+        vec![Action::OfferFile { id, file: spooled }]
+    }
+
+    /// The clipboard took our virtual file list — or would not.
+    ///
+    /// Success is where a delivery becomes real: the entry is registered
+    /// against the spool budget, the origin's transaction closes, and the
+    /// item stays pasteable until the clipboard moves on. Failure deletes
+    /// the entry, because one nothing advertises is peer bytes resting on
+    /// disk for no reason at all.
+    pub fn on_file_offered(&mut self, id: Uuid, result: Result<(), WriteFailure>) -> Vec<Action> {
+        let Some(pending) = self.offering.take() else {
+            tracing::debug!(clipboard_id = %id, "offer result for no pending offer; ignoring");
+            return Vec::new();
+        };
+        if pending.id != id {
+            self.offering = Some(pending);
+            return Vec::new();
+        }
+        match result {
+            Ok(()) => self.registered(pending),
+            // Offering takes the machine-global clipboard lock like any
+            // other write, so it meets the same contention and gets the
+            // same bounded retry (FR-3.4).
+            Err(WriteFailure::Busy) if pending.attempts_made < self.config.retry.max_attempts => {
+                let delay = self.config.retry.delay;
+                tracing::debug!(
+                    clipboard_id = %id,
+                    attempt_count = pending.attempts_made,
+                    "clipboard busy while offering a file; retry scheduled"
+                );
+                self.offering = Some(pending);
+                vec![Action::ScheduleRetry { id, delay }]
+            }
+            Err(failure) => {
+                self.record(Metrics::record_file_failed);
+                tracing::warn!(
+                    clipboard_id = %id,
+                    spool_entry = %pending.file.entry,
+                    attempt_count = pending.attempts_made,
+                    failure = ?failure,
+                    result = "storage_failed",
+                    "a verified file could not be offered for paste; deleting the entry"
+                );
+                vec![
+                    Action::EvictSpoolEntry {
+                        entry: pending.file.entry,
+                    },
+                    Action::Send(OutboundMessage::Applied(ClipboardApplied {
+                        id,
+                        result: ApplyResult::StorageFailed,
+                    })),
+                ]
+            }
+        }
+    }
+
+    /// An offered entry becomes a delivery: counted, acknowledged, and
+    /// from here on subject to the lifetime rule.
+    fn registered(&mut self, pending: PendingOffer) -> Vec<Action> {
+        self.record(|m| m.record_file_stored(pending.file.byte_len));
+        tracing::info!(
+            clipboard_id = %pending.id,
+            byte_count = pending.file.byte_len,
+            spool_entry = %pending.file.entry,
+            archived = pending.file.descriptor.archived,
+            entry_count = pending.file.descriptor.entry_count,
+            attempt_count = pending.attempts_made,
+            latency_ms = elapsed_ms(pending.started),
             result = "stored",
-            "peer file verified and spooled"
+            "peer file spooled and offered for paste"
         );
         // The name is user data (SECURITY.md invariant 6): debug only,
         // never the info line, and never the content at any level.
         tracing::debug!(
-            clipboard_id = %id,
-            file_name = %spooled.descriptor.file_name,
-            "spooled file name"
+            clipboard_id = %pending.id,
+            file_name = %pending.file.descriptor.file_name,
+            "offered file name"
         );
-        self.spooled.push_back(spooled);
-        vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
-            id,
-            result: ApplyResult::Stored,
-        }))]
+        self.offered = Some(pending.file.entry.clone());
+        self.spooled.push_back((pending.file, Instant::now()));
+        vec![
+            Action::Send(OutboundMessage::Applied(ClipboardApplied {
+                id: pending.id,
+                result: ApplyResult::Stored,
+            })),
+            // The age backstop, armed per registration: the real rule is
+            // the clipboard moving on, and this is the floor-sweeper for a
+            // run that never observes it.
+            Action::ScheduleSpoolSweep {
+                delay: self.config.spool_sweep_ttl,
+            },
+        ]
+    }
+
+    /// The clipboard moved on to something that is not ours — ADR 0015's
+    /// entry-lifetime rule, and the whole of it.
+    ///
+    /// This is why there is no age-based expiry as the design first
+    /// proposed: an entry can only be collected once the thing it backs is
+    /// no longer on offer, at which point it could not have been pasted
+    /// anyway. A TTL is the only bound that can delete something the user
+    /// was still planning to paste.
+    pub fn on_clipboard_moved_on(&mut self) -> Vec<Action> {
+        if self.spooled.is_empty() {
+            return Vec::new();
+        }
+        self.offered = None;
+        self.spooled
+            .drain(..)
+            .map(|(file, _)| {
+                tracing::debug!(
+                    spool_entry = %file.entry,
+                    byte_count = file.byte_len,
+                    "the clipboard moved on; collecting the entry behind it"
+                );
+                Action::EvictSpoolEntry { entry: file.entry }
+            })
+            .collect()
+    }
+
+    /// The age backstop came due (`SPOOL_SWEEP_TTL`).
+    ///
+    /// Only entries genuinely past the backstop go, so a timer armed by an
+    /// earlier delivery cannot collect a newer one, and an entry still on
+    /// the clipboard has its promise withdrawn before its bytes vanish.
+    pub fn on_spool_sweep_due(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
+        while let Some((file, registered)) = self.spooled.front() {
+            if registered.elapsed() < self.config.spool_sweep_ttl {
+                break; // oldest first, so everything behind it is younger
+            }
+            tracing::warn!(
+                spool_entry = %file.entry,
+                byte_count = file.byte_len,
+                age_hours = registered.elapsed().as_secs() / 3600,
+                "collecting a spool entry on age: the clipboard was never observed to move on"
+            );
+            if self.offered.as_deref() == Some(file.entry.as_str()) {
+                self.offered = None;
+                actions.push(Action::WithdrawFileOffer);
+            }
+            let entry = file.entry.clone();
+            self.spooled.pop_front();
+            actions.push(Action::EvictSpoolEntry { entry });
+        }
+        actions
     }
 
     /// A decoded clipboard message arrived from the peer.
@@ -1089,8 +1299,18 @@ impl ClipboardEngine {
         }
     }
 
-    /// A scheduled retry came due.
+    /// A scheduled retry came due — for a clipboard write, or for the
+    /// offer of a verified file, which contends for the same lock.
     pub fn on_retry_due(&mut self, id: Uuid) -> Vec<Action> {
+        if let Some(pending) = self.offering.as_mut()
+            && pending.id == id
+        {
+            pending.attempts_made += 1;
+            return vec![Action::OfferFile {
+                id,
+                file: pending.file.clone(),
+            }];
+        }
         let Some(pending) = self.pending_write.as_mut() else {
             return Vec::new(); // superseded meanwhile
         };
@@ -1582,7 +1802,7 @@ impl ClipboardEngine {
             && (self.spooled.len() >= MAX_SPOOL_ENTRIES
                 || self.spooled_bytes().saturating_add(needed) > MAX_SPOOL_BYTES)
         {
-            let Some(evicted) = self.spooled.pop_front() else {
+            let Some((evicted, _)) = self.spooled.pop_front() else {
                 break;
             };
             tracing::info!(
@@ -1591,6 +1811,14 @@ impl ClipboardEngine {
                 needed,
                 "evicting the oldest spool entry to make room for an incoming file"
             );
+            // The oldest entry is normally long off the clipboard, but a
+            // budget that has to evict the *offered* one must take the
+            // promise with it: a virtual file list whose bytes are gone
+            // fails at paste time, in the shell, with nothing from us.
+            if self.offered.as_deref() == Some(evicted.entry.as_str()) {
+                self.offered = None;
+                actions.push(Action::WithdrawFileOffer);
+            }
             actions.push(Action::EvictSpoolEntry {
                 entry: evicted.entry,
             });
@@ -1604,7 +1832,7 @@ impl ClipboardEngine {
     fn spooled_bytes(&self) -> u64 {
         self.spooled
             .iter()
-            .fold(0u64, |total, entry| total.saturating_add(entry.byte_len))
+            .fold(0u64, |total, (file, _)| total.saturating_add(file.byte_len))
     }
 
     /// Abandon the in-flight file transfer: delete the partial, register
@@ -2181,7 +2409,7 @@ mod tests {
     use super::{
         Action, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, InboundMessage,
         MAX_CONCURRENT_FILE_TRANSFERS, MAX_SPOOL_BYTES, MAX_SPOOL_ENTRIES, OutboundMessage,
-        RetryPolicy, TransferScope, WriteFailure,
+        RetryPolicy, SpooledFile, TransferScope, WriteFailure,
     };
 
     fn engine(origin_fill: u8) -> ClipboardEngine {
@@ -2561,17 +2789,11 @@ mod tests {
                         Action::TerminateSession { reason } => {
                             panic!("conforming engines must not terminate: {reason}")
                         }
-                        // Text-only hosts: a spool action here would mean
-                        // the engine invented a file transfer from a text
-                        // copy, which is worth failing on rather than
+                        // A spool action here would mean the engine
+                        // invented a file transfer from a text copy,
+                        // which is worth failing on rather than
                         // absorbing into a wildcard.
-                        spool @ (Action::AdmitFile { .. }
-                        | Action::WriteFileChunk { .. }
-                        | Action::CommitFile { .. }
-                        | Action::AbortFile { .. }
-                        | Action::EvictSpoolEntry { .. }) => {
-                            panic!("a text transaction asked for spool work: {spool:?}")
-                        }
+                        spool => panic!("a text transaction asked for spool work: {spool:?}"),
                     }
                 }
                 // Complete writes instantly (fake clipboard, no
@@ -3705,7 +3927,37 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("the last write should commit, got {after_write:?}"));
         assert_eq!(from, part, "the commit promotes the partial it was given");
-        (engine.on_file_committed(id, true), spooled, to)
+
+        // A promoted entry is not a delivery until something can paste
+        // it, so the commit asks for the offer and the verdict waits.
+        let committed = engine.on_file_committed(id, true);
+        assert!(
+            sent(&committed).is_empty(),
+            "the origin was answered before the file could be pasted: {committed:?}"
+        );
+        let offered = file_offer_of(&committed);
+        assert_eq!(offered.entry, to);
+        (engine.on_file_offered(id, Ok(())), spooled, to)
+    }
+
+    fn file_offer_of(actions: &[Action]) -> SpooledFile {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                Action::OfferFile { file, .. } => Some(file.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected an offer, got {actions:?}"))
+    }
+
+    fn evicted_entries(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::EvictSpoolEntry { entry } => Some(entry.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The whole receiving path: nothing is answered before the spool has
@@ -4068,6 +4320,146 @@ mod tests {
             "exactly the oldest entry makes way"
         );
         assert_eq!(engine.spooled_files().len(), MAX_SPOOL_ENTRIES - 1);
+    }
+
+    /// A file nobody can paste is not a delivery: the verdict waits for
+    /// the offer, and an offer that never lands takes the entry with it
+    /// rather than leaving peer bytes resting on disk for nothing.
+    #[test]
+    fn a_file_that_cannot_be_offered_is_deleted_and_reported_failed() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(4096);
+        let meta = file_meta(&bytes, 1);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, "doc.pdf")));
+        let (id, _, _) = admission_of(&offered);
+        engine.on_file_admitted(id, Ok(()));
+        for chunk in chunk_content(id, &bytes).unwrap() {
+            engine.on_peer_message(InboundMessage::Chunk(chunk));
+            engine.on_file_chunk_written(id);
+        }
+        let committed = engine.on_file_committed(id, true);
+        let entry = file_offer_of(&committed).entry;
+
+        let failed = engine.on_file_offered(id, Err(WriteFailure::Unavailable));
+        assert_eq!(verdict(&failed), ApplyResult::StorageFailed);
+        assert_eq!(evicted_entries(&failed), vec![entry]);
+        assert_eq!(engine.spooled_files().len(), 0);
+    }
+
+    /// Offering takes the machine-global clipboard lock like any other
+    /// write, so contention is retried on the same bounded schedule
+    /// (FR-3.4) rather than costing the transfer.
+    #[test]
+    fn a_busy_clipboard_retries_the_offer_before_giving_up() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(4096);
+        let meta = file_meta(&bytes, 1);
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(meta, "doc.pdf")));
+        let (id, _, _) = admission_of(&offered);
+        engine.on_file_admitted(id, Ok(()));
+        for chunk in chunk_content(id, &bytes).unwrap() {
+            engine.on_peer_message(InboundMessage::Chunk(chunk));
+            engine.on_file_chunk_written(id);
+        }
+        engine.on_file_committed(id, true);
+
+        let busy = engine.on_file_offered(id, Err(WriteFailure::Busy));
+        assert!(
+            matches!(busy.as_slice(), [Action::ScheduleRetry { id: retry, .. }] if *retry == id),
+            "a busy clipboard should schedule a retry, got {busy:?}"
+        );
+        assert!(
+            sent(&busy).is_empty(),
+            "the origin heard a verdict too early"
+        );
+
+        // The retry re-offers the same entry, and success closes the
+        // transaction normally.
+        let again = engine.on_retry_due(id);
+        file_offer_of(&again);
+        let stored = engine.on_file_offered(id, Ok(()));
+        assert_eq!(verdict(&stored), ApplyResult::Stored);
+        assert_eq!(engine.spooled_files().len(), 1);
+    }
+
+    /// The entry-lifetime rule (ADR 0015): an entry lives while the
+    /// clipboard still offers what it backs, and is collected the moment
+    /// the clipboard moves on — not on a timer that could delete
+    /// something the user was still about to paste.
+    #[test]
+    fn the_entry_is_collected_when_the_clipboard_moves_on() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(4096);
+        let (closed, _, entry) = receive_file(&mut engine, "doc.pdf", &bytes, 1);
+        assert_eq!(verdict(&closed), ApplyResult::Stored);
+        assert_eq!(engine.spooled_files().len(), 1);
+
+        // While it is still on offer, nothing collects it — this is the
+        // half a TTL gets wrong.
+        assert!(engine.on_spool_sweep_due().is_empty());
+        assert_eq!(engine.spooled_files().len(), 1);
+
+        let moved_on = engine.on_clipboard_moved_on();
+        assert_eq!(evicted_entries(&moved_on), vec![entry]);
+        assert_eq!(engine.spooled_files().len(), 0);
+        // And it is idempotent: a second local copy collects nothing,
+        // because there is nothing left to collect.
+        assert!(engine.on_clipboard_moved_on().is_empty());
+    }
+
+    /// The backstop behind that rule: an entry whose clipboard was never
+    /// observed to move on goes on age, and its promise is withdrawn
+    /// first so the shell is never left holding one nothing can serve.
+    #[test]
+    fn an_unobserved_entry_is_swept_on_age_and_its_offer_withdrawn() {
+        let mut engine = ClipboardEngine::new(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig {
+                // Everything is instantly "old", which is the only way to
+                // reach a 24-hour backstop in a unit test.
+                spool_sweep_ttl: Duration::ZERO,
+                ..ClipboardConfig::new()
+            },
+        );
+        engine.set_file_receive(FileReceive::Allowed);
+        let bytes = image_bytes(4096);
+        let (_, _, entry) = receive_file(&mut engine, "doc.pdf", &bytes, 1);
+
+        let swept = engine.on_spool_sweep_due();
+        assert!(
+            swept.contains(&Action::WithdrawFileOffer),
+            "an entry still on the clipboard was deleted without withdrawing it: {swept:?}"
+        );
+        assert_eq!(evicted_entries(&swept), vec![entry]);
+        assert_eq!(engine.spooled_files().len(), 0);
+    }
+
+    /// Eviction for budget normally takes an entry nothing is offering.
+    /// When it cannot — the offered entry *is* the oldest — the promise
+    /// goes with the bytes, because a virtual file list whose entry has
+    /// been deleted fails at paste time, in the shell, with nothing from
+    /// us to explain it.
+    #[test]
+    fn evicting_the_offered_entry_withdraws_the_offer_with_it() {
+        let mut engine = granted(0xAA);
+        let bytes = image_bytes(1024);
+        let mut entries = Vec::new();
+        for sequence in 0..MAX_SPOOL_ENTRIES as u64 {
+            // Each delivery replaces the last on the clipboard, so only
+            // the newest is offered; the oldest is what the budget takes.
+            let (_, _, entry) = receive_file(&mut engine, "doc.pdf", &bytes, sequence);
+            entries.push(entry);
+        }
+
+        let offered = engine.on_peer_message(InboundMessage::Offer(file_offer(
+            file_meta(&bytes, 99),
+            "one-more.pdf",
+        )));
+        assert_eq!(evicted_entries(&offered), vec![entries[0].clone()]);
+        assert!(
+            !offered.contains(&Action::WithdrawFileOffer),
+            "an entry nothing was offering took the clipboard with it: {offered:?}"
+        );
     }
 
     /// Files never take the `AlreadyHave` shortcut: a spool entry is not

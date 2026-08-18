@@ -42,6 +42,7 @@ fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFl
     let (driver, sync_events, mut sync_commands) = clipboard_sync(
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
         None,
+        None,
         node.identity.device_id(),
         ClipboardConfig {
             retry: ClipboardRetryPolicy {
