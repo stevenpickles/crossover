@@ -85,6 +85,24 @@ pub const MAX_CLIPBOARD_FILE_BYTES: usize = 256 * 1024 * 1024;
 /// leave; the receiver refuses a descriptor that claims more.
 pub const MAX_CLIPBOARD_FILE_ENTRIES: u32 = 256;
 
+/// Maximum directory nesting the sender will walk when it packs a
+/// selection into one archive (ADR 0015).
+///
+/// A sender-side bound with no wire field of its own: nothing in a
+/// message carries a depth, because nothing on the receiving side ever
+/// looks inside the archive (F9). It lives here beside its sibling caps
+/// because it is the same family of limit — a bound on what one clipboard
+/// item may become — and because the platform crate that enforces it may
+/// carry no dependencies and so mirrors the value rather than importing
+/// it.
+///
+/// Depth is counted in archive path components: a selected file or folder
+/// sits at depth 1, its children at depth 2. Thirty-two is far past any
+/// real project tree and comfortably inside the shell's own path limits,
+/// so a selection that trips it is either pathological or a cycle the
+/// reparse-point refusal did not already catch.
+pub const MAX_ARCHIVE_DEPTH: u32 = 32;
+
 /// Maximum payload bytes in one [`ClipboardChunk`].
 ///
 /// A chunk is the *preemption unit* (ADR 0013): the writer emits at most
