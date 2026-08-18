@@ -87,7 +87,10 @@ saturation case above, since a chunk being preemptable is the whole reason
 ADR 0014 chunks at all.
 
 File transfers (ADR 0015) reuse that machinery and add the fault the
-others cannot have: one that ends with bytes on **disk**. The engine's
+others cannot have: one that ends with bytes on **disk**, and now one that
+ends with a *promise* on the clipboard — an offer that never lands deletes
+the entry and reports the failure, rather than leaving bytes nothing
+advertises. The engine's
 hermetic tests assert each abandonment path leaves nothing registered and
 the partial deleted — a tampered final chunk, a spool write that fails, a
 rename that fails, a lost session, an expired deadline, a superseding

@@ -207,13 +207,15 @@ system's paste mechanism, executing the user's own gesture, copies them out of
 a completed spool entry — Crossover advertises a virtual file list and the
 shell performs that write.
 
-**Implemented so far** (feature/126–128): the protected spool and its
-handle-only boundary (F15), the `file_receive` grant (F1), and the whole
-receiving path from offer to verified entry — F3, F5, F6, F7, F8, and
-F12's byte and entry axes. **Not yet**: the virtual file list itself, and
-with it F4's descriptor construction, F10, F13's ownership check, F14's
-render, and F12's age backstop. Until that lands `FILE_CLIPBOARD` is not
-advertised, so no conforming peer sends a file at all.
+**Implemented so far** (feature/126–132): the protected spool and its
+handle-only boundary (F15), the `file_receive` grant (F1), the receiving
+path from offer to verified entry (F3, F5, F6, F7, F8), the virtual file
+list and its render bound (F4's descriptor construction, F10, F13, F14,
+F16), and the whole of F12 — byte and entry budgets, the clipboard
+lifetime rule, and the age backstop behind it. **Not yet**: the sending
+half (`CF_HDROP` observation and folder zipping). `FILE_CLIPBOARD` is
+still unadvertised until that lands, so no conforming peer sends a file
+yet.
 
 1. **F1 — Consent before bytes.** No file transfer is accepted from a peer
    whose trust-store record does not carry `file_receive` (§4). The check runs
