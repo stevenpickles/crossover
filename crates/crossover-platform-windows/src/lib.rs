@@ -37,6 +37,10 @@ pub mod service_daemon;
 pub mod spool;
 #[cfg(windows)]
 pub mod stdio;
+#[cfg(all(windows, test))]
+mod test_support;
+#[cfg(windows)]
+pub mod virtual_file;
 // Pure watchdog logic (ADR 0011), deliberately not Windows-gated so it is
 // compiled and unit-tested on every CI OS even though only the Windows daemon
 // drives it.
@@ -68,6 +72,8 @@ pub use service_daemon::run_service_daemon;
 pub use spool::WindowsSpoolStorage;
 #[cfg(windows)]
 pub use stdio::ensure_standard_streams;
+#[cfg(windows)]
+pub use virtual_file::WindowsVirtualFiles;
 pub use worker_supervisor::{SessionId, WorkerAction, WorkerSupervisor, WorkerSupervisorConfig};
 
 /// Repoint invalid standard streams so output never panics in a console-less
