@@ -101,12 +101,29 @@ const WM_APP_COMMAND: u32 = WM_APP + 1;
 /// Private message asking the apartment thread to shut down.
 const WM_APP_SHUTDOWN: u32 = WM_APP + 2;
 
-/// Mark-of-the-Web, as the shell writes it into an alternate data stream:
-/// zone 3 is "Internet", which is what `SmartScreen` and Office Protected
-/// View key off. Peer-delivered content is untrusted content, and saying so
-/// in the one place Windows already looks is worth more than any check
-/// Crossover could add (F10, T18).
-const ZONE_IDENTIFIER: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+/// The zone stamped on a pasted file, as the shell writes it into the
+/// `Zone.Identifier` alternate data stream.
+///
+/// **Zone 1, Local intranet — which is what the file actually is.** It
+/// arrived from a paired machine on the local network, so that is the
+/// honest description, and the marking is kept for what it genuinely
+/// provides: provenance. Anything asking where the file came from can see
+/// that it did not originate on this machine.
+///
+/// Zone 3 ("Internet") was built first and changed on a maintainer
+/// decision. It is the marking that makes `SmartScreen` challenge an
+/// executable and Office open a document in Protected View, and on a
+/// two-machine LAN link that is friction on every ordinary paste in
+/// exchange for a defence against an attacker SECURITY.md §6 already
+/// places out of scope — a paired peer that has itself been compromised.
+/// The cost is stated rather than hidden: ADR 0015 accepts that no
+/// validator can reject a name like `report.pdf.exe` and argues those are
+/// "contained downstream" by the zone marking. At zone 1 that containment
+/// is weaker — the stream is still written and still readable, but the
+/// execution-warning machinery does not treat the file as untrusted
+/// content. F10's rule that Crossover itself never launches anything is
+/// unaffected.
+const ZONE_IDENTIFIER: &[u8] = b"[ZoneTransfer]\r\nZoneId=1\r\n";
 
 /// `CanIncludeInClipboardHistory` and
 /// `ExcludeClipboardContentFromMonitorProcessing` (F16). Both are
@@ -1588,9 +1605,10 @@ mod tests {
         println!();
         println!("A virtual file is now on the clipboard. Check, in this order:");
         println!("  1. Press Win+V. `crossover-probe.txt` must NOT be listed.");
-        println!("  2. Paste (Ctrl+V) into a folder. The file must appear, with");
-        println!("     its content, and its properties must show the");
-        println!("     'came from another computer' security warning (MOTW).");
+        println!("  2. Paste (Ctrl+V) into a folder. The file must appear with");
+        println!("     its content, and must open without a SmartScreen or");
+        println!("     Protected View prompt — but `Get-Content -Stream");
+        println!("     Zone.Identifier <file>` must show ZoneId=1.");
         println!("  3. On a second machine signed into the same Microsoft");
         println!("     account with clipboard sync on, Win+V must not show it.");
         println!();
@@ -1599,13 +1617,18 @@ mod tests {
         let _ = std::io::stdin().read_line(&mut line);
     }
 
-    /// Mark-of-the-Web, in the form the shell writes into the alternate
-    /// data stream. Zone 3 is what makes `SmartScreen` and Protected View
-    /// treat a pasted file as the untrusted content it is.
+    /// The zone the shell stamps into `Zone.Identifier`: intranet, which
+    /// is where the file came from. Asserted as an exact string because it
+    /// is a decision (see the constant), not a detail — a change to it
+    /// changes whether every pasted document opens in Protected View.
     #[test]
-    fn the_zone_identifier_marks_content_as_internet_zone() {
+    fn a_pasted_file_is_marked_as_coming_from_the_local_intranet() {
         let text = std::str::from_utf8(ZONE_IDENTIFIER).unwrap();
         assert!(text.starts_with("[ZoneTransfer]"));
-        assert!(text.contains("ZoneId=3"));
+        assert!(text.contains("ZoneId=1"), "{text}");
+        assert!(
+            !text.contains("ZoneId=3"),
+            "the internet zone was restored: {text}"
+        );
     }
 }
