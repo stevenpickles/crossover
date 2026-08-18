@@ -159,6 +159,33 @@ pub fn open_virtual_files(
     }
 }
 
+/// Open the thing that packs a local file selection into one offerable
+/// blob (ADR 0015, "Sender side").
+///
+/// `None` where this platform has no sending half, which is the honest
+/// answer rather than a portable `std::fs` walk: a portable walk cannot
+/// see a junction — `FILE_ATTRIBUTE_REPARSE_POINT` covers mount points
+/// that `symlink_metadata` reports as an ordinary directory — so it would
+/// satisfy the signature while voiding the refusal the security argument
+/// rests on.
+#[must_use]
+// The `Option` is the cross-platform shape, not a redundant wrapper: it is
+// `None` on every platform without a sending half, and clippy only sees
+// the one branch this build compiles.
+#[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
+pub fn open_file_blob_builder() -> Option<std::sync::Arc<dyn crossover_platform::FileBlobBuilder>> {
+    #[cfg(windows)]
+    {
+        Some(std::sync::Arc::new(
+            crossover_platform_windows::WindowsFileBlobBuilder::new(),
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// Open the platform display-info provider (primary-display geometry and
 /// cursor position, ADR 0009).
 ///

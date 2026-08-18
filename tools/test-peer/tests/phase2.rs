@@ -43,6 +43,7 @@ fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFl
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
         None,
         None,
+        None,
         node.identity.device_id(),
         ClipboardConfig {
             retry: ClipboardRetryPolicy {

@@ -37,8 +37,8 @@ use crossover_security::{
 
 use crate::console::{self, ConsoleCommand};
 use crate::storage::{
-    open_clipboard_provider, open_cursor_mask, open_display, open_input, open_secure_storage,
-    open_service_manager, open_spool, open_virtual_files,
+    open_clipboard_provider, open_cursor_mask, open_display, open_file_blob_builder, open_input,
+    open_secure_storage, open_service_manager, open_spool, open_virtual_files,
 };
 
 /// One ceremony's allowance, listener and connector alike. Generous
@@ -535,10 +535,17 @@ fn setup_clipboard_sync(
     let spool = open_spool();
     let virtual_files = open_virtual_files(spool.as_ref());
     let file_paste_ready = spool.is_some() && virtual_files.is_some();
+    // The sending half's builder is wired now that the engine has a
+    // transaction to drive it from (ADR 0015). It stays inert until
+    // `FILE_CLIPBOARD` is advertised and a send policy is supplied: the
+    // engine's default is `FileSend::Unsupported`, so nothing is packed
+    // and nothing is offered until that lands.
+    let blob_builder = open_file_blob_builder();
     let (driver, events, commands) = clipboard_sync(
         provider,
         spool,
         virtual_files,
+        blob_builder,
         device,
         ClipboardConfig::new(),
         Some(Arc::clone(metrics)),
