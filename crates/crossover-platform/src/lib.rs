@@ -14,6 +14,7 @@ pub mod input;
 pub mod secure_storage;
 pub mod service;
 pub mod spool;
+pub mod virtual_file;
 
 pub use clipboard::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
@@ -31,6 +32,7 @@ pub use spool::{
     MAX_SPOOL_ENTRY_NAME_BYTES, MAX_SPOOL_ENUMERATED_OBJECTS, SpoolEntry, SpoolError, SpoolStorage,
     SpoolSweep, UnsupportedSpoolStorage, validate_entry_name,
 };
+pub use virtual_file::{UnsupportedVirtualFileClipboard, VirtualFile, VirtualFileClipboard};
 
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =
