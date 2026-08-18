@@ -105,8 +105,21 @@
 > offer being staged back to the peer that sent it, which no content hash
 > could do: a virtual file list has no bytes to hash.
 >
-> **What remains**: the sender side (`CF_HDROP` and folder zipping), and
-> only then advertising `FILE_CLIPBOARD`. Until that bit is advertised no
+> **The sender's two lower halves exist** (2026-08-18). A local `CF_HDROP`
+> copy is observed and handed up as paths rather than bytes, and a
+> selection is packed into one blob — a single file verbatim, a folder or
+> a multi-entry selection as one Stored-entry archive — with the exact
+> length and SHA-256 the offer must carry. Every refusal ADR 0015 names is
+> typed and happens before anything could travel: entry count, depth and
+> cumulative bytes are judged *during* the walk, a reparse point or an
+> unreadable entry refuses the whole item rather than quietly shrinking
+> it, and the temporary artifact is delete-on-close so no refusal path can
+> leave one behind. The five decisions this forced are recorded in ADR
+> 0015 rather than left in the code.
+>
+> **What remains**: the engine's send transaction — staging a selection,
+> building its blob, and offering it — and only then advertising
+> `FILE_CLIPBOARD`. Until that bit is advertised no
 > conforming peer sends a file, so the path built so far is exercised by
 > tests alone — deliberately, since the alternative is spooling deliveries
 > nothing can yet paste. One question is answered by a human rather than by

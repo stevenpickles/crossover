@@ -212,10 +212,16 @@ handle-only boundary (F15), the `file_receive` grant (F1), the receiving
 path from offer to verified entry (F3, F5, F6, F7, F8), the virtual file
 list and its render bound (F4's descriptor construction, F10, F13, F14,
 F16), and the whole of F12 — byte and entry budgets, the clipboard
-lifetime rule, and the age backstop behind it. **Not yet**: the sending
-half (`CF_HDROP` observation and folder zipping). `FILE_CLIPBOARD` is
-still unadvertised until that lands, so no conforming peer sends a file
-yet.
+lifetime rule, and the age backstop behind it. The sending half's lower
+two slices are built as well (feature/133–134): a local `CF_HDROP` copy is
+observed, and a selection is packed into one blob under the refusals ADR
+0015 requires — count, depth and cumulative bytes judged during the walk,
+and a symlink, junction, or other reparse point refusing the **whole**
+item rather than being followed or silently skipped, so a copied shortcut
+cannot pack out-of-tree content into something the user believes they
+selected. **Not yet**: the engine transaction that offers such a blob.
+`FILE_CLIPBOARD` is still unadvertised until that lands, so no conforming
+peer sends a file yet.
 
 1. **F1 — Consent before bytes.** No file transfer is accepted from a peer
    whose trust-store record does not carry `file_receive` (§4). The check runs

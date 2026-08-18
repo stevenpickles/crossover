@@ -598,6 +598,7 @@ knob answering to this section, not just a memory one.
 | TLS | rustls + tokio-rustls, TLS 1.3 | See [SECURITY.md](SECURITY.md) |
 | Transport | TCP (+ `TCP_NODELAY` for input/control traffic) | QUIC only if measurement demands it (ADR) |
 | Serialization | postcard ([ADR 0001](adr/0001-wire-serialization-format.md)) | Explicit size limits, deterministic encoding, fuzzed parsers; `default-features = false` drops the unmaintained `atomic-polyfill` heapless brings in |
+| Archives (sender only) | `zip`, `default-features = false` | Write-only, Stored entries: no codec is built, so no decompression backend enters the tree, and nothing in the workspace reads an archive ([SECURITY.md](SECURITY.md) F9). `clippy.toml` disallows the reader type so the ban is mechanical rather than a convention |
 | Logging | tracing + tracing-subscriber | Structured from first commit |
 | CLI | clap | |
 | Config | TOML, versioned schema | |
