@@ -219,9 +219,15 @@ observed, and a selection is packed into one blob under the refusals ADR
 and a symlink, junction, or other reparse point refusing the **whole**
 item rather than being followed or silently skipped, so a copied shortcut
 cannot pack out-of-tree content into something the user believes they
-selected. **Not yet**: the engine transaction that offers such a blob.
-`FILE_CLIPBOARD` is still unadvertised until that lands, so no conforming
-peer sends a file yet.
+selected. The engine transaction over that blob is built too
+(feature/135): the peer's negotiated file support and its `clipboard_send`
+grant are judged **before** anything is walked or packed, F13's third
+guard — no path inside the spool root is ever a send source — is
+enforced, and every path that ends the transaction drops the blob, whose
+delete-on-close handle is what removes the artifact. **Not yet**:
+`FILE_CLIPBOARD` is still unadvertised and the application supplies no
+send policy, so the gate is closed in both directions and no file
+travels either way.
 
 1. **F1 — Consent before bytes.** No file transfer is accepted from a peer
    whose trust-store record does not carry `file_receive` (§4). The check runs
@@ -379,6 +385,16 @@ peer sends a file yet.
     item's content hash and suppresses a matching outbound offer; and no path
     inside the spool root may ever be staged as a send source. The first fires
     without reading or rendering anything.
+    **The spool-path rule is a comparison, not a resolution.** Answering it
+    needs the root's name, which F15 deliberately keeps out of every
+    operational path, so the boundary reports the root for *comparison and
+    diagnostics only* and the engine matches path components against it —
+    case-insensitively, and answering "ours" for anything it cannot judge
+    without resolving (a relative path, a `..` component), because the safe
+    direction of a wrong answer is a copy that does not synchronize rather
+    than a loop. Every spool operation still goes through the opened handle.
+    One path inside the root refuses the whole selection: one clipboard item
+    is one blob, so a partial send would be content the user did not select.
     **Ownership is two conditions, not one**, and the second was added
     because the first was observed answering wrongly: `OleIsCurrentClipboard`
     compares against the object OLE last placed, and it still reported "ours"

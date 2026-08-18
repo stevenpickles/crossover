@@ -117,12 +117,28 @@
 > leave one behind. The five decisions this forced are recorded in ADR
 > 0015 rather than left in the code.
 >
-> **What remains**: the engine's send transaction — staging a selection,
-> building its blob, and offering it — and only then advertising
-> `FILE_CLIPBOARD`. Until that bit is advertised no
-> conforming peer sends a file, so the path built so far is exercised by
-> tests alone — deliberately, since the alternative is spooling deliveries
-> nothing can yet paste. One question is answered by a human rather than by
+> **The send transaction is built** (2026-08-18). A local file selection
+> now becomes an offer and a chunk stream: the peer's negotiated file
+> support and its `clipboard_send` grant are judged *before* anything is
+> walked, because the build is the expensive step and an un-negotiated
+> file offer is fatal to an older peer's session rather than merely
+> unanswered. The bytes never enter the engine — an outbound item carries
+> either bytes it retains or a blob the driver holds open, and for a blob
+> the engine names each chunk's offset and length and the driver reads
+> exactly that slice, so the sender is O(chunk) exactly as the receiver's
+> write-through is. Every path that ends the transaction hands the blob
+> back, which is what deletes the artifact: delivered, declined,
+> superseded, timed out, session lost, unreadable. The sender's half of
+> loop prevention is in too — a `CF_HDROP` resolving inside the spool is
+> never staged.
+>
+> **What remains**: advertising `FILE_CLIPBOARD`, and computing the send
+> policy from the negotiated features and the trust store the way
+> `file_receive_policy` already computes its twin. Until that bit is
+> advertised no
+> conforming peer sends a file and this side's send gate stays closed, so
+> the path built so far is exercised by tests alone — deliberately, since
+> the alternative is spooling deliveries nothing can yet paste. One question is answered by a human rather than by
 > CI before the paste path ships: whether Windows honours the
 > history/cloud exclusions the object declares (docs/TESTING.md §1.6).
 >

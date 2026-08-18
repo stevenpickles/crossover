@@ -1095,3 +1095,128 @@ rather than one of them being suffixed: ordinary shell selections come
 from a single folder where the filesystem has already made names unique,
 so this is a pathological clipboard rather than a case worth
 accommodating.
+
+## Decisions taken while implementing the sending transaction (2026-08-18)
+
+The engine half — the piece that takes an observed selection, has it
+packed, and runs the ADR 0005 transaction over the result — settled six
+more things.
+
+### The engine is told the feature bit, because the send gate is too late
+
+Everywhere else in the system the negotiated feature set is enforced at
+`gate_outbound`, the one place every frame passes on its way to the wire
+(PROTOCOL.md §3.1), and the engine deliberately knows nothing about it —
+`TRANSFER_TIMEOUT`'s doc even records the cost of that: an offer the gate
+refuses locally waits out the full deadline, because the engine cannot
+know a capability was missing.
+
+Files cannot pay that cost, and not because a minute is long. By the time
+a frame reaches the send gate the archive has already been built: a walk
+over the selection and a write of up to 256 MiB, spent to learn something
+a single bit answered before any of it started. So the engine takes a
+`FileSend` policy the way it already takes `FileReceive` — supplied by the
+application, refreshed as the negotiated features or the trust store
+change, closed by default — and judges it *before* emitting a build. The
+send gate still stands behind it; this is a second check in front of an
+expensive step, not a replacement for the authoritative one.
+
+The four states are the ADR's own refusal list made legible: no sending
+half in this build, the peer never advertised `FILE_CLIPBOARD`, the peer
+holds no `clipboard_send` grant, and allowed. A user acts on each
+differently (NFR-3), and collapsing them to a boolean would report "not
+sent" for all three.
+
+### The spool root travels as a string, for one comparison
+
+Loop-prevention layer 2 — "a `CF_HDROP` path resolving inside the spool
+root is never staged" — needs the root's *name*, and F15 built the spool
+so that it has none to give: it is a handle precisely so nothing
+re-resolves `%LOCALAPPDATA%\...`.
+
+The resolution is that `SpoolStorage` now answers where it is, for
+comparison and diagnostics only, and the engine holds that string and
+compares path components against it. Nothing opens it, resolves it, or
+hands it to an API; every spool operation still goes through the handle,
+so the property F15 rests on is untouched. Where there is no spool the
+answer is `None`, which is not a hole but the truthful statement that
+nothing of ours is on disk for a selection to point at.
+
+Two properties of the comparison are deliberate. It matches components
+case-insensitively, because the only filesystem this rule currently
+guards does, and a case-sensitive check would miss `...\SPOOL\`. And it
+answers *"treat as ours"* for anything it cannot judge without resolving
+— a relative path, or one carrying a `..` component — because the safe
+direction of a wrong answer here is a copy that does not synchronize,
+not a loop on the largest payload type in the system. A shell `CF_HDROP`
+produces absolute, normalized paths, so the concession costs nothing
+real.
+
+One path inside the spool refuses the **whole** selection rather than
+being dropped from it: one clipboard item is one blob, so a partial
+selection would send something the user did not select.
+
+### The engine names the chunk; the driver reads it
+
+The receiving side's split — "the engine decides, the driver touches the
+disk" — inverts cleanly. An outbound item now carries a *body* that is
+either bytes the engine retains (text, images, as before) or a blob the
+driver holds open, and `Action::SendFileChunk` names an offset and a
+length rather than carrying a payload. The driver reads exactly that
+slice when it sends the frame.
+
+That is what makes the sender O(chunk) rather than O(file), mirroring the
+receiver's write-through, and it is why a 256 MiB file costs the engine
+the same memory a 4 KiB one does. The chunk *plan* is shared with images
+unchanged: same `ChunkPlan`, same one-chunk-per-command pacing, so a file
+is preempted by live input exactly as ADR 0013 requires without a second
+implementation of anything.
+
+Dropping the blob deletes the artifact (delete-on-close, above), so every
+exit path emits `ReleaseFileBlob`: delivered, declined, superseded by a
+newer local copy, lost to the conflict race, timed out, session lost,
+unreadable. The driver's slot is one deep by construction as well, so a
+second selection replaces the first even if a release were ever missed.
+
+### A build gets its own deadline scope
+
+`TransferScope` gains `Build`. Two scopes existed because an outbound
+offer and an inbound reassembly can be in flight at once and a shared
+deadline would let one keep resetting the other's clock; a build is a
+third such thing, and a sharper case: it runs *while an unrelated
+outbound transfer is still going*, since it does not supersede anything
+until it has something to supersede with. Arming it on the outbound clock
+would leave that transfer unbounded.
+
+A build that never answers is abandoned on that deadline, and its answer,
+if it arrives later, is released rather than offered — the same
+supersession rule the transaction slot has always had, one step earlier
+in the pipeline.
+
+### `AlreadyHave` is handled on the sending side, though we never send it
+
+This ADR rules out hash dedup for files: a spool entry may have been
+evicted, so *our* receiver cannot honestly claim to already have one, and
+a test asserts it never does. The sending side still handles the decline,
+because a peer's may — the decline path is typed and shared with images,
+and `AlreadyHave` is success-shaped there. The outcome is the right one
+either way: the transaction closes, the blob is released, and **zero
+payload bytes** follow, which is what the offered flow at any size buys.
+
+### The name is judged once more, at the last point before the wire
+
+`wire_file_name` is applied here rather than at the encoder, and the
+length is re-checked against `MAX_CLIPBOARD_FILE_BYTES` even though the
+builder already bounded it. Both are NFR-1's rule about validating
+*before* the wire rather than at it: a name or a length that first failed
+inside `encode_payload` would be a refusal with no diagnostic and no
+counter, which is exactly the silent drop FR-3.6 forbids.
+
+### What is deliberately not here yet
+
+`FILE_CLIPBOARD` is still unadvertised and the application supplies no
+send policy, so the gate is closed and nothing is packed in production.
+That is the next slice, and it is a small one: advertise the bit, and
+compute `FileSend` from the session's negotiated features and the peer's
+`clipboard_send` grant the way `file_receive_policy` already computes its
+twin.
