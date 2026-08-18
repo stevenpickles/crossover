@@ -72,6 +72,21 @@ pub enum ClipboardError {
 /// content, FR-7.4).
 pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// The largest number of paths a [`ClipboardContent::FileList`] may carry.
+///
+/// A deliberate mirror of
+/// `crossover_protocol::clipboard::MAX_CLIPBOARD_FILE_ENTRIES` — this crate
+/// has no dependencies by design (docs/ARCHITECTURE.md §4), so the boundary
+/// cannot name the protocol constant. `crossover-core` holds a test that the
+/// two are equal, so they cannot drift.
+///
+/// It lives here for the reason [`MAX_CLIPBOARD_IMAGE_BYTES`] does: the
+/// bound must bite at the source. `DragQueryFileW` reports a `CF_HDROP`'s
+/// entry count before a single path is read, so a selection past this
+/// ceiling is refused before any per-entry allocation — never partially
+/// enumerated, never truncated (NFR-1, ADR 0015).
+pub const MAX_CLIPBOARD_FILE_ENTRIES: u32 = 256;
+
 /// Raster formats a [`ClipboardContent::Image`] may carry (ADR 0014).
 ///
 /// A deliberate mirror of `crossover_protocol::clipboard::ImageFormat`:
@@ -98,6 +113,14 @@ pub enum ClipboardImageFormat {
 /// invalid UTF-8 into a channel whose consumers assume otherwise. Image
 /// bytes are a plain `Vec<u8>` precisely because nothing may assume
 /// anything about them.
+///
+/// `FileList` is a local *observation*, not a payload (ADR 0015, "Sender
+/// side"; feature/133): a `CF_HDROP` names files on the machine that copied
+/// them, so the boundary hands up the paths themselves rather than bytes —
+/// there is nothing to make opaque, and no length to bound the way an image
+/// or a block of text is bounded. Named in platform-neutral terms
+/// deliberately: `CF_HDROP` is a Windows format name, and nothing above
+/// this boundary may name an OS clipboard format (NFR-4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardContent {
     /// UTF-8 text (`CF_UNICODETEXT` on Windows).
@@ -109,6 +132,15 @@ pub enum ClipboardContent {
         /// The image bytes, opaque.
         bytes: Vec<u8>,
     },
+    /// A local file/folder selection (`CF_HDROP` on Windows): the absolute
+    /// paths on this machine, exactly as the OS reported them.
+    ///
+    /// Bounded to at most [`MAX_CLIPBOARD_FILE_ENTRIES`] paths by the
+    /// backend that produced this value — never allocated unbounded from
+    /// clipboard data (NFR-1). What becomes of the selection — walking it,
+    /// zipping it, offering it to a peer — is engine and driver work this
+    /// crate does not do; this variant only reports what is locally true.
+    FileList(Vec<std::path::PathBuf>),
 }
 
 impl ClipboardContent {
@@ -118,17 +150,24 @@ impl ClipboardContent {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(text) => Some(text),
-            Self::Image { .. } => None,
+            Self::Image { .. } | Self::FileList(_) => None,
         }
     }
 
     /// Content byte length, for bounds checks and diagnostics. Never the
     /// content itself — contents are never logged (FR-7.4).
+    ///
+    /// For `FileList`, the sum of the paths' own encoded lengths — an
+    /// informational figure only. It is not a bound anything checks: the
+    /// figure that will eventually matter is the finished archive's byte
+    /// length, computed only once the selection is walked (ADR 0015),
+    /// which is not this crate's job.
     #[must_use]
     pub fn byte_len(&self) -> usize {
         match self {
             Self::Text(text) => text.len(),
             Self::Image { bytes, .. } => bytes.len(),
+            Self::FileList(paths) => paths.iter().map(|path| path.as_os_str().len()).sum(),
         }
     }
 }
@@ -201,7 +240,7 @@ pub trait ClipboardProvider: Send + Sync {
     fn read_text(&self) -> Result<Option<String>, ClipboardError> {
         Ok(match self.read()? {
             Some(ClipboardContent::Text(text)) => Some(text),
-            Some(ClipboardContent::Image { .. }) | None => None,
+            Some(ClipboardContent::Image { .. } | ClipboardContent::FileList(_)) | None => None,
         })
     }
 
