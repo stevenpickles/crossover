@@ -18,6 +18,7 @@ crossover-platform = { workspace = true }
 # state transition — the watchdog logs it at the moment of detection.
 tracing = { workspace = true }
 windows = { workspace = true }
+windows-core = { workspace = true }
 
 # tracing-subscriber only for the manual key-capture probe, which prints
 # the per-key diagnostic (scan code, extended/injected flags, HID) to

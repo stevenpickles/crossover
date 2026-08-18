@@ -959,8 +959,8 @@ fn pump_thread(listener: &SharedListener, init: &std::sync::mpsc::Sender<Result<
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     use crossover_platform::{ClipboardError, ClipboardProvider};
@@ -1112,14 +1112,10 @@ mod tests {
         }
     }
 
-    /// The Windows clipboard is machine-global: serialize every test that
-    /// touches it, across this whole test binary.
-    fn clipboard_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    /// The Windows clipboard is machine-global, and the virtual-file
+    /// object shares it, so the lock is crate-wide rather than per module
+    /// (see `test_support`).
+    use crate::test_support::clipboard_lock;
 
     #[test]
     fn write_then_read_round_trips_unicode() {

@@ -78,14 +78,28 @@
 > `file_receive` grant reaches a running worker through the poll that
 > already re-reads the trust store for revocation.
 >
-> **What remains is the half the user can see**: the virtual file list
-> (`CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS` through an `IDataObject`
-> on its own STA thread), the entry-lifetime rule that depends on observing
-> the clipboard move on, the sender side (`CF_HDROP` and folder zipping),
-> and only then advertising `FILE_CLIPBOARD`. Until that bit is advertised
-> no conforming peer sends a file, so the path built here is exercised by
+> **The data object exists** (2026-08-17). A spooled entry can be offered
+> to Explorer as a virtual file list on an apartment thread of its own:
+> the descriptor carries the validated name and size, the contents are
+> served only as a read-only stream at index zero, and the file the shell
+> writes carries Mark-of-the-Web. Automated tests drive it through the real
+> clipboard as a consumer does and read the entry back byte for byte. Two
+> findings came out of building it, both recorded in ADR 0015:
+> `OleIsCurrentClipboard` alone reported "still ours" after a same-process
+> Win32 write, so ownership now also requires an unchanged clipboard
+> sequence number (SECURITY.md F13); and the OLE clipboard's own mediating
+> object answers out-of-enumeration requests before ours does, so the
+> typed refusal codes are asserted against the object directly.
+>
+> **What remains**: wiring the object to the engine so a completed transfer
+> is offered, the entry-lifetime rule (which the object's `is_current` now
+> makes observable), the sender side (`CF_HDROP` and folder zipping), and
+> only then advertising `FILE_CLIPBOARD`. Until that bit is advertised no
+> conforming peer sends a file, so the path built so far is exercised by
 > tests alone — deliberately, since the alternative is spooling deliveries
-> nothing can yet paste.
+> nothing can yet paste. One question is answered by a human rather than by
+> CI before the paste path ships: whether Windows honours the
+> history/cloud exclusions the object declares (docs/TESTING.md §1.6).
 >
 > Phase 6 (Windows Prototype Hardening) closed 2026-08-14: the multi-day
 > unattended soak — the last exit criterion — ran 2026-08-11 → 2026-08-14
