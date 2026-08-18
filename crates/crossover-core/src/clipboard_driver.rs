@@ -27,15 +27,17 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crossover_platform::{
-    ClipboardError, ClipboardProvider, SpoolError, SpoolStorage, VirtualFile, VirtualFileClipboard,
+    ClipboardError, ClipboardProvider, FileBlob, FileBlobBuilder, FileBlobRefusal, SpoolError,
+    SpoolStorage, VirtualFile, VirtualFileClipboard,
 };
 use crossover_protocol::RawFrame;
 use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
 use crossover_protocol::hello::MessageType;
 
 use crate::clipboard::{
-    Action, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, InboundMessage,
-    MIN_FREE_SPACE_MARGIN_BYTES, OutboundMessage, SpooledFile, TransferScope, WriteFailure,
+    Action, BuiltBlob, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, FileSend,
+    InboundMessage, MIN_FREE_SPACE_MARGIN_BYTES, OutboundMessage, SpooledFile, TransferScope,
+    WriteFailure,
 };
 use crate::command::{FrameTarget, SessionCommand};
 use crate::metrics::Metrics;
@@ -127,6 +129,25 @@ pub enum SyncEvent {
     /// on its revocation poll. Sending the policy in stops the *next*
     /// transfer without waiting for a reconnect.
     FileReceivePolicy(FileReceive),
+    /// Whether local files may be *sent* to the peer (ADR 0015), as the
+    /// application currently reads the negotiated feature set and the
+    /// trust store. An event for the same reason its receiving twin is:
+    /// both answers change while the process runs.
+    FileSendPolicy(FileSend),
+    /// The builder finished with a local selection: one blob, or a typed
+    /// refusal (ADR 0015).
+    ///
+    /// An event rather than a return value because the build is
+    /// **blocking and long** — seconds on gigabytes — so it runs on a
+    /// blocking thread and reports back here. Running it inline would
+    /// park the loop that has to keep answering frames, which is the
+    /// deafness [`ClipboardSyncDriver::send_command`] exists to avoid.
+    FileBlobBuilt {
+        /// Which selection was packed.
+        id: Uuid,
+        /// The blob, or why there is not one.
+        outcome: Box<Result<FileBlob, FileBlobRefusal>>,
+    },
 }
 
 /// The clipboard sync driver. Create with [`clipboard_sync`], then spawn
@@ -148,6 +169,15 @@ pub struct ClipboardSyncDriver {
     /// because on Windows it owns an apartment thread of its own, which
     /// the ADR requires rather than prefers.
     virtual_files: Option<Arc<dyn VirtualFileClipboard>>,
+    /// Packs a local file selection into one offerable blob (ADR 0015),
+    /// or `None` where this build has no sending half. `None` is not a
+    /// degraded mode either: the engine is told file send is unsupported
+    /// and every selection is refused observably.
+    blob_builder: Option<Arc<dyn FileBlobBuilder>>,
+    /// The blob of the selection in flight, keyed by transaction. One at
+    /// a time, structurally — a second build replaces it, and dropping it
+    /// is what deletes the sender's temporary artifact.
+    file_blob: Option<(Uuid, FileBlob)>,
     events_rx: mpsc::Receiver<SyncEvent>,
     events_tx: mpsc::Sender<SyncEvent>,
     commands_tx: CommandSender,
@@ -183,6 +213,7 @@ pub fn clipboard_sync(
     provider: Arc<dyn ClipboardProvider>,
     spool: Option<Arc<dyn SpoolStorage>>,
     virtual_files: Option<Arc<dyn VirtualFileClipboard>>,
+    blob_builder: Option<Arc<dyn FileBlobBuilder>>,
     origin: Uuid,
     config: ClipboardConfig,
     metrics: Option<Arc<Metrics>>,
@@ -207,12 +238,26 @@ pub fn clipboard_sync(
         let _ = notify.try_send(SyncEvent::LocalChanged);
     })))?;
 
+    let mut engine = ClipboardEngine::with_metrics(origin, config, metrics.clone());
+    // The sender-side loop guard's one input (ADR 0015, SECURITY.md F13):
+    // the root's *name*, so a `CF_HDROP` pointing back into the spool is
+    // recognized. Compared, never resolved — every spool operation still
+    // goes through the opened handle.
+    engine.set_spool_root(
+        spool
+            .as_ref()
+            .and_then(|spool| spool.root_path())
+            .map(std::path::Path::to_path_buf),
+    );
+
     let driver = ClipboardSyncDriver {
-        engine: ClipboardEngine::with_metrics(origin, config, metrics.clone()),
+        engine,
         provider,
         spool,
         file_write: None,
         virtual_files,
+        blob_builder,
+        file_blob: None,
         events_rx,
         events_tx: events_tx.clone(),
         commands_tx,
@@ -320,6 +365,32 @@ impl ClipboardSyncDriver {
                 self.engine.set_file_receive(policy);
                 Vec::new()
             }
+            SyncEvent::FileSendPolicy(policy) => {
+                // Clamped like its twin, and for the mirrored reason: a
+                // selection needs something that can pack it, and without
+                // a builder this build cannot send one whatever the peer
+                // and the trust store say.
+                let policy = if self.blob_builder.is_some() {
+                    policy
+                } else {
+                    FileSend::Unsupported
+                };
+                self.engine.set_file_send(policy);
+                Vec::new()
+            }
+            SyncEvent::FileBlobBuilt { id, outcome } => match *outcome {
+                Ok(blob) => {
+                    // Held here for the whole transaction: the engine gets
+                    // the numbers, the open handle stays with the driver,
+                    // and dropping it is what removes the artifact. A
+                    // second build replaces the first, so the slot is one
+                    // deep by construction.
+                    let summary = BuiltBlob::of(&blob);
+                    self.file_blob = Some((id, blob));
+                    self.engine.on_file_blob_built(id, Ok(summary))
+                }
+                Err(refusal) => self.engine.on_file_blob_built(id, Err(refusal)),
+            },
             SyncEvent::SettleDue(generation) => {
                 if generation == self.settle_generation {
                     self.engine.on_settle_due()
@@ -866,6 +937,94 @@ impl ClipboardSyncDriver {
         }
     }
 
+    /// Pack a local selection on a blocking thread (ADR 0015).
+    ///
+    /// Spawned rather than awaited inline, and the reason is the same one
+    /// that shaped [`Self::send_command`]: the walk reads the selection
+    /// and the archive writes it back out, which on gigabytes is seconds,
+    /// and a driver that stops taking events for seconds is the deaf
+    /// first hop of the wedge cycle. The result comes back as an ordinary
+    /// event, so a build in flight costs the loop nothing.
+    fn build_file_blob(&mut self, id: Uuid, selection: Vec<std::path::PathBuf>) -> Vec<Action> {
+        let Some(builder) = self.blob_builder.clone() else {
+            // Reachable only if the policy said otherwise; answered
+            // rather than ignored, so the engine's pending build is
+            // resolved instead of waiting out its deadline.
+            return self
+                .engine
+                .on_file_blob_built(id, Err(FileBlobRefusal::Unsupported));
+        };
+        let notify = self.events_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = builder.build(&selection);
+            // Blocking send: the queue is bounded and this thread has
+            // nothing else to do, so waiting for room is correct — and a
+            // dropped result would leave the engine's build unanswered
+            // until its deadline.
+            let _ = notify.blocking_send(SyncEvent::FileBlobBuilt {
+                id,
+                outcome: Box::new(outcome),
+            });
+        });
+        Vec::new()
+    }
+
+    /// Read one chunk out of the built blob and send it.
+    ///
+    /// Exactly `len` bytes at `offset`, allocated to that size and no
+    /// other: this is the sending half of ADR 0015's O(chunk) rule, and
+    /// the mirror of the receiver writing each chunk through to the spool
+    /// as it arrives. Neither side ever holds the item.
+    async fn send_file_chunk(&mut self, id: Uuid, index: u32, offset: u64, len: u32) -> bool {
+        let payload = match self.read_blob_chunk(id, offset, len) {
+            Ok(payload) => payload,
+            Err(reason) => {
+                tracing::warn!(clipboard_id = %id, chunk_index = index, error = %reason, "reading the packed selection failed");
+                let more = self.engine.on_file_read_failed(id);
+                self.pending.extend(more);
+                return true;
+            }
+        };
+        match self
+            .send_message(OutboundMessage::Chunk(
+                crossover_protocol::clipboard::ClipboardChunk { id, index, payload },
+            ))
+            .await
+        {
+            (SendOutcome::Sent, more) => self.pending.extend(more),
+            (SendOutcome::Closed, _) => return false,
+            (SendOutcome::Abandoned, _) => {}
+        }
+        true
+    }
+
+    /// The read itself, bounded by the chunk length the engine named.
+    fn read_blob_chunk(&mut self, id: Uuid, offset: u64, len: u32) -> Result<Vec<u8>, String> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let Some((open_id, blob)) = self.file_blob.as_mut() else {
+            return Err("no packed selection is open".to_owned());
+        };
+        if *open_id != id {
+            return Err("the packed selection open is a different one".to_owned());
+        }
+        blob.content
+            .seek(SeekFrom::Start(offset))
+            .map_err(|error| error.to_string())?;
+        let mut payload = vec![0u8; len as usize];
+        blob.content
+            .read_exact(&mut payload)
+            .map_err(|error| error.to_string())?;
+        Ok(payload)
+    }
+
+    /// Drop the built blob, which is what deletes the temporary artifact.
+    fn release_file_blob(&mut self, id: Uuid) {
+        if self.file_blob.as_ref().is_some_and(|(open, _)| *open == id) {
+            self.file_blob = None;
+        }
+    }
+
     /// Perform one engine action, queueing whatever it produces.
     ///
     /// Deliberately **one** action, not a drain: see [`Self::run`] for why
@@ -948,6 +1107,21 @@ impl ClipboardSyncDriver {
                 self.schedule(delay, SyncEvent::SpoolSweepDue);
             }
             Action::EvictSpoolEntry { entry } => self.evict_entry(&entry),
+            Action::BuildFileBlob { id, selection } => {
+                let more = self.build_file_blob(id, selection);
+                self.pending.extend(more);
+            }
+            Action::SendFileChunk {
+                id,
+                index,
+                offset,
+                len,
+            } => {
+                if !self.send_file_chunk(id, index, offset, len).await {
+                    return false;
+                }
+            }
+            Action::ReleaseFileBlob { id } => self.release_file_blob(id),
             Action::ScheduleSettle { delay } => {
                 // Bump the generation: any timer already in flight becomes
                 // a no-op when it fires, so the debounce restarts without
@@ -985,7 +1159,7 @@ mod tests {
     };
     use crossover_platform::SpoolError;
 
-    use crate::clipboard::{ClipboardConfig, FileReceive, RetryPolicy};
+    use crate::clipboard::{ClipboardConfig, FileReceive, FileSend, RetryPolicy};
     use crate::metrics::Metrics;
 
     struct Rig {
@@ -996,12 +1170,20 @@ mod tests {
     }
 
     fn rig() -> Rig {
-        rig_with_spool(None, None)
+        rig_with(None, None, None)
     }
 
     fn rig_with_spool(
         spool: Option<Arc<dyn crossover_platform::SpoolStorage>>,
         virtual_files: Option<Arc<dyn VirtualFileClipboard>>,
+    ) -> Rig {
+        rig_with(spool, virtual_files, None)
+    }
+
+    fn rig_with(
+        spool: Option<Arc<dyn crossover_platform::SpoolStorage>>,
+        virtual_files: Option<Arc<dyn VirtualFileClipboard>>,
+        blob_builder: Option<Arc<dyn crossover_platform::FileBlobBuilder>>,
     ) -> Rig {
         let clipboard = Arc::new(InMemoryClipboard::new());
         let config = ClipboardConfig {
@@ -1018,6 +1200,7 @@ mod tests {
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
             spool,
             virtual_files,
+            blob_builder,
             Uuid::from_bytes([0xAA; 16]),
             config,
             Some(Arc::clone(&metrics)),
@@ -1551,6 +1734,7 @@ mod tests {
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
             None,
             None,
+            None,
             Uuid::from_bytes([0xAA; 16]),
             ClipboardConfig {
                 // The deadline is the subject here, so it is short — the
@@ -1984,5 +2168,136 @@ mod tests {
         assert_eq!(message_type, MessageType::ClipboardDecline.wire());
         let decline = ClipboardDecline::decode_payload(&payload).unwrap();
         assert_eq!(decline.reason, DeclineReason::UnsupportedType);
+    }
+
+    /// The sending half end to end through the driver (ADR 0015): a
+    /// local file copy is packed off the hot thread, offered, and then
+    /// streamed **out of the blob**, one chunk read per frame — never the
+    /// whole item into memory.
+    #[tokio::test]
+    async fn a_copied_file_is_packed_offered_and_streamed_from_the_blob() {
+        use crossover_platform::fakes::FakeFileBlobBuilder;
+        use crossover_protocol::clipboard::{ClipboardAccept, ClipboardChunk, MAX_CHUNK_BYTES};
+
+        let bytes: Vec<u8> = (0..MAX_CHUNK_BYTES * 2 + 9)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let builder = Arc::new(FakeFileBlobBuilder::new("report.pdf", bytes.clone()));
+        let mut rig = rig_with(
+            None,
+            None,
+            Some(Arc::clone(&builder) as Arc<dyn crossover_platform::FileBlobBuilder>),
+        );
+        rig.events
+            .send(SyncEvent::FileSendPolicy(FileSend::Allowed))
+            .await
+            .unwrap();
+        rig.clipboard
+            .set_file_list_locally(vec![std::path::PathBuf::from(r"C:\work\report.pdf")]);
+
+        let SessionCommand::SendFrame {
+            message_type,
+            payload,
+            ..
+        } = next_command(&mut rig).await
+        else {
+            panic!("expected an offer");
+        };
+        assert_eq!(message_type, MessageType::ClipboardOffer.wire());
+        let offer = ClipboardOffer::decode_payload(&payload).unwrap();
+        assert_eq!(offer.meta.content_type, ContentType::File);
+        assert_eq!(offer.meta.content_length, bytes.len() as u64);
+        assert_eq!(
+            offer.descriptor.as_ref().map(|d| d.file_name.as_str()),
+            Some("report.pdf")
+        );
+        assert_eq!(
+            builder.selections(),
+            vec![vec![std::path::PathBuf::from(r"C:\work\report.pdf")]],
+            "the builder must be handed the selection the clipboard reported"
+        );
+
+        rig.events
+            .send(frame(
+                MessageType::ClipboardAccept,
+                ClipboardAccept { id: offer.meta.id }
+                    .encode_payload()
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let mut streamed = Vec::new();
+        for index in 0..3u32 {
+            let SessionCommand::SendFrame {
+                message_type,
+                payload,
+                ..
+            } = next_command(&mut rig).await
+            else {
+                panic!("expected chunk {index}");
+            };
+            assert_eq!(message_type, MessageType::ClipboardChunk.wire());
+            let chunk = ClipboardChunk::decode_payload(&payload).unwrap();
+            assert_eq!(chunk.id, offer.meta.id);
+            assert_eq!(chunk.index, index);
+            streamed.extend(chunk.payload);
+        }
+        assert_eq!(streamed, bytes, "the blob was not streamed verbatim");
+
+        let quiet = timeout(Duration::from_millis(200), rig.commands.recv()).await;
+        assert!(quiet.is_err(), "extra traffic after the stream: {quiet:?}");
+    }
+
+    /// A build the builder refuses produces no traffic at all, and the
+    /// driver stays usable — an ordinary text copy travels right after.
+    #[tokio::test]
+    async fn a_refused_pack_produces_no_traffic_and_leaves_the_driver_working() {
+        use crossover_platform::fakes::FakeFileBlobBuilder;
+
+        let builder = Arc::new(FakeFileBlobBuilder::new("report.pdf", vec![1, 2, 3]));
+        builder.refuse_next(crossover_platform::FileBlobRefusal::ReparsePoint);
+        let mut rig = rig_with(
+            None,
+            None,
+            Some(Arc::clone(&builder) as Arc<dyn crossover_platform::FileBlobBuilder>),
+        );
+        rig.events
+            .send(SyncEvent::FileSendPolicy(FileSend::Allowed))
+            .await
+            .unwrap();
+        rig.clipboard
+            .set_file_list_locally(vec![std::path::PathBuf::from(r"C:\work\link")]);
+
+        // Nothing travels for the refused selection.
+        let quiet = timeout(Duration::from_millis(300), rig.commands.recv()).await;
+        assert!(quiet.is_err(), "a refused pack sent something: {quiet:?}");
+        assert_eq!(builder.selections().len(), 1);
+
+        rig.clipboard.set_text_locally("still works");
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected the text to travel");
+        };
+        assert_eq!(message_type, MessageType::ClipboardData.wire());
+    }
+
+    /// Without a builder there is no sending half, and the policy the
+    /// application supplies cannot talk this build into one — the same
+    /// clamp the receiving side has, in the other direction.
+    #[tokio::test]
+    async fn a_driver_without_a_builder_never_packs_a_selection() {
+        let mut rig = rig();
+        rig.events
+            .send(SyncEvent::FileSendPolicy(FileSend::Allowed))
+            .await
+            .unwrap();
+        rig.clipboard
+            .set_file_list_locally(vec![std::path::PathBuf::from(r"C:\work\report.pdf")]);
+
+        let quiet = timeout(Duration::from_millis(300), rig.commands.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a build with no builder sent something: {quiet:?}"
+        );
     }
 }

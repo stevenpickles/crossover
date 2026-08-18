@@ -20,15 +20,15 @@ use crossover_core::supervision::{
 };
 use crossover_core::{
     ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
-    FileReceive, FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics, OutboundSender,
-    SeamlessInputs, SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology,
-    clipboard_sync, edge_detect, input_control, outbound_channel,
+    FileReceive, FileSend, FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics,
+    OutboundSender, SeamlessInputs, SessionCommand, SessionListener, SessionOptions, SyncEvent,
+    Topology, clipboard_sync, edge_detect, input_control, outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
 use crossover_platform::{ServiceError, ServiceStatus};
 use crossover_protocol::DEFAULT_PORT;
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::hello::{FeatureFlags, MessageType};
 use crossover_protocol::input::{InputBatch, WireInputEvent};
 use crossover_security::pairing::{PairedPeer, PairingCode, PairingIdentity};
 use crossover_security::{
@@ -37,8 +37,8 @@ use crossover_security::{
 
 use crate::console::{self, ConsoleCommand};
 use crate::storage::{
-    open_clipboard_provider, open_cursor_mask, open_display, open_input, open_secure_storage,
-    open_service_manager, open_spool, open_virtual_files,
+    open_clipboard_provider, open_cursor_mask, open_display, open_file_blob_builder, open_input,
+    open_secure_storage, open_service_manager, open_spool, open_virtual_files,
 };
 
 /// One ceremony's allowance, listener and connector alike. Generous
@@ -535,10 +535,17 @@ fn setup_clipboard_sync(
     let spool = open_spool();
     let virtual_files = open_virtual_files(spool.as_ref());
     let file_paste_ready = spool.is_some() && virtual_files.is_some();
+    // The sending half's builder is wired now that the engine has a
+    // transaction to drive it from (ADR 0015). It stays inert until
+    // `FILE_CLIPBOARD` is advertised and a send policy is supplied: the
+    // engine's default is `FileSend::Unsupported`, so nothing is packed
+    // and nothing is offered until that lands.
+    let blob_builder = open_file_blob_builder();
     let (driver, events, commands) = clipboard_sync(
         provider,
         spool,
         virtual_files,
+        blob_builder,
         device,
         ClipboardConfig::new(),
         Some(Arc::clone(metrics)),
@@ -842,12 +849,19 @@ impl SessionFanout {
         self.publish_file_policy().await;
     }
 
-    /// Tell the clipboard driver what the trust store currently says about
-    /// receiving files.
+    /// Tell the clipboard driver what the trust store and the negotiated
+    /// sessions currently say about receiving and sending files (ADR 0015).
     async fn publish_file_policy(&self) {
         let live = live_peer_fingerprints(&self.registry);
-        let policy = file_receive_policy(self.spool_open, &*self.storage, &live);
-        let _ = self.sync.send(SyncEvent::FileReceivePolicy(policy)).await;
+        let receive_policy = file_receive_policy(self.spool_open, &*self.storage, &live);
+        let _ = self
+            .sync
+            .send(SyncEvent::FileReceivePolicy(receive_policy))
+            .await;
+
+        let live_sessions = live_peer_sessions(&self.registry);
+        let send_policy = file_send_policy(&*self.storage, &live_sessions);
+        let _ = self.sync.send(SyncEvent::FileSendPolicy(send_policy)).await;
     }
 
     async fn frame(&self, session: Uuid, frame: crossover_protocol::RawFrame) {
@@ -1166,6 +1180,11 @@ struct SessionRoute {
     sink: FrameSink,
     kill: Option<watch::Sender<bool>>,
     peer_fingerprint: SpkiFingerprint,
+    /// Capabilities negotiated for this session (`SessionInfo::features`,
+    /// docs/PROTOCOL.md §3.1) — what `file_send_policy` reads to judge
+    /// `FILE_CLIPBOARD` the same way `file_receive_policy` reads the trust
+    /// store (ADR 0015).
+    features: FeatureFlags,
     /// When this session was established, so a session still live at
     /// shutdown can still report how long it lasted (`close_live_sessions`).
     established_at: Instant,
@@ -1293,6 +1312,17 @@ fn live_peer_fingerprints(registry: &SessionRegistry) -> Vec<SpkiFingerprint> {
         .collect()
 }
 
+/// Fingerprint plus negotiated features of every peer with a live
+/// session — everyone this machine could send a file *to* right now, and
+/// what each one's `Hello` said about receiving one (`file_send_policy`,
+/// ADR 0015).
+fn live_peer_sessions(registry: &SessionRegistry) -> Vec<(SpkiFingerprint, FeatureFlags)> {
+    registry_lock(registry)
+        .values()
+        .map(|route| (route.peer_fingerprint, route.features))
+        .collect()
+}
+
 /// Whether peer files may be received right now (ADR 0015).
 ///
 /// Fail-closed at every step, and deliberately judged over **all** live
@@ -1332,6 +1362,57 @@ fn file_receive_policy(
     }
 }
 
+/// Whether local files may be sent to the peer right now (ADR 0015) — the
+/// mirror of [`file_receive_policy`], judged from the same two inputs the
+/// engine's `FileSend` gate needs: what each live session's `Hello`
+/// negotiated, and what the trust store currently grants.
+///
+/// `NotNegotiated` unless **every** live session's `Hello` intersection
+/// contains `FILE_CLIPBOARD` — an offer built for a peer that never
+/// advertised it would be a content type its session cannot decode
+/// (docs/PROTOCOL.md §3.1), so this has to fail closed the same way an
+/// un-negotiated peer does for receiving. `Denied` unless every live peer
+/// also holds `clipboard_send`; otherwise `Allowed`. Judged over **all**
+/// live peers for the same session-agnostic reason `file_receive_policy`
+/// is: the engine cannot address one selection at one peer, so a peer
+/// that cannot take a file closes the door for everyone until the engine
+/// becomes session-aware.
+///
+/// A store that will not load is `Denied` rather than an error, matching
+/// its twin: a transient read failure must never *open* a send surface.
+///
+/// This does not need to know whether a blob builder is wired — the
+/// driver clamps to `FileSend::Unsupported` itself when none is
+/// (`clipboard_driver`'s handling of `SyncEvent::FileSendPolicy`), so this
+/// function only ever answers the negotiation and permission question.
+fn file_send_policy(
+    storage: &dyn SecureStorage,
+    live: &[(SpkiFingerprint, FeatureFlags)],
+) -> FileSend {
+    if live.is_empty() {
+        return FileSend::Denied;
+    }
+    if !live
+        .iter()
+        .all(|(_, features)| features.contains(FeatureFlags::FILE_CLIPBOARD))
+    {
+        return FileSend::NotNegotiated;
+    }
+    let Ok(trust) = TrustStore::load(storage) else {
+        return FileSend::Denied;
+    };
+    let granted = live.iter().all(|(fingerprint, _)| {
+        trust
+            .find_by_fingerprint(*fingerprint)
+            .is_some_and(|peer| peer.permissions().clipboard_send)
+    });
+    if granted {
+        FileSend::Allowed
+    } else {
+        FileSend::Denied
+    }
+}
+
 /// Terminate one session on revocation: fire an inbound session's kill
 /// switch, or shut the outbound supervisor down (its one peer is now
 /// untrusted, so stopping reconnection to it is correct). The normal
@@ -1355,9 +1436,10 @@ fn terminate_on_revocation(route: &SessionRoute) {
 /// rejected by the per-accept/attempt trust read; this closes the
 /// active-session half of SECURITY.md §4 / T6.
 ///
-/// **File receive** (ADR 0015): `crossover peers deny-files` runs in
-/// another process, so withdrawing the grant reaches a running worker
-/// here — within one poll, and without waiting for a reconnect.
+/// **File receive and file send** (ADR 0015): `crossover peers deny-files`
+/// runs in another process, and so does whatever edits `clipboard_send`,
+/// so withdrawing either grant reaches a running worker here — within one
+/// poll, and without waiting for a reconnect.
 ///
 /// Never returns — runs as a branch of the foreground select.
 async fn apply_trust_changes(
@@ -1390,6 +1472,12 @@ async fn apply_trust_changes(
                 spool_open,
                 &**storage,
                 &fingerprints,
+            )))
+            .await;
+        let sessions = live_peer_sessions(registry);
+        let _ = sync
+            .send(SyncEvent::FileSendPolicy(file_send_policy(
+                &**storage, &sessions,
             )))
             .await;
         for id in revoked_session_ids(&live, &trust) {
@@ -1577,6 +1665,7 @@ async fn listener_loop(
                         sink: FrameSink::Inbound(outbound_tx),
                         kill: Some(shutdown_tx),
                         peer_fingerprint: info.peer_fingerprint,
+                        features: info.features,
                         established_at,
                     },
                 );
@@ -1659,6 +1748,7 @@ async fn outbound_event_loop(
                             sink: FrameSink::Outbound(Arc::clone(handle)),
                             kill: None,
                             peer_fingerprint: info.peer_fingerprint,
+                            features: info.features,
                             // Set just above, when the session came up.
                             established_at: established_at.unwrap_or_else(Instant::now),
                         },
@@ -1887,6 +1977,7 @@ mod tests {
                 sink: FrameSink::Inbound(sink),
                 kill: Some(kill_tx),
                 peer_fingerprint: certified.fingerprint(),
+                features: crossover_protocol::hello::FeatureFlags::NONE,
                 established_at: Instant::now(),
             },
         )])));
@@ -2081,6 +2172,7 @@ mod tests {
                 sink: FrameSink::Inbound(sink),
                 kill: None,
                 peer_fingerprint: certified.fingerprint(),
+                features: crossover_protocol::hello::FeatureFlags::NONE,
                 established_at: Instant::now()
                     .checked_sub(Duration::from_secs(90))
                     .expect("90s before now is representable"),
@@ -2403,6 +2495,86 @@ mod tests {
         assert_eq!(
             file_receive_policy(true, &InMemorySecureStorage::new(), &[fingerprint(1)]),
             FileReceive::Denied
+        );
+    }
+
+    /// The sending half's mirror of the gate above (ADR 0015). Checked in
+    /// the same order a user needs to be told apart: whether the peer can
+    /// even decode a file offer at all (`NotNegotiated`, docs/PROTOCOL.md
+    /// §3.1 — an un-negotiated content type is fatal to the peer's
+    /// session, so this must fail closed before anything is built) before
+    /// whether it is permitted to (`Denied`).
+    #[test]
+    fn file_send_is_granted_only_when_negotiated_and_every_live_peer_holds_send() {
+        use crossover_platform::fakes::InMemorySecureStorage;
+        use crossover_protocol::hello::FeatureFlags;
+        use crossover_security::{TrustStore, TrustedPeer};
+
+        use super::{FileSend, file_send_policy};
+
+        fn fingerprint(fill: u8) -> crossover_security::SpkiFingerprint {
+            crossover_security::SpkiFingerprint::from([fill; 32])
+        }
+
+        let storage = InMemorySecureStorage::new();
+        let mut trust = TrustStore::default();
+        let paired = TrustedPeer::new(Uuid::from_bytes([1; 16]), "paired", fingerprint(1)).unwrap();
+        trust.add_peer(paired).unwrap();
+        trust.save(&storage).unwrap();
+
+        let negotiated = FeatureFlags::FILE_CLIPBOARD;
+        let not_negotiated = FeatureFlags::NONE;
+
+        // Nobody connected: nothing to send to.
+        assert_eq!(file_send_policy(&storage, &[]), FileSend::Denied);
+
+        // A negotiated, trusted peer: `clipboard_send` is on by default
+        // (`PeerPermissions::FULL`, unlike `file_receive`).
+        assert_eq!(
+            file_send_policy(&storage, &[(fingerprint(1), negotiated)]),
+            FileSend::Allowed
+        );
+
+        // The peer never advertised FILE_CLIPBOARD.
+        assert_eq!(
+            file_send_policy(&storage, &[(fingerprint(1), not_negotiated)]),
+            FileSend::NotNegotiated
+        );
+
+        // An unpaired fingerprint holds no `clipboard_send` grant at all,
+        // and it closes the door for the trusted peer beside it too — the
+        // same session-agnostic rule `file_receive_policy` applies, since
+        // clipboard sync cannot address one selection at one peer.
+        assert_eq!(
+            file_send_policy(&storage, &[(fingerprint(9), negotiated)]),
+            FileSend::Denied
+        );
+        assert_eq!(
+            file_send_policy(
+                &storage,
+                &[(fingerprint(1), negotiated), (fingerprint(9), negotiated)]
+            ),
+            FileSend::Denied
+        );
+
+        // A store that will not load must never open the surface.
+        assert_eq!(
+            file_send_policy(
+                &InMemorySecureStorage::new(),
+                &[(fingerprint(1), negotiated)]
+            ),
+            FileSend::Denied
+        );
+
+        // The transition `apply_trust_changes`'s poll relies on: the store
+        // changes underneath a live, previously-Allowed session, and the
+        // very next read answers `Denied` with no session teardown and no
+        // reconnect needed to observe it.
+        let revoked = TrustStore::default();
+        revoked.save(&storage).unwrap();
+        assert_eq!(
+            file_send_policy(&storage, &[(fingerprint(1), negotiated)]),
+            FileSend::Denied
         );
     }
 }

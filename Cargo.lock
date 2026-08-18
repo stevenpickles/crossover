@@ -343,6 +343,7 @@ dependencies = [
 name = "crossover-platform"
 version = "0.2.0"
 dependencies = [
+ "sha2 0.11.0",
  "thiserror",
 ]
 

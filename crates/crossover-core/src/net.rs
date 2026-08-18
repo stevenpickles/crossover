@@ -746,15 +746,15 @@ mod tests {
 
         // Capability negotiation is the intersection of the two Hellos
         // (docs/PROTOCOL.md §3), and both sides here are this build, so
-        // the intersection is what it advertises — CHUNKED_CLIPBOARD
-        // since ADR 0014's platform slice.
+        // the intersection is what it advertises — CHUNKED_CLIPBOARD and
+        // FILE_CLIPBOARD, both since ADR 0015's final slice (feature/136).
         //
         // Note what this does and does not prove: written this way it is
         // tautological in the value (negotiating a set with itself), so
         // it pins the *plumbing* — that each side's advertisement reaches
         // the other and lands on `SessionInfo::features` — and nothing
         // about which bits are advertised. The value itself is pinned by
-        // the golden Hello snapshot's `0x01`
+        // the golden Hello snapshot's `0x03`
         // (`crossover-protocol::hello`), and the asymmetric case that
         // actually matters is
         // `unnegotiated_content_is_refused_before_it_reaches_the_wire`

@@ -288,6 +288,13 @@ impl WindowsSpoolStorage {
 }
 
 impl SpoolStorage for WindowsSpoolStorage {
+    fn root_path(&self) -> Option<&Path> {
+        // The same text `display_path` returns, and used the same way:
+        // compared, never resolved. Every operation below still goes
+        // through the handle (F15).
+        Some(&self.display_path)
+    }
+
     fn entries(&self) -> Result<Vec<SpoolEntry>, SpoolError> {
         let mut buffer = aligned_buffer(ENUM_BUFFER_BYTES);
         let buffer_bytes = u32::try_from(ENUM_BUFFER_BYTES).unwrap_or(u32::MAX);

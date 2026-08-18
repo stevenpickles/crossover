@@ -156,27 +156,23 @@ impl FeatureFlags {
 
     /// What **this build** advertises in its `Hello`.
     ///
-    /// Bit 0 only. It is deliberately *not* [`FeatureFlags::ALL`]: the
-    /// file wire types exist (ADR 0015's protocol slice), but the
-    /// receiving half a file offer implies — the `file_receive` grant,
-    /// the bounded spool, and the virtual file list on the OS clipboard —
-    /// does not. Advertising is a promise to **handle**, so the bit stays
-    /// clear until every layer beneath it can honour it, and a peer that
-    /// offers us a file today is answered by nothing being negotiated
-    /// rather than by a transfer we would drop.
-    ///
-    /// Bit 0 has been advertised since ADR 0014's platform slice: every
-    /// layer of *that* promise is real. The wire carries chunked images,
-    /// the engine offers, streams, reassembles, verifies and installs
-    /// them, and `crossover-platform-windows` reads and writes `CF_DIB`
-    /// on the actual OS clipboard.
+    /// [`FeatureFlags::ALL`] since ADR 0015's final slice (feature/136):
+    /// every layer beneath *both* bits is now real. Bit 0 has carried
+    /// chunked images since ADR 0014's platform slice — offered, streamed,
+    /// reassembled, verified and installed, with
+    /// `crossover-platform-windows` reading and writing `CF_DIB` on the
+    /// actual OS clipboard. Bit 1 is the same promise for files: the
+    /// receiving half — spool, verify, virtual-file paste — landed in
+    /// feature/126-132, and the sending half — observation, blob builder,
+    /// engine transaction — in feature/133-135; this bit is the deliberate
+    /// final act that lets a conforming peer actually reach either half.
     ///
     /// Flipping a bit is wire-visible (the `Hello` a peer receives
     /// changes) and deliberately safe: a feature activates only on the
     /// *intersection* of the two advertisements, so a peer that predates
     /// the bit negotiates it away and is sent nothing new
     /// (docs/PROTOCOL.md §3.1).
-    pub const ADVERTISED: Self = Self::CHUNKED_CLIPBOARD;
+    pub const ADVERTISED: Self = Self::ALL;
 
     /// Whether every bit in `feature` is set. `NONE` is contained by
     /// everything, so base-protocol capabilities never need a bit.
@@ -323,7 +319,7 @@ mod tests {
             &[0x11; 16][..],                     // device_id bytes
             &[0x04, b'l', b'e', b'f', b't'][..], // device_name
             &[0x00],                             // OsFamily::Windows
-            &[0x01],                             // FeatureFlags(CHUNKED_CLIPBOARD)
+            &[0x03],                             // FeatureFlags(CHUNKED_CLIPBOARD | FILE_CLIPBOARD)
         ]
         .concat();
         assert_eq!(
@@ -333,23 +329,19 @@ mod tests {
     }
 
     /// The bits the snapshot above pins, stated as an invariant rather
-    /// than a byte: bit 0 is `CHUNKED_CLIPBOARD`, and it is what this
-    /// build advertises now that every layer beneath it — wire, engine,
-    /// and the Windows `CF_DIB` backend — can honour the promise
-    /// (ADR 0014).
-    ///
-    /// Bit 1, `FILE_CLIPBOARD`, is defined but **not** advertised: the
-    /// wire types exist, the spool and the virtual file paste do not, and
-    /// advertising is a promise to handle. This assertion is the one that
-    /// has to be edited — deliberately — by the slice that makes the
-    /// promise true.
+    /// than a byte: bit 0 is `CHUNKED_CLIPBOARD`, advertised since ADR
+    /// 0014's platform slice, and bit 1 is `FILE_CLIPBOARD`, advertised
+    /// since ADR 0015's final slice (feature/136) now that both the
+    /// receiving half (feature/126-132) and the sending half
+    /// (feature/133-135) can honour the promise. This assertion is the one
+    /// that would have to be edited — deliberately — if either promise
+    /// ever had to be withdrawn.
     #[test]
-    fn this_build_advertises_chunked_clipboard_but_not_files() {
-        assert_ne!(FeatureFlags::ADVERTISED, FeatureFlags::ALL);
+    fn this_build_advertises_both_clipboard_feature_bits() {
+        assert_eq!(FeatureFlags::ADVERTISED, FeatureFlags::ALL);
         assert!(FeatureFlags::ADVERTISED.contains(FeatureFlags::CHUNKED_CLIPBOARD));
-        assert!(!FeatureFlags::ADVERTISED.contains(FeatureFlags::FILE_CLIPBOARD));
-        assert!(FeatureFlags::ALL.contains(FeatureFlags::FILE_CLIPBOARD));
-        // And a peer that has never heard of it still gets nothing: the
+        assert!(FeatureFlags::ADVERTISED.contains(FeatureFlags::FILE_CLIPBOARD));
+        // And a peer that has never heard of either still gets nothing: the
         // intersection with an empty advertisement is empty.
         assert_eq!(
             FeatureFlags::negotiate(FeatureFlags::ADVERTISED, FeatureFlags::NONE),

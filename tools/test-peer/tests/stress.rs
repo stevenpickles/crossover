@@ -53,6 +53,7 @@ fn side(origin: u8) -> Side {
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
         None,
         None,
+        None,
         Uuid::from_bytes([origin; 16]),
         ClipboardConfig {
             retry: ClipboardRetryPolicy {

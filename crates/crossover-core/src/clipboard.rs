@@ -33,20 +33,24 @@
 //! hash and the length are the only things ever computed over them.
 
 use std::collections::VecDeque;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+use crossover_platform::{
+    BlobNaming, ClipboardContent, ClipboardImageFormat, FileBlob, FileBlobRefusal,
+};
 use crossover_protocol::clipboard::{
     ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ChunkOutcome, ChunkPlan, ChunkReassembly, ChunkStream,
     ClipboardAccept, ClipboardApplied, ClipboardChunk, ClipboardData, ClipboardDecline,
     ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, FileDescriptor, ImageFormat,
-    StreamOutcome, content_hash,
+    MAX_CLIPBOARD_FILE_ENTRIES, StreamOutcome, content_hash,
 };
 use crossover_protocol::hello::MessageType;
 
+use crate::file_blob::wire_file_name;
 use crate::metrics::Metrics;
 
 /// How many recently-applied content hashes are remembered for loop
@@ -321,6 +325,17 @@ pub enum TransferScope {
     /// A peer item we accepted (the reassembly buffer, or an accepted
     /// text offer whose `Data` has not arrived).
     Inbound,
+    /// A local file selection the driver is packing into a blob (ADR
+    /// 0015).
+    ///
+    /// A third scope rather than a reuse of [`Self::Outbound`], for the
+    /// reason that made two out of one: a build runs *while an unrelated
+    /// outbound transfer is still in flight* — it does not supersede
+    /// anything until it has something to supersede with — so arming it
+    /// on the outbound clock would restart that transfer's deadline and
+    /// leave it unbounded. A build that never reports back is its own
+    /// stall, with its own bound.
+    Build,
 }
 
 /// Why a clipboard write did not succeed.
@@ -478,6 +493,60 @@ pub enum Action {
         /// How long to wait.
         delay: Duration,
     },
+    /// Pack a local file selection into one offerable blob, then report
+    /// back via [`ClipboardEngine::on_file_blob_built`] (ADR 0015,
+    /// "Sender side").
+    ///
+    /// Emitted only after every gate that can be judged without touching
+    /// the filesystem has passed, because this is the expensive one: the
+    /// walk reads the selection and the archive writes it out again, which
+    /// on gigabytes is seconds and a temporary file. Spending that to
+    /// learn what a feature bit or a permission flag already said would be
+    /// the sender-side version of the mistake the receiver avoids by
+    /// answering the offer before the bytes arrive.
+    ///
+    /// **Blocking, and long.** The driver must not run it on the
+    /// clipboard listener's thread or on the loop that has to keep
+    /// answering events (ADR 0015, "Threading").
+    BuildFileBlob {
+        /// Transaction id the reply — and the blob — must reference.
+        id: Uuid,
+        /// The raw local paths the clipboard reported, unvalidated and in
+        /// the order it reported them.
+        selection: Vec<PathBuf>,
+    },
+    /// Read one chunk out of the built blob and send it to the peer, then
+    /// call [`ClipboardEngine::on_chunk_sent`] — or
+    /// [`ClipboardEngine::on_file_read_failed`] if the bytes could not be
+    /// read.
+    ///
+    /// The engine names the slice rather than carrying it, which is what
+    /// makes the sending half O(chunk) instead of O(file): a 256 MiB item
+    /// is 4096 of these, and at no point does either the engine or the
+    /// driver hold more than one chunk of it (ADR 0015, mirroring the
+    /// receiver's write-through).
+    SendFileChunk {
+        /// Which transfer the chunk belongs to.
+        id: Uuid,
+        /// Chunk index, as the receiver's plan will expect it.
+        index: u32,
+        /// Byte offset into the blob.
+        offset: u64,
+        /// Exactly how many bytes this chunk carries.
+        len: u32,
+    },
+    /// Drop the built blob for `id`, deleting the sender's temporary
+    /// artifact. Best-effort and idempotent: no reply, because there is
+    /// no decision left to make.
+    ///
+    /// Emitted on **every** path that ends an outbound file transaction —
+    /// delivered, declined, superseded, timed out, session lost — so a
+    /// stalled transaction can never pin up to `MAX_CLIPBOARD_FILE_BYTES`
+    /// of this machine's own disk (NFR-1).
+    ReleaseFileBlob {
+        /// Which blob is finished with.
+        id: Uuid,
+    },
 }
 
 /// Whether peer files may be received at all, and if not, why not.
@@ -502,6 +571,80 @@ pub enum FileReceive {
     Denied,
     /// Granted: offers are judged on their merits.
     Allowed,
+}
+
+/// Whether a local file selection may be sent to the peer at all, and if
+/// not, why not (ADR 0015, "Sender side").
+///
+/// The mirror of [`FileReceive`], and four states for the same reason
+/// that one has three: the refusals are different answers and a user acts
+/// on them differently (NFR-3). The engine is sans-io and knows neither
+/// the negotiated feature set nor the trust store, so the application
+/// supplies this and refreshes it as either changes; the default is the
+/// closed one, so a build that never wires a sender refuses by
+/// construction rather than by remembering to.
+///
+/// **This is a gate, not an optimization.** It is judged *before* a
+/// selection is walked, so a peer that cannot take files never costs this
+/// machine a filesystem walk and an archive — and, more importantly, an
+/// un-negotiated `ContentType::File` is fatal to an older peer's session
+/// rather than skippable (docs/PROTOCOL.md §3.1), so the offer must never
+/// be built in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileSend {
+    /// No blob builder in this build: a selection cannot be packed here,
+    /// whatever the peer or the trust store say. The default.
+    #[default]
+    Unsupported,
+    /// The peer never advertised `FILE_CLIPBOARD`, so a file offer would
+    /// be a frame its session cannot decode.
+    NotNegotiated,
+    /// The peer holds no `clipboard_send` grant.
+    Denied,
+    /// Granted and negotiated: selections are judged on their merits.
+    Allowed,
+}
+
+/// What the driver built from a local selection, minus the bytes.
+///
+/// Everything a `crossover_platform::FileBlob` carries except its open
+/// handle, which stays with the driver: the engine decides the
+/// transaction from the length, the hash and the name, and never sees a
+/// byte of the item (ADR 0015). The name is still the *proposed* one —
+/// judging it against the wire's rules is the engine's job, because a
+/// name that reaches a shell is judged by exactly one validator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltBlob {
+    /// The bare name the item should travel under, not yet validated.
+    pub proposed_name: String,
+    /// Where that name came from, and so what a failed validation means.
+    pub naming: BlobNaming,
+    /// Whether the blob is an archive the builder packed.
+    pub archived: bool,
+    /// Filesystem entries packed.
+    pub entry_count: u32,
+    /// Total bytes of those entries before packing.
+    pub original_bytes: u64,
+    /// Exact length of the blob: what the offer declares.
+    pub content_length: u64,
+    /// SHA-256 of the blob, as the receiver will verify it.
+    pub content_hash: [u8; 32],
+}
+
+impl BuiltBlob {
+    /// Everything but the bytes, taken from a built blob.
+    #[must_use]
+    pub fn of(blob: &FileBlob) -> Self {
+        Self {
+            proposed_name: blob.proposed_name.clone(),
+            naming: blob.naming,
+            archived: blob.archived,
+            entry_count: blob.entry_count,
+            original_bytes: blob.original_bytes,
+            content_length: blob.content_length,
+            content_hash: blob.content_hash,
+        }
+    }
 }
 
 /// Why the spool refused to admit a transfer (the driver's answer to
@@ -608,27 +751,57 @@ impl InboundMessage {
 /// docs/ARCHITECTURE.md §5.2, which states it.
 #[derive(Debug)]
 enum Outbound {
-    /// Offer sent; awaiting Accept/Decline. Holds the content, because
+    /// Offer sent; awaiting Accept/Decline. Holds the body, because
     /// an Accept means "send it now".
     AwaitingAccept {
         meta: ClipboardMeta,
-        content: Vec<u8>,
+        body: OutboundBody,
         started: Instant,
     },
     /// Accepted and streaming chunks (ADR 0014). `next_index` is the
     /// chunk to emit when the driver comes back for another.
     Streaming {
         meta: ClipboardMeta,
-        content: Vec<u8>,
+        body: OutboundBody,
         plan: ChunkPlan,
         next_index: u32,
         started: Instant,
     },
-    /// Everything sent; awaiting Applied. Content released.
+    /// Everything sent; awaiting Applied. Body released.
     AwaitingApplied {
         meta: ClipboardMeta,
         started: Instant,
     },
+}
+
+/// Where an in-flight outbound item's bytes actually live.
+///
+/// Two answers, and the difference is the whole reason the file half
+/// costs the engine no memory (ADR 0015). Text and an image are read
+/// into this process and retained here until the transaction closes; a
+/// file selection is packed into a blob the *driver* holds open on disk,
+/// and the engine never sees a byte of it — it knows the length, the
+/// hash and the name, which is everything the transaction is decided
+/// from. Chunking is identical either way: the same [`ChunkPlan`], the
+/// same one-chunk-at-a-time pacing (ADR 0013), only a different place
+/// the bytes are fetched from when the chunk is actually sent.
+#[derive(Debug)]
+enum OutboundBody {
+    /// Bytes retained by the engine (text, images).
+    Bytes(Vec<u8>),
+    /// A blob the driver holds open (ADR 0015). Carries nothing: the
+    /// descriptor went out with the offer, and what remains to be decided
+    /// about a file in flight is decided from its `ClipboardMeta` like
+    /// any other item's.
+    Blob,
+}
+
+impl OutboundBody {
+    /// Whether these bytes are held in *this* process's memory, and so
+    /// are what the transfer deadline exists to bound.
+    const fn is_retained(&self) -> bool {
+        matches!(self, Self::Bytes(_))
+    }
 }
 
 impl Outbound {
@@ -650,7 +823,34 @@ impl Outbound {
 
     /// Whether this state retains an item buffer, and so needs a deadline.
     const fn retains_content(&self) -> bool {
-        matches!(self, Self::AwaitingAccept { .. } | Self::Streaming { .. })
+        match self {
+            Self::AwaitingAccept { body, .. } | Self::Streaming { body, .. } => body.is_retained(),
+            Self::AwaitingApplied { .. } => false,
+        }
+    }
+
+    /// The action that hands the driver-held blob back, if this state
+    /// still pins one.
+    ///
+    /// Called on **every** path that ends an outbound transaction, which
+    /// is the whole discipline: dropping the blob deletes the sender's
+    /// temporary artifact, and a transaction that ended without doing so
+    /// would pin up to `MAX_CLIPBOARD_FILE_BYTES` of the sender's own
+    /// disk until the process exited (ADR 0015, NFR-1).
+    fn release(&self) -> Option<Action> {
+        match self {
+            Self::AwaitingAccept {
+                meta,
+                body: OutboundBody::Blob,
+                ..
+            }
+            | Self::Streaming {
+                meta,
+                body: OutboundBody::Blob,
+                ..
+            } => Some(Action::ReleaseFileBlob { id: meta.id }),
+            _ => None,
+        }
     }
 }
 
@@ -723,6 +923,18 @@ impl FileTransfer {
     }
 }
 
+/// A local file selection handed to the driver's builder and not yet
+/// answered (ADR 0015).
+///
+/// Holds no paths and no bytes: the selection went out with the action,
+/// and what is kept is only what is needed to recognize the answer and to
+/// say how long the pack took.
+#[derive(Debug)]
+struct PendingBuild {
+    id: Uuid,
+    started: Instant,
+}
+
 /// Inbound write-with-retry state.
 #[derive(Debug)]
 struct PendingWrite {
@@ -765,6 +977,21 @@ pub struct ClipboardEngine {
     /// Whether peer files may be received here at all. Supplied by the
     /// application from the trust store; closed until it says otherwise.
     file_receive: FileReceive,
+    /// Whether local files may be *sent* to the peer (ADR 0015). Supplied
+    /// the same way and for the same reason, and closed by default.
+    file_send: FileSend,
+    /// The spool root, for one purpose only: recognizing a `CF_HDROP`
+    /// that points back into it, which must never be staged (ADR 0015
+    /// loop prevention, SECURITY.md F13). Held as text and compared, never
+    /// opened and never resolved — the spool itself is reached by handle
+    /// and nothing here changes that. `None` where this build has no
+    /// spool, which is also the only honest answer then: with nothing
+    /// writing there, no path can be inside it.
+    spool_root: Option<PathBuf>,
+    /// A local file selection the driver is packing (ADR 0015). At most
+    /// one, and a newer local copy supersedes it — the same rule
+    /// `outbound` has, one step earlier in the pipeline.
+    building: Option<PendingBuild>,
     /// Verified spool entries, oldest first, each with when it was
     /// registered — the eviction order, the spool's byte budget, and the
     /// age the [`SPOOL_SWEEP_TTL`] backstop measures. Computed from
@@ -787,6 +1014,7 @@ pub struct ClipboardEngine {
     /// no-op, so superseded timers need no cancellation.
     outbound_generation: u64,
     inbound_generation: u64,
+    build_generation: u64,
     /// The write (with retries) currently underway.
     pending_write: Option<PendingWrite>,
     /// Clipboard protocol violations this peer has committed since the
@@ -828,12 +1056,16 @@ impl ClipboardEngine {
             reassembly: None,
             file: None,
             file_receive: FileReceive::default(),
+            file_send: FileSend::default(),
+            spool_root: None,
+            building: None,
             spooled: VecDeque::new(),
             offering: None,
             offered: None,
             recent_transfers: VecDeque::new(),
             outbound_generation: 0,
             inbound_generation: 0,
+            build_generation: 0,
             pending_write: None,
             violations: 0,
             metrics,
@@ -872,21 +1104,22 @@ impl ClipboardEngine {
     /// Typed since ADR 0014: the same rules apply to every content type —
     /// only the bound and the flow differ, and both come from the type.
     ///
-    /// A [`ClipboardContent::FileList`] observation (ADR 0015, feature/133)
-    /// is a deliberate no-op here: `into_wire` returns `None` for it, which
-    /// this treats exactly like an oversized or empty item — nothing is
-    /// staged, nothing is hashed, `current_local_hash` and `applied_hashes`
-    /// are untouched. The sender side ADR 0015 describes — walking the
-    /// selection, building the archive, minting the offer — is feature/135's
-    /// job; until it lands, a local file/folder copy is observable but
-    /// silently does not synchronize, which is the unchanged behavior this
-    /// build has always had for files.
+    /// A [`ClipboardContent::FileList`] observation goes down its own
+    /// path (ADR 0015, "Sender side"): the bytes do not exist yet, so it
+    /// is gated, then handed to the driver's builder, and only the blob
+    /// that comes back can be hashed, named and offered. Everything a
+    /// clipboard item is judged on here — dedup, loop suppression, the
+    /// type's maximum — applies to it too, one step later, where the
+    /// numbers it is judged on first exist.
     pub fn on_local_read(&mut self, content: Option<ClipboardContent>) -> Vec<Action> {
         let Some(content) = content else {
             return Vec::new(); // empty, or a format this build cannot read
         };
+        if let ClipboardContent::FileList(selection) = content {
+            return self.on_local_file_list(selection);
+        }
         let Some((content_type, bytes)) = into_wire(content) else {
-            return Vec::new(); // a file-list observation; see the doc above
+            return Vec::new(); // never reached; see `into_wire`
         };
         let max = content_type.max_content_bytes();
         if bytes.len() as u64 > max {
@@ -950,6 +1183,304 @@ impl ClipboardEngine {
             tracing::info!(policy = ?receive, "file receive policy changed");
         }
         self.file_receive = receive;
+    }
+
+    /// Set whether local files may be sent to the peer (ADR 0015).
+    ///
+    /// The application owns this for the same reason it owns
+    /// [`Self::set_file_receive`]: it holds the trust store and the
+    /// negotiated feature set, and a sans-io engine can see neither. It is
+    /// re-supplied whenever either answer changes, so a revoked grant or a
+    /// reconnection to a peer that cannot take files stops the *next*
+    /// selection without waiting for anything.
+    pub fn set_file_send(&mut self, send: FileSend) {
+        if self.file_send != send {
+            tracing::info!(policy = ?send, "file send policy changed");
+        }
+        self.file_send = send;
+    }
+
+    /// Tell the engine where the spool root is, so a copy of something
+    /// inside it is never staged back to its sender (ADR 0015 loop
+    /// prevention, SECURITY.md F13).
+    ///
+    /// The path is **compared and never used**: nothing here opens it,
+    /// resolves it, or hands it to an API. `None` — no spool in this
+    /// build — is not a hole, it is the truthful answer that nothing of
+    /// ours is on disk for a selection to point at.
+    pub fn set_spool_root(&mut self, root: Option<PathBuf>) {
+        self.spool_root = root;
+    }
+
+    /// A local file selection was observed (ADR 0015, "Sender side").
+    ///
+    /// Gates first, cheapest first, and **all of them before the build**,
+    /// because the build is the expensive irreversible step: it reads the
+    /// selection and writes an archive, which on gigabytes is seconds and
+    /// a temporary file the size of the item. Spending that to discover
+    /// what a feature bit already said would be the sender's version of
+    /// accepting bytes before checking whether there is room for them.
+    ///
+    /// The order is: is there a selection at all; is it *ours* (a copy of
+    /// something in the spool, which must never travel back); may files be
+    /// sent to this peer; is the selection within the entry cap that can
+    /// be judged without walking anything. Only then does a build start.
+    fn on_local_file_list(&mut self, selection: Vec<PathBuf>) -> Vec<Action> {
+        if selection.is_empty() {
+            tracing::debug!("empty local file selection; nothing to stage");
+            return Vec::new();
+        }
+        // Loop prevention, layer 2 (ADR 0015). Layer 1 is the platform's
+        // own-object check, which fires first and without reading
+        // anything; this is what holds if that ever misses — a replacement
+        // object placed by a shell extension, a provider that lost track
+        // across a restart. Judged before the permission gates on purpose:
+        // this is not a refusal, it is our own item coming back, and
+        // reporting it as a refusal would be a diagnostic that misleads.
+        if self.selection_is_ours(&selection) {
+            self.record(Metrics::record_clipboard_loop_suppressed);
+            tracing::debug!(
+                entry_count = selection.len(),
+                "local file selection points inside the spool; not staging it"
+            );
+            return Vec::new();
+        }
+        match self.file_send {
+            FileSend::Allowed => {}
+            FileSend::Unsupported => {
+                return self.refuse_selection(
+                    "this build cannot pack a file selection for sending",
+                    selection.len(),
+                );
+            }
+            FileSend::NotNegotiated => {
+                return self.refuse_selection(
+                    "the peer did not negotiate file support, so nothing is built or offered",
+                    selection.len(),
+                );
+            }
+            FileSend::Denied => {
+                return self
+                    .refuse_selection("this peer holds no clipboard-send grant", selection.len());
+            }
+        }
+        // The one bound that can be judged without touching a disk: the
+        // top-level selection alone already packs more entries than one
+        // item may carry. The builder enforces the rest during the walk,
+        // where the subdirectories become visible.
+        if selection.len() > MAX_CLIPBOARD_FILE_ENTRIES as usize {
+            return self.refuse_selection(
+                "the selection packs more entries than one item may carry",
+                selection.len(),
+            );
+        }
+
+        let mut actions = self.abandon_build("superseded by a newer local copy");
+        let id = Uuid::new_v4();
+        let deadline = self.arm_timeout(TransferScope::Build);
+        self.building = Some(PendingBuild {
+            id,
+            started: Instant::now(),
+        });
+        tracing::debug!(
+            clipboard_id = %id,
+            entry_count = selection.len(),
+            "packing a local file selection"
+        );
+        actions.push(Action::BuildFileBlob { id, selection });
+        actions.push(deadline);
+        actions
+    }
+
+    /// Refuse a selection here and now, observably (FR-3.6): a warning
+    /// naming the gate that closed and a counter, never a silent nothing
+    /// and never the paths themselves.
+    fn refuse_selection(&mut self, why: &str, entry_count: usize) -> Vec<Action> {
+        self.record(Metrics::record_file_send_refused);
+        tracing::warn!(entry_count, reason = why, "local file selection not sent");
+        Vec::new()
+    }
+
+    /// Whether any path in a selection resolves inside the spool root.
+    ///
+    /// **Any** is the rule, not *all*: one clipboard item is one blob, so
+    /// a selection that is partly ours cannot be sent minus those entries
+    /// without sending something the user did not select.
+    ///
+    /// Deliberately conservative about what it cannot judge. A relative
+    /// path, or one containing a `..` component, cannot be compared
+    /// against a root without resolving it — which is filesystem work the
+    /// engine does not do and, on the spool, work F15 forbids outright —
+    /// so such a path is treated as *possibly* ours and the selection is
+    /// not staged. A shell `CF_HDROP` carries absolute, normalized paths,
+    /// so this costs nothing real, and the direction of the concession is
+    /// the safe one: a copy that does not synchronize, rather than a loop
+    /// on the largest payload type in the system.
+    fn selection_is_ours(&self, selection: &[PathBuf]) -> bool {
+        let Some(root) = self.spool_root.as_deref() else {
+            return false; // no spool: nothing of ours is on disk to copy
+        };
+        selection.iter().any(|path| inside_spool(root, path))
+    }
+
+    /// Drop a build in flight, returning the action that releases
+    /// whatever the driver may already have produced for it.
+    ///
+    /// The release is emitted even though the blob may not exist yet: the
+    /// driver's answer can be in flight at this exact moment, and an
+    /// idempotent release is how that race is closed rather than reasoned
+    /// about.
+    fn abandon_build(&mut self, why: &str) -> Vec<Action> {
+        let Some(build) = self.building.take() else {
+            return Vec::new();
+        };
+        self.record(Metrics::record_file_send_refused);
+        tracing::debug!(
+            clipboard_id = %build.id,
+            elapsed_ms = elapsed_ms(build.started),
+            reason = why,
+            "local file selection abandoned before it was offered"
+        );
+        vec![Action::ReleaseFileBlob { id: build.id }]
+    }
+
+    /// The driver packed the selection — or refused it (ADR 0015).
+    ///
+    /// This is where a file item finally becomes an ordinary clipboard
+    /// item: it has a length, a hash and a name, so it goes through the
+    /// same dedup, the same loop guard and the same offered transaction
+    /// every other type does. Everything before this point was about
+    /// producing those three numbers.
+    pub fn on_file_blob_built(
+        &mut self,
+        id: Uuid,
+        outcome: Result<BuiltBlob, FileBlobRefusal>,
+    ) -> Vec<Action> {
+        let Some(build) = self.building.take_if(|build| build.id == id) else {
+            // Superseded, abandoned, or timed out while it was building.
+            // The blob is still handed back — this is the race
+            // `abandon_build` cannot resolve on its own, and the artifact
+            // is this machine's own disk.
+            tracing::debug!(clipboard_id = %id, "blob for no pending selection; releasing it");
+            return vec![Action::ReleaseFileBlob { id }];
+        };
+        let built_ms = elapsed_ms(build.started);
+        let blob = match outcome {
+            Ok(blob) => blob,
+            Err(refusal) => {
+                // The refusal names the fault and never the data
+                // (SECURITY.md invariant 6): no path, no file name, no
+                // contents.
+                self.record(Metrics::record_file_send_refused);
+                tracing::warn!(
+                    clipboard_id = %id,
+                    elapsed_ms = built_ms,
+                    error = %refusal,
+                    "local file selection refused; nothing offered"
+                );
+                return Vec::new();
+            }
+        };
+        // Reject, never repair (ADR 0015): a name the user chose that
+        // cannot conform refuses the item rather than travelling as
+        // something they did not pick. A derived name falls back instead,
+        // which `wire_file_name` decides — one validator for the one
+        // string of a file transfer a shell ever sees.
+        let file_name = match wire_file_name(&blob.proposed_name, blob.naming) {
+            Ok(name) => name,
+            Err(error) => {
+                self.record(Metrics::record_file_send_refused);
+                tracing::warn!(
+                    clipboard_id = %id,
+                    error = %error,
+                    "local file selection has no name that can travel; nothing offered"
+                );
+                return vec![Action::ReleaseFileBlob { id }];
+            }
+        };
+        // Both bounds re-checked here rather than trusted from the
+        // builder: this is the last point before an offer is minted, and
+        // the offer's own encoder would otherwise be the first thing to
+        // notice (NFR-1 — validate before the wire, not at it).
+        let max = ContentType::File.max_content_bytes();
+        if blob.content_length == 0 || blob.content_length > max {
+            self.record(Metrics::record_file_send_refused);
+            tracing::warn!(
+                clipboard_id = %id,
+                byte_count = blob.content_length,
+                max,
+                "packed file selection is empty or over the protocol maximum; not synchronized"
+            );
+            return vec![Action::ReleaseFileBlob { id }];
+        }
+
+        // Loop prevention, layer 3 (ADR 0015): close to inert on Windows,
+        // where a delivered file is never read back as bytes, and kept
+        // because a platform whose fallback delivers real files would put
+        // it straight back in the firing line.
+        if self.applied_hashes.contains(&blob.content_hash) {
+            self.current_local_hash = Some(blob.content_hash);
+            self.record(Metrics::record_clipboard_loop_suppressed);
+            return vec![Action::ReleaseFileBlob { id }];
+        }
+        if self.current_local_hash == Some(blob.content_hash) {
+            tracing::debug!(clipboard_id = %id, "packed selection is unchanged content; not re-sent");
+            return vec![Action::ReleaseFileBlob { id }];
+        }
+        self.current_local_hash = Some(blob.content_hash);
+
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        let meta = ClipboardMeta {
+            id,
+            origin: self.origin,
+            sequence,
+            content_type: ContentType::File,
+            content_length: blob.content_length,
+            content_hash: blob.content_hash,
+        };
+        let descriptor = FileDescriptor {
+            file_name,
+            archived: blob.archived,
+            entry_count: blob.entry_count,
+            original_bytes: blob.original_bytes,
+        };
+        // The name is logged; the contents never are. A file name is user
+        // data and the receiving side already logs the offered one, so the
+        // sent one is no new disclosure (SECURITY.md invariant 6).
+        tracing::info!(
+            clipboard_id = %id,
+            file_name = %descriptor.file_name,
+            byte_count = blob.content_length,
+            entry_count = descriptor.entry_count,
+            archived = descriptor.archived,
+            elapsed_ms = built_ms,
+            "offering a packed file selection"
+        );
+        self.record(|m| m.record_file_sent(blob.content_length));
+        self.start_outbound_body(meta, OutboundBody::Blob, Some(descriptor))
+    }
+
+    /// A chunk of the blob could not be read back (ADR 0015).
+    ///
+    /// The transaction ends here: half an item is never sent as if it
+    /// were the item, and the peer's own deadline closes its side. The
+    /// blob is released, which is also what removes the artifact that
+    /// could not be read.
+    pub fn on_file_read_failed(&mut self, id: Uuid) -> Vec<Action> {
+        let Some(outbound) = self.outbound.take() else {
+            return vec![Action::ReleaseFileBlob { id }];
+        };
+        if outbound.meta().id != id {
+            self.outbound = Some(outbound);
+            return vec![Action::ReleaseFileBlob { id }];
+        }
+        self.record(Metrics::record_file_send_failed);
+        tracing::warn!(
+            clipboard_id = %id,
+            "the packed file selection could not be read back; abandoning the transfer"
+        );
+        outbound.release().into_iter().collect()
     }
 
     /// Verified files resting in the spool, oldest first.
@@ -1347,6 +1878,9 @@ impl ClipboardEngine {
         // longer in flight; it is deleted rather than adopted by the new
         // session (ADR 0015: nothing partially received is registered).
         let mut actions = self.abort_file("session re-established", false);
+        // A selection being packed for the session that just ended has
+        // nobody to be offered to; the artifact goes with it.
+        actions.extend(self.abandon_build("session re-established"));
         self.recent_transfers.clear();
         // A fresh session gets a fresh violation budget: the counter
         // bounds one peer's misbehaviour on one connection, not a
@@ -1369,11 +1903,13 @@ impl ClipboardEngine {
     /// sent: the peer is gone, and the deadline that would have answered
     /// it becomes moot with the session.
     pub fn on_session_lost(&mut self) -> Vec<Action> {
+        let mut released_outbound = None;
         if let Some(outbound) = self.outbound.take() {
             tracing::debug!(
                 clipboard_id = %outbound.meta().id,
                 "outbound clipboard transaction abandoned: session lost"
             );
+            released_outbound = outbound.release();
         }
         if let Some(meta) = self.expecting_data.take() {
             tracing::debug!(
@@ -1390,8 +1926,17 @@ impl ClipboardEngine {
         }
         // Not nothing, for a file: the partial is on disk, and the peer
         // being gone is exactly why it must not be left there. No verdict
-        // travels — there is nobody to tell.
-        self.abort_file("session lost", false)
+        // travels — there is nobody to tell. The *sending* side has a
+        // temporary artifact of its own, and the same argument applies to
+        // it: released here, and released again by the outbound state
+        // above if the transaction had got past the build.
+        let mut actions = self.abandon_build("session lost");
+        if let Some(release) = released_outbound {
+            self.record(Metrics::record_file_send_failed);
+            actions.push(release);
+        }
+        actions.extend(self.abort_file("session lost", false));
+        actions
     }
 
     /// A transfer deadline came due (ADR 0014).
@@ -1424,6 +1969,14 @@ impl ClipboardEngine {
                     result = "abandoned",
                     "outbound clipboard transaction abandoned: no answer within the deadline"
                 );
+                // A file's bytes are not in this process, so the deadline
+                // is not protecting memory here — it is protecting the
+                // sender's own disk, which a stalled transaction would pin
+                // for as long as the session lived (ADR 0015).
+                if let Some(release) = outbound.release() {
+                    self.record(Metrics::record_file_send_failed);
+                    return vec![release];
+                }
                 Vec::new()
             }
             TransferScope::Inbound => {
@@ -1461,6 +2014,24 @@ impl ClipboardEngine {
                 }
                 actions
             }
+            TransferScope::Build => {
+                if generation != self.build_generation {
+                    return Vec::new(); // a newer selection restarted the clock
+                }
+                if self.building.is_none() {
+                    return Vec::new();
+                }
+                // A build that has not answered inside the deadline is
+                // either wedged or working on something absurd; either way
+                // the answer, if it ever comes, is released rather than
+                // offered (`on_file_blob_built` sees no pending build).
+                self.record(Metrics::record_clipboard_abandoned);
+                tracing::warn!(
+                    result = "abandoned",
+                    "packing a local file selection did not finish within the deadline"
+                );
+                self.abandon_build("deadline")
+            }
         }
     }
 
@@ -1473,7 +2044,7 @@ impl ClipboardEngine {
     pub fn on_chunk_sent(&mut self, id: Uuid) -> Vec<Action> {
         let Some(Outbound::Streaming {
             meta,
-            content,
+            body,
             plan,
             next_index,
             started,
@@ -1485,7 +2056,7 @@ impl ClipboardEngine {
             // A late confirmation for a transfer that has been replaced.
             self.outbound = Some(Outbound::Streaming {
                 meta,
-                content,
+                body,
                 plan,
                 next_index,
                 started,
@@ -1493,38 +2064,71 @@ impl ClipboardEngine {
             return Vec::new();
         }
         if next_index >= plan.chunk_count() {
-            // Every chunk is out; the content buffer is released here and
-            // only the verdict remains outstanding.
+            // Every chunk is out; the body is released here — the buffer
+            // freed, or the driver's blob handed back so the sender's
+            // temporary artifact is deleted — and only the verdict remains
+            // outstanding.
+            let released = Outbound::Streaming {
+                meta,
+                body,
+                plan,
+                next_index,
+                started,
+            }
+            .release();
             self.outbound = Some(Outbound::AwaitingApplied { meta, started });
-            return Vec::new();
+            return released.into_iter().collect();
         }
-        let Some(chunk) = chunk_at(meta.id, &content, plan, next_index) else {
-            // Unreachable: the plan was derived from this buffer's length.
+        let Some(action) = chunk_action(meta.id, &body, plan, next_index) else {
+            // Unreachable: the plan was derived from this item's declared
+            // length. Released rather than merely dropped, so an
+            // impossible arithmetic fault still cannot pin a blob.
             tracing::error!(
                 clipboard_id = %meta.id,
                 chunk_index = next_index,
                 "clipboard chunk slice out of range; abandoning the transfer"
             );
-            return Vec::new();
+            self.record(Metrics::record_clipboard_abandoned);
+            return release_of(&body, meta.id);
         };
         self.outbound = Some(Outbound::Streaming {
             meta,
-            content,
+            body,
             plan,
             next_index: next_index.saturating_add(1),
             started,
         });
-        vec![Action::Send(OutboundMessage::Chunk(chunk))]
+        vec![action]
     }
 
     // --- internals ---
 
     fn start_outbound(&mut self, meta: ClipboardMeta, content: Vec<u8>) -> Vec<Action> {
+        self.start_outbound_body(meta, OutboundBody::Bytes(content), None)
+    }
+
+    /// Start an outbound transaction whose bytes may live here or in the
+    /// driver's blob.
+    ///
+    /// `descriptor` is the file half of the offer (ADR 0015) and is
+    /// `Some` exactly when `body` is a blob — the protocol enforces the
+    /// same rule in both directions, so a mismatch would not encode.
+    fn start_outbound_body(
+        &mut self,
+        meta: ClipboardMeta,
+        body: OutboundBody,
+        descriptor: Option<FileDescriptor>,
+    ) -> Vec<Action> {
+        let mut superseded = Vec::new();
         if let Some(previous) = self.outbound.take() {
             tracing::debug!(
                 clipboard_id = %previous.meta().id,
                 "outbound clipboard transaction superseded by newer local copy"
             );
+            if let Some(release) = previous.release() {
+                self.record(Metrics::record_file_send_failed);
+                superseded.push(release);
+            }
         }
         self.record(Metrics::record_clipboard_sent);
         let started = Instant::now();
@@ -1543,26 +2147,34 @@ impl ClipboardEngine {
         // restart the clock.
         let deadline = self.arm_timeout(TransferScope::Outbound);
         if !offered {
+            let OutboundBody::Bytes(content) = body else {
+                // Unreachable: a blob is a file, and a file is chunked.
+                tracing::error!(clipboard_id = %meta.id, "inline flow for a blob item; abandoning");
+                superseded.push(Action::ReleaseFileBlob { id: meta.id });
+                return superseded;
+            };
             self.outbound = Some(Outbound::AwaitingApplied { meta, started });
-            return vec![
-                Action::Send(OutboundMessage::Data(ClipboardData { meta, content })),
-                deadline,
-            ];
+            superseded.push(Action::Send(OutboundMessage::Data(ClipboardData {
+                meta,
+                content,
+            })));
+            superseded.push(deadline);
+            return superseded;
         }
         self.outbound = Some(Outbound::AwaitingAccept {
             meta,
-            content,
+            body,
             started,
         });
-        vec![
-            Action::Send(OutboundMessage::Offer(ClipboardOffer {
-                meta,
-                // No descriptor: this engine stages text and images, and
-                // only a file offer carries one (ADR 0015).
-                descriptor: None,
-            })),
-            deadline,
-        ]
+        superseded.push(Action::Send(OutboundMessage::Offer(ClipboardOffer {
+            meta,
+            // `Some` for a file and nothing else: the protocol rejects a
+            // descriptor on any other type, and a file offer without one
+            // (ADR 0015).
+            descriptor,
+        })));
+        superseded.push(deadline);
+        superseded
     }
 
     /// Start (or restart) a scope's deadline, returning the action that
@@ -1576,6 +2188,10 @@ impl ClipboardEngine {
             TransferScope::Inbound => {
                 self.inbound_generation = self.inbound_generation.wrapping_add(1);
                 self.inbound_generation
+            }
+            TransferScope::Build => {
+                self.build_generation = self.build_generation.wrapping_add(1);
+                self.build_generation
             }
         };
         Action::ScheduleTransferTimeout {
@@ -1622,11 +2238,13 @@ impl ClipboardEngine {
     }
 
     fn on_peer_offer(&mut self, offer: &ClipboardOffer) -> Vec<Action> {
-        if let Some(reason) = self.conflict_verdict(offer.meta) {
-            return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
+        let mut actions = Vec::new();
+        if let Some(reason) = self.conflict_verdict(offer.meta, &mut actions) {
+            actions.push(Action::Send(OutboundMessage::Decline(ClipboardDecline {
                 id: offer.meta.id,
                 reason,
-            }))];
+            })));
+            return actions;
         }
         // No `AlreadyHave` for files (docs/PROTOCOL.md §5). The hash this
         // would compare against describes what is on the *clipboard*, and
@@ -1640,10 +2258,11 @@ impl ClipboardEngine {
             // payload bytes moved (ADR 0005) — and for a chunked item that
             // is the whole point of offering it, since a re-pasted snip
             // then costs one offer and one decline instead of megabytes.
-            return vec![Action::Send(OutboundMessage::Decline(ClipboardDecline {
+            actions.push(Action::Send(OutboundMessage::Decline(ClipboardDecline {
                 id: offer.meta.id,
                 reason: DeclineReason::AlreadyHave,
-            }))];
+            })));
+            return actions;
         }
 
         // Accepting supersedes whatever inbound transfer was in flight:
@@ -1657,11 +2276,11 @@ impl ClipboardEngine {
             );
         }
         self.abandon_reassembly("superseded by a newer offer");
-        let mut superseded = self.abort_file("superseded by a newer offer", false);
+        actions.extend(self.abort_file("superseded by a newer offer", false));
 
         if offer.meta.content_type.needs_file_descriptor() {
-            superseded.extend(self.on_file_offer(offer));
-            return superseded;
+            actions.extend(self.on_file_offer(offer));
+            return actions;
         }
 
         if offer.meta.content_type.is_chunked() {
@@ -1672,11 +2291,11 @@ impl ClipboardEngine {
             match ChunkReassembly::begin(offer.meta) {
                 Ok(reassembly) => {
                     self.reassembly = Some(reassembly);
-                    superseded.push(Action::Send(OutboundMessage::Accept(ClipboardAccept {
+                    actions.push(Action::Send(OutboundMessage::Accept(ClipboardAccept {
                         id: offer.meta.id,
                     })));
-                    superseded.push(self.arm_timeout(TransferScope::Inbound));
-                    return superseded;
+                    actions.push(self.arm_timeout(TransferScope::Inbound));
+                    return actions;
                 }
                 Err(error) => {
                     // Declined, not dropped: a typed answer closes the
@@ -1689,18 +2308,18 @@ impl ClipboardEngine {
                         error = %error,
                         "declining a chunked offer this side cannot buffer"
                     );
-                    superseded.extend(decline(offer.meta.id, DeclineReason::NotReady));
-                    return superseded;
+                    actions.extend(decline(offer.meta.id, DeclineReason::NotReady));
+                    return actions;
                 }
             }
         }
 
         self.expecting_data = Some(offer.meta);
-        superseded.push(Action::Send(OutboundMessage::Accept(ClipboardAccept {
+        actions.push(Action::Send(OutboundMessage::Accept(ClipboardAccept {
             id: offer.meta.id,
         })));
-        superseded.push(self.arm_timeout(TransferScope::Inbound));
-        superseded
+        actions.push(self.arm_timeout(TransferScope::Inbound));
+        actions
     }
 
     /// A file offer (ADR 0015): permission, then room, then a partial to
@@ -1932,10 +2551,14 @@ impl ClipboardEngine {
         match self.outbound.take() {
             Some(Outbound::AwaitingAccept {
                 meta,
-                content,
+                body,
                 started,
             }) if meta.id == id => {
                 if !meta.content_type.is_chunked() {
+                    let OutboundBody::Bytes(content) = body else {
+                        tracing::error!(clipboard_id = %meta.id, "inline accept for a blob item; abandoning");
+                        return vec![Action::ReleaseFileBlob { id: meta.id }];
+                    };
                     self.outbound = Some(Outbound::AwaitingApplied { meta, started });
                     return vec![Action::Send(OutboundMessage::Data(ClipboardData {
                         meta,
@@ -1944,18 +2567,19 @@ impl ClipboardEngine {
                 }
                 // The split is the same arithmetic the receiver derives
                 // from the offered length and chunk 0 — one implementation,
-                // both sides (ADR 0014).
+                // both sides (ADR 0014), and one for both bodies: a blob
+                // is chunked by the same plan, only read from elsewhere.
                 let Ok(plan) = ChunkPlan::for_length(meta.content_length) else {
                     tracing::error!(
                         clipboard_id = %meta.id,
                         byte_count = meta.content_length,
                         "clipboard item cannot be split into chunks; abandoning"
                     );
-                    return Vec::new();
+                    return release_of(&body, meta.id);
                 };
-                let Some(first) = chunk_at(meta.id, &content, plan, 0) else {
+                let Some(first) = chunk_action(meta.id, &body, plan, 0) else {
                     tracing::error!(clipboard_id = %meta.id, "empty clipboard chunk plan; abandoning");
-                    return Vec::new();
+                    return release_of(&body, meta.id);
                 };
                 tracing::debug!(
                     clipboard_id = %meta.id,
@@ -1965,12 +2589,12 @@ impl ClipboardEngine {
                 );
                 self.outbound = Some(Outbound::Streaming {
                     meta,
-                    content,
+                    body,
                     plan,
                     next_index: 1,
                     started,
                 });
-                vec![Action::Send(OutboundMessage::Chunk(first))]
+                vec![first]
             }
             other => {
                 self.outbound = other; // restore whatever it was
@@ -2003,7 +2627,11 @@ impl ClipboardEngine {
     /// spending the wire on nobody.
     fn on_peer_decline(&mut self, decline: &ClipboardDecline) -> Vec<Action> {
         match self.outbound.take() {
-            Some(Outbound::AwaitingAccept { meta, started, .. }) if meta.id == decline.id => {
+            Some(Outbound::AwaitingAccept {
+                meta,
+                body,
+                started,
+            }) if meta.id == decline.id => {
                 let latency_ms = elapsed_ms(started);
                 self.record(|m| m.record_clipboard_latency(clamp_ms(latency_ms)));
                 let outcome = match decline.reason {
@@ -2024,7 +2652,17 @@ impl ClipboardEngine {
                     latency_ms,
                     "clipboard offer resolved"
                 );
-                Vec::new()
+                // A declined file moves **zero payload bytes**: the blob
+                // is handed back here, before a chunk is ever read, which
+                // is the whole reason files use the offered flow at any
+                // size (ADR 0005, ADR 0015). `AlreadyHave` is the
+                // success-shaped case of that — our receiver never sends
+                // it for a file, but a peer's may, and dedup is a
+                // delivery, not a failure.
+                if matches!(body, OutboundBody::Blob) && outcome == "declined" {
+                    self.record(Metrics::record_file_send_failed);
+                }
+                release_of(&body, decline.id)
             }
             other => {
                 self.outbound = other;
@@ -2159,29 +2797,33 @@ impl ClipboardEngine {
     /// (FR-3.2 — `Applied` is sent only by [`Self::on_write_result`],
     /// after the destination clipboard actually took the content).
     fn install_inbound(&mut self, meta: ClipboardMeta, bytes: Vec<u8>) -> Vec<Action> {
-        if let Some(reason) = self.conflict_verdict(meta) {
+        let mut actions = Vec::new();
+        if let Some(reason) = self.conflict_verdict(meta, &mut actions) {
             debug_assert_eq!(reason, DeclineReason::Superseded);
             self.record(Metrics::record_clipboard_superseded);
-            return vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
+            actions.push(Action::Send(OutboundMessage::Applied(ClipboardApplied {
                 id: meta.id,
                 result: ApplyResult::Superseded,
-            }))];
+            })));
+            return actions;
         }
 
         // Loop/echo guard: identical content is a success without a write.
         if self.current_local_hash == Some(meta.content_hash) {
-            return vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
+            actions.push(Action::Send(OutboundMessage::Applied(ClipboardApplied {
                 id: meta.id,
                 result: ApplyResult::Applied,
-            }))];
+            })));
+            return actions;
         }
 
         // Wire validation guarantees UTF-8 for Utf8Text; defensive here.
         let Some(content) = from_wire(meta.content_type, bytes) else {
-            return vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
+            actions.push(Action::Send(OutboundMessage::Applied(ClipboardApplied {
                 id: meta.id,
                 result: ApplyResult::ContentRejected,
-            }))];
+            })));
+            return actions;
         };
 
         if let Some(superseded) = self.pending_write.take() {
@@ -2196,10 +2838,11 @@ impl ClipboardEngine {
             content: Arc::clone(&content),
             attempts_made: 1,
         });
-        vec![Action::WriteClipboard {
+        actions.push(Action::WriteClipboard {
             id: meta.id,
             content,
-        }]
+        });
+        actions
     }
 
     /// Count one clipboard protocol violation, terminating the session
@@ -2231,10 +2874,13 @@ impl ClipboardEngine {
     /// wire on an item nobody is assembling any more.
     fn on_peer_applied(&mut self, applied: &ClipboardApplied) -> Vec<Action> {
         match self.outbound.take() {
-            Some(
-                Outbound::AwaitingApplied { meta, started }
-                | Outbound::Streaming { meta, started, .. },
-            ) if meta.id == applied.id => {
+            Some(closing @ (Outbound::AwaitingApplied { .. } | Outbound::Streaming { .. }))
+                if closing.meta().id == applied.id =>
+            {
+                let (meta, started) = (closing.meta(), closing.started());
+                // A verdict ends the transaction, so a stream it cuts
+                // short is also the last chance to hand a blob back.
+                let released: Vec<Action> = closing.release().into_iter().collect();
                 let outcome = match applied.result {
                     ApplyResult::Applied => "applied",
                     ApplyResult::Superseded => "superseded",
@@ -2258,7 +2904,13 @@ impl ClipboardEngine {
                     latency_ms,
                     "clipboard transaction closed"
                 );
-                Vec::new()
+                if !released.is_empty() && !matches!(applied.result, ApplyResult::Stored) {
+                    // Every file verdict but `Stored` is a delivery that
+                    // did not happen, and FR-3.6 wants that counted rather
+                    // than merely logged.
+                    self.record(Metrics::record_file_send_failed);
+                }
+                released
             }
             other => {
                 self.outbound = other;
@@ -2273,7 +2925,15 @@ impl ClipboardEngine {
     /// identically on both machines. `Some(Superseded)` means the inbound
     /// item lost and must be refused; `None` means it wins (our outbound
     /// closes locally as superseded).
-    fn conflict_verdict(&mut self, inbound: ClipboardMeta) -> Option<DeclineReason> {
+    /// `released` collects the action that hands back a driver-held blob
+    /// when the loser of the race is *ours* — the one exit path from an
+    /// outbound transaction that is not reached by taking `outbound`
+    /// somewhere the release is already written.
+    fn conflict_verdict(
+        &mut self,
+        inbound: ClipboardMeta,
+        released: &mut Vec<Action>,
+    ) -> Option<DeclineReason> {
         let ours = self.outbound.as_ref()?.meta();
         // Reaching here means an inbound item arrived while our own was in
         // flight: a genuine near-simultaneous race (FR-3.5).
@@ -2291,6 +2951,10 @@ impl ClipboardEngine {
                 latency_ms,
                 "outbound item lost the conflict race; converging on the peer's item"
             );
+            if let Some(release) = self.outbound.take().and_then(|ours| ours.release()) {
+                self.record(Metrics::record_file_send_failed);
+                released.push(release);
+            }
             self.outbound = None;
             None
         } else {
@@ -2330,6 +2994,92 @@ fn chunk_at(id: Uuid, content: &[u8], plan: ChunkPlan, index: u32) -> Option<Cli
     let end = start.checked_add(len)?;
     let payload = content.get(start..end)?.to_vec();
     Some(ClipboardChunk { id, index, payload })
+}
+
+/// The action that puts chunk `index` of an outbound item on the wire.
+///
+/// One function for both bodies, because the *decision* is identical and
+/// only the source of the bytes differs: bytes the engine retains are
+/// sliced here and travel as a ready [`ClipboardChunk`]; a blob's are
+/// named by offset and length so the driver reads exactly that chunk out
+/// of the open file when it sends it. The second form is what keeps the
+/// sender O(chunk) rather than O(file) (ADR 0015), and it is the mirror
+/// of the receiver's write-through.
+///
+/// `None` when the index is past the transfer or the buffer does not
+/// reach — unreachable for a plan derived from the item's own declared
+/// length, and a returned value rather than a panic (NFR-1).
+fn chunk_action(id: Uuid, body: &OutboundBody, plan: ChunkPlan, index: u32) -> Option<Action> {
+    match body {
+        OutboundBody::Bytes(content) => Some(Action::Send(OutboundMessage::Chunk(chunk_at(
+            id, content, plan, index,
+        )?))),
+        OutboundBody::Blob => {
+            let len = plan.chunk_len(index)?;
+            let offset = u64::from(index).checked_mul(u64::from(plan.chunk_bytes()))?;
+            // The last byte must be inside the blob the offer declared.
+            let end = offset.checked_add(u64::from(len))?;
+            if end > plan.total_bytes() {
+                return None;
+            }
+            Some(Action::SendFileChunk {
+                id,
+                index,
+                offset,
+                len,
+            })
+        }
+    }
+}
+
+/// Whether `path` names something inside `root` — the sender-side half of
+/// ADR 0015's loop prevention (SECURITY.md F13).
+///
+/// A pure comparison over path components: nothing is opened, nothing is
+/// resolved, and the spool's handle-only boundary (F15) is untouched.
+/// Components are matched case-insensitively, because that is what the
+/// only filesystem this rule currently guards does, and matching
+/// case-sensitively there would be a check that misses `C:\...\SPOOL`.
+///
+/// `true` — do not stage — is also the answer for anything that cannot be
+/// judged without resolving it: a relative path, or one carrying a `..`
+/// component. A shell `CF_HDROP` never produces either, so the concession
+/// costs nothing real and the direction is the safe one.
+fn inside_spool(root: &Path, path: &Path) -> bool {
+    fn judgeable(path: &Path) -> Option<Vec<String>> {
+        let mut parts = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::ParentDir => return None,
+                Component::CurDir => {}
+                Component::Prefix(prefix) => {
+                    parts.push(prefix.as_os_str().to_string_lossy().to_lowercase());
+                }
+                // A separator on Windows and illegal in a name on Unix,
+                // so the root marker cannot collide with a real component.
+                Component::RootDir => parts.push("/".to_owned()),
+                Component::Normal(part) => parts.push(part.to_string_lossy().to_lowercase()),
+            }
+        }
+        Some(parts)
+    }
+
+    let (Some(root), Some(candidate)) = (judgeable(root), judgeable(path)) else {
+        return true; // unjudgeable without resolving it: treat as ours
+    };
+    if !path.is_absolute() || root.is_empty() {
+        return true;
+    }
+    candidate.len() >= root.len() && candidate[..root.len()] == root[..]
+}
+
+/// The release action for a body being dropped outside an [`Outbound`]
+/// state, as a list so a caller can return it directly.
+fn release_of(body: &OutboundBody, id: Uuid) -> Vec<Action> {
+    match body {
+        OutboundBody::Blob => vec![Action::ReleaseFileBlob { id }],
+        OutboundBody::Bytes(_) => Vec::new(),
+    }
 }
 
 /// Platform image tag → protocol image tag.
@@ -2418,22 +3168,40 @@ fn clamp_ms(ms: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
     use uuid::Uuid;
 
-    use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+    use crossover_platform::{BlobNaming, ClipboardContent, ClipboardImageFormat, FileBlobRefusal};
     use crossover_protocol::clipboard::{
         ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardAccept, ClipboardApplied, ClipboardChunk,
-        ClipboardData, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, FileDescriptor,
-        ImageFormat, MAX_CHUNK_BYTES, chunk_content, content_hash,
+        ClipboardData, ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
+        FileDescriptor, ImageFormat, MAX_CHUNK_BYTES, chunk_content, content_hash,
     };
 
     use std::time::Duration;
 
     use super::{
-        Action, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, InboundMessage,
-        MAX_CONCURRENT_FILE_TRANSFERS, MAX_SPOOL_BYTES, MAX_SPOOL_ENTRIES, OutboundMessage,
-        RetryPolicy, SpooledFile, TransferScope, WriteFailure,
+        Action, BuiltBlob, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, FileSend,
+        InboundMessage, MAX_CONCURRENT_FILE_TRANSFERS, MAX_SPOOL_BYTES, MAX_SPOOL_ENTRIES,
+        OutboundMessage, RetryPolicy, SpooledFile, TransferScope, WriteFailure,
     };
+    use crate::metrics::Metrics;
+    use crossover_protocol::clipboard::MAX_CLIPBOARD_FILE_ENTRIES;
+
+    /// The one deadline the actions asked for, as `(scope, generation)`.
+    fn timeout_of(actions: &[Action]) -> (TransferScope, u64) {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                Action::ScheduleTransferTimeout {
+                    scope, generation, ..
+                } => Some((*scope, *generation)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a transfer deadline, got {actions:?}"))
+    }
 
     fn engine(origin_fill: u8) -> ClipboardEngine {
         ClipboardEngine::new(Uuid::from_bytes([origin_fill; 16]), ClipboardConfig::new())
@@ -2639,7 +3407,10 @@ mod tests {
     /// normally, so the no-op is not accidentally wedging outbound state
     /// (`current_local_hash`, `applied_hashes`, or the sequence counter).
     #[test]
-    fn a_local_file_selection_is_observed_but_not_yet_staged() {
+    fn a_local_file_selection_is_not_staged_by_a_build_without_a_sender() {
+        // The default policy is the closed one, so a build that never
+        // wires a sending half refuses by construction rather than by
+        // remembering to (ADR 0015).
         let mut e = engine(0xAA);
         let paths = vec![
             std::path::PathBuf::from(r"C:\Users\test\report.pdf"),
@@ -2648,9 +3419,9 @@ mod tests {
         assert!(
             e.on_local_read(Some(ClipboardContent::FileList(paths)))
                 .is_empty(),
-            "a file-list observation must not mint an offer yet"
+            "a file selection must not be walked with no sender to walk it"
         );
-        // Nothing about the no-op should prevent an ordinary text copy
+        // Nothing about the refusal should prevent an ordinary text copy
         // from travelling right afterwards.
         assert_eq!(sent(&copy(&mut e, "still works")).len(), 1);
     }
@@ -4586,5 +5357,618 @@ mod tests {
             sent(&echoed).is_empty(),
             "delivered content was offered back to its origin: {echoed:?}"
         );
+    }
+
+    // ---- the sending half of files (ADR 0015, "Sender side") ----
+
+    /// An engine configured the way the application configures one when
+    /// the peer advertised `FILE_CLIPBOARD` and holds `clipboard_send`.
+    fn sender(origin_fill: u8) -> ClipboardEngine {
+        let mut engine = engine(origin_fill);
+        engine.set_file_send(FileSend::Allowed);
+        engine
+    }
+
+    fn selection(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    /// An absolute spool root for *this* platform.
+    ///
+    /// The guard turns on `Path::is_absolute`, which is a per-platform
+    /// question: a Windows path is one undivided component on Unix and
+    /// not absolute there, so a test written in one dialect would assert
+    /// the fallback rather than the rule on the other two OSes the CI
+    /// gate runs.
+    fn spool_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Users\test\AppData\Local\Crossover\spool")
+        } else {
+            PathBuf::from("/home/test/.local/share/crossover/spool")
+        }
+    }
+
+    /// A path somewhere else entirely, absolute on this platform.
+    fn elsewhere(name: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\work").join(name)
+        } else {
+            PathBuf::from("/home/test/work").join(name)
+        }
+    }
+
+    /// The same path, shouted: the comparison must not turn on case.
+    fn shout(path: &Path) -> PathBuf {
+        PathBuf::from(path.to_string_lossy().to_uppercase())
+    }
+
+    /// Copy a file selection locally, through the same trigger every
+    /// other observation goes through.
+    fn copy_files(engine: &mut ClipboardEngine, paths: &[&str]) -> Vec<Action> {
+        engine.on_local_change();
+        engine.on_settle_due();
+        engine.on_local_read(Some(ClipboardContent::FileList(selection(paths))))
+    }
+
+    /// The one build the actions asked for.
+    fn build_of(actions: &[Action]) -> (Uuid, Vec<PathBuf>) {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                Action::BuildFileBlob { id, selection } => Some((*id, selection.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a build action, got {actions:?}"))
+    }
+
+    fn releases(actions: &[Action]) -> Vec<Uuid> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::ReleaseFileBlob { id } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn file_chunks(actions: &[Action]) -> Vec<(u32, u64, u32)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::SendFileChunk {
+                    index, offset, len, ..
+                } => Some((*index, *offset, *len)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// [`MAX_CHUNK_BYTES`] as the `u32` the plan and the offsets use.
+    fn chunk_bytes() -> u32 {
+        u32::try_from(MAX_CHUNK_BYTES).expect("the chunk size fits a u32")
+    }
+
+    fn blob(name: &str, len: u64) -> BuiltBlob {
+        BuiltBlob {
+            proposed_name: name.to_owned(),
+            naming: BlobNaming::Own,
+            archived: false,
+            entry_count: 1,
+            original_bytes: len,
+            content_length: len,
+            content_hash: content_hash(&image_bytes(usize::try_from(len).unwrap_or(0))),
+        }
+    }
+
+    /// Copy a selection and answer its build, returning `(id, actions)`.
+    fn pack(engine: &mut ClipboardEngine, name: &str, len: u64) -> (Uuid, Vec<Action>) {
+        let staged = copy_files(engine, &[r"C:\work\report.pdf"]);
+        let (id, _) = build_of(&staged);
+        let offered = engine.on_file_blob_built(id, Ok(blob(name, len)));
+        (id, offered)
+    }
+
+    /// Drive an accepted file transfer to its last chunk, the way the
+    /// driver does: one chunk, then ask for the next.
+    fn drain_file_chunks(
+        engine: &mut ClipboardEngine,
+        id: Uuid,
+    ) -> (Vec<(u32, u64, u32)>, Vec<Action>) {
+        let mut chunks = Vec::new();
+        let mut actions = engine.on_peer_message(InboundMessage::Accept(ClipboardAccept { id }));
+        loop {
+            let emitted = file_chunks(&actions);
+            if emitted.is_empty() {
+                return (chunks, actions);
+            }
+            chunks.extend(emitted);
+            assert!(chunks.len() <= 8192, "the chunk stream never terminated");
+            actions = engine.on_chunk_sent(id);
+        }
+    }
+
+    /// The gate order the ADR requires: nothing is walked, packed or
+    /// written for a peer that could not take the result anyway. Each
+    /// closed gate is a *refusal*, observable rather than silent (FR-3.6).
+    #[test]
+    fn a_selection_is_never_walked_for_a_peer_that_cannot_take_it() {
+        for policy in [
+            FileSend::Unsupported,
+            FileSend::NotNegotiated,
+            FileSend::Denied,
+        ] {
+            let mut engine = engine(0xAA);
+            engine.set_file_send(policy);
+            let actions = copy_files(&mut engine, &[r"C:\work\report.pdf"]);
+            assert!(
+                actions.is_empty(),
+                "{policy:?} produced work before the gate: {actions:?}"
+            );
+        }
+    }
+
+    /// The one bound judgeable without touching a disk bites before the
+    /// walk; the rest are the builder's, during it.
+    #[test]
+    fn a_selection_past_the_entry_cap_is_refused_before_the_walk() {
+        let mut engine = sender(0xAA);
+        let paths: Vec<String> = (0..=MAX_CLIPBOARD_FILE_ENTRIES)
+            .map(|i| format!(r"C:\work\{i}.bin"))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        assert!(copy_files(&mut engine, &refs).is_empty());
+
+        // One fewer is inside the cap and does start a build.
+        let mut engine = sender(0xAA);
+        let refs: Vec<&str> = refs[1..].to_vec();
+        build_of(&copy_files(&mut engine, &refs));
+    }
+
+    /// A refused build is reported and leaves nothing behind: no offer,
+    /// no retained state, and the next selection works normally.
+    #[test]
+    fn a_refused_build_surfaces_and_leaves_nothing_staged() {
+        let mut engine = sender(0xAA);
+        let staged = copy_files(&mut engine, &[r"C:\work\photos"]);
+        let (id, paths) = build_of(&staged);
+        assert_eq!(paths, selection(&[r"C:\work\photos"]));
+
+        let refused = engine.on_file_blob_built(id, Err(FileBlobRefusal::ReparsePoint));
+        assert!(
+            sent(&refused).is_empty() && releases(&refused).is_empty(),
+            "a refused build must not offer anything or pin a blob: {refused:?}"
+        );
+        // And the machine is clean: an ordinary text copy still travels.
+        assert_eq!(sent(&copy(&mut engine, "unaffected")).len(), 1);
+    }
+
+    /// The happy path, end to end: offer, accept, chunks named by offset
+    /// and length, then the blob handed back the moment the last one is
+    /// out — before the verdict, because the bytes are no longer needed.
+    #[test]
+    fn a_packed_selection_is_offered_then_streamed_a_chunk_at_a_time() {
+        let mut engine = sender(0xAA);
+        let bytes = u64::from(chunk_bytes()) * 2 + 17;
+        let (id, offered) = pack(&mut engine, "report.pdf", bytes);
+
+        let offer = offer_of(&offered);
+        assert_eq!(offer.meta.id, id);
+        assert_eq!(offer.meta.content_type, ContentType::File);
+        assert_eq!(offer.meta.content_length, bytes);
+        let descriptor = offer.descriptor.clone().expect("a file offer carries one");
+        assert_eq!(descriptor.file_name, "report.pdf");
+        assert_eq!(descriptor.entry_count, 1);
+        assert!(!descriptor.archived);
+        offer.validate().expect("the offer must be conforming");
+        assert!(
+            releases(&offered).is_empty(),
+            "the blob is needed until the last chunk is out"
+        );
+
+        let (chunks, closing) = drain_file_chunks(&mut engine, id);
+        assert_eq!(
+            chunks,
+            vec![
+                (0, 0, chunk_bytes()),
+                (1, u64::from(chunk_bytes()), chunk_bytes()),
+                (2, u64::from(chunk_bytes()) * 2, 17),
+            ],
+            "every chunk must name exactly its own slice, and nothing more"
+        );
+
+        // The confirmation of the last chunk releases the blob and leaves
+        // only the verdict outstanding.
+        assert_eq!(releases(&closing), vec![id]);
+        assert!(engine.on_chunk_sent(id).is_empty());
+
+        let closed = engine.on_peer_message(InboundMessage::Applied(ClipboardApplied {
+            id,
+            result: ApplyResult::Stored,
+        }));
+        assert!(
+            closed.is_empty(),
+            "a stored file needs nothing more: {closed:?}"
+        );
+    }
+
+    /// The engine never holds the item: what it emits per chunk is a
+    /// slice *description*, so a 256 MiB selection costs it nothing
+    /// beyond the plan (ADR 0015's O(chunk) rule, sending side).
+    #[test]
+    fn the_engine_never_carries_a_byte_of_the_item() {
+        let mut engine = sender(0xAA);
+        let bytes = crossover_protocol::clipboard::MAX_CLIPBOARD_FILE_BYTES as u64;
+        let (id, offered) = pack(&mut engine, "big.zip", bytes);
+        assert_eq!(sent(&offered).len(), 1);
+
+        let (chunks, closing) = drain_file_chunks(&mut engine, id);
+        assert_eq!(releases(&closing), vec![id]);
+        assert_eq!(
+            chunks.len(),
+            usize::try_from(bytes.div_ceil(u64::from(chunk_bytes()))).unwrap()
+        );
+        // Contiguous, non-overlapping, and exactly covering the item.
+        let mut expected_offset = 0u64;
+        for (index, offset, len) in &chunks {
+            assert_eq!(
+                *offset, expected_offset,
+                "chunk {index} starts in the wrong place"
+            );
+            expected_offset += u64::from(*len);
+        }
+        assert_eq!(expected_offset, bytes);
+    }
+
+    /// Hash dedup is the peer's to claim, and when it does the transfer
+    /// costs zero payload bytes — the same success-shaped decline an
+    /// image gets. Our own receiver never sends it for a file (ADR 0015),
+    /// but a peer's may, and dedup is a delivery rather than a failure.
+    #[test]
+    fn a_peer_that_already_holds_the_file_costs_zero_chunks() {
+        let mut engine = sender(0xAA);
+        let (id, offered) = pack(&mut engine, "report.pdf", 4096);
+        assert_eq!(sent(&offered).len(), 1);
+
+        let closed = engine.on_peer_message(InboundMessage::Decline(ClipboardDecline {
+            id,
+            reason: DeclineReason::AlreadyHave,
+        }));
+        assert!(
+            file_chunks(&closed).is_empty(),
+            "a dedup decline must move no payload bytes: {closed:?}"
+        );
+        assert_eq!(
+            releases(&closed),
+            vec![id],
+            "the blob must be handed back on a decline"
+        );
+        assert!(engine.on_chunk_sent(id).is_empty());
+    }
+
+    /// Every typed decline ends the transaction and drops the blob,
+    /// whatever the reason was.
+    #[test]
+    fn a_declined_file_releases_its_blob_before_a_chunk_is_read() {
+        for reason in [
+            DeclineReason::NotPermitted,
+            DeclineReason::InsufficientSpace,
+            DeclineReason::TooLarge,
+            DeclineReason::NotReady,
+            DeclineReason::UnsupportedType,
+            DeclineReason::InvalidName,
+            DeclineReason::Superseded,
+        ] {
+            let mut engine = sender(0xAA);
+            let (id, _) = pack(&mut engine, "report.pdf", 4096);
+            let closed =
+                engine.on_peer_message(InboundMessage::Decline(ClipboardDecline { id, reason }));
+            assert_eq!(releases(&closed), vec![id], "{reason:?} pinned the blob");
+            assert!(file_chunks(&closed).is_empty(), "{reason:?} moved bytes");
+        }
+    }
+
+    /// Reject, never repair: a name the *selection* gave itself and that
+    /// cannot travel refuses the item rather than arriving under a name
+    /// nobody picked. A derived name falls back instead.
+    #[test]
+    fn a_name_the_user_chose_that_cannot_travel_refuses_the_item() {
+        let mut engine = sender(0xAA);
+        let staged = copy_files(&mut engine, &[r"C:\work\report.pdf"]);
+        let (id, _) = build_of(&staged);
+        let mut hostile = blob("invoice\u{202e}gnp.exe", 4096);
+        hostile.naming = BlobNaming::Own;
+        let refused = engine.on_file_blob_built(id, Ok(hostile));
+        assert!(sent(&refused).is_empty(), "a hostile name reached the wire");
+        assert_eq!(releases(&refused), vec![id]);
+
+        // The same name, *derived* from a folder nobody named for this
+        // purpose, falls back rather than refusing.
+        let mut engine = sender(0xAA);
+        let staged = copy_files(&mut engine, &[r"C:\work\a", r"C:\work\b"]);
+        let (id, _) = build_of(&staged);
+        let mut derived = blob("invoice\u{202e}gnp.zip", 4096);
+        derived.naming = BlobNaming::Derived;
+        derived.archived = true;
+        derived.entry_count = 2;
+        let offered = engine.on_file_blob_built(id, Ok(derived));
+        let offer = offer_of(&offered);
+        assert_eq!(
+            offer.descriptor.expect("descriptor").file_name,
+            crate::file_blob::FALLBACK_ARCHIVE_NAME
+        );
+        offer.meta.validate().expect("conforming meta");
+    }
+
+    /// The protocol's own bounds are re-checked here rather than left for
+    /// the encoder to discover (NFR-1: validate before the wire).
+    #[test]
+    fn an_empty_or_oversized_blob_never_becomes_an_offer() {
+        for length in [
+            0,
+            crossover_protocol::clipboard::MAX_CLIPBOARD_FILE_BYTES as u64 + 1,
+        ] {
+            let mut engine = sender(0xAA);
+            let staged = copy_files(&mut engine, &[r"C:\work\report.pdf"]);
+            let (id, _) = build_of(&staged);
+            let refused = engine.on_file_blob_built(id, Ok(blob("report.pdf", length)));
+            assert!(sent(&refused).is_empty(), "{length} bytes was offered");
+            assert_eq!(releases(&refused), vec![id]);
+        }
+    }
+
+    /// A `CF_HDROP` pointing back into the spool is our own delivered item
+    /// coming round again, and offering it back is FR-3.3's loop on the
+    /// largest payload type in the system (ADR 0015 layer 2, F13).
+    #[test]
+    fn a_selection_inside_the_spool_is_never_staged() {
+        let root = spool_root();
+        let mut engine = sender(0xAA);
+        engine.set_spool_root(Some(root.clone()));
+
+        let inside = [
+            root.join("3f2a.bin"),
+            // Case is not a distinction the filesystem this guards makes.
+            shout(&root).join("3f2a.bin"),
+            // The root itself.
+            root.clone(),
+            // Unjudgeable without resolving it: treated as ours.
+            root.join("..").join("spool").join("3f2a.bin"),
+            PathBuf::from("spool").join("3f2a.bin"),
+        ];
+        for path in inside {
+            let actions =
+                engine.on_local_read(Some(ClipboardContent::FileList(vec![path.clone()])));
+            assert!(
+                actions.is_empty(),
+                "{} was staged for sending: {actions:?}",
+                path.display()
+            );
+        }
+
+        // A sibling directory whose name merely starts the same way is
+        // *not* inside it — component-wise, not a string prefix.
+        let sibling = root
+            .parent()
+            .expect("the spool root has a parent")
+            .join("spool-backup")
+            .join("note.txt");
+        build_of(&engine.on_local_read(Some(ClipboardContent::FileList(vec![sibling]))));
+
+        // One path inside the spool poisons the whole selection: one
+        // clipboard item is one blob, so it cannot be sent minus that
+        // entry without sending something the user did not select.
+        let mixed = engine.on_local_read(Some(ClipboardContent::FileList(vec![
+            elsewhere("report.pdf"),
+            root.join("3f2a.bin"),
+        ])));
+        assert!(
+            mixed.is_empty(),
+            "a partly-ours selection was staged: {mixed:?}"
+        );
+    }
+
+    /// With no spool there is nothing of ours on disk for a selection to
+    /// point at, so the guard is vacuous rather than closed.
+    #[test]
+    fn without_a_spool_no_path_is_ours() {
+        let mut engine = sender(0xAA);
+        build_of(&copy_files(&mut engine, &[r"C:\anything\at\all.bin"]));
+    }
+
+    /// A newer local copy supersedes a build in flight, and the answer to
+    /// the superseded build is released rather than offered — the race
+    /// the driver cannot resolve on its own.
+    #[test]
+    fn a_newer_copy_supersedes_a_build_and_its_answer_is_released() {
+        let mut engine = sender(0xAA);
+        let first = copy_files(&mut engine, &[r"C:\work\a.pdf"]);
+        let (first_id, _) = build_of(&first);
+
+        let second = copy_files(&mut engine, &[r"C:\work\b.pdf"]);
+        assert_eq!(
+            releases(&second),
+            vec![first_id],
+            "the superseded build must give its artifact back"
+        );
+        let (second_id, _) = build_of(&second);
+        assert_ne!(first_id, second_id);
+
+        // The late answer to the first build is released, not offered.
+        let late = engine.on_file_blob_built(first_id, Ok(blob("a.pdf", 4096)));
+        assert!(sent(&late).is_empty());
+        assert_eq!(releases(&late), vec![first_id]);
+
+        // The second still offers normally.
+        let offered = engine.on_file_blob_built(second_id, Ok(blob("b.pdf", 4096)));
+        assert_eq!(offer_of(&offered).meta.id, second_id);
+    }
+
+    /// A newer local copy of *anything* supersedes a file transfer in
+    /// flight, and the blob goes with it.
+    #[test]
+    fn a_newer_local_copy_supersedes_a_file_transfer_and_releases_its_blob() {
+        let mut engine = sender(0xAA);
+        let (id, _) = pack(&mut engine, "report.pdf", 4096);
+        let text = copy(&mut engine, "something else entirely");
+        assert_eq!(releases(&text), vec![id]);
+        assert_eq!(sent(&text).len(), 1);
+    }
+
+    /// A build that never answers has its own deadline, on its own
+    /// generation — arming it must not disarm an unrelated transfer that
+    /// is still in flight.
+    #[test]
+    fn a_build_that_never_answers_is_abandoned_on_its_own_deadline() {
+        let mut engine = sender(0xAA);
+        // An image transfer is in flight and keeps its own deadline.
+        let image = copy_image(&mut engine, image_bytes(4096));
+        let image_deadline = timeout_of(&image);
+        assert_eq!(image_deadline.0, TransferScope::Outbound);
+
+        let staged = copy_files(&mut engine, &[r"C:\work\report.pdf"]);
+        let (id, _) = build_of(&staged);
+        let build_deadline = timeout_of(&staged);
+        assert_eq!(build_deadline.0, TransferScope::Build);
+
+        // The image's deadline still fires: the build did not steal it.
+        let expired = engine.on_transfer_timeout(image_deadline.0, image_deadline.1);
+        assert!(!expired.is_empty() || engine.outbound.is_none());
+
+        let abandoned = engine.on_transfer_timeout(build_deadline.0, build_deadline.1);
+        assert_eq!(releases(&abandoned), vec![id]);
+        // A late answer is released rather than offered.
+        let late = engine.on_file_blob_built(id, Ok(blob("report.pdf", 4096)));
+        assert!(sent(&late).is_empty());
+        assert_eq!(releases(&late), vec![id]);
+    }
+
+    /// An offered file nobody answers expires like any other transaction,
+    /// and here the deadline is protecting the sender's *disk* rather
+    /// than its memory.
+    #[test]
+    fn the_deadline_releases_a_blob_nothing_answered_for() {
+        let mut engine = sender(0xAA);
+        let (id, offered) = pack(&mut engine, "report.pdf", 4096);
+        let (scope, generation) = timeout_of(&offered);
+        assert_eq!(scope, TransferScope::Outbound);
+        let expired = engine.on_transfer_timeout(scope, generation);
+        assert_eq!(releases(&expired), vec![id]);
+    }
+
+    /// The session going takes the artifact with it, from either state:
+    /// a build in flight, or an offer already out.
+    #[test]
+    fn session_loss_releases_whatever_the_sending_half_was_holding() {
+        let mut engine = sender(0xAA);
+        let staged = copy_files(&mut engine, &[r"C:\work\report.pdf"]);
+        let (building_id, _) = build_of(&staged);
+        assert_eq!(releases(&engine.on_session_lost()), vec![building_id]);
+
+        let mut engine = sender(0xAA);
+        let (id, _) = pack(&mut engine, "report.pdf", 4096);
+        assert_eq!(releases(&engine.on_session_lost()), vec![id]);
+
+        // And re-establishing does the same for a build the gap orphaned.
+        let mut engine = sender(0xAA);
+        let staged = copy_files(&mut engine, &[r"C:\work\report.pdf"]);
+        let (orphan, _) = build_of(&staged);
+        assert_eq!(releases(&engine.on_session_established()), vec![orphan]);
+    }
+
+    /// Losing the conflict race is an exit path like any other, and the
+    /// one that does not go through `outbound.take()` at its call site.
+    #[test]
+    fn losing_the_conflict_race_releases_the_blob() {
+        let mut engine = sender(0xAA);
+        let (id, offered) = pack(&mut engine, "report.pdf", 4096);
+        let ours = offer_of(&offered).meta;
+
+        // A peer item with a higher (sequence, origin) wins.
+        let theirs = ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xFF; 16]),
+            sequence: ours.sequence + 1,
+            content_type: ContentType::Utf8Text,
+            content_length: 128,
+            content_hash: content_hash(&[7; 128]),
+        };
+        let raced = engine.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta: theirs,
+            descriptor: None,
+        }));
+        assert_eq!(releases(&raced), vec![id]);
+    }
+
+    /// A file this engine just applied is not offered back to the peer
+    /// that sent it — ADR 0015's third loop-prevention layer, on the
+    /// sending side this time.
+    #[test]
+    fn a_file_we_just_applied_is_never_offered_back() {
+        let mut engine = sender(0xAA);
+        engine.set_file_receive(FileReceive::Allowed);
+        let bytes = image_bytes(4096);
+        let (closed, _, _) = receive_file(&mut engine, "doc.pdf", &bytes, 1);
+        assert_eq!(verdict(&closed), ApplyResult::Stored);
+
+        // The same bytes, packed from a local copy of the pasted file.
+        let staged = copy_files(&mut engine, &[r"C:\work\doc.pdf"]);
+        let (id, _) = build_of(&staged);
+        let mut same = blob("doc.pdf", bytes.len() as u64);
+        same.content_hash = content_hash(&bytes);
+        let suppressed = engine.on_file_blob_built(id, Ok(same));
+        assert!(
+            sent(&suppressed).is_empty(),
+            "a delivered file was offered back to its origin: {suppressed:?}"
+        );
+        assert_eq!(releases(&suppressed), vec![id]);
+    }
+
+    /// A blob that cannot be read back ends the transfer rather than
+    /// sending half an item, and the artifact goes.
+    #[test]
+    fn a_blob_that_cannot_be_read_ends_the_transfer() {
+        let mut engine = sender(0xAA);
+        let (id, _) = pack(&mut engine, "report.pdf", u64::from(chunk_bytes()) * 2);
+        let accepted = engine.on_peer_message(InboundMessage::Accept(ClipboardAccept { id }));
+        assert_eq!(file_chunks(&accepted).len(), 1);
+
+        let failed = engine.on_file_read_failed(id);
+        assert_eq!(releases(&failed), vec![id]);
+        assert!(
+            engine.on_chunk_sent(id).is_empty(),
+            "the stream must be over"
+        );
+    }
+
+    /// The sending half's outcomes are counted where FR-3.6 needs them:
+    /// a refusal here is not "nothing happened".
+    #[test]
+    fn the_sending_half_counts_what_it_refused_and_what_it_sent() {
+        let metrics = Arc::new(Metrics::new());
+        let mut engine = ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig::new(),
+            Some(Arc::clone(&metrics)),
+        );
+
+        // Gated off: refused, not silent.
+        engine.set_file_send(FileSend::NotNegotiated);
+        assert!(copy_files(&mut engine, &[r"C:\work\a.pdf"]).is_empty());
+        assert_eq!(metrics.snapshot().clipboard_files_send_refused, 1);
+
+        // Allowed, built, offered.
+        engine.set_file_send(FileSend::Allowed);
+        let (id, offered) = pack(&mut engine, "report.pdf", 4096);
+        assert_eq!(sent(&offered).len(), 1);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.clipboard_files_sent, 1);
+        assert_eq!(snapshot.clipboard_file_sent_bytes, 4096);
+
+        // Declined for a real reason: a delivery that did not happen.
+        engine.on_peer_message(InboundMessage::Decline(ClipboardDecline {
+            id,
+            reason: DeclineReason::NotPermitted,
+        }));
+        assert_eq!(metrics.snapshot().clipboard_files_send_failed, 1);
     }
 }

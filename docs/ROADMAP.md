@@ -117,14 +117,51 @@
 > leave one behind. The five decisions this forced are recorded in ADR
 > 0015 rather than left in the code.
 >
-> **What remains**: the engine's send transaction — staging a selection,
-> building its blob, and offering it — and only then advertising
-> `FILE_CLIPBOARD`. Until that bit is advertised no
-> conforming peer sends a file, so the path built so far is exercised by
-> tests alone — deliberately, since the alternative is spooling deliveries
-> nothing can yet paste. One question is answered by a human rather than by
-> CI before the paste path ships: whether Windows honours the
-> history/cloud exclusions the object declares (docs/TESTING.md §1.6).
+> **The send transaction is built** (2026-08-18). A local file selection
+> now becomes an offer and a chunk stream: the peer's negotiated file
+> support and its `clipboard_send` grant are judged *before* anything is
+> walked, because the build is the expensive step and an un-negotiated
+> file offer is fatal to an older peer's session rather than merely
+> unanswered. The bytes never enter the engine — an outbound item carries
+> either bytes it retains or a blob the driver holds open, and for a blob
+> the engine names each chunk's offset and length and the driver reads
+> exactly that slice, so the sender is O(chunk) exactly as the receiver's
+> write-through is. Every path that ends the transaction hands the blob
+> back, which is what deletes the artifact: delivered, declined,
+> superseded, timed out, session lost, unreadable. The sender's half of
+> loop prevention is in too — a `CF_HDROP` resolving inside the spool is
+> never staged.
+>
+> **The sender side is built** (2026-08-18): local `CF_HDROP` observation
+> (feature/133, PR #38), the blob builder (feature/134, PR #39), and the
+> engine's send transaction over it (feature/135, PR #40) — the three
+> paragraphs above.
+>
+> **`FILE_CLIPBOARD` is advertised** (2026-08-18, feature/136). This was the
+> deliberate final act: `FeatureFlags::ADVERTISED` is now `ALL`, so a
+> conforming peer can actually reach either half of the file path instead of
+> negotiating it away. The send policy is computed the way
+> `file_receive_policy` already computes its twin — `SessionRoute` now
+> carries each live session's negotiated features, `file_send_policy` folds
+> them with the trust store's `clipboard_send` grant into
+> `FileSend::{Unsupported, NotNegotiated, Denied, Allowed}`, and it is
+> published at the same two points `file_receive_policy` is: session
+> establishment/loss, and the trust-store revocation poll — so revoking
+> `clipboard_send` reaches a running worker within one poll, exactly as
+> revoking `file_receive` already did.
+>
+> Two things worth being plain about, so this entry does not overstate what
+> landed. **`clipboard_send` is, as of this slice, the first permission this
+> codebase enforces anywhere** — text and images still travel without
+> checking it, unchanged from before; this slice was not scoped to fix that.
+> And **this closes construction, not validation**: the whole file path —
+> offer, blob build, chunked send, spool, verify, virtual-file paste — has
+> been exercised by the test suites only. No two-machine hardware run has
+> moved a real file between the two workstations yet, which is what the
+> phase needs next before files can be called done. One question is still
+> answered by a human rather than by CI before that: whether Windows honours
+> the clipboard-history/cloud exclusions the virtual-file object declares
+> (docs/TESTING.md §1.6) — open, carried forward.
 >
 > Phase 6 (Windows Prototype Hardening) closed 2026-08-14: the multi-day
 > unattended soak — the last exit criterion — ran 2026-08-11 → 2026-08-14
