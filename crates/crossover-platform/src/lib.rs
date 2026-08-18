@@ -18,7 +18,7 @@ pub mod virtual_file;
 
 pub use clipboard::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
-    MAX_CLIPBOARD_IMAGE_BYTES,
+    MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
 };
 pub use cursor::{CursorMask, CursorMaskError, NoopCursorMask};
 pub use display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};

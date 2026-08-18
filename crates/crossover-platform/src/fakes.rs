@@ -128,6 +128,12 @@ impl InMemoryClipboard {
         self.set_locally(ClipboardContent::Image { format, bytes });
     }
 
+    /// Simulate a local Explorer file/folder copy: set a file-list
+    /// observation and notify (ADR 0015, feature/133).
+    pub fn set_file_list_locally(&self, paths: Vec<std::path::PathBuf>) {
+        self.set_locally(ClipboardContent::FileList(paths));
+    }
+
     /// Simulate any local copy: set content and notify the listener.
     pub fn set_locally(&self, content: ClipboardContent) {
         let listener = {
@@ -926,6 +932,32 @@ mod clipboard_tests {
                 bytes: vec![0x89, b'P', b'N', b'G', 0x00, 0xFF],
             })
         );
+    }
+
+    /// A file-list observation (ADR 0015, feature/133) round-trips like any
+    /// other typed content and is not text — the same shape the image test
+    /// above asserts, so core tests can script a local Explorer copy with
+    /// no OS clipboard.
+    #[test]
+    fn file_list_content_round_trips_and_is_not_text() {
+        use crate::clipboard::ClipboardContent;
+        use std::path::PathBuf;
+
+        let clipboard = InMemoryClipboard::new();
+        let notifications = counting_listener(&clipboard);
+        let paths = vec![
+            PathBuf::from(r"C:\Users\test\report.pdf"),
+            PathBuf::from(r"C:\Users\test\photos"),
+        ];
+
+        clipboard.set_file_list_locally(paths.clone());
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            clipboard.read().unwrap(),
+            Some(ClipboardContent::FileList(paths))
+        );
+        assert_eq!(clipboard.read_text().unwrap(), None);
+        assert_eq!(clipboard.peek(), None);
     }
 }
 
