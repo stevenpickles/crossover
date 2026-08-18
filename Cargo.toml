@@ -139,6 +139,15 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 zeroize = "1"
+# Write-only zip support for the sender's one-blob-per-item rule (ADR
+# 0015). default-features = false is load-bearing rather than tidy: the
+# defaults pull aes, bzip2, deflate/zopfli, lzma, ppmd, xz and zstd, and
+# the archive is written with Stored entries only, so every one of those
+# codecs would be supply-chain surface for a compression this design does
+# not perform. Nothing in the workspace reads an archive — F9's guarantee
+# is that no archive parser ever meets untrusted input — which the reader
+# ban in clippy.toml holds mechanically.
+zip = { version = "8", default-features = false }
 
 # `unsafe_code = "forbid"` enforces NFR-6 (docs/SPECIFICATION.md). Platform
 # crates may later relax it locally with documented justification.

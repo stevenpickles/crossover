@@ -13,12 +13,23 @@ crossover-platform = { workspace = true }
 # Win32 bindings only when actually building for Windows; on other targets
 # this crate compiles as an empty shell so tri-OS CI builds the workspace.
 [target.'cfg(windows)'.dependencies]
+# sha2: the sender hashes a blob while it still has the bytes, so nothing
+# re-reads a 256 MiB item to learn its own identity. The algorithm is not
+# a local choice — it is what crossover_protocol::clipboard::content_hash
+# computes and what the receiver's ChunkStream verifies incrementally, and
+# a core test holds the two together.
+sha2 = { workspace = true }
 # tracing: hook loss is an asynchronous event with no error path to
 # surface through, and NFR-3 forbids a silent failure of an important
 # state transition — the watchdog logs it at the moment of detection.
 tracing = { workspace = true }
 windows = { workspace = true }
 windows-core = { workspace = true }
+# Write-only: this crate packs archives and nothing in the workspace reads
+# one (docs/SECURITY.md F9). See the workspace manifest for the feature
+# reasoning, and clippy.toml for the ban that keeps the reader out of
+# production code.
+zip = { workspace = true }
 
 # tracing-subscriber only for the manual key-capture probe, which prints
 # the per-key diagnostic (scan code, extended/injected flags, HID) to
