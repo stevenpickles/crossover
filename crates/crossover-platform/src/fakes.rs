@@ -13,6 +13,7 @@ use crate::clipboard::{
 };
 use crate::cursor::{CursorMask, CursorMaskError};
 use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
+use crate::file_blob::{BlobNaming, FileBlob, FileBlobBuilder, FileBlobRefusal};
 use crate::input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerEvent,
 };
@@ -1178,5 +1179,164 @@ impl VirtualFileClipboard for FakeVirtualFiles {
             .unwrap_or_else(PoisonError::into_inner) += 1;
         *self.current.lock().unwrap_or_else(PoisonError::into_inner) = false;
         Ok(())
+    }
+}
+
+/// What a [`FakeFileBlobBuilder`] should produce for the next selection.
+///
+/// The packing itself is the Windows builder's business (the walk, the
+/// reparse-point rule, the archive); this stands in for its *answer*, so
+/// the engine transaction above it can be driven over every shape of
+/// result without a filesystem to arrange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeBlob {
+    /// The name the builder derived, before any validation.
+    pub proposed_name: String,
+    /// Where that name came from.
+    pub naming: BlobNaming,
+    /// Whether the blob stands for an archive.
+    pub archived: bool,
+    /// How many entries it packs.
+    pub entry_count: u32,
+    /// Uncompressed total of those entries.
+    pub original_bytes: u64,
+    /// The blob's bytes.
+    pub content: Vec<u8>,
+}
+
+impl FakeBlob {
+    /// One file's bytes, travelling verbatim under `name`.
+    #[must_use]
+    pub fn verbatim(name: &str, content: Vec<u8>) -> Self {
+        Self {
+            proposed_name: name.to_owned(),
+            naming: BlobNaming::Own,
+            archived: false,
+            entry_count: 1,
+            original_bytes: content.len() as u64,
+            content,
+        }
+    }
+}
+
+/// A scriptable [`FileBlobBuilder`].
+///
+/// The one place it diverges from the real contract is stated rather than
+/// hidden: a real builder never lets a caller name the artifact, and this
+/// one writes into a directory of its own under the process temp
+/// directory so a test can run without a platform builder. It matches the
+/// contract where it counts — the returned handle is positioned at the
+/// start, and the file is unlinked as soon as it is open, so the bytes
+/// live exactly as long as the [`FileBlob`] does.
+#[derive(Debug)]
+pub struct FakeFileBlobBuilder {
+    plan: Mutex<FakeBlob>,
+    refuse_next: Mutex<Option<FileBlobRefusal>>,
+    selections: Mutex<Vec<Vec<std::path::PathBuf>>>,
+    dir: std::path::PathBuf,
+}
+
+impl FakeFileBlobBuilder {
+    /// A builder that packs every selection into `content`, under `name`.
+    ///
+    /// # Panics
+    ///
+    /// If its working directory cannot be created — a fake with nowhere
+    /// to write is a broken test rig, not a condition to model.
+    #[must_use]
+    pub fn new(name: &str, content: Vec<u8>) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "crossover-fake-blob-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("fake blob builder working directory");
+        Self {
+            plan: Mutex::new(FakeBlob::verbatim(name, content)),
+            refuse_next: Mutex::new(None),
+            selections: Mutex::new(Vec::new()),
+            dir,
+        }
+    }
+
+    /// Produce `blob` for every following selection.
+    pub fn produce(&self, blob: FakeBlob) {
+        *self.plan.lock().unwrap_or_else(PoisonError::into_inner) = blob;
+    }
+
+    /// Refuse the next selection with `refusal`, then resume producing.
+    pub fn refuse_next(&self, refusal: FileBlobRefusal) {
+        *self
+            .refuse_next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(refusal);
+    }
+
+    /// Every selection handed to this builder, oldest first.
+    #[must_use]
+    pub fn selections(&self) -> Vec<Vec<std::path::PathBuf>> {
+        self.selections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for FakeFileBlobBuilder {
+    fn drop(&mut self) {
+        // Best effort: the artifacts are already unlinked, so this only
+        // removes the directory itself.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl FileBlobBuilder for FakeFileBlobBuilder {
+    fn build(&self, selection: &[std::path::PathBuf]) -> Result<FileBlob, FileBlobRefusal> {
+        use sha2::Digest as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        self.selections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(selection.to_vec());
+        if let Some(refusal) = self
+            .refuse_next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            return Err(refusal);
+        }
+        let plan = self
+            .plan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let path = self
+            .dir
+            .join(format!("{}.blob", NEXT.fetch_add(1, Ordering::Relaxed)));
+        let backend = |error: std::io::Error| FileBlobRefusal::Backend {
+            reason: error.to_string(),
+        };
+        std::fs::write(&path, &plan.content).map_err(backend)?;
+        let content = std::fs::File::open(&path).map_err(backend)?;
+        // Unlinked while open, so the bytes outlive the name and die with
+        // the handle — the property the real builder gets from
+        // `FILE_FLAG_DELETE_ON_CLOSE`.
+        let _ = std::fs::remove_file(&path);
+        Ok(FileBlob {
+            proposed_name: plan.proposed_name,
+            naming: plan.naming,
+            archived: plan.archived,
+            entry_count: plan.entry_count,
+            original_bytes: plan.original_bytes,
+            content_length: plan.content.len() as u64,
+            content_hash: sha2::Sha256::digest(&plan.content).into(),
+            content,
+        })
     }
 }
