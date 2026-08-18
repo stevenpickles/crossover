@@ -228,6 +228,17 @@ pub enum FileBlobRefusal {
         reason: String,
     },
 
+    /// Two entries of the selection would be packed under the same name.
+    ///
+    /// Refused rather than suffixed, for the same reason a name is never
+    /// repaired: the second entry would travel under a name the user
+    /// never gave it, inside an item they cannot inspect before it
+    /// arrives. Ordinary shell selections come from one folder, where the
+    /// filesystem has already made names unique, so this is a
+    /// pathological clipboard rather than a case worth accommodating.
+    #[error("two entries of the selection would be packed under the same name")]
+    DuplicateName,
+
     /// The temporary artifact could not be created, written, or read
     /// back — a fault in our own workspace rather than in the selection.
     #[error("the file blob could not be built: {reason}")]
