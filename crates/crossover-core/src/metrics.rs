@@ -215,6 +215,17 @@ pub struct Metrics {
     clipboard_files_declined: AtomicU64,
     clipboard_files_failed: AtomicU64,
     clipboard_file_bytes: AtomicU64,
+    // The sending half of the same three questions (ADR 0015, "Sender
+    // side"). Kept apart from the receiving counters rather than folded
+    // into them: a refusal here happened on *this* machine, before any of
+    // the selection travelled, and FR-3.6 requires that to be visible as
+    // something other than "nothing happened". Without the split, a user
+    // whose copy is refused locally and a user whose peer declined would
+    // read the same number.
+    clipboard_files_sent: AtomicU64,
+    clipboard_files_send_refused: AtomicU64,
+    clipboard_files_send_failed: AtomicU64,
+    clipboard_file_sent_bytes: AtomicU64,
     clipboard_latency_ms: Mutex<Vec<u32>>,
     clipboard_latency_dropped: AtomicU64,
     // Count/total/max rather than a sample vector, because this is the one
@@ -387,6 +398,29 @@ impl Metrics {
     pub fn record_file_failed(&self) {
         self.clipboard_files_failed.fetch_add(1, Ordering::Relaxed);
     }
+    /// A local file selection was packed and offered to the peer (ADR
+    /// 0015). Counted at the offer, which is the first moment anything
+    /// about the item leaves this machine.
+    pub fn record_file_sent(&self, byte_len: u64) {
+        self.clipboard_files_sent.fetch_add(1, Ordering::Relaxed);
+        self.clipboard_file_sent_bytes
+            .fetch_add(byte_len, Ordering::Relaxed);
+    }
+    /// A local file selection was refused here, before any of it could
+    /// travel: no negotiated file support, no `clipboard_send` grant, a
+    /// selection the builder would not pack, or a name that does not
+    /// conform (FR-3.6 — never a silent drop).
+    pub fn record_file_send_refused(&self) {
+        self.clipboard_files_send_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// An outbound file transaction that started and did not deliver: the
+    /// peer declined it, the deadline expired, the session went, or the
+    /// blob could not be read back.
+    pub fn record_file_send_failed(&self) {
+        self.clipboard_files_send_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
     /// How long an input frame waited between being handed to the send
     /// path and reaching the wire, in microseconds.
     ///
@@ -532,6 +566,10 @@ impl Metrics {
             clipboard_files_declined: load(&self.clipboard_files_declined),
             clipboard_files_failed: load(&self.clipboard_files_failed),
             clipboard_file_bytes: load(&self.clipboard_file_bytes),
+            clipboard_files_sent: load(&self.clipboard_files_sent),
+            clipboard_files_send_refused: load(&self.clipboard_files_send_refused),
+            clipboard_files_send_failed: load(&self.clipboard_files_send_failed),
+            clipboard_file_sent_bytes: load(&self.clipboard_file_sent_bytes),
             clipboard_latency_dropped: load(&self.clipboard_latency_dropped),
             input_lane_avg_us: {
                 let n = load(&self.input_queue_latency_count);
@@ -651,6 +689,14 @@ pub struct Report {
     pub clipboard_files_failed: u64,
     /// Bytes of spooled file content accepted from peers.
     pub clipboard_file_bytes: u64,
+    /// Local file selections packed and offered to the peer (ADR 0015).
+    pub clipboard_files_sent: u64,
+    /// Local file selections refused here before any of them travelled.
+    pub clipboard_files_send_refused: u64,
+    /// Outbound file transactions that started and did not deliver.
+    pub clipboard_files_send_failed: u64,
+    /// Bytes of file content offered to the peer.
+    pub clipboard_file_sent_bytes: u64,
     /// Latency samples dropped past the retention cap.
     pub clipboard_latency_dropped: u64,
     /// Mean time an input frame waited *before the writer took it* (µs) —
@@ -744,6 +790,10 @@ impl Report {
             clipboard_files_declined = self.clipboard_files_declined,
             clipboard_files_failed = self.clipboard_files_failed,
             clipboard_file_bytes = self.clipboard_file_bytes,
+            clipboard_files_sent = self.clipboard_files_sent,
+            clipboard_files_send_refused = self.clipboard_files_send_refused,
+            clipboard_files_send_failed = self.clipboard_files_send_failed,
+            clipboard_file_sent_bytes = self.clipboard_file_sent_bytes,
             latency_p50_ms = self.latency_p50,
             latency_p95_ms = self.latency_p95,
             latency_max_ms = self.latency_max,
