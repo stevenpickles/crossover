@@ -140,7 +140,7 @@ cargo test -p crossover-platform-windows -- --ignored manual_the_offer_stays_out
 |------|---------------------|
 | `clipboard::tests::manual_a_real_snip_is_read_as_a_stable_image` | Take a snip (`Win+Shift+S`) **before** running; the test asserts the Snipping Tool's own DIB reads as an image, sits inside the ceiling, and yields identical bytes on consecutive reads |
 | `clipboard::tests::manual_an_installed_image_pastes_into_other_applications` | Run it, then paste (`Ctrl+V`) into Paint, Word, and a browser compose box, and confirm the gradient appears in each |
-| `virtual_file::tests::manual_the_offer_stays_out_of_clipboard_history_and_cloud_sync` | Run it, then check three things it prints: the item does **not** appear in Win+V; pasting into a folder produces the file with its content and a Mark-of-the-Web warning in its properties; and a second machine on the same Microsoft account with clipboard sync on does not see it. The last two are the invariant-7 half — a "yes" there is a finding, not a nuisance |
+| `virtual_file::tests::manual_the_offer_stays_out_of_clipboard_history_and_cloud_sync` | Run it, then check three things it prints: the item does **not** appear in Win+V; pasting into a folder produces the file with its content, opening without a Protected View or SmartScreen prompt, but with `ZoneId=1` in its `Zone.Identifier` stream; and a second machine on the same Microsoft account with clipboard sync on does not see it. The last two are the invariant-7 half — a "yes" there is a finding, not a nuisance |
 
 Both are also on the two-machine list in [SOAK.md](SOAK.md), where the
 interesting version is the same paste after the image crossed the wire.

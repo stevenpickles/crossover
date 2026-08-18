@@ -82,7 +82,9 @@
 > to Explorer as a virtual file list on an apartment thread of its own:
 > the descriptor carries the validated name and size, the contents are
 > served only as a read-only stream at index zero, and the file the shell
-> writes carries Mark-of-the-Web. Automated tests drive it through the real
+> writes records where it came from (Local intranet — the internet zone
+> was built first and changed on a maintainer decision, ADR 0015).
+> Automated tests drive it through the real
 > clipboard as a consumer does and read the entry back byte for byte. Two
 > findings came out of building it, both recorded in ADR 0015:
 > `OleIsCurrentClipboard` alone reported "still ours" after a same-process

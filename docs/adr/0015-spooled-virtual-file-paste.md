@@ -269,11 +269,12 @@ verified completion is what this ADR revises.
   - `CFSTR_FILECONTENTS`, `lindex` 0 — **delayed rendering**: the bytes are
     produced only when something asks, and they are produced by reading the
     spool entry;
-  - `CFSTR_ZONEIDENTIFIER` — Internet zone, so the file the shell creates
-    carries Mark-of-the-Web and SmartScreen / Office Protected View treat it as
-    the untrusted content it is. The spool entry itself is stamped the same way.
-    This is Windows-specific and lives behind a `crossover-platform` trait,
-    no-op where the concept does not exist.
+  - `CFSTR_ZONEIDENTIFIER` — **Local intranet zone** (see the 2026-08-17
+    decision below; this originally read *Internet*), so the file the shell
+    creates records where it came from without the execution-warning
+    machinery treating it as internet-sourced. This is Windows-specific and
+    lives behind a `crossover-platform` trait, no-op where the concept does
+    not exist.
 - **The accepted `FORMATETC` set is exact, and everything else is refused.**
   `CFSTR_FILECONTENTS` is served **only** as `TYMED_ISTREAM`, and only for
   `lindex == 0`; the descriptor and the zone identifier are served only as
@@ -832,9 +833,10 @@ ceiling buys reach and spends responsiveness.
 - ~~Whether `MAX_CLIPBOARD_FILE_BYTES` (256 MiB) is the right ceiling.~~
   Settled above: it stands.
 - Whether `CFSTR_ZONEIDENTIFIER` on the data object actually causes the shell to
-  stamp Mark-of-the-Web on the pasted file across the Explorer versions we care
+  stamp the zone onto the pasted file across the Explorer versions we care
   about, or whether the marking is only reliable on the spool copy. A
-  verify-at-implementation item, not a design fork.
+  verify-at-implementation item, not a design fork — and one the manual
+  paste probe now checks by reading the file's `Zone.Identifier` stream.
 - ~~**Clipboard History (Win+V) and Cloud Clipboard.**~~ Settled below: the
   file item is excluded (F16), text and images are disclosed rather than
   suppressed. The behavioural half remains verify-before-ship, per the
@@ -947,6 +949,44 @@ answers out-of-enumeration requests itself. The refusal still happens,
 which is what production needs, but the specific codes this ADR
 specifies — `DV_E_TYMED`, `DV_E_LINDEX` — are only observable by calling
 our object directly, which is how they are tested.
+
+### The zone is intranet, not internet (2026-08-17)
+
+The design stamped `ZoneId=3` and leaned on it: the reject-not-repair
+name rules explicitly *do not* try to catch `report.pdf.exe`, a homoglyph,
+or a double extension, and argue instead that such names are "contained
+downstream" because the pasted file carries Mark-of-the-Web. Zone 3 is
+what makes SmartScreen challenge an executable and Office open a document
+in Protected View.
+
+Changed to `ZoneId=1`, Local intranet, on a maintainer decision, for two
+reasons that point the same way.
+
+**It is the accurate description.** The file came from a paired machine on
+the local network. Zone 3 says it came from the internet, which is simply
+untrue, and a marking that misdescribes its own provenance is a poor
+foundation for anything downstream to reason about.
+
+**The friction is certain and the protection is against an attacker
+already out of scope.** Every ordinary document pasted between the user's
+two machines pays the Protected View banner and the blocked-file warning.
+What zone 3 buys in return is a challenge on content sent by a *paired
+peer that has itself been compromised* — which SECURITY.md §6 documents as
+out of scope and does not defend against.
+
+**What is lost, stated plainly.** The downstream containment for
+extension-hiding names is weaker: the `Zone.Identifier` stream is still
+written and still readable, so provenance survives and anything that
+inspects zones can act on it, but SmartScreen and Protected View will not
+treat a pasted file as untrusted content. F10 is unaffected — Crossover
+still never opens, launches, previews, or hands anything to a shell
+association — and the containment that remains is the one §6 names:
+nothing leaves the spool without the user's own paste gesture, and
+anti-malware on the receiving machine is the user's.
+
+Making the zone configurable was considered and rejected for now: it is a
+security-relevant knob whose two settings are hard to explain, on a
+feature whose whole design brief is "deliberately minimal".
 
 ### What is deliberately not here yet
 

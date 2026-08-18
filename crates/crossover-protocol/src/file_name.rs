@@ -24,7 +24,9 @@
 //! What the list is *not* is an anti-malware filter (ADR 0015 says so
 //! plainly): `report.pdf.exe` and Cyrillic homoglyphs are valid names no
 //! validator can refuse without refusing real ones, and they are
-//! contained downstream by Mark-of-the-Web instead. This is "the names
+//! contained downstream by the zone marking and by F10's no-execution rule
+//! instead — a weaker containment since that zone became Local intranet
+//! (ADR 0015, 2026-08-17), and knowingly so. This is "the names
 //! that would break a *path*, plus the ones that lie about their own
 //! rendering".
 

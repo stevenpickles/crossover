@@ -282,7 +282,9 @@ advertised, so no conforming peer sends a file at all.
    mislead without malforming — `report.pdf.exe`, homoglyph spellings, a double
    extension under a shell that hides known types — are valid filenames and are
    accepted knowingly; they are contained downstream by the Internet-zone
-   marking (F10's no-execution rule plus Mark-of-the-Web on the pasted file),
+   marking (F10's no-execution rule plus the zone stamped on the pasted file,
+   which since ADR 0015's 2026-08-17 decision is Local intranet rather than
+   Internet — provenance without the execution-warning machinery),
    not by this validator.
 5. **F5 — No overwrite, ever, of anything we create.** Spool entries are
    created with an exclusive create (`CREATE_NEW` / `O_EXCL`) under a locally
