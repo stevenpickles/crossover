@@ -871,11 +871,23 @@ impl ClipboardEngine {
     ///
     /// Typed since ADR 0014: the same rules apply to every content type —
     /// only the bound and the flow differ, and both come from the type.
+    ///
+    /// A [`ClipboardContent::FileList`] observation (ADR 0015, feature/133)
+    /// is a deliberate no-op here: `into_wire` returns `None` for it, which
+    /// this treats exactly like an oversized or empty item — nothing is
+    /// staged, nothing is hashed, `current_local_hash` and `applied_hashes`
+    /// are untouched. The sender side ADR 0015 describes — walking the
+    /// selection, building the archive, minting the offer — is feature/135's
+    /// job; until it lands, a local file/folder copy is observable but
+    /// silently does not synchronize, which is the unchanged behavior this
+    /// build has always had for files.
     pub fn on_local_read(&mut self, content: Option<ClipboardContent>) -> Vec<Action> {
         let Some(content) = content else {
             return Vec::new(); // empty, or a format this build cannot read
         };
-        let (content_type, bytes) = into_wire(content);
+        let Some((content_type, bytes)) = into_wire(content) else {
+            return Vec::new(); // a file-list observation; see the doc above
+        };
         let max = content_type.max_content_bytes();
         if bytes.len() as u64 > max {
             tracing::warn!(
@@ -2344,18 +2356,29 @@ const fn platform_format(format: ImageFormat) -> ClipboardImageFormat {
     }
 }
 
-/// Typed platform content → the wire's `(type, bytes)` pair.
+/// Typed platform content → the wire's `(type, bytes)` pair, or `None` for
+/// content this call never stages.
 ///
 /// Image bytes move by value and untouched: no transcode, no compression,
 /// no inspection — the hash and the length are all that is ever computed
 /// over them (ADR 0014).
-fn into_wire(content: ClipboardContent) -> (ContentType, Vec<u8>) {
-    match content {
+///
+/// `FileList` returns `None`: a local file/folder selection is observable
+/// (feature/133), but the engine does not yet stage it for transmission —
+/// the archive builder and offer transaction are feature/135's job (ADR
+/// 0015 "Sender side"). `on_local_read` is the only caller and already
+/// returns early for `FileList` before reaching here, so this arm is
+/// defense in depth, not a path production takes; `None` mirrors the shape
+/// `on_local_read` already uses for an oversized or empty item, so the
+/// outcome is the same either way.
+fn into_wire(content: ClipboardContent) -> Option<(ContentType, Vec<u8>)> {
+    Some(match content {
         ClipboardContent::Text(text) => (ContentType::Utf8Text, text.into_bytes()),
         ClipboardContent::Image { format, bytes } => {
             (ContentType::Image(wire_format(format)), bytes)
         }
-    }
+        ClipboardContent::FileList(_) => return None,
+    })
 }
 
 /// Verified wire bytes → typed platform content.
@@ -2606,6 +2629,30 @@ mod tests {
         assert!(e.on_local_read(Some(snip(huge_image))).is_empty());
         // And an empty image is not an image.
         assert!(e.on_local_read(Some(snip(Vec::new()))).is_empty());
+    }
+
+    /// A local file/folder selection is observable (feature/133), but the
+    /// engine does not yet stage it for transmission: the archive builder
+    /// and offer transaction are feature/135's job (ADR 0015 "Sender
+    /// side"). Proved as a deliberate no-op rather than merely an absence
+    /// of actions — an ordinary text copy right after must still travel
+    /// normally, so the no-op is not accidentally wedging outbound state
+    /// (`current_local_hash`, `applied_hashes`, or the sequence counter).
+    #[test]
+    fn a_local_file_selection_is_observed_but_not_yet_staged() {
+        let mut e = engine(0xAA);
+        let paths = vec![
+            std::path::PathBuf::from(r"C:\Users\test\report.pdf"),
+            std::path::PathBuf::from(r"C:\Users\test\photos"),
+        ];
+        assert!(
+            e.on_local_read(Some(ClipboardContent::FileList(paths)))
+                .is_empty(),
+            "a file-list observation must not mint an offer yet"
+        );
+        // Nothing about the no-op should prevent an ordinary text copy
+        // from travelling right afterwards.
+        assert_eq!(sent(&copy(&mut e, "still works")).len(), 1);
     }
 
     /// The full loop-prevention cycle: receive, write, own-write
@@ -3801,6 +3848,21 @@ mod tests {
             crossover_platform::MAX_CLIPBOARD_IMAGE_BYTES,
             MAX_CLIPBOARD_IMAGE_BYTES,
             "the platform boundary's ceiling drifted from the protocol's"
+        );
+    }
+
+    /// The same mirror, for the file-entry ceiling (ADR 0015, feature/133):
+    /// `crossover-platform` states its own `MAX_CLIPBOARD_FILE_ENTRIES`
+    /// because it may carry no dependencies, and this is where the two are
+    /// proved equal so they cannot drift apart silently.
+    #[test]
+    fn the_platform_file_entry_ceiling_agrees_with_the_protocol() {
+        use crossover_protocol::clipboard::MAX_CLIPBOARD_FILE_ENTRIES;
+
+        assert_eq!(
+            crossover_platform::MAX_CLIPBOARD_FILE_ENTRIES,
+            MAX_CLIPBOARD_FILE_ENTRIES,
+            "the platform boundary's file-entry ceiling drifted from the protocol's"
         );
     }
 
