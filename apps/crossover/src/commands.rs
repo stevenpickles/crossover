@@ -38,7 +38,7 @@ use crossover_security::{
 use crate::console::{self, ConsoleCommand};
 use crate::storage::{
     open_clipboard_provider, open_cursor_mask, open_display, open_input, open_secure_storage,
-    open_service_manager, open_spool,
+    open_service_manager, open_spool, open_virtual_files,
 };
 
 /// One ceremony's allowance, listener and connector alike. Generous
@@ -516,6 +516,38 @@ fn setup_input_control(
     Ok((control_events, control_commands))
 }
 
+/// Start clipboard synchronization: the provider, the spool a received
+/// file lands in, and the mechanism it is pasted from (ADR 0015).
+///
+/// Returns the event sender, the command receiver, and whether this run
+/// can deliver a file at all — which needs **both** halves. A spool with
+/// no paste mechanism, or a paste mechanism with no spool, is not a
+/// capability, and reporting it as one would mean accepting transfers
+/// nobody could use.
+fn setup_clipboard_sync(
+    device: Uuid,
+    metrics: &Arc<Metrics>,
+) -> anyhow::Result<(mpsc::Sender<SyncEvent>, CommandReceiver, bool)> {
+    let provider = open_clipboard_provider()?;
+    // The spool is opened (and swept) once per run. `None` means this run
+    // cannot receive files — never a fallback to an unprotected directory,
+    // which would void the guarantee the spool exists to make.
+    let spool = open_spool();
+    let virtual_files = open_virtual_files(spool.as_ref());
+    let file_paste_ready = spool.is_some() && virtual_files.is_some();
+    let (driver, events, commands) = clipboard_sync(
+        provider,
+        spool,
+        virtual_files,
+        device,
+        ClipboardConfig::new(),
+        Some(Arc::clone(metrics)),
+    )
+    .context("starting clipboard sync")?;
+    tokio::spawn(driver.run());
+    Ok((events, commands, file_paste_ready))
+}
+
 pub async fn run(
     device_name: &str,
     listen_bind: Option<String>,
@@ -554,20 +586,8 @@ pub async fn run(
 
     // Clipboard sync: one driver for the peer relationship; sessions of
     // either role feed it and carry its frames.
-    let provider = open_clipboard_provider()?;
-    // The spool is opened (and swept) once per run. `None` means this run
-    // cannot receive files at all — never a fallback to an unprotected
-    // directory, which would void the guarantee it exists to make.
-    let spool = open_spool();
-    let (sync_driver, sync_events, sync_commands) = clipboard_sync(
-        provider,
-        spool.clone(),
-        identity.device_id(),
-        ClipboardConfig::new(),
-        Some(Arc::clone(&metrics)),
-    )
-    .context("starting clipboard sync")?;
-    tokio::spawn(sync_driver.run());
+    let (sync_events, sync_commands, file_paste_ready) =
+        setup_clipboard_sync(identity.device_id(), &metrics)?;
 
     // Input control: capture/inject, the transfer engine, cursor masking,
     // and (in seamless mode) the edge detector.
@@ -587,7 +607,7 @@ pub async fn run(
         metrics: Some(Arc::clone(&metrics)),
         storage: Arc::clone(&storage),
         registry: Arc::clone(&registry),
-        spool_open: spool.is_some(),
+        spool_open: file_paste_ready,
     };
 
     // Both drivers emit the same SessionCommands; merge them into the two
@@ -644,7 +664,7 @@ pub async fn run(
         ) => {}
         // Act on trust-store edits made while this run is up: revocation
         // (ADR 0010) and the file-receive grant (ADR 0015).
-        () = apply_trust_changes(&storage, &registry, &policy_events, spool.is_some()) => {}
+        () = apply_trust_changes(&storage, &registry, &policy_events, file_paste_ready) => {}
     }
     if let Some(handle) = &handle {
         handle.shutdown();
