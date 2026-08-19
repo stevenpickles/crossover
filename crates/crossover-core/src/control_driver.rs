@@ -50,7 +50,7 @@ use crate::control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
     OutboundControl,
 };
-use crate::edge_driver::EdgeMode;
+use crate::edge_driver::{EdgeMode, EdgeModeUpdate};
 use crate::input::InputEvent;
 use crate::outbound::{CommandReceiver, CommandSender, command_lanes};
 use crate::topology::{EdgeFraction, MonitorRect, Topology};
@@ -140,10 +140,18 @@ pub struct SeamlessInputs {
     pub topology: Topology,
     /// Display geometry for that mapping.
     pub display: Arc<dyn DisplayInfo>,
-    /// Where the edge detector's watching mode is sent, derived from this
-    /// machine's control state so it watches to *leave* while local, to
-    /// *return* while controlled, and idles while it drives the peer.
-    pub edge_mode: mpsc::Sender<EdgeMode>,
+    /// Where the edge detector's watching mode is published, derived from
+    /// this machine's control state so it watches to *leave* while local,
+    /// to *return* while controlled, and idles while it drives the peer.
+    ///
+    /// A `watch`, not a queue: the mode is a level, so latest-wins is the
+    /// correct semantics and publishing never blocks. That last part is
+    /// load-bearing — the mode used to ride a bounded `mpsc` that closed a
+    /// cycle back onto this loop (mode → detector → crossings →
+    /// `control_events` → here, and this loop is the only thing draining
+    /// them), so any slowness here amplified itself into the stall-then-
+    /// burst the 2026-08-19 hardware logs show.
+    pub edge_mode: watch::Sender<EdgeModeUpdate>,
 }
 
 pub struct InputControlDriver {
@@ -185,16 +193,30 @@ pub struct InputControlDriver {
     /// `--left`/`--right`. `None` makes placement and edge-mode emission
     /// no-ops (an explicit-only run).
     seamless: Option<SeamlessInputs>,
-    /// The last edge mode emitted, so only changes are sent.
+    /// The last edge mode published, so an unchanged mode is republished
+    /// only when something else asks for it (see `edge_reprime_due`).
     last_edge_mode: EdgeMode,
-    /// How many edge-mode updates have been sent. A crossing carries the
-    /// generation the detector held when it fired, and it reaches this loop
-    /// through two bounded queues with its `kind` frozen at detection time —
-    /// so a crossing that queued behind a mode change describes a control
-    /// state that no longer exists (a `Return` detected under a grant that
-    /// has since ended would revoke a *fresh* one). Anything that does not
-    /// match this counter is dropped.
+    /// The generation stamped on the last edge mode published. A crossing
+    /// carries the generation the detector was watching under when it
+    /// fired, and it reaches this loop through a bounded queue with its
+    /// `kind` frozen at detection time — so a crossing that queued behind a
+    /// mode change describes a control state that no longer exists (a
+    /// `Return` detected under a grant that has since ended would revoke a
+    /// *fresh* one). Anything that does not match this is dropped.
     edge_mode_generation: u64,
+    /// Set when a `PlaceCursor` has just put the pointer *on* the linked
+    /// column, meaning the detector must re-prime there or read the
+    /// placement itself as an arrival.
+    ///
+    /// A first grant re-primes for free, because taking it changes the edge
+    /// mode. A *refreshed* grant (ADR 0009 addendum, 2026-08-19: a
+    /// re-request from the session already holding control) does not change
+    /// `is_controlled`, so nothing would be published and the placement
+    /// could fire a spurious return — revoking the grant just re-issued.
+    /// Republishing under a new generation fixes both halves at once: the
+    /// detector re-primes on the placed cursor, and any crossing still in
+    /// flight from before the refresh no longer matches and is dropped.
+    edge_reprime_due: bool,
     /// The monitor layout last seen on the health tick, for noticing a
     /// display change (dock, undock, a monitor powering off) while running.
     /// The seamless machinery re-reads geometry on every use, so nothing
@@ -258,6 +280,7 @@ pub fn input_control(
         // the driver's job on the first state change.
         last_edge_mode: EdgeMode::Idle,
         edge_mode_generation: 0,
+        edge_reprime_due: false,
         seen_monitors: None,
         events_rx,
         events_tx: events_tx.clone(),
@@ -342,7 +365,7 @@ impl InputControlDriver {
             }
             // Any branch may have changed the control state; keep the edge
             // detector's watching mode in step with it (ADR 0009).
-            self.sync_edge_mode().await;
+            self.sync_edge_mode();
         }
         // Dropping the sender ends the applier, which restores the cursor —
         // so it is never left hidden when the driver stops mid-control.
@@ -545,36 +568,53 @@ impl InputControlDriver {
         }
     }
 
-    /// Send the current edge mode to the detector when it has changed, so
-    /// detection tracks the control state. Each delivered update advances
-    /// the crossing generation, which the detector counts identically —
-    /// crossings detected before the change then no longer match, and are
-    /// dropped by [`edge_crossing_is_current`](Self::edge_crossing_is_current).
-    async fn sync_edge_mode(&mut self) {
-        if self.seamless.is_none() {
+    /// Publish the current edge mode when it has changed — or when a cursor
+    /// placement has asked for a re-prime under an unchanged mode — so
+    /// detection tracks the control state.
+    ///
+    /// Every publication carries a fresh generation, which the detector
+    /// stamps onto the crossings it then emits; crossings detected before
+    /// this publication no longer match and are dropped by
+    /// [`edge_crossing_is_current`](Self::edge_crossing_is_current). The
+    /// generation is advanced whether or not a detector is listening: it
+    /// travels *inside* the published value, so there are no two counts to
+    /// keep in step, and a crossing from a departed detector could not
+    /// arrive anyway.
+    ///
+    /// Non-blocking by construction (`watch`), so this cannot become the
+    /// slow step in a loop that is also the only drainer of what the
+    /// detector produces.
+    fn sync_edge_mode(&mut self) {
+        let reprime = std::mem::take(&mut self.edge_reprime_due);
+        let Some(seamless) = &self.seamless else {
+            return; // explicit-only run: no detector to publish to
+        };
+        let mode = self.edge_mode();
+        if mode == self.last_edge_mode && !reprime {
             return;
         }
-        let mode = self.edge_mode();
-        if mode != self.last_edge_mode {
-            tracing::debug!(?mode, "control: edge mode -> detector");
-            self.last_edge_mode = mode;
-            if let Some(seamless) = &self.seamless
-                && seamless.edge_mode.send(mode).await.is_ok()
-            {
-                // Counted only once the detector has the update, so a dead
-                // detector cannot leave the counters disagreeing. Saturating
-                // so no run length can wrap a stale generation onto a
-                // current one.
-                self.edge_mode_generation = self.edge_mode_generation.saturating_add(1);
-            }
-        }
+        self.last_edge_mode = mode;
+        // Saturating so no run length can wrap a stale generation onto a
+        // current one.
+        self.edge_mode_generation = self.edge_mode_generation.saturating_add(1);
+        tracing::debug!(
+            ?mode,
+            generation = self.edge_mode_generation,
+            reprime,
+            "control: edge mode -> detector"
+        );
+        let _ = seamless.edge_mode.send_replace(EdgeModeUpdate {
+            mode,
+            generation: self.edge_mode_generation,
+        });
     }
 
     /// Whether a crossing detected under `generation` still describes the
     /// control state this machine is in. A crossing carries a `kind` frozen
-    /// at detection time and travels through two bounded queues to get
-    /// here; if the edge mode changed on the way, acting on it would apply
-    /// a decision about the old state to the new one.
+    /// at detection time and travels through bounded queues to get here; if
+    /// the edge mode was republished on the way — a changed mode, or a
+    /// re-prime after a cursor placement — acting on it would apply a
+    /// decision about the old state to the new one.
     fn edge_crossing_is_current(&self, generation: u64, kind: &'static str) -> bool {
         if generation == self.edge_mode_generation {
             return true;
@@ -795,7 +835,14 @@ impl InputControlDriver {
                         self.controlled_input_baseline = self.capture.last_input_tick();
                     }
                 }
-                ControlAction::PlaceCursor(fraction) => self.place_cursor(fraction),
+                ControlAction::PlaceCursor(fraction) => {
+                    self.place_cursor(fraction);
+                    // The pointer now sits on the linked column, which is
+                    // also the trigger column. Ask for a re-prime there —
+                    // needed even when the control state, and so the mode,
+                    // did not change at all (a refreshed grant).
+                    self.edge_reprime_due = true;
+                }
                 ControlAction::ScheduleRequestTimeout {
                     session,
                     request_id,
@@ -926,7 +973,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
     use uuid::Uuid;
 
@@ -943,7 +990,7 @@ mod tests {
     use super::{InputControlEvent, input_control};
     use crate::command::{FrameTarget, SessionCommand};
     use crate::control::{ControlConfig, ControlNotice};
-    use crate::edge_driver::{CrossingKind, EdgeMode, REARM_MARGIN};
+    use crate::edge_driver::{CrossingKind, EdgeMode, EdgeModeUpdate, REARM_MARGIN};
     use crate::input::{InputEvent, KeyEvent, PointerButton, PointerEvent, hid};
     use crate::topology::{CursorPoint, EdgeFraction, LinkSide, MonitorRect, Topology};
 
@@ -965,10 +1012,9 @@ mod tests {
         events: mpsc::Sender<InputControlEvent>,
         commands: crate::outbound::CommandReceiver,
         notices: mpsc::Receiver<ControlNotice>,
-        edge_modes: mpsc::Receiver<EdgeMode>,
-        /// Edge-mode updates observed so far — the generation a
-        /// hand-injected crossing must carry (see [`generation_at`]).
-        edge_generation: u64,
+        /// A real subscription to what the driver publishes — the detecting
+        /// rig included, since a `watch` has as many receivers as it likes.
+        edge_modes: watch::Receiver<EdgeModeUpdate>,
     }
 
     /// The rig's edge-poll period, mirroring the application's ~125 Hz.
@@ -982,8 +1028,7 @@ mod tests {
     /// [`EdgeDetectDriver`] watching the same [`FakeDisplay`] the injector
     /// places the cursor on, with its crossings forwarded back in as control
     /// events. That closes the loop placement → detection → transfer, which
-    /// a bare edge-mode receiver leaves open. Its `edge_modes` receiver is a
-    /// dead stub — the detector holds the real one.
+    /// a bare edge-mode receiver leaves open.
     fn edge_detecting_rig() -> Rig {
         build_rig(true)
     }
@@ -998,18 +1043,18 @@ mod tests {
         // A left-member topology (links on the right edge) so PlaceCursor
         // has geometry to map through; most tests never trigger it.
         let topology = Topology::new(LinkSide::Left);
-        let (edge_mode_tx, edge_modes, detection) = if detect {
+        let (edge_mode_tx, detection) = if detect {
             let (edge_driver, mode_tx, crossings) = crate::edge_driver::edge_detect(
                 Arc::clone(&display) as Arc<dyn DisplayInfo>,
                 topology,
                 EDGE_POLL,
             );
-            let (_dropped, dead) = mpsc::channel(1);
-            (mode_tx, dead, Some((edge_driver, crossings)))
+            (mode_tx, Some((edge_driver, crossings)))
         } else {
-            let (tx, rx) = mpsc::channel(8);
-            (tx, rx, None)
+            (watch::channel(EdgeModeUpdate::initial()).0, None)
         };
+        // Subscribed before the driver exists, so no publication is missed.
+        let edge_modes = edge_mode_tx.subscribe();
         let seamless = super::SeamlessInputs {
             topology,
             display: Arc::clone(&display) as Arc<dyn DisplayInfo>,
@@ -1056,7 +1101,6 @@ mod tests {
             commands,
             notices,
             edge_modes,
-            edge_generation: 0,
         }
     }
 
@@ -1074,24 +1118,33 @@ mod tests {
             .expect("notice channel closed")
     }
 
-    async fn next_edge_mode(rig: &mut Rig) -> EdgeMode {
-        timeout(Duration::from_secs(5), rig.edge_modes.recv())
+    /// The next edge-mode publication. A `watch` coalesces, so this is the
+    /// newest value at the moment it is read, not necessarily every value
+    /// the driver sent — which is exactly the contract the detector reads
+    /// it under.
+    async fn next_edge_update(rig: &mut Rig) -> EdgeModeUpdate {
+        timeout(Duration::from_secs(5), rig.edge_modes.changed())
             .await
             .expect("timed out waiting for an edge mode")
-            .expect("edge-mode channel closed")
+            .expect("edge-mode channel closed");
+        *rig.edge_modes.borrow_and_update()
     }
 
-    /// The edge-mode generation in force once `expected` has been reached,
-    /// counted from the updates the driver actually sent. A crossing
-    /// injected by hand must carry this to be acted on. Counted rather than
-    /// assumed one-per-transition: the driver drains events in batches, so
-    /// two control-state changes in one batch produce a single update.
+    async fn next_edge_mode(rig: &mut Rig) -> EdgeMode {
+        next_edge_update(rig).await.mode
+    }
+
+    /// The edge-mode generation in force once `expected` has been reached.
+    /// A crossing injected by hand must carry this to be acted on. Read
+    /// from the published value rather than counted: the driver drains
+    /// events in batches (two control-state changes in one batch produce a
+    /// single publication) and the channel coalesces besides, so the only
+    /// authority on the current generation is the sender's own stamp.
     async fn generation_at(rig: &mut Rig, expected: EdgeMode) -> u64 {
         loop {
-            let mode = next_edge_mode(rig).await;
-            rig.edge_generation += 1;
-            if mode == expected {
-                return rig.edge_generation;
+            let update = next_edge_update(rig).await;
+            if update.mode == expected {
+                return update.generation;
             }
         }
     }
@@ -2193,6 +2246,90 @@ mod tests {
         assert_eq!(
             next_notice(&mut rig).await,
             ControlNotice::PeerControlRevoked
+        );
+    }
+
+    /// A *refreshed* grant — a re-request from the session that already
+    /// holds control, so a late answer converges rather than deadlocking
+    /// (ADR 0009 addendum, 2026-08-19) — places the cursor on the linked
+    /// column exactly as a first grant does. But it does not change
+    /// `is_controlled`, so the edge mode does not change either, and
+    /// nothing used to be republished. With the trigger armed (the user had
+    /// moved clear of the column in the meantime) the placement itself then
+    /// read as an arrival: the refresh revoked the grant it had just
+    /// re-issued.
+    #[tokio::test]
+    async fn a_refreshed_grant_re_primes_the_detector_instead_of_returning() {
+        tokio::time::pause();
+        let mut rig = edge_detecting_rig();
+        peer_takes_control_across_the_edge(&mut rig).await;
+        let before = generation_at(&mut rig, EdgeMode::Returning).await;
+        edge_polls(4).await; // the detector adopts Returning and primes
+
+        // The user's cursor travels well clear of the linked column, which
+        // is what arms the trigger — without this the placement could not
+        // fire whatever the mode did, and the test would prove nothing.
+        let clear = 1919 - i32::try_from(REARM_MARGIN).unwrap() - 1;
+        rig.display.set_cursor(CursorPoint { x: clear, y: 540 });
+        edge_polls(4).await;
+
+        // The grant holder asks again (its own answer came too late), so
+        // the engine refreshes the grant and places the cursor back on the
+        // entry column.
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest {
+                    request_id: 2,
+                    entry: Some(EdgeFraction::new(0.5).to_wire()),
+                }
+                .encode_payload()
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected a response to the refreshing request");
+        };
+        assert_eq!(message_type, MessageType::ControlResponse.wire());
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+        assert_eq!(
+            rig.display.cursor_position().unwrap(),
+            CursorPoint { x: 1919, y: 540 },
+            "the refresh did not place the cursor on the entry column"
+        );
+
+        // The refresh's own placement must fire nothing.
+        edge_polls(8).await;
+        assert!(
+            timeout(Duration::from_millis(500), rig.notices.recv())
+                .await
+                .is_err(),
+            "the refresh's cursor placement revoked the grant it had just re-issued"
+        );
+
+        // What makes that true: the (unchanged) mode is republished under a
+        // new generation, which re-primes the detector on the placed cursor.
+        let after = generation_at(&mut rig, EdgeMode::Returning).await;
+        assert!(
+            after > before,
+            "a refreshed grant left the detector primed for the state before it"
+        );
+
+        // And a crossing detected before the refresh — in flight while it
+        // happened — is stale, so it cannot revoke the refreshed grant.
+        rig.events
+            .send(InputControlEvent::EdgeReturn {
+                position: EdgeFraction::new(0.5),
+                generation: before,
+            })
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(500), rig.commands.recv())
+                .await
+                .is_err(),
+            "a crossing from before the refresh revoked the refreshed grant"
         );
     }
 

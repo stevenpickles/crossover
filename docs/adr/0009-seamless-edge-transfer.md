@@ -340,13 +340,36 @@ nowhere near the margin, so they no longer can.
 
 **Crossings are also generation-stamped.** A crossing carries a `kind`
 (leave/return) frozen at detection time and reaches the control loop through
-two bounded queues. If the control state changed on the way, acting on it
+a bounded queue. If the control state changed on the way, acting on it
 applies a decision about a state that no longer exists — a stale `Return` can
-revoke a *fresh* grant. Every edge-mode update the control driver sends now
-advances a counter that the detector counts identically and stamps on each
-crossing; the control driver drops any crossing whose stamp is not current.
-That is a correctness fix independent of the margin, and it stays correct
-however the polling and queueing are later retimed.
+revoke a *fresh* grant. Every edge-mode publication carries a generation; the
+detector stamps it onto the crossings it emits under that mode, and the
+control driver drops any crossing whose stamp is not the one it last
+published. That is a correctness fix independent of the margin, and it stays
+correct however the polling and queueing are later retimed.
+
+**The mode itself is a level, on a `watch`.** It says what this machine is
+watching for *right now*, so latest-wins is the correct semantics and
+publishing must never block. It used to ride a bounded `mpsc` that closed a
+cycle back onto the control loop — mode → detector → crossings → control
+events → the control loop, which is the only thing that drains them — so any
+slowness there fed back into itself and cleared only in `MAX_DRAIN_BATCH`
+bursts. That is why the generation is *carried inside the published value*
+rather than counted at each end: counting was only ever correct over a
+lossless FIFO, and a coalescing channel would drift the two counts apart on
+the first collapsed burst. Carried, it cannot.
+
+**A cursor placement re-primes the detector, whatever the mode did.** Entry
+placement parks the pointer *on* the linked column, which is also the trigger
+column; priming there is what stops it firing. A first grant re-primed for
+free, because taking it changed the mode — but a **refreshed** grant (below)
+does not change `is_controlled`, so nothing was published, and with the
+trigger armed the refresh's own placement fired a return that revoked the
+grant it had just re-issued. The re-prime is therefore tied to the
+`PlaceCursor` that causes it: every placement republishes the mode, unchanged
+value and all, under a new generation. The detector primes on the placed
+cursor, and the new generation invalidates any crossing detected before the
+refresh.
 
 ## Addendum (2026-08-19): late answers are self-correcting
 
@@ -397,7 +420,10 @@ here waits on a clock or a heuristic; convergence follows from the message
 order alone.
 
 The head-of-line delay on the answering side that opened the window is a
-separate matter, addressed in the inbound routing work rather than here.
+separate matter, settled in
+[ADR 0013](0013-interactive-over-bulk-prioritization.md)'s 2026-08-19
+addendum: inbound frames are now routed by message type, so a control
+request no longer waits on the clipboard driver's queue to discard it.
 
 The `RETURNING` state this ADR promised above (between `REMOTE` and `LOCAL`)
 was never built and is not needed: the reverse crossing is detected on the

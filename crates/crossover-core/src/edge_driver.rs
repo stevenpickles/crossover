@@ -21,7 +21,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
 use crossover_platform::DisplayInfo;
@@ -55,6 +55,42 @@ impl EdgeMode {
     }
 }
 
+/// What the control wiring publishes to the detector: the mode to watch
+/// in, and the generation that publication is.
+///
+/// The mode is a **level**, not an event — "what this machine is watching
+/// for right now" — so it travels on a [`watch`] channel: latest wins,
+/// publishing never blocks, and a detector that fell behind reads the
+/// current state rather than a queue of superseded ones. That matters
+/// beyond tidiness: the mode used to ride a bounded `mpsc` inside a cycle
+/// (control loop → mode → detector → crossings → control loop), so any
+/// slowness in the loop fed back into itself.
+///
+/// The generation is stamped by the **sender** and carried inside the
+/// value, because a `watch` coalesces: counting updates at each end — the
+/// scheme a lossless FIFO allowed — would drift the moment two
+/// publications collapsed into one. Carried, it cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeModeUpdate {
+    /// What to watch for.
+    pub mode: EdgeMode,
+    /// Which publication this is. Monotonic; stamped onto every crossing
+    /// detected under it (see [`EdgeCrossing::generation`]).
+    pub generation: u64,
+}
+
+impl EdgeModeUpdate {
+    /// The state before the control wiring has published anything: idle,
+    /// generation zero.
+    #[must_use]
+    pub const fn initial() -> Self {
+        Self {
+            mode: EdgeMode::Idle,
+            generation: 0,
+        }
+    }
+}
+
 /// Which direction a detected crossing goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrossingKind {
@@ -72,13 +108,12 @@ pub struct EdgeCrossing {
     pub kind: CrossingKind,
     /// Normalized position along the edge.
     pub position: EdgeFraction,
-    /// The [`EdgeMode`] generation this crossing was detected under — the
-    /// number of mode updates the detector had received when it fired.
-    /// `kind` is frozen at detection time, so a crossing that queues behind
-    /// a control-state change would otherwise act on a state that no longer
-    /// exists (a stale `Return` revoking a *fresh* grant). The control
-    /// driver counts the mode updates it sends and discards any crossing
-    /// whose generation is not the current one.
+    /// The [`EdgeModeUpdate::generation`] the detector was watching under
+    /// when this fired. `kind` is frozen at detection time, so a crossing
+    /// that queues behind a control-state change would otherwise act on a
+    /// state that no longer exists (a stale `Return` revoking a *fresh*
+    /// grant). The control driver stamps each mode it publishes and
+    /// discards any crossing whose generation is not the current one.
     pub generation: u64,
 }
 
@@ -188,8 +223,8 @@ impl EdgeDetector {
 
 /// Build an edge-detection driver for `topology`, polling `display` every
 /// `poll_interval`. Returns the driver (spawn [`EdgeDetectDriver::run`]),
-/// a sender the control wiring uses to set the [`EdgeMode`], and a
-/// receiver of detected [`EdgeCrossing`]s.
+/// a sender the control wiring uses to publish the [`EdgeModeUpdate`], and
+/// a receiver of detected [`EdgeCrossing`]s.
 #[must_use]
 pub fn edge_detect(
     display: Arc<dyn DisplayInfo>,
@@ -197,10 +232,10 @@ pub fn edge_detect(
     poll_interval: Duration,
 ) -> (
     EdgeDetectDriver,
-    mpsc::Sender<EdgeMode>,
+    watch::Sender<EdgeModeUpdate>,
     mpsc::Receiver<EdgeCrossing>,
 ) {
-    let (mode_tx, mode_rx) = mpsc::channel(8);
+    let (mode_tx, mode_rx) = watch::channel(EdgeModeUpdate::initial());
     let (crossings_tx, crossings_rx) = mpsc::channel(8);
     let driver = EdgeDetectDriver {
         display,
@@ -219,13 +254,13 @@ pub struct EdgeDetectDriver {
     display: Arc<dyn DisplayInfo>,
     detector: EdgeDetector,
     mode: EdgeMode,
-    /// How many mode updates have been applied. Stamped on every crossing
-    /// so a consumer can tell one detected under the current control state
-    /// from one that queued behind a state change (see
-    /// [`EdgeCrossing::generation`]). The sender counts its own updates, so
-    /// the two counts agree without a wider channel type.
+    /// The generation of the mode currently applied, stamped on every
+    /// crossing so a consumer can tell one detected under the current
+    /// control state from one that queued behind a state change (see
+    /// [`EdgeCrossing::generation`]). Read from the published value, never
+    /// counted here — a `watch` coalesces, so counting would drift.
     generation: u64,
-    mode_rx: mpsc::Receiver<EdgeMode>,
+    mode_rx: watch::Receiver<EdgeModeUpdate>,
     crossings_tx: mpsc::Sender<EdgeCrossing>,
     poll_interval: Duration,
 }
@@ -241,21 +276,25 @@ impl EdgeDetectDriver {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                update = self.mode_rx.recv() => {
-                    let Some(mode) = update else { break }; // wiring gone
-                    self.mode = mode;
-                    // Saturating so a very long-lived process cannot wrap a
-                    // stale generation onto a current one.
-                    self.generation = self.generation.saturating_add(1);
-                    tracing::debug!(?mode, generation = self.generation, "edge: watching mode changed");
-                    if mode != EdgeMode::Idle {
-                        // Begin from the current cursor so a position
-                        // already at the edge does not fire immediately.
-                        self.prime();
+                changed = self.mode_rx.changed() => {
+                    if changed.is_err() {
+                        break; // wiring gone
+                    }
+                    if self.apply_mode() {
                         ticker.reset();
                     }
                 }
                 _ = ticker.tick(), if self.mode != EdgeMode::Idle => {
+                    // `select!` picks at random among ready branches, so a
+                    // mode already published can lose to this tick and the
+                    // poll would observe under a superseded state. The mode
+                    // is a level: take the newest before looking at all.
+                    if self.mode_rx.has_changed().unwrap_or(false) {
+                        if self.apply_mode() {
+                            ticker.reset();
+                        }
+                        continue;
+                    }
                     if !self.poll().await {
                         break; // crossings receiver gone
                     }
@@ -263,6 +302,29 @@ impl EdgeDetectDriver {
             }
         }
         tracing::debug!("edge-detection driver stopped");
+    }
+
+    /// Adopt the latest published mode. Returns whether the detector was
+    /// re-primed (and the poll ticker should restart with it), which is
+    /// every update that is not [`EdgeMode::Idle`] — including a *repeat*
+    /// of the current mode, which is how the control wiring asks for a
+    /// re-prime after placing the cursor (ADR 0009 addendum, 2026-08-19).
+    fn apply_mode(&mut self) -> bool {
+        let update = *self.mode_rx.borrow_and_update();
+        self.mode = update.mode;
+        self.generation = update.generation;
+        tracing::debug!(
+            mode = ?update.mode,
+            generation = update.generation,
+            "edge: watching mode published"
+        );
+        if update.mode == EdgeMode::Idle {
+            return false;
+        }
+        // Begin from the current cursor so a position already at the edge
+        // does not fire immediately.
+        self.prime();
+        true
     }
 
     /// Read the cursor once and prime the detector's edge state.
@@ -347,13 +409,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
     use tokio::time::{sleep, timeout};
 
     use crossover_platform::DisplayInfo;
     use crossover_platform::fakes::FakeDisplay;
 
-    use super::{CrossingKind, EdgeCrossing, EdgeDetector, EdgeMode, REARM_MARGIN, edge_detect};
+    use super::{
+        CrossingKind, EdgeCrossing, EdgeDetector, EdgeMode, EdgeModeUpdate, REARM_MARGIN,
+        edge_detect,
+    };
     use crate::topology::{CursorPoint, LinkSide, MonitorRect, Screen, Topology};
 
     const HD: Screen = Screen {
@@ -543,13 +608,26 @@ mod tests {
             .expect("crossings channel closed")
     }
 
-    fn rig(
-        side: LinkSide,
-    ) -> (
-        Arc<FakeDisplay>,
-        mpsc::Sender<EdgeMode>,
-        mpsc::Receiver<EdgeCrossing>,
-    ) {
+    /// The control wiring's half of the mode channel: publishes a mode
+    /// under a fresh generation, exactly as the control driver does.
+    struct Modes {
+        tx: watch::Sender<EdgeModeUpdate>,
+        generation: u64,
+    }
+
+    impl Modes {
+        /// Publish `mode` and return the generation it went out under.
+        fn set(&mut self, mode: EdgeMode) -> u64 {
+            self.generation += 1;
+            let _ = self.tx.send_replace(EdgeModeUpdate {
+                mode,
+                generation: self.generation,
+            });
+            self.generation
+        }
+    }
+
+    fn rig(side: LinkSide) -> (Arc<FakeDisplay>, Modes, mpsc::Receiver<EdgeCrossing>) {
         let display = Arc::new(FakeDisplay::new(HD));
         display.set_cursor(MIDDLE); // away from either edge to start
         let (driver, mode_tx, crossings_rx) = edge_detect(
@@ -558,13 +636,20 @@ mod tests {
             Duration::from_millis(5),
         );
         tokio::spawn(driver.run());
-        (display, mode_tx, crossings_rx)
+        (
+            display,
+            Modes {
+                tx: mode_tx,
+                generation: 0,
+            },
+            crossings_rx,
+        )
     }
 
     #[tokio::test]
     async fn leaving_mode_emits_a_leave_at_the_linked_edge() {
-        let (display, mode_tx, mut crossings) = rig(LinkSide::Left);
-        mode_tx.send(EdgeMode::Leaving).await.unwrap();
+        let (display, mut modes, mut crossings) = rig(LinkSide::Left);
+        modes.set(EdgeMode::Leaving);
         sleep(SETTLE).await; // primes on the middle cursor: away from the edge
         display.set_cursor(at(1919, 540)); // right edge, half-way down
         let crossing = next_crossing(&mut crossings).await;
@@ -574,34 +659,76 @@ mod tests {
 
     #[tokio::test]
     async fn returning_mode_emits_a_return() {
-        let (display, mode_tx, mut crossings) = rig(LinkSide::Right); // links left
-        mode_tx.send(EdgeMode::Returning).await.unwrap();
+        let (display, mut modes, mut crossings) = rig(LinkSide::Right); // links left
+        modes.set(EdgeMode::Returning);
         sleep(SETTLE).await;
         display.set_cursor(at(0, 270)); // left edge
         let crossing = next_crossing(&mut crossings).await;
         assert_eq!(crossing.kind, CrossingKind::Return);
     }
 
-    /// Every crossing is stamped with the number of mode updates the
-    /// detector had applied when it fired, so a consumer can tell a
-    /// crossing detected under the current control state from one that
-    /// queued behind a state change.
+    /// Every crossing is stamped with the generation of the mode it was
+    /// detected under, so a consumer can tell a crossing detected under the
+    /// current control state from one that queued behind a state change.
     #[tokio::test]
     async fn a_crossing_carries_the_mode_generation_it_was_detected_under() {
-        let (display, mode_tx, mut crossings) = rig(LinkSide::Left);
-        mode_tx.send(EdgeMode::Leaving).await.unwrap(); // generation 1
+        let (display, mut modes, mut crossings) = rig(LinkSide::Left);
+        modes.set(EdgeMode::Leaving);
         sleep(SETTLE).await;
-        mode_tx.send(EdgeMode::Returning).await.unwrap(); // generation 2
+        let generation = modes.set(EdgeMode::Returning);
         sleep(SETTLE).await;
         display.set_cursor(at(1919, 540));
         let crossing = next_crossing(&mut crossings).await;
         assert_eq!(crossing.kind, CrossingKind::Return);
-        assert_eq!(crossing.generation, 2);
+        assert_eq!(crossing.generation, generation);
+    }
+
+    /// The mode is a level on a coalescing channel, so a burst may collapse
+    /// — but never past its end. The detector must land on the *last* mode
+    /// published, primed and stamped with that publication's generation,
+    /// whatever the intermediate ones were.
+    #[tokio::test]
+    async fn a_burst_of_modes_leaves_the_detector_primed_for_the_last_one() {
+        let (display, mut modes, mut crossings) = rig(LinkSide::Left);
+        // Published back to back, with nothing awaited in between: the
+        // detector may well see only the final value.
+        modes.set(EdgeMode::Leaving);
+        modes.set(EdgeMode::Idle);
+        modes.set(EdgeMode::Returning);
+        let generation = modes.set(EdgeMode::Leaving);
+        sleep(SETTLE).await; // primes on the middle cursor
+
+        display.set_cursor(at(1919, 540));
+        let crossing = next_crossing(&mut crossings).await;
+        assert_eq!(
+            crossing.kind,
+            CrossingKind::Leave,
+            "the detector kept a superseded mode from the burst"
+        );
+        assert_eq!(
+            crossing.generation, generation,
+            "the crossing was stamped with a generation from mid-burst"
+        );
+    }
+
+    /// The same, ending on `Idle`: coalescing must not resurrect the
+    /// watching mode a burst passed through on its way to stopping.
+    #[tokio::test]
+    async fn a_burst_ending_idle_stops_the_detector() {
+        let (display, mut modes, mut crossings) = rig(LinkSide::Left);
+        modes.set(EdgeMode::Leaving);
+        modes.set(EdgeMode::Idle);
+        sleep(SETTLE).await;
+        display.set_cursor(at(900, 540));
+        sleep(SETTLE).await;
+        display.set_cursor(at(1919, 540));
+        let quiet = timeout(Duration::from_millis(200), crossings.recv()).await;
+        assert!(quiet.is_err(), "a burst that ended idle still emitted");
     }
 
     #[tokio::test]
     async fn idle_mode_never_emits_even_at_the_edge() {
-        let (display, _mode_tx, mut crossings) = rig(LinkSide::Left);
+        let (display, _modes, mut crossings) = rig(LinkSide::Left);
         // No mode set (defaults to Idle). Park the cursor at the edge.
         display.set_cursor(at(1919, 540));
         let quiet = timeout(Duration::from_millis(200), crossings.recv()).await;
@@ -610,10 +737,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_cursor_already_at_the_edge_when_watching_begins_does_not_fire() {
-        let (display, mode_tx, mut crossings) = rig(LinkSide::Left);
+        let (display, mut modes, mut crossings) = rig(LinkSide::Left);
         // Cursor at the edge *before* the mode turns on (primed there).
         display.set_cursor(at(1919, 540));
-        mode_tx.send(EdgeMode::Leaving).await.unwrap();
+        modes.set(EdgeMode::Leaving);
         let quiet = timeout(Duration::from_millis(150), crossings.recv()).await;
         assert!(quiet.is_err(), "fired on a cursor already at the edge");
         // A fresh arrival does fire: leave the edge, let a poll see it,
@@ -627,9 +754,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_mid_watch_unplug_emits_no_crossing_until_a_fresh_arrival() {
-        let (display, mode_tx, mut crossings) = rig(LinkSide::Left);
+        let (display, mut modes, mut crossings) = rig(LinkSide::Left);
         display.set_monitors(LAPTOP_AND_EXTERNAL.to_vec());
-        mode_tx.send(EdgeMode::Leaving).await.unwrap();
+        modes.set(EdgeMode::Leaving);
         sleep(SETTLE).await; // primes: middle of the laptop, away from any edge
         // Park the cursor on the laptop's right column — interior while the
         // external monitor is present — and let a poll observe it there.
@@ -649,9 +776,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_display_failure_is_survived_without_a_crossing() {
-        let (display, mode_tx, mut crossings) = rig(LinkSide::Left);
+        let (display, mut modes, mut crossings) = rig(LinkSide::Left);
         display.fail_with("no display");
-        mode_tx.send(EdgeMode::Leaving).await.unwrap();
+        modes.set(EdgeMode::Leaving);
         display.set_cursor(at(1919, 540));
         // The driver keeps polling, gets errors, and emits nothing — no
         // panic, no crossing.

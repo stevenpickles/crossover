@@ -786,13 +786,63 @@ fn start_outbound(
     (Some(Arc::new(handle)), Some(events))
 }
 
-/// Session lifecycle and inbound frames fanned out to both the clipboard
-/// and input-control drivers. Each driver ignores what is not its
-/// traffic, so broadcasting is simpler and cheaper than routing by type.
-/// The session id travels with every event: clipboard sync is
-/// session-agnostic (FR-5.4), but the control driver binds to one
-/// session and drops the rest (FR-5.1), so it must know which session
-/// each frame arrived on.
+/// Which driver an inbound frame belongs to — the inbound counterpart of
+/// [`SendPriority`](crossover_core::SendPriority), and the same partition
+/// by message type (ADR 0013 addendum, 2026-08-19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundRoute {
+    /// Clipboard and file traffic: the sync driver's, and nobody else's.
+    Sync,
+    /// Input and control-transfer traffic: the control driver's.
+    Control,
+    /// Neither driver claims it. Only a message type this build does not
+    /// know reaches here (the session layer answers or rejects everything
+    /// else before it becomes an app frame), and both drivers ignore it —
+    /// but *ignoring* is their decision to make, not this function's, so
+    /// the unknown keeps its historical delivery to both rather than being
+    /// dropped by a classifier that predates it.
+    Both,
+}
+
+/// Route one inbound frame by message type. Total by construction: every
+/// arm of [`MessageType`], and the unknown, lands somewhere.
+fn inbound_route(message_type: u16) -> InboundRoute {
+    match MessageType::from_wire(message_type) {
+        Some(
+            MessageType::ClipboardOffer
+            | MessageType::ClipboardAccept
+            | MessageType::ClipboardDecline
+            | MessageType::ClipboardData
+            | MessageType::ClipboardChunk
+            | MessageType::ClipboardApplied,
+        ) => InboundRoute::Sync,
+        Some(
+            MessageType::InputBatch
+            | MessageType::ReleaseAllInput
+            | MessageType::ControlRequest
+            | MessageType::ControlResponse
+            | MessageType::ControlRelease,
+        ) => InboundRoute::Control,
+        // Session-layer traffic never becomes an app frame: `dispatch_frame`
+        // answers Ping, accepts Pong, and fails the session on Hello or a
+        // pairing message. Listed so adding a message type is a compile
+        // error here rather than a silent misroute.
+        Some(
+            MessageType::Hello
+            | MessageType::Ping
+            | MessageType::Pong
+            | MessageType::PairingStart
+            | MessageType::PairingConfirm,
+        )
+        | None => InboundRoute::Both,
+    }
+}
+
+/// Session lifecycle and inbound frames routed to the clipboard and
+/// input-control drivers. The session id travels with every event:
+/// clipboard sync is session-agnostic (FR-5.4), but the control driver
+/// binds to one session and drops the rest (FR-5.1), so it must know which
+/// session each frame arrived on.
 #[derive(Clone)]
 struct SessionFanout {
     sync: mpsc::Sender<SyncEvent>,
@@ -811,6 +861,10 @@ struct SessionFanout {
 
 impl SessionFanout {
     /// Deliver to both drivers **concurrently**, never one behind the other.
+    ///
+    /// For what genuinely concerns both: the session lifecycle, and the
+    /// unknown message type neither driver claims. Frames belonging to one
+    /// driver are routed there instead (see [`frame`](Self::frame)).
     ///
     /// Sequential delivery makes the first driver's backpressure the second
     /// driver's latency. That is exactly backwards here: the clipboard driver
@@ -870,6 +924,21 @@ impl SessionFanout {
         let _ = self.sync.send(SyncEvent::FileSendPolicy(send_policy)).await;
     }
 
+    /// Hand one inbound frame to the driver it belongs to — and only that
+    /// one (ADR 0013 addendum, 2026-08-19).
+    ///
+    /// Broadcasting was simpler, but it made every frame's delivery wait on
+    /// *both* queues, so an inbound `ControlRequest` had to be accepted by
+    /// the clipboard driver — which discards it — before this call returned
+    /// and the session's serial frame pump could move on. Under a saturated
+    /// bulk path that wait was 4.7 s on hardware, and it applied to the
+    /// 125 Hz input stream too. Routing by type removes the wait and the
+    /// clone of every bulk payload for a driver that threw it away.
+    ///
+    /// Same-driver order is unchanged: one frame is delivered before the
+    /// next is classified, so each driver still sees its own traffic in
+    /// exactly arrival order (ADR 0005's transaction state machine and the
+    /// input sequence both depend on that).
     async fn frame(&self, session: Uuid, frame: crossover_protocol::RawFrame) {
         // Count input events injected from the peer at the point they
         // arrive; the network layer already counts the frames, this adds
@@ -880,11 +949,24 @@ impl SessionFanout {
         {
             metrics.record_input_received(total, keys);
         }
-        self.fan_out(
-            SyncEvent::Frame(frame.clone()),
-            InputControlEvent::Frame { session, frame },
-        )
-        .await;
+        match inbound_route(frame.message_type) {
+            InboundRoute::Sync => {
+                let _ = self.sync.send(SyncEvent::Frame(frame)).await;
+            }
+            InboundRoute::Control => {
+                let _ = self
+                    .control
+                    .send(InputControlEvent::Frame { session, frame })
+                    .await;
+            }
+            InboundRoute::Both => {
+                self.fan_out(
+                    SyncEvent::Frame(frame.clone()),
+                    InputControlEvent::Frame { session, frame },
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -2426,6 +2508,184 @@ mod tests {
              release path is independent of it"
         );
         lost.abort();
+    }
+
+    /// A stand-in fanout over shallow channels, for the inbound-routing
+    /// tests. Nothing in them touches the trust store or the registry, so
+    /// both are empty.
+    fn routing_fanout(
+        sync: tokio::sync::mpsc::Sender<crossover_core::SyncEvent>,
+        control: tokio::sync::mpsc::Sender<crossover_core::InputControlEvent>,
+    ) -> super::SessionFanout {
+        super::SessionFanout {
+            sync,
+            control,
+            metrics: None,
+            storage: Arc::new(crossover_platform::fakes::InMemorySecureStorage::new()),
+            registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            spool_open: false,
+        }
+    }
+
+    fn raw(message_type: MessageType, payload: Vec<u8>) -> crossover_protocol::RawFrame {
+        crossover_protocol::RawFrame {
+            message_type: message_type.wire(),
+            message_id: 1,
+            payload,
+        }
+    }
+
+    /// Let the runtime settle: a bounded number of polls, so a test that
+    /// depends on something *not* completing cannot pass by being slow.
+    async fn settle() {
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The inbound head-of-line block behind the 2026-08-19 incident: every
+    /// frame used to be broadcast to *both* drivers and awaited on both, so
+    /// an inbound `ControlRequest` waited on the clipboard driver's queue —
+    /// which then discarded it. With a saturated bulk path that wait was
+    /// 4.7 s on hardware. Routing by message type means a control frame
+    /// never touches the bulk path at all.
+    #[tokio::test]
+    async fn an_inbound_control_frame_is_not_gated_on_a_saturated_clipboard_queue() {
+        use crossover_core::{InputControlEvent, SyncEvent};
+
+        let (sync_tx, _sync_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(16);
+        let fanout = routing_fanout(sync_tx, control_tx);
+        let session = Uuid::from_bytes([0x5A; 16]);
+
+        // Back the clipboard driver's queue right up and park a bulk frame
+        // against it: the state the incident's machine was in.
+        while fanout.sync.try_send(SyncEvent::LocalChanged).is_ok() {}
+        let bulk = {
+            let fanout = fanout.clone();
+            tokio::spawn(async move {
+                fanout
+                    .frame(session, raw(MessageType::ClipboardChunk, vec![0xBB; 64]))
+                    .await;
+            })
+        };
+        settle().await;
+        assert!(
+            !bulk.is_finished(),
+            "the clipboard queue drained; this test no longer saturates the bulk path"
+        );
+
+        // The control request arrives next. It must be handed to the control
+        // driver and the call must *return* — a fanout that waits on the bulk
+        // queue here stalls every frame behind this one.
+        let answered = {
+            let fanout = fanout.clone();
+            tokio::spawn(async move {
+                fanout
+                    .frame(session, raw(MessageType::ControlRequest, vec![0x01, 0x00]))
+                    .await;
+            })
+        };
+        settle().await;
+        assert!(
+            answered.is_finished(),
+            "an inbound control frame waited on the saturated clipboard queue"
+        );
+
+        let event = control_rx
+            .try_recv()
+            .expect("the control request never reached the control driver");
+        assert!(matches!(
+            event,
+            InputControlEvent::Frame { frame, .. }
+                if frame.message_type == MessageType::ControlRequest.wire()
+        ));
+        // And the bulk frame was never copied to the control driver.
+        assert!(
+            control_rx.try_recv().is_err(),
+            "a clipboard frame was delivered to the control driver"
+        );
+        bulk.abort();
+    }
+
+    /// Routing is total and by class: clipboard traffic reaches only the
+    /// sync driver, input and control traffic only the control driver, and
+    /// same-driver order is exactly the arrival order.
+    #[tokio::test]
+    async fn inbound_frames_route_to_one_driver_in_arrival_order() {
+        use crossover_core::{InputControlEvent, SyncEvent};
+
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(32);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(32);
+        let fanout = routing_fanout(sync_tx, control_tx);
+        let session = Uuid::from_bytes([0x5B; 16]);
+
+        let bulk = [
+            MessageType::ClipboardOffer,
+            MessageType::ClipboardAccept,
+            MessageType::ClipboardDecline,
+            MessageType::ClipboardChunk,
+            MessageType::ClipboardData,
+            MessageType::ClipboardApplied,
+        ];
+        let interactive = [
+            MessageType::InputBatch,
+            MessageType::ReleaseAllInput,
+            MessageType::ControlRequest,
+            MessageType::ControlResponse,
+            MessageType::ControlRelease,
+        ];
+        for message_type in bulk.into_iter().chain(interactive) {
+            fanout.frame(session, raw(message_type, vec![0x00])).await;
+        }
+
+        for expected in bulk {
+            let Some(SyncEvent::Frame(frame)) = sync_rx.try_recv().ok() else {
+                panic!("{expected:?} did not reach the sync driver in order");
+            };
+            assert_eq!(frame.message_type, expected.wire());
+        }
+        assert!(sync_rx.try_recv().is_err(), "interactive traffic leaked");
+
+        for expected in interactive {
+            let Some(InputControlEvent::Frame { frame, .. }) = control_rx.try_recv().ok() else {
+                panic!("{expected:?} did not reach the control driver in order");
+            };
+            assert_eq!(frame.message_type, expected.wire());
+        }
+        assert!(control_rx.try_recv().is_err(), "bulk traffic leaked");
+    }
+
+    /// A message type this build does not know keeps its old behavior — both
+    /// drivers see it (each ignores it) — rather than being silently dropped
+    /// by a classification that only knows the types it was written for.
+    #[tokio::test]
+    async fn an_unknown_message_type_still_reaches_both_drivers() {
+        use crossover_core::{InputControlEvent, SyncEvent};
+
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        let fanout = routing_fanout(sync_tx, control_tx);
+
+        fanout
+            .frame(
+                Uuid::from_bytes([0x5C; 16]),
+                crossover_protocol::RawFrame {
+                    message_type: 0x7777,
+                    message_id: 1,
+                    payload: vec![0xEE],
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            sync_rx.try_recv(),
+            Ok(SyncEvent::Frame(frame)) if frame.message_type == 0x7777
+        ));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(InputControlEvent::Frame { frame, .. }) if frame.message_type == 0x7777
+        ));
     }
 
     #[test]

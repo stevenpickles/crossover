@@ -572,10 +572,11 @@ and the driver behind them. Every later step (draining the session's event
 task, fanning the loss out to the drivers) pushes into the drivers' bounded
 event channels, so doing any of it first waits on a driver that is waiting
 on the send path that this drop releases. For the same reason the fanout
-delivers to both drivers concurrently rather than in sequence: the clipboard
-driver is the one that parks under bulk backpressure, and sequencing the
-control driver behind it would gate `ReleaseAllInput` — a stuck key — on a
-stalled transfer.
+delivers *session lifecycle* events to both drivers concurrently rather than
+in sequence: the clipboard driver is the one that parks under bulk
+backpressure, and sequencing the control driver behind it would gate
+`ReleaseAllInput` — a stuck key — on a stalled transfer. Inbound *frames* are
+not fanned out at all any more; they are routed by class (§5.5).
 
 Keepalive never enters the queues at all: `run_session` writes `Ping`
 straight to the writer on its idle tick and answers `Pong` from the dispatch
@@ -585,6 +586,47 @@ Preemption granularity is bounded below by one frame: a frame in flight is
 unpreemptable. [ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md)'s
 chunking is what shrinks that unit, which is why chunk size is a *latency*
 knob answering to this section, not just a memory one.
+
+### 5.5 Inbound frame routing
+
+The same two classes, read the other way round. §5.4 splits what this machine
+*sends*; this is what it does with what arrives.
+
+`run_session` hands each decoded application frame to the application's
+per-session frame pump, which is strictly serial. The pump used to broadcast
+every frame to **both** the clipboard driver and the control driver and await
+both — each driver discarding whatever was not its own. That made a
+`ControlRequest`'s delivery wait on the clipboard driver's queue, and under
+bulk backpressure that wait was **4.7 s** on 2026-08-19 hardware, which cost
+the requester a control timeout ([ADR
+0013](adr/0013-interactive-over-bulk-prioritization.md) addendum, 2026-08-19).
+
+Frames are now **routed by message type to exactly one driver**:
+
+| Route | Messages |
+|-------|----------|
+| **sync driver** | `ClipboardOffer`/`Accept`/`Decline`/`Data`/`Chunk`/`Applied` |
+| **control driver** | `InputBatch`, `ReleaseAllInput`, `ControlRequest`/`Response`/`Release` |
+| **both** | a message type this build does not recognize |
+
+The classification is **total**, and the unrecognized type is why the third
+row exists: whether to ignore an unknown frame is a driver's decision, not
+the classifier's, so it keeps its historical delivery to both rather than
+becoming a silent drop. Nothing else reaches here — `dispatch_frame` answers
+`Ping`, accepts `Pong`, and fails the session on `Hello` or a pairing
+message, so those never become application frames.
+
+Two invariants the routing keeps. **Order within a driver is arrival order**:
+one frame is delivered before the next is classified, which ADR 0005's
+transaction state machine and the applied-input sequence both require.
+**Nothing is buffered**: routing adds no queue, it removes a wait.
+
+It does not give inbound preemption, and cannot. Backpressure from a
+saturated clipboard path still reaches the peer, and one ordered TCP stream
+then delays whatever the peer sent behind it — priority #2 (clipboard
+reliability) outranks #5 (input latency), so bulk is never dropped to clear
+the way. What is guaranteed is narrower: an interactive frame is never
+delayed by a queue belonging to a driver with no interest in it.
 
 ## 6. Concurrency model
 
@@ -601,6 +643,16 @@ knob answering to this section, not just a memory one.
   ordered, per [PROTOCOL.md](PROTOCOL.md) §6. Backpressure on a bulk queue
   must never propagate to an interactive one, which is why the send path
   runs a task per priority class rather than a task per stage (§5.4).
+- **A level travels on a `watch`, not a queue.** State that means "what is
+  true right now" — desired cursor visibility, the edge detector's watching
+  mode — is latest-wins by nature, so queueing it buys nothing and costs a
+  blocking send. That matters where the consumer feeds back into the
+  producer: the edge mode used to ride a bounded `mpsc` inside a cycle
+  (control loop → mode → detector → crossings → control loop, which the same
+  loop drains), so the loop's own slowness pushed back on itself. Anything
+  that must be *counted* across such a channel has to travel inside the
+  value, since a `watch` coalesces — which is how the crossing generation is
+  carried ([ADR 0009](adr/0009-seamless-edge-transfer.md)).
 - No global mutable state; no sleeps as synchronization; state machines are
   deterministic functions of (state, event) for testability.
 
