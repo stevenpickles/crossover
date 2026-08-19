@@ -943,9 +943,9 @@ mod tests {
     use super::{InputControlEvent, input_control};
     use crate::command::{FrameTarget, SessionCommand};
     use crate::control::{ControlConfig, ControlNotice};
-    use crate::edge_driver::EdgeMode;
+    use crate::edge_driver::{CrossingKind, EdgeMode, REARM_MARGIN};
     use crate::input::{InputEvent, KeyEvent, PointerButton, PointerEvent, hid};
-    use crate::topology::{EdgeFraction, LinkSide, MonitorRect, Topology};
+    use crate::topology::{CursorPoint, EdgeFraction, LinkSide, MonitorRect, Topology};
 
     const HD: Screen = Screen {
         width: 1920,
@@ -971,16 +971,47 @@ mod tests {
         edge_generation: u64,
     }
 
+    /// The rig's edge-poll period, mirroring the application's ~125 Hz.
+    const EDGE_POLL: Duration = Duration::from_millis(8);
+
     fn rig() -> Rig {
+        build_rig(false)
+    }
+
+    /// A rig wired the way the application wires a seamless machine: a real
+    /// [`EdgeDetectDriver`] watching the same [`FakeDisplay`] the injector
+    /// places the cursor on, with its crossings forwarded back in as control
+    /// events. That closes the loop placement → detection → transfer, which
+    /// a bare edge-mode receiver leaves open. Its `edge_modes` receiver is a
+    /// dead stub — the detector holds the real one.
+    fn edge_detecting_rig() -> Rig {
+        build_rig(true)
+    }
+
+    fn build_rig(detect: bool) -> Rig {
         let capture = Arc::new(FakeInputCapture::new());
         let injector = Arc::new(FakeInputInjector::new());
         let cursor_mask = Arc::new(FakeCursorMask::new());
         let display = Arc::new(FakeDisplay::new(HD));
-        let (edge_mode_tx, edge_modes) = mpsc::channel(8);
+        // Placements move the display's cursor, as a real absolute move does.
+        injector.follow(Arc::clone(&display));
         // A left-member topology (links on the right edge) so PlaceCursor
         // has geometry to map through; most tests never trigger it.
+        let topology = Topology::new(LinkSide::Left);
+        let (edge_mode_tx, edge_modes, detection) = if detect {
+            let (edge_driver, mode_tx, crossings) = crate::edge_driver::edge_detect(
+                Arc::clone(&display) as Arc<dyn DisplayInfo>,
+                topology,
+                EDGE_POLL,
+            );
+            let (_dropped, dead) = mpsc::channel(1);
+            (mode_tx, dead, Some((edge_driver, crossings)))
+        } else {
+            let (tx, rx) = mpsc::channel(8);
+            (tx, rx, None)
+        };
         let seamless = super::SeamlessInputs {
-            topology: Topology::new(LinkSide::Left),
+            topology,
             display: Arc::clone(&display) as Arc<dyn DisplayInfo>,
             edge_mode: edge_mode_tx,
         };
@@ -994,6 +1025,28 @@ mod tests {
             },
         );
         tokio::spawn(driver.run());
+        if let Some((edge_driver, mut crossings)) = detection {
+            tokio::spawn(edge_driver.run());
+            let control_events = events.clone();
+            // The application's `spawn_edge_wiring`, in miniature.
+            tokio::spawn(async move {
+                while let Some(crossing) = crossings.recv().await {
+                    let event = match crossing.kind {
+                        CrossingKind::Leave => InputControlEvent::EdgeLeave {
+                            position: crossing.position,
+                            generation: crossing.generation,
+                        },
+                        CrossingKind::Return => InputControlEvent::EdgeReturn {
+                            position: crossing.position,
+                            generation: crossing.generation,
+                        },
+                    };
+                    if control_events.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         Rig {
             capture,
             injector,
@@ -2062,6 +2115,84 @@ mod tests {
             (placements[0].y - 540).abs() <= 1,
             "placed at mid-height, got y={}",
             placements[0].y
+        );
+    }
+
+    /// Let the edge detector run a few polls. Under `tokio::time::pause`
+    /// this advances the clock deterministically rather than waiting.
+    async fn edge_polls(count: u32) {
+        tokio::time::sleep(EDGE_POLL * count).await;
+    }
+
+    /// Bring an edge-detecting rig to "a peer controls this machine",
+    /// entered at mid-height so the cursor is placed on the linked column —
+    /// exactly where a real transfer leaves it.
+    async fn peer_takes_control_across_the_edge(rig: &mut Rig) {
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest {
+                    request_id: 1,
+                    entry: Some(EdgeFraction::new(0.5).to_wire()),
+                }
+                .encode_payload()
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(rig).await;
+        assert_eq!(next_notice(rig).await, ControlNotice::PeerTookControl);
+    }
+
+    /// The hardware bounce this margin exists for (ADR 0009 addendum,
+    /// 2026-08-19). Entry parks the cursor **on** the linked column, and the
+    /// same column means *return* while the peer drives this machine — so
+    /// with a bare one-pixel rising edge, a wobble at the seam fired a
+    /// complete reverse transfer, which re-parked both cursors on their
+    /// trigger columns and repeated (ten take/revoke cycles in five seconds
+    /// on hardware). Here the whole loop is real: the injector's placement
+    /// moves the display's cursor and a real detector polls it.
+    #[tokio::test]
+    async fn a_wobble_on_the_entry_column_does_not_bounce_control_back() {
+        tokio::time::pause();
+        let mut rig = edge_detecting_rig();
+        peer_takes_control_across_the_edge(&mut rig).await;
+        // The placement really moved the cursor onto the linked column.
+        assert_eq!(
+            rig.display.cursor_position().unwrap(),
+            CursorPoint { x: 1919, y: 540 }
+        );
+        // Let the detector adopt Returning mode and prime on that cursor.
+        edge_polls(4).await;
+
+        // The seam wobble: a pixel off the column and back, twice — what a
+        // hand resting against the edge produces at 125 Hz polling.
+        for _ in 0..2 {
+            rig.display.set_cursor(CursorPoint { x: 1918, y: 540 });
+            edge_polls(4).await;
+            rig.display.set_cursor(CursorPoint { x: 1919, y: 540 });
+            edge_polls(4).await;
+        }
+        assert!(
+            timeout(Duration::from_millis(500), rig.notices.recv())
+                .await
+                .is_err(),
+            "a wobble at the seam revoked the peer's control"
+        );
+
+        // Deliberate travel back into the screen re-arms, and the next
+        // touch of the column returns control as it should.
+        let clear = 1919 - i32::try_from(REARM_MARGIN).unwrap() - 1;
+        rig.display.set_cursor(CursorPoint { x: clear, y: 540 });
+        edge_polls(4).await;
+        rig.display.set_cursor(CursorPoint { x: 1919, y: 540 });
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::PeerControlRevoked
         );
     }
 
