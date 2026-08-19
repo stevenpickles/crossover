@@ -671,7 +671,12 @@ living exemplar.
 ## 10. Logging conventions
 
 `tracing` is wired from Phase 0 (FR-7.3); the subscriber is installed once
-in `apps/crossover/src/logging.rs`. Conventions:
+in `apps/crossover/src/logging.rs`. The service daemon (`crossover-svc`,
+ADR 0011) installs its own subscriber the same way in
+`apps/crossover-svc/src/logging.rs`, but to a different file location —
+`%ProgramData%\Crossover\logs` rather than `~/.crossover/logs` — because it
+runs as `LocalSystem`, not the console user, so `~` there is the SYSTEM
+profile (ADR 0011 addendum, 2026-08-19). Conventions:
 
 - **Metadata only.** Clipboard contents and private key material never
   appear in logs at any level (FR-7.4). Clipboard transactions log

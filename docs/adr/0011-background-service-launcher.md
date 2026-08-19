@@ -151,3 +151,36 @@ just exit code, gates a relaunch.
   service must never gain untrusted input. A future review checks it holds.
 - Implementation lands behind `crossover service install/uninstall/status`;
   the interactive `crossover run` is unchanged.
+
+## Addendum: durable supervision logging (2026-08-19)
+
+A two-machine soak turned up a diagnosability gap in the design above. The
+worker on one machine died abruptly at 02:05:38 UTC (the peer saw a TCP RST)
+and `crossover-svc` relaunched it at 02:05:39 — exactly the crash-recovery
+behavior this ADR calls for — but nothing durable recorded *why*. The service
+initialized `tracing` to stderr only, on the theory that "the SCM/event
+pipeline captures it"; that is not true for a `LocalSystem` service with no
+console, so the exit code `GetExitCodeProcess` had already read, and every
+other supervision event, was written and immediately lost. Diagnosing the
+incident took multiple manual forensics passes and remained inconclusive.
+
+Fix (`crossover-svc/src/logging.rs`): a second sink, a daily-rotating file
+under **`%ProgramData%\Crossover\logs`**, alongside the unchanged stderr sink.
+This is deliberately *not* `~/.crossover/logs` (the worker's log location,
+documented in [ARCHITECTURE.md](../ARCHITECTURE.md) §10 and
+[SOAK.md](../SOAK.md)): the service runs as `LocalSystem`, so `~` there
+resolves to the SYSTEM profile, a location no one checks. `%ProgramData%` is
+fixed and machine-local regardless of which account context the service
+happens to run under.
+
+Every supervision transition the loop already drove is now a structured log
+line: worker launched (session id), worker exited (exit code as decimal *and*
+hex, plus whether the supervisor classified it as a crash — the headline gap
+the incident exposed), a service-initiated stop and *why* (`StopReason` on
+`WorkerAction::StopWorker` in `worker_supervisor.rs`: `ServiceStopping`,
+`Logoff`, or `SessionChanged`, versus a real crash — kept in the pure,
+unit-tested state machine, not the untestable daemon glue), launch failures,
+backoff waits and the delay chosen, SCM stop/shutdown controls (with which
+control fired), and session-change notifications with the probed result.
+`crossover service install` and `crossover service status` now print the log
+path so it is discoverable without reading this ADR.
