@@ -148,7 +148,7 @@ pub struct SeamlessInputs {
     /// correct semantics and publishing never blocks. That last part is
     /// load-bearing — the mode used to ride a bounded `mpsc` that closed a
     /// cycle back onto this loop (mode → detector → crossings →
-    /// control_events → here, and this loop is the only thing draining
+    /// `control_events` → here, and this loop is the only thing draining
     /// them), so any slowness here amplified itself into the stall-then-
     /// burst the 2026-08-19 hardware logs show.
     pub edge_mode: watch::Sender<EdgeModeUpdate>,
