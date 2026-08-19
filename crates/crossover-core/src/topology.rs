@@ -63,14 +63,22 @@ impl Edge {
         }
     }
 
+    /// How far *inside* the screen `x` sits from this edge's outer column:
+    /// `0` on the column itself, positive toward the interior, negative for
+    /// a coordinate beyond the column. Saturating, so a nonsense coordinate
+    /// from the platform can never overflow (NFR-1: no panics on input).
+    fn inset_of(self, x: i32, monitor: MonitorRect) -> i32 {
+        match self {
+            Self::Left => x.saturating_sub(self.outer_x(monitor)),
+            Self::Right => self.outer_x(monitor).saturating_sub(x),
+        }
+    }
+
     /// Does a cursor at horizontal position `x` touch this edge of
     /// `monitor`? Touching means reaching the extreme column (or,
     /// defensively, any coordinate at or beyond it).
     fn touched_by(self, x: i32, monitor: MonitorRect) -> bool {
-        match self {
-            Self::Left => x <= self.outer_x(monitor),
-            Self::Right => x >= self.outer_x(monitor),
-        }
+        self.inset_of(x, monitor) <= 0
     }
 }
 
@@ -231,6 +239,30 @@ impl Topology {
         }
     }
 
+    /// Is `cursor` clear of the linked edge by more than `margin` pixels —
+    /// far enough inside the screen that a fresh approach to the edge is a
+    /// deliberate one, not a wobble at the seam?
+    ///
+    /// This is the *release* half of a Schmitt trigger around
+    /// [`leaving`](Self::leaving)'s bare threshold. Detection alone cannot
+    /// distinguish a cursor resting on the entry column (where a transfer
+    /// puts it) from a cursor arriving at it, so a one-pixel excursion and
+    /// return read as a genuine crossing; requiring real travel away from
+    /// the column before the next crossing counts breaks that loop.
+    ///
+    /// Judged on the horizontal distance from the linked column only: the
+    /// column is what a crossing is measured against, and a layout with no
+    /// monitors (never reported by a real display) is never "clear", so the
+    /// degenerate case can only ever suppress a crossing, not invent one.
+    #[must_use]
+    pub fn clear_of_edge(self, cursor: CursorPoint, monitors: &[MonitorRect], margin: u32) -> bool {
+        let Some(monitor) = self.edge_monitor(monitors) else {
+            return false;
+        };
+        let margin = i32::try_from(margin).unwrap_or(i32::MAX);
+        self.linked_edge().inset_of(cursor.x, monitor) > margin
+    }
+
     /// Where the cursor should appear when control arrives here for a peer
     /// that crossed at `fraction`: on this machine's edge monitor, at that
     /// fraction of the monitor's height. The inverse direction of
@@ -301,6 +333,67 @@ mod tests {
         );
         let right = Topology::new(LinkSide::Right);
         assert!(right.leaving(CursorPoint { x: -5, y: 10 }, &hd()).is_some());
+    }
+
+    #[test]
+    fn clear_of_edge_needs_real_travel_away_from_the_linked_column() {
+        let left = Topology::new(LinkSide::Left); // links on x == 1919
+        // On the column, and just off it: not clear — this is the wobble a
+        // transfer's entry placement leaves the cursor in.
+        assert!(!left.clear_of_edge(CursorPoint { x: 1919, y: 540 }, &hd(), 24));
+        assert!(!left.clear_of_edge(CursorPoint { x: 1918, y: 540 }, &hd(), 24));
+        // Exactly the margin is still not clear; one pixel further is.
+        assert!(!left.clear_of_edge(CursorPoint { x: 1895, y: 540 }, &hd(), 24));
+        assert!(left.clear_of_edge(CursorPoint { x: 1894, y: 540 }, &hd(), 24));
+        // Past the column (the OS can report beyond it) is never clear.
+        assert!(!left.clear_of_edge(CursorPoint { x: 5000, y: 540 }, &hd(), 24));
+
+        let right = Topology::new(LinkSide::Right); // links on x == 0
+        assert!(!right.clear_of_edge(CursorPoint { x: 0, y: 540 }, &hd(), 24));
+        assert!(!right.clear_of_edge(CursorPoint { x: 24, y: 540 }, &hd(), 24));
+        assert!(right.clear_of_edge(CursorPoint { x: 25, y: 540 }, &hd(), 24));
+        assert!(!right.clear_of_edge(CursorPoint { x: -50, y: 540 }, &hd(), 24));
+
+        // A zero margin degenerates to "anywhere but the column itself".
+        assert!(left.clear_of_edge(CursorPoint { x: 1918, y: 540 }, &hd(), 0));
+        assert!(!left.clear_of_edge(CursorPoint { x: 1919, y: 540 }, &hd(), 0));
+    }
+
+    #[test]
+    fn clear_of_edge_is_measured_against_the_edge_monitor() {
+        // Two monitors side by side: the linked (right) edge is the outer
+        // one's far column, so the whole first monitor is clear of it.
+        let monitors = [
+            MonitorRect {
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+            MonitorRect {
+                left: 1920,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+        ];
+        let left = Topology::new(LinkSide::Left);
+        assert!(left.clear_of_edge(CursorPoint { x: 1919, y: 540 }, &monitors, 24));
+        assert!(!left.clear_of_edge(CursorPoint { x: 3839, y: 540 }, &monitors, 24));
+    }
+
+    #[test]
+    fn clear_of_edge_never_panics_on_a_degenerate_layout_or_coordinate() {
+        let left = Topology::new(LinkSide::Left);
+        // No monitors: nothing to be clear of, so never clear (a crossing
+        // can only be suppressed, never invented).
+        assert!(!left.clear_of_edge(CursorPoint { x: 0, y: 0 }, &[], 24));
+        // Extreme coordinates and margins saturate rather than overflow.
+        assert!(!left.clear_of_edge(CursorPoint { x: i32::MAX, y: 0 }, &hd(), u32::MAX));
+        assert!(!left.clear_of_edge(CursorPoint { x: i32::MIN, y: 0 }, &hd(), u32::MAX));
+        let right = Topology::new(LinkSide::Right);
+        assert!(!right.clear_of_edge(CursorPoint { x: i32::MAX, y: 0 }, &hd(), u32::MAX));
+        assert!(!right.clear_of_edge(CursorPoint { x: i32::MIN, y: 0 }, &hd(), u32::MAX));
     }
 
     #[test]
