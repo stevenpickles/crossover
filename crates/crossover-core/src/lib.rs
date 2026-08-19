@@ -33,7 +33,8 @@ pub use control::{
 };
 pub use control_driver::{InputControlDriver, InputControlEvent, SeamlessInputs, input_control};
 pub use edge_driver::{
-    CrossingKind, EdgeCrossing, EdgeDetectDriver, EdgeDetector, EdgeMode, edge_detect,
+    CrossingKind, EdgeCrossing, EdgeDetectDriver, EdgeDetector, EdgeMode, EdgeModeUpdate,
+    edge_detect,
 };
 pub use file_blob::{FALLBACK_ARCHIVE_NAME, wire_file_name};
 pub use input::{
