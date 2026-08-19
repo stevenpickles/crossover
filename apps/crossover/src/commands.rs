@@ -384,6 +384,10 @@ pub fn service_install() -> anyhow::Result<()> {
         "It starts at boot and launches `crossover run` in your session, restarting it on \
          crash (ADR 0011)."
     );
+    println!(
+        "Service supervision events (launches, exits, stops) are logged to \
+         %ProgramData%\\Crossover\\logs — check there if the worker ever stops unexpectedly."
+    );
     Ok(())
 }
 
@@ -422,9 +426,11 @@ pub fn service_status() -> anyhow::Result<()> {
         }
         Ok(ServiceStatus::Installed { running: true }) => {
             println!("The Crossover background service is installed and running.");
+            println!("Supervision log: %ProgramData%\\Crossover\\logs");
         }
         Ok(ServiceStatus::Installed { running: false }) => {
             println!("The Crossover background service is installed but not running.");
+            println!("Supervision log: %ProgramData%\\Crossover\\logs");
         }
         Err(ServiceError::Unsupported) => {
             print_service_unsupported();
