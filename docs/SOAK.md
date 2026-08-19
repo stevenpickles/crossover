@@ -662,6 +662,12 @@ Then use the machines normally. Over the soak window (target: multiple days):
   kept), which is where you read back reconnects, control transfers, worker
   relaunches, and errors after a multi-day run. `crossover status` and Task
   Manager give the at-a-glance state; the log files give the history.
+  The service daemon itself (`crossover-svc.exe`, the `LocalSystem` process
+  that launches and watches the worker) keeps a **separate** log at
+  **`%ProgramData%\Crossover\logs`** (`crossover-svc.<date>.log`) — this is
+  where a worker's exit code, a crash-vs-intentional-stop classification, and
+  backoff/relaunch timing live, distinct from the worker's own protocol-level
+  log (ADR 0011 addendum, 2026-08-19).
 
 ### Findings
 
