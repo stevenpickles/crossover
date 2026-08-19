@@ -716,7 +716,22 @@ impl ControlEngine {
             })
         {
             self.outbound = Outbound::Local;
-            vec![ControlAction::Notify(ControlNotice::RequestTimedOut)]
+            // Reverting locally is not enough: the peer may be about to
+            // grant a request we have stopped waiting for, and a grant
+            // nobody believes they hold leaves that machine wedged as
+            // "controlled" by a driver that will never drive. So the
+            // cancellation goes on the wire too. It is idempotent with the
+            // undo-stray release in `on_peer_response`: whichever arrives
+            // second finds a peer that holds nothing over us and that we do
+            // not control, which `on_peer_release`'s last branch already
+            // treats as a silent no-op.
+            vec![
+                ControlAction::Send {
+                    session,
+                    message: OutboundControl::Release(None),
+                },
+                ControlAction::Notify(ControlNotice::RequestTimedOut),
+            ]
         } else {
             Vec::new()
         }
@@ -1245,6 +1260,40 @@ mod tests {
             "a grant nobody is waiting for must be explicitly released"
         );
         assert!(!engine.is_controlling());
+    }
+
+    #[test]
+    fn a_timed_out_request_cancels_on_the_wire() {
+        // Reverting locally is not enough: the peer may be about to grant a
+        // request we have stopped waiting for, and a grant nobody believes
+        // they hold wedges that machine as "controlled" by a driver that
+        // will never drive. The timeout says so on the wire (feature/139).
+        let mut engine = established_engine();
+        let request_id =
+            sent_request_id(&engine.handle(ControlEvent::UserRequestControl { session: SESSION }));
+        let actions = engine.handle(ControlEvent::RequestTimeout {
+            session: SESSION,
+            request_id,
+        });
+        assert_eq!(
+            actions,
+            vec![
+                send(OutboundControl::Release(None)),
+                ControlAction::Notify(ControlNotice::RequestTimedOut),
+            ]
+        );
+        assert!(!engine.is_controlling());
+
+        // The cancel is idempotent with the undo-stray release, because a
+        // release from a session that holds nothing over us — and that we do
+        // not control — is already a silent no-op (`on_peer_release`'s last
+        // branch). Whichever of the two arrives second changes nothing.
+        let mut peer_engine = established_engine();
+        assert!(
+            peer_engine
+                .handle(peer(InboundControl::Release(None)))
+                .is_empty()
+        );
     }
 
     #[test]
