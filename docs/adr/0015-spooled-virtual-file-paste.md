@@ -1240,3 +1240,72 @@ slice was scoped to fix. And advertising the bit is validated by the test
 suites only; no two-machine hardware run has exercised a real file
 transfer end to end yet, so this is construction complete, not delivery
 proven (docs/TESTING.md's Definition of Done).
+
+## Addendum: hardware-validated on wire-crossed machines (2026-08-19)
+
+Construction-complete became delivery-proven. A two-machine session over a
+direct 2.5/10 GbE link — machine A listening, machine B dialing, initial
+build `e689a3b`, final retests on the build carrying PRs #43–#46 — moved
+real files and folders across the wire in both directions and exercised
+this ADR's guardrails as guardrails rather than as assertions over test
+fixtures. The full session record is docs/SOAK.md's Phase 7 files section;
+this addendum states the outcome against this ADR specifically.
+
+**What passed.** Single-file transfer both directions, byte-identical,
+opening without SmartScreen or Protected View but carrying `ZoneId=1` in
+`Zone.Identifier` — the 2026-08-17 zone decision above, confirmed live, not
+just unit-tested. Folder and multi-selection packing into one Stored-entry
+zip, contents identical after extraction. `AlreadyHave` dedup instant with
+nothing on the wire. The >256 MiB refusal observed live as `TooLarge`
+(268,500,992 bytes against the 268,435,456-byte `MAX_CLIPBOARD_FILE_BYTES`),
+nothing partial sent, the clipboard path unwedged afterward. Loop
+prevention held under both passive observation and a deliberate
+provocation: a spool-path copy probe was suppressed silently,
+`clipboard_loop_suppressed` incrementing exactly once. A 200 MiB /
+130-entry zip packed in ~2 s with input responsive throughout.
+
+**The open question this ADR carried is answered.** §1.6's third exception
+(F16, invariant 7) — whether Windows actually honors the Clipboard
+History/Cloud Clipboard exclusions the data object declares — was verified
+on two machines with a real wire crossing between them, not only locally:
+the received offer does not appear in Win+V history and does not
+cloud-sync; the pasted file opens unprompted, `ZoneId=1` intact. This
+satisfies the Definition of Done's platform-test item
+(docs/TESTING.md §1.6, §5) for the files slice.
+
+**An operational fact worth recording here, for whoever next runs
+`allow-files`:** `file_receive` is default-off per this ADR and must be
+granted on the *receiving* machine, which sounds obvious until a two-way
+test needs it granted on **both** machines — the first attempt on this
+session failed `NotPermitted` because it was granted on only one side.
+
+**What was deliberately not exercised on hardware, and why that is
+defensible.** The mid-transfer network-disconnect case was skipped: at
+2.5 Gbps a 200 MiB transfer completes sub-second, leaving no practical
+"mid" for a manual disconnect to land in. Engine-level fault injection
+remains the primary evidence for the abandonment paths this ADR and
+docs/TESTING.md §1.5 both describe (a tampered final chunk, a spool write
+failure, a lost session, an expired deadline — all hermetic). A real
+abrupt disconnect was nonetheless observed live during the session,
+described next.
+
+**What this session found and fixed, none of it specific to the file
+path itself.** An edge-transfer bounce (PR #44, feature/137), a
+control-request lockout (PR #45, feature/139), and an inbound
+head-of-line block that had control frames sharing the clipboard driver's
+queue (PR #46, feature/140) were all fixed forward during this validation
+pass. Separately, the worker on machine B died abruptly at 02:05:38 UTC
+(the peer saw a TCP RST); the service relaunched it in ~1.3 s, the session
+re-established, and no input was left stuck — but the worker's root cause
+**remains unknown**, unrecorded by design until PR #43 (feature/138, the
+ADR 0011 addendum) landed durable supervision logging. That fix makes a
+recurrence diagnosable; it does not explain this one. docs/SOAK.md carries
+the full account, including the retest that shows the edge/control/routing
+fixes hold under ~20 rapid crossings.
+
+**What this addendum does not close.** This is the files slice, not
+Phase 7. The phase's separate input-latency exit criterion
+(docs/ROADMAP.md, held at 64 KiB) was not re-measured with the rigor of
+feature/117/118 on this wired link — the informal p50 reading taken here
+is a data point toward doing that measurement, not the measurement
+itself.

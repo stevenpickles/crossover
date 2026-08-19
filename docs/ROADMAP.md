@@ -163,6 +163,51 @@
 > the clipboard-history/cloud exclusions the virtual-file object declares
 > (docs/TESTING.md §1.6) — open, carried forward.
 >
+> **The files slice is hardware-validated** (2026-08-19), closing the item
+> above. A two-machine session over a direct 2.5/10 GbE wired link —
+> machines A (listener) and B (dialer), initial build `e689a3b`, final
+> retests on the build containing PRs #43–#46 — exercised the whole path
+> construction had previously only test suites for
+> ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)'s 2026-08-19 addendum
+> and [SOAK.md](SOAK.md)'s Phase 7 files section carry the full session
+> record). Single-file and folder/multi-selection transfers arrived
+> byte-identical in both directions and opened without SmartScreen or
+> Protected View, carrying `ZoneId=1`; `AlreadyHave` dedup, the >256 MiB
+> `TooLarge` refusal (observed live, 268,500,992 bytes vs. the 268,435,456
+> max), and loop prevention (a deliberate spool-path copy probe suppressed
+> silently, `clipboard_loop_suppressed` incrementing exactly once) all held.
+> **The question left open above is now answered**: docs/TESTING.md §1.6's
+> third exception (F16) is confirmed on wire-crossed hardware, not just
+> locally — a received offer does not appear in Win+V history and does not
+> cloud-sync, and the pasted file opens unprompted with `ZoneId=1`.
+>
+> The session found and fixed four real defects, all merged to `dev`: an
+> edge-transfer bounce under a hand tremor at the seam, ADR 0009's
+> deliberately deferred push-through risk materializing (PR #44, feature/137,
+> re-arm hysteresis); a control-request lockout from a ~4.7 s-late answer
+> racing its own retry into a self-healing ~7 s lockout (PR #45, feature/139);
+> an inbound head-of-line block — control frames were gated on the clipboard
+> driver's queue, with no inbound interactive/bulk separation, ADR 0013
+> having been outbound-only until now (PR #46, feature/140); and a silent
+> worker death on B at 02:05:38 UTC that self-healed in ~1.3 s with no stuck
+> input, but whose root cause the service recorded nowhere — fixed forward,
+> not diagnosed, by durable supervision logging (PR #43, feature/138, ADR
+> 0011 addendum). Retests on the post-#46 build confirm the seam no longer
+> bounces and ~20 rapid crossings ran clean.
+>
+> **This closes delivery-proven for files, not Phase 7.** The phase's input
+> latency exit criterion is still open: it remains held at 64 KiB
+> (2026-08-16, above), and this session's hardware read — input responsive
+> throughout large file transfers, p50 input-path latency ~3 ms during sends
+> — is an informal wired-link data point, not the rigorous max-latency
+> instrumentation (feature/117/118) redone over wired. The wired link that
+> just proved out files is exactly the link that decision was waiting to be
+> revisited on; a formal wired re-run of that measurement is a candidate next
+> step, not undertaken here. Also skipped, deliberately: the mid-transfer
+> network-disconnect case — at 2.5 Gbps a 200 MiB transfer completes
+> sub-second, leaving no practical "mid" — with the 02:05:38 abrupt-disconnect
+> recovery standing as live evidence for that class of fault ([SOAK.md](SOAK.md)).
+>
 > Phase 6 (Windows Prototype Hardening) closed 2026-08-14: the multi-day
 > unattended soak — the last exit criterion — ran 2026-08-11 → 2026-08-14
 > between the two workstations under the background service, with no manual
