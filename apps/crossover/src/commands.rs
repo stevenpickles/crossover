@@ -992,12 +992,16 @@ fn spawn_edge_wiring(
     tokio::spawn(edge_driver.run());
     tokio::spawn(async move {
         while let Some(crossing) = crossings.recv().await {
+            // The generation rides along so the control driver can drop a
+            // crossing whose control state has since changed (ADR 0009).
             let event = match crossing.kind {
                 CrossingKind::Leave => InputControlEvent::EdgeLeave {
                     position: crossing.position,
+                    generation: crossing.generation,
                 },
                 CrossingKind::Return => InputControlEvent::EdgeReturn {
                     position: crossing.position,
+                    generation: crossing.generation,
                 },
             };
             if control_events.send(event).await.is_err() {

@@ -6,7 +6,7 @@
 //! crate's own tests.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::clipboard::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
@@ -365,6 +365,10 @@ pub struct FakeInputInjector {
     /// set to script a secure desktop. Stored inverted so the derived default
     /// (`false`) means "injectable".
     blocked: Mutex<bool>,
+    /// A display whose cursor follows this injector's placements, when one
+    /// is linked (see [`FakeInputInjector::follow`]). Unlinked by default,
+    /// so placements are only recorded.
+    display: Mutex<Option<Arc<FakeDisplay>>>,
 }
 
 impl FakeInputInjector {
@@ -416,6 +420,15 @@ impl FakeInputInjector {
     pub fn set_can_inject(&self, available: bool) {
         *lock(&self.blocked) = !available;
     }
+
+    /// Make `display`'s cursor follow this injector's placements, the way a
+    /// real absolute move is immediately visible to the display query that
+    /// edge detection polls. Without this link a placement is only recorded,
+    /// which hides feedback loops between placing the cursor and detecting
+    /// where it now is.
+    pub fn follow(&self, display: Arc<FakeDisplay>) {
+        *lock(&self.display) = Some(display);
+    }
 }
 
 impl InputInjector for FakeInputInjector {
@@ -429,6 +442,13 @@ impl InputInjector for FakeInputInjector {
 
     fn place_cursor(&self, position: CursorPoint) -> Result<(), InputError> {
         lock(&self.placements).push(position);
+        // A real placement moves the pointer the display then reports; a
+        // linked display models that, so tests see the same feedback the
+        // machine does.
+        let display = lock(&self.display).clone();
+        if let Some(display) = display {
+            display.set_cursor(position);
+        }
         Ok(())
     }
 

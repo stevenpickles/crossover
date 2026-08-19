@@ -11,10 +11,12 @@
 //!
 //! The pure [`EdgeDetector`] turns a stream of cursor observations into a
 //! crossing on the **rising edge only** — the first observation where the
-//! cursor reaches the linked edge after being away — so a cursor pinned
-//! at the screen edge fires the transfer once, not on every poll. The
-//! async [`EdgeDetectDriver`] polls the display, applies the mode, and
-//! emits the crossings.
+//! cursor reaches the linked edge after being clear of it — so a cursor
+//! pinned at the screen edge fires the transfer once, not on every poll.
+//! "Clear of it" is a Schmitt trigger, not a bare threshold: the cursor
+//! must travel [`REARM_MARGIN`] pixels inward before the next touch counts
+//! (see that constant). The async [`EdgeDetectDriver`] polls the display,
+//! applies the mode, and emits the crossings.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,20 +72,45 @@ pub struct EdgeCrossing {
     pub kind: CrossingKind,
     /// Normalized position along the edge.
     pub position: EdgeFraction,
+    /// The [`EdgeMode`] generation this crossing was detected under — the
+    /// number of mode updates the detector had received when it fired.
+    /// `kind` is frozen at detection time, so a crossing that queues behind
+    /// a control-state change would otherwise act on a state that no longer
+    /// exists (a stale `Return` revoking a *fresh* grant). The control
+    /// driver counts the mode updates it sends and discards any crossing
+    /// whose generation is not the current one.
+    pub generation: u64,
 }
 
+/// How far the cursor must travel back inside the screen, in pixels, before
+/// a touch of the linked edge counts as a new crossing (ADR 0009 addendum,
+/// 2026-08-19).
+///
+/// A transfer leaves the cursor resting *exactly* on the linked column at
+/// both ends — that is deliberate, for cursor continuity — and the linked
+/// edge does double duty (leave while local, return while controlled). With
+/// a bare one-pixel rising edge, a two-pixel wobble at 125 Hz polling was
+/// enough to fire a complete reverse transfer, which re-parked both cursors
+/// on their trigger columns and so repeated: ten take/revoke cycles in five
+/// seconds on hardware. Requiring real inward travel first makes a wobble
+/// inert while costing a deliberate crossing nothing — a real crossing
+/// covers far more than this margin on its way to the edge.
+pub const REARM_MARGIN: u32 = 24;
+
 /// The pure crossing detector: rising-edge detection against the linked
-/// edge. Holds whether the cursor was at the edge last time — and the
-/// monitor layout that judgment was made against — so a crossing fires
-/// once on arrival, never repeatedly while the cursor sits pinned there,
-/// and never because the *edge* moved under a stationary cursor. No I/O.
+/// edge, with hysteresis. Holds whether a touch of the edge is currently
+/// *armed* — and the monitor layout that judgment was made against — so a
+/// crossing fires once on a genuine arrival, never repeatedly while the
+/// cursor sits pinned there or jitters against it, and never because the
+/// *edge* moved under a stationary cursor. No I/O.
 #[derive(Debug)]
 pub struct EdgeDetector {
     topology: Topology,
-    /// Whether the cursor was against the linked edge at the last
-    /// observation.
-    at_edge: bool,
-    /// The monitor layout `at_edge` was computed against. A layout change
+    /// Whether a touch of the linked edge would count as a crossing: set
+    /// only by an observation [`REARM_MARGIN`] pixels clear of the linked
+    /// column, cleared by every crossing and by priming near the edge.
+    armed: bool,
+    /// The monitor layout `armed` was computed against. A layout change
     /// (dock, undock, a monitor powering off) moves the linked edge without
     /// the cursor moving, so the flag no longer describes the geometry the
     /// cursor is actually in: an interior column can become the edge in one
@@ -93,23 +120,31 @@ pub struct EdgeDetector {
 }
 
 impl EdgeDetector {
-    /// A detector for a machine of this `topology`, starting away from the
-    /// edge.
+    /// A detector for a machine of this `topology`, disarmed: the first
+    /// observation primes it against the layout it carries.
     #[must_use]
     pub fn new(topology: Topology) -> Self {
         Self {
             topology,
-            at_edge: false,
+            armed: false,
             layout: Vec::new(),
         }
     }
 
-    /// Set the at-edge state from a cursor **without** emitting a
-    /// crossing. Used when detection (re)starts, so a cursor already
-    /// sitting at the edge does not fire an immediate, unintended
-    /// transfer — only a fresh arrival does.
+    /// Set the armed state from a cursor **without** emitting a crossing.
+    /// Used when detection (re)starts, so a cursor already sitting at the
+    /// edge — where a transfer's entry placement puts it — does not fire an
+    /// immediate, unintended transfer; only an arrival from clear of the
+    /// edge does.
+    ///
+    /// Priming applies the same [`REARM_MARGIN`] test as
+    /// [`observe`](Self::observe), so it arms only for a cursor already
+    /// well inside the screen. That also closes the race between the entry
+    /// placement and this prime — they run on different tasks, so a few
+    /// injected pixels of motion can land in between, and they are nowhere
+    /// near enough to arm.
     pub fn prime(&mut self, cursor: CursorPoint, monitors: &[MonitorRect]) {
-        self.at_edge = self.topology.leaving(cursor, monitors).is_some();
+        self.armed = self.topology.clear_of_edge(cursor, monitors, REARM_MARGIN);
         if self.layout.as_slice() != monitors {
             self.layout = monitors.to_vec();
         }
@@ -121,9 +156,10 @@ impl EdgeDetector {
         self.layout.as_slice() != monitors
     }
 
-    /// Observe a cursor position. Returns the crossing fraction only on
-    /// the rising edge — the cursor reaching the linked edge after being
-    /// away from it — and `None` otherwise (away, still pinned, or a
+    /// Observe a cursor position. Returns the crossing fraction only on an
+    /// armed rising edge — the cursor reaching the linked edge after having
+    /// been [`REARM_MARGIN`] pixels clear of it — and `None` otherwise
+    /// (clear of the edge, still pinned, jittering against it, or a
     /// monitor-layout change, which re-primes against the new geometry
     /// rather than treating a moved edge as an arrival).
     #[must_use]
@@ -136,10 +172,17 @@ impl EdgeDetector {
             self.prime(cursor, monitors);
             return None;
         }
+        if self.topology.clear_of_edge(cursor, monitors, REARM_MARGIN) {
+            self.armed = true;
+        }
         let touching = self.topology.leaving(cursor, monitors);
-        let rising = touching.is_some() && !self.at_edge;
-        self.at_edge = touching.is_some();
-        if rising { touching } else { None }
+        if touching.is_some() && self.armed {
+            // One crossing per approach: the next needs a fresh re-arm.
+            self.armed = false;
+            touching
+        } else {
+            None
+        }
     }
 }
 
@@ -163,6 +206,7 @@ pub fn edge_detect(
         display,
         detector: EdgeDetector::new(topology),
         mode: EdgeMode::Idle,
+        generation: 0,
         mode_rx,
         crossings_tx,
         poll_interval,
@@ -175,6 +219,12 @@ pub struct EdgeDetectDriver {
     display: Arc<dyn DisplayInfo>,
     detector: EdgeDetector,
     mode: EdgeMode,
+    /// How many mode updates have been applied. Stamped on every crossing
+    /// so a consumer can tell one detected under the current control state
+    /// from one that queued behind a state change (see
+    /// [`EdgeCrossing::generation`]). The sender counts its own updates, so
+    /// the two counts agree without a wider channel type.
+    generation: u64,
     mode_rx: mpsc::Receiver<EdgeMode>,
     crossings_tx: mpsc::Sender<EdgeCrossing>,
     poll_interval: Duration,
@@ -194,7 +244,10 @@ impl EdgeDetectDriver {
                 update = self.mode_rx.recv() => {
                     let Some(mode) = update else { break }; // wiring gone
                     self.mode = mode;
-                    tracing::debug!(?mode, "edge: watching mode changed");
+                    // Saturating so a very long-lived process cannot wrap a
+                    // stale generation onto a current one.
+                    self.generation = self.generation.saturating_add(1);
+                    tracing::debug!(?mode, generation = self.generation, "edge: watching mode changed");
                     if mode != EdgeMode::Idle {
                         // Begin from the current cursor so a position
                         // already at the edge does not fire immediately.
@@ -269,11 +322,16 @@ impl EdgeDetectDriver {
                 position = position.value(),
                 cursor_x = cursor.x,
                 cursor_y = cursor.y,
+                generation = self.generation,
                 "edge: crossing detected"
             );
             if self
                 .crossings_tx
-                .send(EdgeCrossing { kind, position })
+                .send(EdgeCrossing {
+                    kind,
+                    position,
+                    generation: self.generation,
+                })
                 .await
                 .is_err()
             {
@@ -295,7 +353,7 @@ mod tests {
     use crossover_platform::DisplayInfo;
     use crossover_platform::fakes::FakeDisplay;
 
-    use super::{CrossingKind, EdgeCrossing, EdgeDetector, EdgeMode, edge_detect};
+    use super::{CrossingKind, EdgeCrossing, EdgeDetector, EdgeMode, REARM_MARGIN, edge_detect};
     use crate::topology::{CursorPoint, LinkSide, MonitorRect, Screen, Topology};
 
     const HD: Screen = Screen {
@@ -404,6 +462,67 @@ mod tests {
         assert!(d.observe(at(0, 500), &HD_MON).is_some());
     }
 
+    /// The hardware bounce (ADR 0009 addendum, 2026-08-19): a transfer
+    /// leaves the cursor resting on the linked column, so a one- or
+    /// two-pixel wobble there used to read as a fresh arrival and fire a
+    /// complete reverse transfer. Only travel clear of the column by more
+    /// than [`REARM_MARGIN`] re-arms the trigger.
+    #[test]
+    fn a_wobble_at_the_edge_does_not_cross_but_real_travel_does() {
+        let margin = i32::try_from(REARM_MARGIN).unwrap();
+        let column = 1919; // the left member's linked column
+        let mut d = EdgeDetector::new(Topology::new(LinkSide::Left));
+        // Detection begins with the cursor parked on the column, exactly
+        // where an entry placement leaves it.
+        d.prime(at(column, 540), &HD_MON);
+
+        // Jitter of a pixel, and of the whole margin, is inert — however
+        // often it repeats.
+        for _ in 0..3 {
+            assert!(d.observe(at(column - 1, 540), &HD_MON).is_none());
+            assert!(d.observe(at(column, 540), &HD_MON).is_none());
+            assert!(d.observe(at(column - margin, 540), &HD_MON).is_none());
+            assert!(d.observe(at(column, 540), &HD_MON).is_none());
+        }
+
+        // One pixel past the margin is real travel: the next touch crosses.
+        assert!(
+            d.observe(at(column - margin - 1, 540), &HD_MON).is_none(),
+            "moving clear of the edge is not itself a crossing"
+        );
+        assert!(d.observe(at(column, 540), &HD_MON).is_some());
+        // And only once: the crossing disarms it again.
+        assert!(d.observe(at(column, 540), &HD_MON).is_none());
+    }
+
+    /// The same hysteresis on the mirrored side, where the linked column is
+    /// `x == 0` and clearing it means moving *right*.
+    #[test]
+    fn the_rearm_margin_applies_on_the_left_linked_edge_too() {
+        let margin = i32::try_from(REARM_MARGIN).unwrap();
+        let mut d = EdgeDetector::new(Topology::new(LinkSide::Right));
+        d.prime(at(0, 500), &HD_MON);
+        assert!(d.observe(at(1, 500), &HD_MON).is_none());
+        assert!(d.observe(at(0, 500), &HD_MON).is_none());
+        assert!(d.observe(at(margin, 500), &HD_MON).is_none());
+        assert!(d.observe(at(0, 500), &HD_MON).is_none());
+        assert!(d.observe(at(margin + 1, 500), &HD_MON).is_none());
+        assert!(d.observe(at(0, 500), &HD_MON).is_some());
+    }
+
+    /// A deliberate crossing pays nothing for the hysteresis: a cursor
+    /// crossing the screen is clear of the edge the whole way, so the very
+    /// first observation that reaches the column fires.
+    #[test]
+    fn a_deliberate_crossing_still_fires_on_the_first_touch() {
+        let mut d = EdgeDetector::new(Topology::new(LinkSide::Left));
+        d.prime(at(100, 400), &HD_MON);
+        for x in [400, 900, 1400, 1800] {
+            assert!(d.observe(at(x, 400), &HD_MON).is_none());
+        }
+        assert!(d.observe(at(1919, 400), &HD_MON).is_some());
+    }
+
     // ---- the async driver ----
     //
     // The driver polls a real clock, so these tests start the cursor in
@@ -461,6 +580,23 @@ mod tests {
         display.set_cursor(at(0, 270)); // left edge
         let crossing = next_crossing(&mut crossings).await;
         assert_eq!(crossing.kind, CrossingKind::Return);
+    }
+
+    /// Every crossing is stamped with the number of mode updates the
+    /// detector had applied when it fired, so a consumer can tell a
+    /// crossing detected under the current control state from one that
+    /// queued behind a state change.
+    #[tokio::test]
+    async fn a_crossing_carries_the_mode_generation_it_was_detected_under() {
+        let (display, mode_tx, mut crossings) = rig(LinkSide::Left);
+        mode_tx.send(EdgeMode::Leaving).await.unwrap(); // generation 1
+        sleep(SETTLE).await;
+        mode_tx.send(EdgeMode::Returning).await.unwrap(); // generation 2
+        sleep(SETTLE).await;
+        display.set_cursor(at(1919, 540));
+        let crossing = next_crossing(&mut crossings).await;
+        assert_eq!(crossing.kind, CrossingKind::Return);
+        assert_eq!(crossing.generation, 2);
     }
 
     #[tokio::test]

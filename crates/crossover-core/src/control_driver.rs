@@ -105,12 +105,18 @@ pub enum InputControlEvent {
     EdgeLeave {
         /// Normalized crossing position along the edge.
         position: EdgeFraction,
+        /// The edge-mode generation the crossing was detected under; a
+        /// crossing from an earlier generation is stale and dropped.
+        generation: u64,
     },
     /// The cursor returned to the linked edge while the peer controls this
     /// machine: reclaim control, carrying where it crossed (ADR 0009).
     EdgeReturn {
         /// Normalized crossing position along the edge.
         position: EdgeFraction,
+        /// The edge-mode generation the crossing was detected under; a
+        /// crossing from an earlier generation is stale and dropped.
+        generation: u64,
     },
     /// One captured input event, pointer or key (platform sink bridge).
     Captured(InputEvent),
@@ -181,6 +187,14 @@ pub struct InputControlDriver {
     seamless: Option<SeamlessInputs>,
     /// The last edge mode emitted, so only changes are sent.
     last_edge_mode: EdgeMode,
+    /// How many edge-mode updates have been sent. A crossing carries the
+    /// generation the detector held when it fired, and it reaches this loop
+    /// through two bounded queues with its `kind` frozen at detection time —
+    /// so a crossing that queued behind a mode change describes a control
+    /// state that no longer exists (a `Return` detected under a grant that
+    /// has since ended would revoke a *fresh* one). Anything that does not
+    /// match this counter is dropped.
+    edge_mode_generation: u64,
     /// The monitor layout last seen on the health tick, for noticing a
     /// display change (dock, undock, a monitor powering off) while running.
     /// The seamless machinery re-reads geometry on every use, so nothing
@@ -243,6 +257,7 @@ pub fn input_control(
         // Idle until a session establishes: emitting the initial mode is
         // the driver's job on the first state change.
         last_edge_mode: EdgeMode::Idle,
+        edge_mode_generation: 0,
         seen_monitors: None,
         events_rx,
         events_tx: events_tx.clone(),
@@ -383,13 +398,27 @@ impl InputControlDriver {
                     ControlEvent::UserRequestControl { session }
                 }
                 InputControlEvent::ReleaseControl => ControlEvent::UserRelease,
-                InputControlEvent::EdgeLeave { position } => {
+                InputControlEvent::EdgeLeave {
+                    position,
+                    generation,
+                } => {
+                    if !self.edge_crossing_is_current(generation, "leave") {
+                        continue;
+                    }
                     // Same session choice as a console take-control, plus
                     // where the cursor crossed (ADR 0009).
                     let session = self.sessions.last().copied().unwrap_or_else(Uuid::nil);
                     ControlEvent::EdgeLeave { session, position }
                 }
-                InputControlEvent::EdgeReturn { position } => ControlEvent::EdgeReturn { position },
+                InputControlEvent::EdgeReturn {
+                    position,
+                    generation,
+                } => {
+                    if !self.edge_crossing_is_current(generation, "return") {
+                        continue;
+                    }
+                    ControlEvent::EdgeReturn { position }
+                }
                 InputControlEvent::RequestTimeout {
                     session,
                     request_id,
@@ -517,7 +546,10 @@ impl InputControlDriver {
     }
 
     /// Send the current edge mode to the detector when it has changed, so
-    /// detection tracks the control state.
+    /// detection tracks the control state. Each delivered update advances
+    /// the crossing generation, which the detector counts identically —
+    /// crossings detected before the change then no longer match, and are
+    /// dropped by [`edge_crossing_is_current`](Self::edge_crossing_is_current).
     async fn sync_edge_mode(&mut self) {
         if self.seamless.is_none() {
             return;
@@ -526,10 +558,34 @@ impl InputControlDriver {
         if mode != self.last_edge_mode {
             tracing::debug!(?mode, "control: edge mode -> detector");
             self.last_edge_mode = mode;
-            if let Some(seamless) = &self.seamless {
-                let _ = seamless.edge_mode.send(mode).await;
+            if let Some(seamless) = &self.seamless
+                && seamless.edge_mode.send(mode).await.is_ok()
+            {
+                // Counted only once the detector has the update, so a dead
+                // detector cannot leave the counters disagreeing. Saturating
+                // so no run length can wrap a stale generation onto a
+                // current one.
+                self.edge_mode_generation = self.edge_mode_generation.saturating_add(1);
             }
         }
+    }
+
+    /// Whether a crossing detected under `generation` still describes the
+    /// control state this machine is in. A crossing carries a `kind` frozen
+    /// at detection time and travels through two bounded queues to get
+    /// here; if the edge mode changed on the way, acting on it would apply
+    /// a decision about the old state to the new one.
+    fn edge_crossing_is_current(&self, generation: u64, kind: &'static str) -> bool {
+        if generation == self.edge_mode_generation {
+            return true;
+        }
+        tracing::debug!(
+            kind,
+            generation,
+            current = self.edge_mode_generation,
+            "edge: stale crossing dropped; the control state changed after it was detected"
+        );
+        false
     }
 
     /// Hand `event` to the engine, tracing the transition — unless it is
@@ -887,9 +943,9 @@ mod tests {
     use super::{InputControlEvent, input_control};
     use crate::command::{FrameTarget, SessionCommand};
     use crate::control::{ControlConfig, ControlNotice};
-    use crate::edge_driver::EdgeMode;
+    use crate::edge_driver::{CrossingKind, EdgeMode, REARM_MARGIN};
     use crate::input::{InputEvent, KeyEvent, PointerButton, PointerEvent, hid};
-    use crate::topology::{EdgeFraction, LinkSide, MonitorRect, Topology};
+    use crate::topology::{CursorPoint, EdgeFraction, LinkSide, MonitorRect, Topology};
 
     const HD: Screen = Screen {
         width: 1920,
@@ -910,18 +966,52 @@ mod tests {
         commands: crate::outbound::CommandReceiver,
         notices: mpsc::Receiver<ControlNotice>,
         edge_modes: mpsc::Receiver<EdgeMode>,
+        /// Edge-mode updates observed so far — the generation a
+        /// hand-injected crossing must carry (see [`generation_at`]).
+        edge_generation: u64,
     }
 
+    /// The rig's edge-poll period, mirroring the application's ~125 Hz.
+    const EDGE_POLL: Duration = Duration::from_millis(8);
+
     fn rig() -> Rig {
+        build_rig(false)
+    }
+
+    /// A rig wired the way the application wires a seamless machine: a real
+    /// [`EdgeDetectDriver`] watching the same [`FakeDisplay`] the injector
+    /// places the cursor on, with its crossings forwarded back in as control
+    /// events. That closes the loop placement → detection → transfer, which
+    /// a bare edge-mode receiver leaves open. Its `edge_modes` receiver is a
+    /// dead stub — the detector holds the real one.
+    fn edge_detecting_rig() -> Rig {
+        build_rig(true)
+    }
+
+    fn build_rig(detect: bool) -> Rig {
         let capture = Arc::new(FakeInputCapture::new());
         let injector = Arc::new(FakeInputInjector::new());
         let cursor_mask = Arc::new(FakeCursorMask::new());
         let display = Arc::new(FakeDisplay::new(HD));
-        let (edge_mode_tx, edge_modes) = mpsc::channel(8);
+        // Placements move the display's cursor, as a real absolute move does.
+        injector.follow(Arc::clone(&display));
         // A left-member topology (links on the right edge) so PlaceCursor
         // has geometry to map through; most tests never trigger it.
+        let topology = Topology::new(LinkSide::Left);
+        let (edge_mode_tx, edge_modes, detection) = if detect {
+            let (edge_driver, mode_tx, crossings) = crate::edge_driver::edge_detect(
+                Arc::clone(&display) as Arc<dyn DisplayInfo>,
+                topology,
+                EDGE_POLL,
+            );
+            let (_dropped, dead) = mpsc::channel(1);
+            (mode_tx, dead, Some((edge_driver, crossings)))
+        } else {
+            let (tx, rx) = mpsc::channel(8);
+            (tx, rx, None)
+        };
         let seamless = super::SeamlessInputs {
-            topology: Topology::new(LinkSide::Left),
+            topology,
             display: Arc::clone(&display) as Arc<dyn DisplayInfo>,
             edge_mode: edge_mode_tx,
         };
@@ -935,6 +1025,28 @@ mod tests {
             },
         );
         tokio::spawn(driver.run());
+        if let Some((edge_driver, mut crossings)) = detection {
+            tokio::spawn(edge_driver.run());
+            let control_events = events.clone();
+            // The application's `spawn_edge_wiring`, in miniature.
+            tokio::spawn(async move {
+                while let Some(crossing) = crossings.recv().await {
+                    let event = match crossing.kind {
+                        CrossingKind::Leave => InputControlEvent::EdgeLeave {
+                            position: crossing.position,
+                            generation: crossing.generation,
+                        },
+                        CrossingKind::Return => InputControlEvent::EdgeReturn {
+                            position: crossing.position,
+                            generation: crossing.generation,
+                        },
+                    };
+                    if control_events.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         Rig {
             capture,
             injector,
@@ -944,6 +1056,7 @@ mod tests {
             commands,
             notices,
             edge_modes,
+            edge_generation: 0,
         }
     }
 
@@ -966,6 +1079,21 @@ mod tests {
             .await
             .expect("timed out waiting for an edge mode")
             .expect("edge-mode channel closed")
+    }
+
+    /// The edge-mode generation in force once `expected` has been reached,
+    /// counted from the updates the driver actually sent. A crossing
+    /// injected by hand must carry this to be acted on. Counted rather than
+    /// assumed one-per-transition: the driver drains events in batches, so
+    /// two control-state changes in one batch produce a single update.
+    async fn generation_at(rig: &mut Rig, expected: EdgeMode) -> u64 {
+        loop {
+            let mode = next_edge_mode(rig).await;
+            rig.edge_generation += 1;
+            if mode == expected {
+                return rig.edge_generation;
+            }
+        }
     }
 
     /// Wait until the cursor mask reaches `hidden` (it is applied on a
@@ -1223,9 +1351,11 @@ mod tests {
 
         // The cursor returns across this machine's edge: the user has left,
         // so the cursor must hide even though control reverts to local.
+        let generation = generation_at(&mut rig, EdgeMode::Returning).await;
         rig.events
             .send(InputControlEvent::EdgeReturn {
                 position: EdgeFraction::new(0.5),
+                generation,
             })
             .await
             .unwrap();
@@ -1279,9 +1409,11 @@ mod tests {
             .unwrap();
         let _grant = next_command(&mut rig).await;
         assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+        let generation = generation_at(&mut rig, EdgeMode::Returning).await;
         rig.events
             .send(InputControlEvent::EdgeReturn {
                 position: EdgeFraction::new(0.5),
+                generation,
             })
             .await
             .unwrap();
@@ -1983,6 +2115,149 @@ mod tests {
             (placements[0].y - 540).abs() <= 1,
             "placed at mid-height, got y={}",
             placements[0].y
+        );
+    }
+
+    /// Let the edge detector run a few polls. Under `tokio::time::pause`
+    /// this advances the clock deterministically rather than waiting.
+    async fn edge_polls(count: u32) {
+        tokio::time::sleep(EDGE_POLL * count).await;
+    }
+
+    /// Bring an edge-detecting rig to "a peer controls this machine",
+    /// entered at mid-height so the cursor is placed on the linked column —
+    /// exactly where a real transfer leaves it.
+    async fn peer_takes_control_across_the_edge(rig: &mut Rig) {
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest {
+                    request_id: 1,
+                    entry: Some(EdgeFraction::new(0.5).to_wire()),
+                }
+                .encode_payload()
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(rig).await;
+        assert_eq!(next_notice(rig).await, ControlNotice::PeerTookControl);
+    }
+
+    /// The hardware bounce this margin exists for (ADR 0009 addendum,
+    /// 2026-08-19). Entry parks the cursor **on** the linked column, and the
+    /// same column means *return* while the peer drives this machine — so
+    /// with a bare one-pixel rising edge, a wobble at the seam fired a
+    /// complete reverse transfer, which re-parked both cursors on their
+    /// trigger columns and repeated (ten take/revoke cycles in five seconds
+    /// on hardware). Here the whole loop is real: the injector's placement
+    /// moves the display's cursor and a real detector polls it.
+    #[tokio::test]
+    async fn a_wobble_on_the_entry_column_does_not_bounce_control_back() {
+        tokio::time::pause();
+        let mut rig = edge_detecting_rig();
+        peer_takes_control_across_the_edge(&mut rig).await;
+        // The placement really moved the cursor onto the linked column.
+        assert_eq!(
+            rig.display.cursor_position().unwrap(),
+            CursorPoint { x: 1919, y: 540 }
+        );
+        // Let the detector adopt Returning mode and prime on that cursor.
+        edge_polls(4).await;
+
+        // The seam wobble: a pixel off the column and back, twice — what a
+        // hand resting against the edge produces at 125 Hz polling.
+        for _ in 0..2 {
+            rig.display.set_cursor(CursorPoint { x: 1918, y: 540 });
+            edge_polls(4).await;
+            rig.display.set_cursor(CursorPoint { x: 1919, y: 540 });
+            edge_polls(4).await;
+        }
+        assert!(
+            timeout(Duration::from_millis(500), rig.notices.recv())
+                .await
+                .is_err(),
+            "a wobble at the seam revoked the peer's control"
+        );
+
+        // Deliberate travel back into the screen re-arms, and the next
+        // touch of the column returns control as it should.
+        let clear = 1919 - i32::try_from(REARM_MARGIN).unwrap() - 1;
+        rig.display.set_cursor(CursorPoint { x: clear, y: 540 });
+        edge_polls(4).await;
+        rig.display.set_cursor(CursorPoint { x: 1919, y: 540 });
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::PeerControlRevoked
+        );
+    }
+
+    /// A crossing carries a `kind` frozen at detection time through two
+    /// bounded queues. If the control state changed on the way — the grant
+    /// it was detected under ended, and a new one began — acting on it would
+    /// revoke the *fresh* grant. The mode generation makes that impossible.
+    #[tokio::test]
+    async fn a_crossing_detected_under_a_superseded_mode_is_dropped() {
+        tokio::time::pause();
+        let mut rig = rig();
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        let before = generation_at(&mut rig, EdgeMode::Leaving).await;
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest {
+                    request_id: 1,
+                    entry: None,
+                }
+                .encode_payload()
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+        let current = generation_at(&mut rig, EdgeMode::Returning).await;
+        assert!(current > before, "the grant must advance the generation");
+
+        // A Return detected back under the pre-grant generation arrives
+        // late: it says nothing about the grant that exists now, so it is
+        // dropped.
+        rig.events
+            .send(InputControlEvent::EdgeReturn {
+                position: EdgeFraction::new(0.5),
+                generation: before,
+            })
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(500), rig.commands.recv())
+                .await
+                .is_err(),
+            "a stale crossing revoked the current grant"
+        );
+
+        // The same crossing under the current generation does revoke.
+        rig.events
+            .send(InputControlEvent::EdgeReturn {
+                position: EdgeFraction::new(0.5),
+                generation: current,
+            })
+            .await
+            .unwrap();
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected a ControlRelease for the edge return");
+        };
+        assert_eq!(message_type, MessageType::ControlRelease.wire());
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::PeerControlRevoked
         );
     }
 

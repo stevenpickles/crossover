@@ -24,7 +24,9 @@ uuid = { workspace = true }
 [dev-dependencies]
 crossover-platform = { workspace = true, features = ["fakes"] }
 proptest = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` gives the paused clock the edge-transfer tests use to drive a
+# polling detector deterministically instead of sleeping on a real one.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
