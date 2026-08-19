@@ -69,16 +69,26 @@ static STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static WAKE_EVENT: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static PENDING: Mutex<Pending> = Mutex::new(Pending::new());
 
+/// Which SCM control asked the service to stop — carried only so the
+/// supervision log can say which (a normal `SC stop`/uninstall versus the
+/// machine shutting down), never used for branching: both are handled
+/// identically otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopControl {
+    Stop,
+    Shutdown,
+}
+
 /// Controls the handler has received but the loop has not yet processed.
 struct Pending {
-    stop: bool,
+    stop: Option<StopControl>,
     session_changed: bool,
 }
 
 impl Pending {
     const fn new() -> Self {
         Self {
-            stop: false,
+            stop: None,
             session_changed: false,
         }
     }
@@ -173,7 +183,11 @@ unsafe extern "system" fn handler_ex(
     _context: *mut c_void,
 ) -> u32 {
     if control == SERVICE_CONTROL_STOP || control == SERVICE_CONTROL_SHUTDOWN {
-        lock_pending().stop = true;
+        lock_pending().stop = Some(if control == SERVICE_CONTROL_SHUTDOWN {
+            StopControl::Shutdown
+        } else {
+            StopControl::Stop
+        });
         set_status(SERVICE_STOP_PENDING, 0, 0);
         signal_wake();
     } else if control == SERVICE_CONTROL_SESSIONCHANGE {
@@ -198,6 +212,7 @@ fn supervise() {
     let now_ms = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut child: Option<Handle> = None;
 
+    tracing::info!(path = %worker_exe.display(), "supervision loop starting");
     supervisor.note_active_session(probe_active_session());
 
     loop {
@@ -214,42 +229,55 @@ fn supervise() {
                         supervisor.note_launch_failed(now_ms());
                     }
                 },
-                WorkerAction::StopWorker => {
+                WorkerAction::StopWorker(reason) => {
+                    tracing::info!(?reason, "stopping worker");
                     if let Some(handle) = child.take() {
                         stop_child(&handle);
                     }
                     supervisor.note_worker_exited(false, now_ms());
                 }
                 WorkerAction::Idle => break,
-                WorkerAction::Stopped => return,
+                WorkerAction::Stopped => {
+                    tracing::info!("supervision loop stopped");
+                    return;
+                }
             }
         }
 
         let timeout_ms = supervisor
             .wake_deadline()
             .map(|deadline| deadline.saturating_sub(now_ms()));
+        if let Some(delay_ms) = timeout_ms {
+            tracing::debug!(delay_ms, "waiting for backoff before next relaunch attempt");
+        }
         wait_for_event(child.as_ref(), timeout_ms);
 
         // Process controls the handler recorded.
         let (stop, session_changed) = {
             let mut pending = lock_pending();
-            let controls = (pending.stop, pending.session_changed);
+            let controls = (pending.stop.take(), pending.session_changed);
             pending.session_changed = false;
             controls
         };
         reset_wake();
-        if stop {
+        if let Some(control) = stop {
+            tracing::info!(?control, "service stop requested");
             supervisor.request_stop();
         }
         if session_changed {
-            supervisor.note_active_session(probe_active_session());
+            let session = probe_active_session();
+            tracing::info!(?session, "session change notified");
+            supervisor.note_active_session(session);
         }
 
         // Reap the child if it exited.
         let exit_code = child.as_ref().and_then(child_exit_code);
         if let Some(code) = exit_code {
             child = None;
-            supervisor.note_worker_exited(code != 0, now_ms());
+            let crashed = code != 0;
+            let exit_code_hex = format!("{code:#010x}");
+            tracing::info!(exit_code = code, %exit_code_hex, crashed, "worker exited");
+            supervisor.note_worker_exited(crashed, now_ms());
         }
     }
 }
