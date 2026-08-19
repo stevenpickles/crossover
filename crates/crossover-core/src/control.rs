@@ -863,6 +863,22 @@ impl ControlEngine {
         // The answer must come from the session we asked, and match the
         // id: a response from any other session is not our grant.
         if session != req_session || response.request_id != request_id {
+            // One stray grant must *not* be undone: a late answer to an
+            // earlier request of ours to this same peer, while a newer
+            // request to it is still in flight. The peer's belief that it
+            // is controlled by us is about to be right — our newer request
+            // either refreshes that grant (`on_peer_request`) or is denied,
+            // in which case the peer already holds nothing. Releasing here
+            // would tear down the grant the newer request is being given,
+            // and the newer grant would arrive with the peer already
+            // released: the desync this pair of fixes exists to end. Any
+            // other stray grant is still undone, so no peer is ever left
+            // controlled by a driver that will never drive.
+            let superseded_by_our_own_retry =
+                session == req_session && response.request_id < request_id;
+            if superseded_by_our_own_retry {
+                return Vec::new();
+            }
             return undo_stray(response.verdict);
         }
         match response.verdict {
@@ -1260,6 +1276,44 @@ mod tests {
             "a grant nobody is waiting for must be explicitly released"
         );
         assert!(!engine.is_controlling());
+    }
+
+    #[test]
+    fn a_grant_superseded_by_our_own_retry_is_not_undone() {
+        // The other half of the late-answer story: after a timeout we ask
+        // the same peer again, and *then* the answer to the first request
+        // turns up. Undoing it would release the grant our second request
+        // is being given, so this one stray grant is left alone — the
+        // second answer decides the shared belief (feature/139).
+        let mut engine = established_engine();
+        let first =
+            sent_request_id(&engine.handle(ControlEvent::UserRequestControl { session: SESSION }));
+        let _ = engine.handle(ControlEvent::RequestTimeout {
+            session: SESSION,
+            request_id: first,
+        });
+        let second =
+            sent_request_id(&engine.handle(ControlEvent::UserRequestControl { session: SESSION }));
+        assert_ne!(first, second);
+
+        let actions = engine.handle(peer(InboundControl::Response(ControlResponse {
+            request_id: first,
+            verdict: ControlVerdict::Granted,
+        })));
+        assert!(
+            actions.is_empty(),
+            "a grant superseded by our own retry must not be released: {actions:?}"
+        );
+        assert!(!engine.is_controlling(), "and must not be adopted either");
+
+        // The answer to the request we are actually waiting for lands us
+        // in control.
+        let actions = engine.handle(peer(InboundControl::Response(ControlResponse {
+            request_id: second,
+            verdict: ControlVerdict::Granted,
+        })));
+        assert!(actions.contains(&ControlAction::StartCapture));
+        assert!(engine.is_controlling());
     }
 
     #[test]
@@ -2082,6 +2136,143 @@ mod tests {
             }],
         })));
         assert_eq!(actions, vec![inject(vec![press(PointerButton::Left)])]);
+    }
+
+    // ---- graceful transition: the late-answer desync (feature/139) ----
+
+    /// The messages an action list asks to put on the wire, as the peer
+    /// engine will receive them.
+    fn wire_messages(actions: Vec<ControlAction>) -> Vec<InboundControl> {
+        actions
+            .into_iter()
+            .filter_map(|action| match action {
+                ControlAction::Send { session, message } => {
+                    assert_eq!(session, SESSION, "a link test has exactly one peer");
+                    Some(match message {
+                        OutboundControl::Request(r) => InboundControl::Request(r),
+                        OutboundControl::Response(r) => InboundControl::Response(r),
+                        OutboundControl::Release(entry) => InboundControl::Release(entry),
+                        OutboundControl::Batch(b) => InboundControl::Batch(b),
+                        OutboundControl::ReleaseAll(r) => InboundControl::ReleaseAll(r),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn notices(actions: &[ControlAction]) -> Vec<ControlNotice> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                ControlAction::Notify(notice) => Some(*notice),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The 2026-08-19 hardware desync, deterministically, over two engines
+    /// linked by hand-flushed queues.
+    ///
+    /// B crosses the edge; A is slow to answer, so B's request times out and
+    /// B crosses again — and only *then* does A get to both requests. On the
+    /// unfixed engine A granted the first and denied the second with
+    /// `AlreadyControlled` — denying the very session holding its grant —
+    /// while B, having moved on, un-did the grant it no longer wanted. The
+    /// two machines locked each other out for seconds.
+    ///
+    /// The invariant: with no further user input, the two engines converge on
+    /// one belief about who controls whom, and B ends able to cross.
+    #[test]
+    fn a_late_answer_after_a_timeout_and_retry_still_converges() {
+        let mut a = established_engine(); // the answering side
+        let mut b = established_engine(); // the requesting side
+        let mut to_a: Vec<InboundControl> = Vec::new();
+        let mut to_b: Vec<InboundControl> = Vec::new();
+        let mut b_notices: Vec<ControlNotice> = Vec::new();
+        let crossing = EdgeFraction::new(0.5);
+
+        // 1. B's cursor reaches the linked edge: request #1 goes out. A is
+        //    busy behind its own inbound queue and does not process it yet.
+        let actions = b.handle(ControlEvent::EdgeLeave {
+            session: SESSION,
+            position: crossing,
+        });
+        let request_id = sent_request_id(&actions);
+        to_a.extend(wire_messages(actions));
+
+        // 2. B's request timer comes due before any answer arrives.
+        let actions = b.handle(ControlEvent::RequestTimeout {
+            session: SESSION,
+            request_id,
+        });
+        b_notices.extend(notices(&actions));
+        to_a.extend(wire_messages(actions));
+        assert!(b_notices.contains(&ControlNotice::RequestTimedOut));
+
+        // 3. Back on local control, B crosses the edge again: request #2.
+        let actions = b.handle(ControlEvent::EdgeLeave {
+            session: SESSION,
+            position: crossing,
+        });
+        to_a.extend(wire_messages(actions));
+
+        // 4. A now works through everything B sent, in order, and the link
+        //    runs until it falls quiet — no further user input anywhere.
+        for _ in 0..8 {
+            if to_a.is_empty() && to_b.is_empty() {
+                break;
+            }
+            for message in std::mem::take(&mut to_a) {
+                to_b.extend(wire_messages(a.handle(peer(message))));
+            }
+            for message in std::mem::take(&mut to_b) {
+                let actions = b.handle(peer(message));
+                b_notices.extend(notices(&actions));
+                to_a.extend(wire_messages(actions));
+            }
+        }
+        assert!(
+            to_a.is_empty() && to_b.is_empty(),
+            "the link never fell quiet: to_a={to_a:?} to_b={to_b:?}"
+        );
+
+        // The invariant: one shared belief, and it is the one B asked for.
+        assert!(
+            b.is_controlling(),
+            "B asked twice and must end up controlling A"
+        );
+        assert_eq!(
+            a.controlled_session_for_test(),
+            Some(SESSION),
+            "A must believe the session driving it is B's"
+        );
+        assert!(
+            !b_notices
+                .iter()
+                .any(|notice| matches!(notice, ControlNotice::RequestDenied(_))),
+            "B must not be left holding a denial it cannot act on: {b_notices:?}"
+        );
+
+        // And the belief is usable: B's input crosses and injects on A
+        // rather than terminating an honest session.
+        let messages = wire_messages(b.handle(captured(vec![press(PointerButton::Left)])));
+        assert!(!messages.is_empty(), "B captured nothing to send");
+        for message in messages {
+            let actions = a.handle(peer(message));
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, ControlAction::Inject(_))),
+                "A did not inject B's input: {actions:?}"
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, ControlAction::Terminate { .. })),
+                "A terminated the session that legitimately holds its grant: {actions:?}"
+            );
+        }
     }
 
     #[test]
