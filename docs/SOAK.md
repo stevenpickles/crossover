@@ -927,3 +927,106 @@ Record the outcome in the Phase 7 exit-criteria notes (docs/ROADMAP.md):
 which applications accepted the pasted image, observed transfer times by
 size, whether input stayed responsive during transfer, and any loop or
 stall seen.
+
+## Phase 7 hardware validation: files (two machines)
+
+ADR 0015's platform slice — the spool, the STA thread and its
+`IDataObject`, the zone marking, and the loop-prevention layers — has the
+same shape of gap images had: everything up to the OS boundary is
+hermetic (docs/TESTING.md §1.6), and what only two real machines and a
+real wire can show is a real file crossing it. This is that session.
+
+### Outcome: passed (2026-08-18 → 2026-08-19)
+
+The session ran between machines A (listener) and B (dialer) over a
+direct 2.5/10 GbE link, initial build `e689a3b`, final retests on the
+build carrying PRs #43–#46:
+
+- **Single-file transfer, both directions**, original name preserved,
+  byte-identical content; opens without SmartScreen or Protected View but
+  carries `ZoneId=1` in `Zone.Identifier` (ADR 0015's 2026-08-17 zone
+  decision, confirmed live).
+- **Folder and multi-selection transfer**: one Stored-entry zip per
+  selection, contents identical after extraction on the receiving side.
+- **`AlreadyHave` dedup**: a re-paste of identical content settled
+  near-instant, with nothing on the wire.
+- **Refusals, typed and observable**: a >256 MiB selection refused as
+  `TooLarge` on the sender, observed live at 02:00:44 UTC — 268,500,992
+  bytes against the 268,435,456-byte `MAX_CLIPBOARD_FILE_BYTES` — with
+  nothing partial sent and the clipboard path unwedged afterward. (The
+  junction/reparse-point and >256-entry refusal cases are covered by the
+  automated suites; the hardware run's live refusal exercised `TooLarge`.)
+- **Loop prevention**: no un-commanded offers appeared during offer-held
+  and post-paste watch windows, sender clipboard content was preserved,
+  and a deliberate provocation — copying a file from inside the spool
+  path — was suppressed silently, `clipboard_loop_suppressed` incrementing
+  exactly once.
+- **docs/TESTING.md §1.6's third exception (F16, invariant 7),
+  wire-crossed**: the received offer does not appear in Win+V clipboard
+  history and does not cloud-sync; the pasted file opens unprompted with
+  `ZoneId=1`.
+- **Throughput and responsiveness**: a 200 MiB / 130-entry zip packed in
+  ~2 s on the sender; input stayed responsive throughout large transfers,
+  p50 input-path latency ~3 ms during sends.
+
+### Defects found and fixed (all merged to `dev`)
+
+1. **Edge-transfer bounce.** Entry placement on the return-trigger
+   column, with a 1 px re-arm margin, caused take/revoke cycles down to
+   ~150 ms under a hand tremor at the seam — ADR 0009's deliberately
+   deferred push-through risk materializing. Fixed by PR #44
+   (feature/137): re-arm hysteresis (`REARM_MARGIN` = 24 px) plus
+   generation-stamped crossings.
+2. **Control-request lockout.** A ~4.7 s-late answer caused a 3 s
+   timeout, then a retry was denied `AlreadyControlled` by the very grant
+   it held — a ~7 s lockout that self-healed. Fixed by PR #45
+   (feature/139): the grant-holder's retry now refreshes its grant
+   instead of being denied, a timeout cancels the request on the wire
+   rather than only locally, and the stray-grant undo was narrowed.
+3. **Inbound head-of-line block.** Control frames were broadcast to, and
+   gated on, the clipboard driver's queue — ADR 0013's interactive/bulk
+   separation was outbound-only, with no inbound equivalent. Fixed by
+   PR #46 (feature/140): routing by frame type, edge mode carried as a
+   watch level with the generation in the value, and placement re-primed
+   on the crossing. Recorded limit: there is still no inbound preemption
+   of a genuinely saturated same-driver queue, by SPECIFICATION.md §2's
+   priority order.
+4. **Silent worker death on B, 02:05:38 UTC — an open observation, not a
+   resolved defect.** The peer saw a TCP RST; the service relaunched the
+   worker in ~1.3 s, the session re-established, no input was left stuck,
+   and Windows Error Reporting has no record of it. The log tail that
+   might have explained it was lost to the non-blocking appender. **Root
+   cause remains unknown** — the service observed the exit code but
+   recorded it nowhere at the time. Fixed forward, not diagnosed, by
+   PR #43 (feature/138): a durable supervision log in
+   `%ProgramData%\Crossover\logs` naming exit codes and stop reasons (ADR
+   0011 addendum, 2026-08-19). A recurrence is now diagnosable; this one
+   was not.
+
+### Retests on the post-#46 build
+
+The seam no longer bounces under deliberate wiggling (deliberate
+crossings remain instant); ~20 rapid crossings ran with zero timeouts and
+zero denials.
+
+### Deliberately skipped
+
+The mid-transfer network-disconnect hardware case was not exercised: at
+2.5 Gbps a 200 MiB transfer completes sub-second, leaving no practical
+"mid" for a manual disconnect to land in. Coverage rationale:
+engine-level fault injection is the primary evidence for FR-6.x per
+docs/TESTING.md §1.5, and the 02:05:38 incident above was a real
+abrupt-disconnect recovery observed live — clean in ~1.3 s, no stuck
+input, no partial state — even though it was not itself a file transfer.
+
+### Operational notes
+
+- **`file_receive` must be granted on both machines.** It is default-off
+  per ADR 0015 and grants only the receiving direction — a two-way test
+  needs `crossover peers allow-files <device-id>` run on both sides. The
+  first attempt on this session failed `NotPermitted` by design, because
+  it had only been granted on one.
+- **Clock skew between the machines was ~0.9 s**, which complicated
+  correlating the two logs by timestamp during the worker-death
+  investigation. Recommend NTP sync ahead of future soaks so cross-machine
+  log correlation does not need manual offset arithmetic.
