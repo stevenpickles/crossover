@@ -198,16 +198,31 @@ The three central state machines live in `crossover-core`, are pure
 Exactly one active input destination at all times (FR-5.1).
 
 ```
-          edge crossing detected
- LOCAL ─────────────────────────────► REQUESTING_REMOTE
-   ▲                                        │ peer acks ready
-   │ reverse edge / peer confirms           ▼
- RETURNING ◄──────────────────────────  REMOTE
+     edge crossing or console request            peer grants
+ LOCAL ──────────────────────────────► REQUESTING ───────────► REMOTE
+   ▲                                        │                     │
+   │        denied / timed out / cancelled  │                     │
+   ├────────────────────────────────────────┘                     │
+   │  handed back / peer revokes (reverse edge) / capture lost /   │
+   └───────────────────────── disconnect ──────────────────────────┘
 ```
+
+The three states are exactly `Outbound::{Local, Requesting, Remote}` in
+`control.rs`. [ADR 0009](adr/0009-seamless-edge-transfer.md) promised a
+fourth, `RETURNING`, between `REMOTE` and `LOCAL`; it was subsumed by this
+design — the reverse crossing is detected on the *controlled* side, which
+revokes, so the controller returns to `LOCAL` on the resulting release with
+no transitional state of its own.
 
 - Transitions are negotiated: request → acknowledge → switch (FR-5.3).
 - Timeout or disconnect in any transitional state falls back to `LOCAL` and
   triggers `ReleaseAllInput` on the remote side (FR-4.4).
+- **Late answers are self-correcting.** A request that timed out cancels
+  itself on the wire, and a re-request from the session that already holds
+  the grant refreshes it rather than being denied, so a slow answer cannot
+  leave the two machines disagreeing about who controls whom (ADR 0009
+  addendum, 2026-08-19). Denial for a request from any *other* session is
+  unchanged — that is the security boundary below.
 - While `REMOTE`: local input is captured and forwarded, local effects are
   suppressed, pointer position maps through the topology model.
 - **Authorization is scoped to the session that holds the grant.** The

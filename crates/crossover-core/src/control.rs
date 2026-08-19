@@ -716,7 +716,22 @@ impl ControlEngine {
             })
         {
             self.outbound = Outbound::Local;
-            vec![ControlAction::Notify(ControlNotice::RequestTimedOut)]
+            // Reverting locally is not enough: the peer may be about to
+            // grant a request we have stopped waiting for, and a grant
+            // nobody believes they hold leaves that machine wedged as
+            // "controlled" by a driver that will never drive. So the
+            // cancellation goes on the wire too. It is idempotent with the
+            // undo-stray release in `on_peer_response`: whichever arrives
+            // second finds a peer that holds nothing over us and that we do
+            // not control, which `on_peer_release`'s last branch already
+            // treats as a silent no-op.
+            vec![
+                ControlAction::Send {
+                    session,
+                    message: OutboundControl::Release(None),
+                },
+                ControlAction::Notify(ControlNotice::RequestTimedOut),
+            ]
         } else {
             Vec::new()
         }
@@ -748,40 +763,86 @@ impl ControlEngine {
                 }),
             }]
         };
-        // One peer controls this machine at a time (single desktop): a
-        // request while already controlled — even by the same session —
-        // is denied.
-        if self.controlled.is_some() {
-            return deny(DenyReason::AlreadyControlled);
+        // One peer controls this machine at a time (single desktop), and
+        // *which* peer is the security boundary: a request from a session
+        // other than the grant holder is denied, always (FR-2.3).
+        //
+        // The grant holder itself is a different case. It only asks again
+        // because it believes it holds nothing — its own request timed out
+        // and it crossed the edge again — so denying it strands both
+        // machines: this one thinks it is driven by a peer that has given
+        // up, and that peer cannot cross until something else disturbs the
+        // state (the 2026-08-19 lockout). A retry from the holder therefore
+        // *refreshes* the grant rather than being denied. Security-neutral:
+        // same principal, same authenticated session, complete mediation
+        // unchanged — the grant is re-issued to the identity that already
+        // held it.
+        if let Some(holder) = self.controlled.as_ref().map(|c| c.session) {
+            if holder != session {
+                return deny(DenyReason::AlreadyControlled);
+            }
+            return self.refresh_grant(session, request);
         }
         match self.outbound {
             // Controlling or requesting: busy. Two simultaneous requests
             // thus produce two denials — deterministic (FR-5.1).
             Outbound::Remote { .. } | Outbound::Requesting { .. } => deny(DenyReason::Busy),
-            Outbound::Local => {
-                self.controlled = Some(Controlled {
-                    session,
-                    applied_sequence: 0,
-                    applied_state: InputState::new(),
-                });
-                let mut actions = vec![ControlAction::Send {
-                    session,
-                    message: OutboundControl::Response(ControlResponse {
-                        request_id: request.request_id,
-                        verdict: ControlVerdict::Granted,
-                    }),
-                }];
-                // An edge-driven request carries where the peer's cursor
-                // left; place ours at the matching height on the entry
-                // edge so the pointer appears to cross seamlessly (ADR
-                // 0009). A console request carries none.
-                if let Some(raw) = request.entry {
-                    actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(raw)));
-                }
-                actions.push(ControlAction::Notify(ControlNotice::PeerTookControl));
-                actions
-            }
+            Outbound::Local => self.grant(session, request),
         }
+    }
+
+    /// Re-issue a grant to the session that already holds one. Everything
+    /// the old grant left held is drained first, from this machine's own
+    /// belief: a refreshed grant must never inherit a latched key or
+    /// button, exactly as a hand-back or a disconnect must not (FR-4.4).
+    ///
+    /// Note for the driver: a refresh does not change `is_controlled`, so
+    /// the edge mode does not change and the crossing detector is not
+    /// re-primed the way it is when a grant is first taken. An edge-driven
+    /// refresh therefore places the cursor on the linked column with the
+    /// detector left as it was — worth re-priming when the edge wiring is
+    /// next revised.
+    fn refresh_grant(&mut self, session: Uuid, request: ControlRequest) -> Vec<ControlAction> {
+        let mut previous = self
+            .controlled
+            .take()
+            .expect("caller established the grant holder");
+        let releases = drain_releases(&mut previous.applied_state);
+        let mut actions = Vec::new();
+        if !releases.is_empty() {
+            actions.push(ControlAction::Inject(releases));
+        }
+        actions.extend(self.grant(session, request));
+        actions
+    }
+
+    /// Record a fresh grant for `session` and answer it. The applied-input
+    /// sequence starts at zero because the controller restarts its own send
+    /// sequence on every grant it is given (`on_peer_response`); a stale
+    /// high-water mark would read the new grant's first batch as a
+    /// regression and terminate an honest session.
+    fn grant(&mut self, session: Uuid, request: ControlRequest) -> Vec<ControlAction> {
+        self.controlled = Some(Controlled {
+            session,
+            applied_sequence: 0,
+            applied_state: InputState::new(),
+        });
+        let mut actions = vec![ControlAction::Send {
+            session,
+            message: OutboundControl::Response(ControlResponse {
+                request_id: request.request_id,
+                verdict: ControlVerdict::Granted,
+            }),
+        }];
+        // An edge-driven request carries where the peer's cursor left;
+        // place ours at the matching height on the entry edge so the
+        // pointer appears to cross seamlessly (ADR 0009). A console
+        // request carries none.
+        if let Some(raw) = request.entry {
+            actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(raw)));
+        }
+        actions.push(ControlAction::Notify(ControlNotice::PeerTookControl));
+        actions
     }
 
     fn on_peer_response(&mut self, session: Uuid, response: ControlResponse) -> Vec<ControlAction> {
@@ -809,6 +870,22 @@ impl ControlEngine {
         // The answer must come from the session we asked, and match the
         // id: a response from any other session is not our grant.
         if session != req_session || response.request_id != request_id {
+            // One stray grant must *not* be undone: a late answer to an
+            // earlier request of ours to this same peer, while a newer
+            // request to it is still in flight. The peer's belief that it
+            // is controlled by us is about to be right — our newer request
+            // either refreshes that grant (`on_peer_request`) or is denied,
+            // in which case the peer already holds nothing. Releasing here
+            // would tear down the grant the newer request is being given,
+            // and the newer grant would arrive with the peer already
+            // released: the desync this pair of fixes exists to end. Any
+            // other stray grant is still undone, so no peer is ever left
+            // controlled by a driver that will never drive.
+            let superseded_by_our_own_retry =
+                session == req_session && response.request_id < request_id;
+            if superseded_by_our_own_retry {
+                return Vec::new();
+            }
             return undo_stray(response.verdict);
         }
         match response.verdict {
@@ -1209,6 +1286,78 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_superseded_by_our_own_retry_is_not_undone() {
+        // The other half of the late-answer story: after a timeout we ask
+        // the same peer again, and *then* the answer to the first request
+        // turns up. Undoing it would release the grant our second request
+        // is being given, so this one stray grant is left alone — the
+        // second answer decides the shared belief (feature/139).
+        let mut engine = established_engine();
+        let first =
+            sent_request_id(&engine.handle(ControlEvent::UserRequestControl { session: SESSION }));
+        let _ = engine.handle(ControlEvent::RequestTimeout {
+            session: SESSION,
+            request_id: first,
+        });
+        let second =
+            sent_request_id(&engine.handle(ControlEvent::UserRequestControl { session: SESSION }));
+        assert_ne!(first, second);
+
+        let actions = engine.handle(peer(InboundControl::Response(ControlResponse {
+            request_id: first,
+            verdict: ControlVerdict::Granted,
+        })));
+        assert!(
+            actions.is_empty(),
+            "a grant superseded by our own retry must not be released: {actions:?}"
+        );
+        assert!(!engine.is_controlling(), "and must not be adopted either");
+
+        // The answer to the request we are actually waiting for lands us
+        // in control.
+        let actions = engine.handle(peer(InboundControl::Response(ControlResponse {
+            request_id: second,
+            verdict: ControlVerdict::Granted,
+        })));
+        assert!(actions.contains(&ControlAction::StartCapture));
+        assert!(engine.is_controlling());
+    }
+
+    #[test]
+    fn a_timed_out_request_cancels_on_the_wire() {
+        // Reverting locally is not enough: the peer may be about to grant a
+        // request we have stopped waiting for, and a grant nobody believes
+        // they hold wedges that machine as "controlled" by a driver that
+        // will never drive. The timeout says so on the wire (feature/139).
+        let mut engine = established_engine();
+        let request_id =
+            sent_request_id(&engine.handle(ControlEvent::UserRequestControl { session: SESSION }));
+        let actions = engine.handle(ControlEvent::RequestTimeout {
+            session: SESSION,
+            request_id,
+        });
+        assert_eq!(
+            actions,
+            vec![
+                send(OutboundControl::Release(None)),
+                ControlAction::Notify(ControlNotice::RequestTimedOut),
+            ]
+        );
+        assert!(!engine.is_controlling());
+
+        // The cancel is idempotent with the undo-stray release, because a
+        // release from a session that holds nothing over us — and that we do
+        // not control — is already a silent no-op (`on_peer_release`'s last
+        // branch). Whichever of the two arrives second changes nothing.
+        let mut peer_engine = established_engine();
+        assert!(
+            peer_engine
+                .handle(peer(InboundControl::Release(None)))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn stale_timeout_after_grant_changes_nothing() {
         let mut engine = controlling_engine();
         // The timer for the (answered) request fires late.
@@ -1268,18 +1417,82 @@ mod tests {
     }
 
     #[test]
-    fn a_controlled_machine_denies_further_requests() {
+    fn a_controlled_machine_denies_requests_from_another_session() {
+        // One peer controls this machine at a time (single desktop), and
+        // *which* peer is the security boundary: a second trusted session
+        // cannot displace the grant holder (FR-2.3).
         let mut engine = controlled_engine();
+        let _ = engine.handle(ControlEvent::SessionEstablished { session: OTHER });
+        let actions = engine.handle(peer_from(
+            OTHER,
+            InboundControl::Request(ControlRequest {
+                request_id: 2,
+                entry: None,
+            }),
+        ));
+        assert_eq!(
+            actions,
+            vec![ControlAction::Send {
+                session: OTHER,
+                message: OutboundControl::Response(ControlResponse {
+                    request_id: 2,
+                    verdict: ControlVerdict::Denied(DenyReason::AlreadyControlled),
+                }),
+            }]
+        );
+        assert_eq!(
+            engine.controlled_session_for_test(),
+            Some(SESSION),
+            "the standing grant must survive an outsider's request"
+        );
+    }
+
+    #[test]
+    fn a_re_request_from_the_grant_holder_refreshes_the_grant() {
+        // The grant holder only re-requests because *it* believes it holds
+        // nothing (its own request timed out and it crossed again). Denying
+        // it AlreadyControlled denies the very session that holds the grant
+        // and locks both machines out; the answer is to re-grant fresh
+        // (feature/139).
+        let mut engine = controlled_engine(); // SESSION controls us, request 1
+        let _ = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 4,
+            events: vec![WireInputEvent::Button {
+                button: WireButton::Left,
+                pressed: true,
+            }],
+        })));
+
         let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
             request_id: 2,
-            entry: None,
+            entry: Some(EdgeFraction::new(0.25).to_wire()),
+        })));
+        assert!(
+            granted(&actions),
+            "the grant holder's retry must refresh, not deny: {actions:?}"
+        );
+        assert!(
+            actions.contains(&inject(vec![PointerEvent::Button {
+                button: PointerButton::Left,
+                pressed: false,
+            }])),
+            "the refreshed grant must drain what the old one left held: {actions:?}"
+        );
+        let placed = placed_cursor(&actions).expect("no cursor placed on a refreshed edge grant");
+        assert!((placed - 0.25).abs() < 1e-4, "placed at {placed}");
+        assert!(engine.is_controlled());
+
+        // The peer restarts its send sequence with the fresh grant, so the
+        // applied-sequence belief must restart too — otherwise sequence 1
+        // reads as a regression and kills a perfectly honest session.
+        let actions = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 1,
+            events: vec![WireInputEvent::Motion { dx: 1, dy: 1 }],
         })));
         assert_eq!(
             actions,
-            vec![send(OutboundControl::Response(ControlResponse {
-                request_id: 2,
-                verdict: ControlVerdict::Denied(DenyReason::AlreadyControlled),
-            }))]
+            vec![inject(vec![PointerEvent::Motion { dx: 1, dy: 1 }])],
+            "the refreshed grant must accept the peer's restarted sequence: {actions:?}"
         );
     }
 
@@ -1930,6 +2143,143 @@ mod tests {
             }],
         })));
         assert_eq!(actions, vec![inject(vec![press(PointerButton::Left)])]);
+    }
+
+    // ---- graceful transition: the late-answer desync (feature/139) ----
+
+    /// The messages an action list asks to put on the wire, as the peer
+    /// engine will receive them.
+    fn wire_messages(actions: Vec<ControlAction>) -> Vec<InboundControl> {
+        actions
+            .into_iter()
+            .filter_map(|action| match action {
+                ControlAction::Send { session, message } => {
+                    assert_eq!(session, SESSION, "a link test has exactly one peer");
+                    Some(match message {
+                        OutboundControl::Request(r) => InboundControl::Request(r),
+                        OutboundControl::Response(r) => InboundControl::Response(r),
+                        OutboundControl::Release(entry) => InboundControl::Release(entry),
+                        OutboundControl::Batch(b) => InboundControl::Batch(b),
+                        OutboundControl::ReleaseAll(r) => InboundControl::ReleaseAll(r),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn notices(actions: &[ControlAction]) -> Vec<ControlNotice> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                ControlAction::Notify(notice) => Some(*notice),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The 2026-08-19 hardware desync, deterministically, over two engines
+    /// linked by hand-flushed queues.
+    ///
+    /// B crosses the edge; A is slow to answer, so B's request times out and
+    /// B crosses again — and only *then* does A get to both requests. On the
+    /// unfixed engine A granted the first and denied the second with
+    /// `AlreadyControlled` — denying the very session holding its grant —
+    /// while B, having moved on, un-did the grant it no longer wanted. The
+    /// two machines locked each other out for seconds.
+    ///
+    /// The invariant: with no further user input, the two engines converge on
+    /// one belief about who controls whom, and B ends able to cross.
+    #[test]
+    fn a_late_answer_after_a_timeout_and_retry_still_converges() {
+        let mut a = established_engine(); // the answering side
+        let mut b = established_engine(); // the requesting side
+        let mut to_a: Vec<InboundControl> = Vec::new();
+        let mut to_b: Vec<InboundControl> = Vec::new();
+        let mut b_notices: Vec<ControlNotice> = Vec::new();
+        let crossing = EdgeFraction::new(0.5);
+
+        // 1. B's cursor reaches the linked edge: request #1 goes out. A is
+        //    busy behind its own inbound queue and does not process it yet.
+        let actions = b.handle(ControlEvent::EdgeLeave {
+            session: SESSION,
+            position: crossing,
+        });
+        let request_id = sent_request_id(&actions);
+        to_a.extend(wire_messages(actions));
+
+        // 2. B's request timer comes due before any answer arrives.
+        let actions = b.handle(ControlEvent::RequestTimeout {
+            session: SESSION,
+            request_id,
+        });
+        b_notices.extend(notices(&actions));
+        to_a.extend(wire_messages(actions));
+        assert!(b_notices.contains(&ControlNotice::RequestTimedOut));
+
+        // 3. Back on local control, B crosses the edge again: request #2.
+        let actions = b.handle(ControlEvent::EdgeLeave {
+            session: SESSION,
+            position: crossing,
+        });
+        to_a.extend(wire_messages(actions));
+
+        // 4. A now works through everything B sent, in order, and the link
+        //    runs until it falls quiet — no further user input anywhere.
+        for _ in 0..8 {
+            if to_a.is_empty() && to_b.is_empty() {
+                break;
+            }
+            for message in std::mem::take(&mut to_a) {
+                to_b.extend(wire_messages(a.handle(peer(message))));
+            }
+            for message in std::mem::take(&mut to_b) {
+                let actions = b.handle(peer(message));
+                b_notices.extend(notices(&actions));
+                to_a.extend(wire_messages(actions));
+            }
+        }
+        assert!(
+            to_a.is_empty() && to_b.is_empty(),
+            "the link never fell quiet: to_a={to_a:?} to_b={to_b:?}"
+        );
+
+        // The invariant: one shared belief, and it is the one B asked for.
+        assert!(
+            b.is_controlling(),
+            "B asked twice and must end up controlling A"
+        );
+        assert_eq!(
+            a.controlled_session_for_test(),
+            Some(SESSION),
+            "A must believe the session driving it is B's"
+        );
+        assert!(
+            !b_notices
+                .iter()
+                .any(|notice| matches!(notice, ControlNotice::RequestDenied(_))),
+            "B must not be left holding a denial it cannot act on: {b_notices:?}"
+        );
+
+        // And the belief is usable: B's input crosses and injects on A
+        // rather than terminating an honest session.
+        let messages = wire_messages(b.handle(captured(vec![press(PointerButton::Left)])));
+        assert!(!messages.is_empty(), "B captured nothing to send");
+        for message in messages {
+            let actions = a.handle(peer(message));
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, ControlAction::Inject(_))),
+                "A did not inject B's input: {actions:?}"
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, ControlAction::Terminate { .. })),
+                "A terminated the session that legitimately holds its grant: {actions:?}"
+            );
+        }
     }
 
     #[test]

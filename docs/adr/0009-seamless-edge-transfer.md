@@ -347,3 +347,61 @@ advances a counter that the detector counts identically and stamps on each
 crossing; the control driver drops any crossing whose stamp is not current.
 That is a correctness fix independent of the margin, and it stays correct
 however the polling and queueing are later retimed.
+
+## Addendum (2026-08-19): late answers are self-correcting
+
+"In any transitional state a timeout or disconnect falls back to `LOCAL`"
+turned out to be only half a rule. Falling back is what the *requester*
+does; it said nothing to the peer, and the peer's slow answer then arrived
+into a world that had moved on. Correlated two-machine logs from a burst of
+rapid grant/edge-revoke cycles caught the consequence: one answer arrived
+4.7 s late and the two state machines locked each other out for seven
+seconds.
+
+The sequence, every step matched to code. B's crossing requested control and
+timed out, so B reverted to local — silently. B crossed again and requested
+a second time. Only then did A work through its inbound backlog: it granted
+the *first* request, and answered the second with
+`Denied(AlreadyControlled)` — denying the very session that held its grant.
+B, meanwhile, received the grant it had stopped waiting for and released it.
+The user saw a denial and could not cross until another push.
+
+Three rules now make a late answer converge on its own:
+
+- **A re-request from the grant holder refreshes the grant.** The holder
+  only asks again because it believes it holds nothing, so a denial strands
+  both machines. The refresh drains everything the old grant left held — a
+  refreshed grant must no more inherit a latched key than a hand-back may
+  leave one (FR-4.4) — and restarts the applied-input sequence, because the
+  controller restarts its send sequence with every grant it is given.
+  `AlreadyControlled` still denies a request from any *other* session: one
+  peer drives this desktop at a time, and *which* peer is the security
+  boundary (FR-2.3). Refreshing is security-neutral — same principal, same
+  authenticated session, complete mediation unchanged.
+- **A timed-out request cancels on the wire**, not just locally, so a grant
+  in flight toward a requester that has given up does not stand with nobody
+  believing they hold it.
+- **The stray-grant undo yields to our own retry.** A late grant for an
+  earlier request, arriving while a newer request to that same session is in
+  flight, is left alone: releasing it would tear down the grant the newer
+  request is being given. Every other stray grant is still undone, so no
+  peer is ever left controlled by a driver that will never drive.
+
+Each rule is idempotent with the others — a release from a session that
+holds nothing, and that we do not control, is already a silent no-op — and
+together they give the property the incident violated, now pinned by a
+deterministic two-engine test that scripts the hardware timeline message by
+message: **with no further user input, both engines converge on one belief
+about who controls whom, and the requester ends able to cross.** Nothing
+here waits on a clock or a heuristic; convergence follows from the message
+order alone.
+
+The head-of-line delay on the answering side that opened the window is a
+separate matter, addressed in the inbound routing work rather than here.
+
+The `RETURNING` state this ADR promised above (between `REMOTE` and `LOCAL`)
+was never built and is not needed: the reverse crossing is detected on the
+controlled side, which revokes, so the controller returns to `LOCAL` on the
+resulting release with no transitional state of its own. ARCHITECTURE §5.1's
+diagram is corrected to the `LOCAL / REQUESTING / REMOTE` the code has always
+had.
