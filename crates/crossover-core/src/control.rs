@@ -748,40 +748,79 @@ impl ControlEngine {
                 }),
             }]
         };
-        // One peer controls this machine at a time (single desktop): a
-        // request while already controlled — even by the same session —
-        // is denied.
-        if self.controlled.is_some() {
-            return deny(DenyReason::AlreadyControlled);
+        // One peer controls this machine at a time (single desktop), and
+        // *which* peer is the security boundary: a request from a session
+        // other than the grant holder is denied, always (FR-2.3).
+        //
+        // The grant holder itself is a different case. It only asks again
+        // because it believes it holds nothing — its own request timed out
+        // and it crossed the edge again — so denying it strands both
+        // machines: this one thinks it is driven by a peer that has given
+        // up, and that peer cannot cross until something else disturbs the
+        // state (the 2026-08-19 lockout). A retry from the holder therefore
+        // *refreshes* the grant rather than being denied. Security-neutral:
+        // same principal, same authenticated session, complete mediation
+        // unchanged — the grant is re-issued to the identity that already
+        // held it.
+        if let Some(holder) = self.controlled.as_ref().map(|c| c.session) {
+            if holder != session {
+                return deny(DenyReason::AlreadyControlled);
+            }
+            return self.refresh_grant(session, request);
         }
         match self.outbound {
             // Controlling or requesting: busy. Two simultaneous requests
             // thus produce two denials — deterministic (FR-5.1).
             Outbound::Remote { .. } | Outbound::Requesting { .. } => deny(DenyReason::Busy),
-            Outbound::Local => {
-                self.controlled = Some(Controlled {
-                    session,
-                    applied_sequence: 0,
-                    applied_state: InputState::new(),
-                });
-                let mut actions = vec![ControlAction::Send {
-                    session,
-                    message: OutboundControl::Response(ControlResponse {
-                        request_id: request.request_id,
-                        verdict: ControlVerdict::Granted,
-                    }),
-                }];
-                // An edge-driven request carries where the peer's cursor
-                // left; place ours at the matching height on the entry
-                // edge so the pointer appears to cross seamlessly (ADR
-                // 0009). A console request carries none.
-                if let Some(raw) = request.entry {
-                    actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(raw)));
-                }
-                actions.push(ControlAction::Notify(ControlNotice::PeerTookControl));
-                actions
-            }
+            Outbound::Local => self.grant(session, request),
         }
+    }
+
+    /// Re-issue a grant to the session that already holds one. Everything
+    /// the old grant left held is drained first, from this machine's own
+    /// belief: a refreshed grant must never inherit a latched key or
+    /// button, exactly as a hand-back or a disconnect must not (FR-4.4).
+    fn refresh_grant(&mut self, session: Uuid, request: ControlRequest) -> Vec<ControlAction> {
+        let mut previous = self
+            .controlled
+            .take()
+            .expect("caller established the grant holder");
+        let releases = drain_releases(&mut previous.applied_state);
+        let mut actions = Vec::new();
+        if !releases.is_empty() {
+            actions.push(ControlAction::Inject(releases));
+        }
+        actions.extend(self.grant(session, request));
+        actions
+    }
+
+    /// Record a fresh grant for `session` and answer it. The applied-input
+    /// sequence starts at zero because the controller restarts its own send
+    /// sequence on every grant it is given (`on_peer_response`); a stale
+    /// high-water mark would read the new grant's first batch as a
+    /// regression and terminate an honest session.
+    fn grant(&mut self, session: Uuid, request: ControlRequest) -> Vec<ControlAction> {
+        self.controlled = Some(Controlled {
+            session,
+            applied_sequence: 0,
+            applied_state: InputState::new(),
+        });
+        let mut actions = vec![ControlAction::Send {
+            session,
+            message: OutboundControl::Response(ControlResponse {
+                request_id: request.request_id,
+                verdict: ControlVerdict::Granted,
+            }),
+        }];
+        // An edge-driven request carries where the peer's cursor left;
+        // place ours at the matching height on the entry edge so the
+        // pointer appears to cross seamlessly (ADR 0009). A console
+        // request carries none.
+        if let Some(raw) = request.entry {
+            actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(raw)));
+        }
+        actions.push(ControlAction::Notify(ControlNotice::PeerTookControl));
+        actions
     }
 
     fn on_peer_response(&mut self, session: Uuid, response: ControlResponse) -> Vec<ControlAction> {
@@ -1268,18 +1307,82 @@ mod tests {
     }
 
     #[test]
-    fn a_controlled_machine_denies_further_requests() {
+    fn a_controlled_machine_denies_requests_from_another_session() {
+        // One peer controls this machine at a time (single desktop), and
+        // *which* peer is the security boundary: a second trusted session
+        // cannot displace the grant holder (FR-2.3).
         let mut engine = controlled_engine();
+        let _ = engine.handle(ControlEvent::SessionEstablished { session: OTHER });
+        let actions = engine.handle(peer_from(
+            OTHER,
+            InboundControl::Request(ControlRequest {
+                request_id: 2,
+                entry: None,
+            }),
+        ));
+        assert_eq!(
+            actions,
+            vec![ControlAction::Send {
+                session: OTHER,
+                message: OutboundControl::Response(ControlResponse {
+                    request_id: 2,
+                    verdict: ControlVerdict::Denied(DenyReason::AlreadyControlled),
+                }),
+            }]
+        );
+        assert_eq!(
+            engine.controlled_session_for_test(),
+            Some(SESSION),
+            "the standing grant must survive an outsider's request"
+        );
+    }
+
+    #[test]
+    fn a_re_request_from_the_grant_holder_refreshes_the_grant() {
+        // The grant holder only re-requests because *it* believes it holds
+        // nothing (its own request timed out and it crossed again). Denying
+        // it AlreadyControlled denies the very session that holds the grant
+        // and locks both machines out; the answer is to re-grant fresh
+        // (feature/139).
+        let mut engine = controlled_engine(); // SESSION controls us, request 1
+        let _ = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 4,
+            events: vec![WireInputEvent::Button {
+                button: WireButton::Left,
+                pressed: true,
+            }],
+        })));
+
         let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
             request_id: 2,
-            entry: None,
+            entry: Some(EdgeFraction::new(0.25).to_wire()),
+        })));
+        assert!(
+            granted(&actions),
+            "the grant holder's retry must refresh, not deny: {actions:?}"
+        );
+        assert!(
+            actions.contains(&inject(vec![PointerEvent::Button {
+                button: PointerButton::Left,
+                pressed: false,
+            }])),
+            "the refreshed grant must drain what the old one left held: {actions:?}"
+        );
+        let placed = placed_cursor(&actions).expect("no cursor placed on a refreshed edge grant");
+        assert!((placed - 0.25).abs() < 1e-4, "placed at {placed}");
+        assert!(engine.is_controlled());
+
+        // The peer restarts its send sequence with the fresh grant, so the
+        // applied-sequence belief must restart too — otherwise sequence 1
+        // reads as a regression and kills a perfectly honest session.
+        let actions = engine.handle(peer(InboundControl::Batch(InputBatch {
+            sequence: 1,
+            events: vec![WireInputEvent::Motion { dx: 1, dy: 1 }],
         })));
         assert_eq!(
             actions,
-            vec![send(OutboundControl::Response(ControlResponse {
-                request_id: 2,
-                verdict: ControlVerdict::Denied(DenyReason::AlreadyControlled),
-            }))]
+            vec![inject(vec![PointerEvent::Motion { dx: 1, dy: 1 }])],
+            "the refreshed grant must accept the peer's restarted sequence: {actions:?}"
         );
     }
 
