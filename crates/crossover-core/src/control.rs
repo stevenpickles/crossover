@@ -796,12 +796,13 @@ impl ControlEngine {
     /// belief: a refreshed grant must never inherit a latched key or
     /// button, exactly as a hand-back or a disconnect must not (FR-4.4).
     ///
-    /// Note for the driver: a refresh does not change `is_controlled`, so
-    /// the edge mode does not change and the crossing detector is not
-    /// re-primed the way it is when a grant is first taken. An edge-driven
-    /// refresh therefore places the cursor on the linked column with the
-    /// detector left as it was — worth re-priming when the edge wiring is
-    /// next revised.
+    /// A refresh does not change `is_controlled`, so the edge mode does not
+    /// change either — and an edge-driven one still places the cursor on
+    /// the linked column, which is the *trigger* column. The driver
+    /// therefore re-primes the detector on every `PlaceCursor`, not only on
+    /// the mode changes a first grant produces; without that, the refresh's
+    /// own placement fires a return and revokes the grant just re-issued
+    /// (ADR 0009 addendum, 2026-08-19).
     fn refresh_grant(&mut self, session: Uuid, request: ControlRequest) -> Vec<ControlAction> {
         let mut previous = self
             .controlled
