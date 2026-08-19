@@ -297,3 +297,53 @@ restoring the defaults on every exit from control and on shutdown, **and** by
 restoring them when a mask is created, so the next launch of Crossover
 self-heals a crash's blanking. Masking is a display nicety: a failure to hide
 or restore is logged and never disturbs control.
+
+## Addendum (2026-08-19): a re-arm margin on the crossing trigger
+
+The risk this ADR accepted — "immediate crossing can fire on an accidental
+brush against the linked edge ... revisited in the soak" — materialized on
+hardware, and worse than an occasional stray transfer: it *oscillated*.
+
+Crossing onto the controlled machine places its cursor **exactly on** the
+linked column (the deliberate entry placement above), and that same column
+means *return* while the peer is in control. The detector's re-arm condition
+was a single observation one pixel off the column, sampled at 125 Hz — so a
+two-pixel wobble at the seam, over 16 ms, read as a fresh arrival and fired a
+complete reverse transfer. Each reversal re-parked *both* cursors on their own
+trigger columns, leaving both machines primed to do it again: ten take/revoke
+cycles in five seconds, with periods down to ~150 ms. It is a self-sustaining
+loop, not a brush.
+
+**The trigger is now a Schmitt trigger.** A touch of the linked edge fires
+only while the detector is *armed*, and only travel more than
+`REARM_MARGIN` pixels (24) back inside the screen re-arms it. Entry
+placement, and priming when detection restarts, leave the detector disarmed.
+
+This is deliberately **neither** of the two mitigations this ADR rejected:
+
+- **Not the entry inset.** The cursor still enters *on* the edge column, so
+  cursor continuity across the seam is unchanged — placing it a few pixels
+  inside was rejected above for making the forward crossing a hair-trigger,
+  and it stays rejected. The hysteresis lives in the *detector's* state, not
+  in where the pointer is put.
+- **Not a dwell.** Nothing waits and nothing is timed, so a deliberate
+  crossing gains exactly zero latency: a cursor travelling toward the edge is
+  far more than 24 px clear of it on the way, so it is armed, and the first
+  observation that reaches the column fires as before. Only a cursor that
+  never left the edge's neighbourhood is inert.
+
+The margin also closes a race the immediate trigger left open: the entry
+placement runs inline on the control loop while the detector primes on its
+own task after a channel hop, so injected motion could land in between and
+arm the detector before it was primed. A few pixels of injected motion are
+nowhere near the margin, so they no longer can.
+
+**Crossings are also generation-stamped.** A crossing carries a `kind`
+(leave/return) frozen at detection time and reaches the control loop through
+two bounded queues. If the control state changed on the way, acting on it
+applies a decision about a state that no longer exists — a stale `Return` can
+revoke a *fresh* grant. Every edge-mode update the control driver sends now
+advances a counter that the detector counts identically and stamps on each
+crossing; the control driver drops any crossing whose stamp is not current.
+That is a correctness fix independent of the margin, and it stays correct
+however the polling and queueing are later retimed.
