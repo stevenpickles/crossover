@@ -29,6 +29,11 @@
 #[path = "../../build_info.rs"]
 mod build_info;
 
+// Windows-only: this is a Windows-service concept (ADR 0011), and the file
+// sink resolves `%ProgramData%`, a Windows environment variable.
+#[cfg(windows)]
+mod logging;
+
 fn main() {
     // Handled before anything else: this binary is normally started by the
     // SCM with no arguments, so the only way it sees any is a human asking
@@ -59,11 +64,16 @@ fn reported_version() -> bool {
 
 #[cfg(windows)]
 fn run() {
-    // The service has no console; log to stderr (the SCM/event pipeline
-    // captures it) so a launch or supervision failure is never silent (NFR-3).
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .init();
+    // The service has no console, and — unlike a foreground process — the SCM
+    // does *not* capture or persist stderr anywhere a person would look; a
+    // stderr-only sink here was simply losing every supervision event (found
+    // during the 2026-08-19 incident: a worker died with no record of why).
+    // So logging goes to a durable rolling file under
+    // `%ProgramData%\Crossover\logs` as well, so a launch or supervision
+    // failure is never silent (NFR-3). The guard must outlive the run — held
+    // here for the service's whole lifetime, since `run_service_daemon`
+    // blocks until the SCM stops it.
+    let _log_guard = logging::init();
     // Returns () today (stub); becomes a Result the dispatcher propagates once
     // the SCM/launcher lands, at which point main gains error handling.
     crossover_platform_windows::run_service_daemon();

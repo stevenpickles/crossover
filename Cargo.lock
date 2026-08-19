@@ -397,6 +397,8 @@ name = "crossover-svc"
 version = "0.2.0"
 dependencies = [
  "crossover-platform-windows",
+ "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "winresource",
 ]
