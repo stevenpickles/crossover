@@ -72,6 +72,14 @@ pub struct EdgeCrossing {
     pub kind: CrossingKind,
     /// Normalized position along the edge.
     pub position: EdgeFraction,
+    /// The [`EdgeMode`] generation this crossing was detected under — the
+    /// number of mode updates the detector had received when it fired.
+    /// `kind` is frozen at detection time, so a crossing that queues behind
+    /// a control-state change would otherwise act on a state that no longer
+    /// exists (a stale `Return` revoking a *fresh* grant). The control
+    /// driver counts the mode updates it sends and discards any crossing
+    /// whose generation is not the current one.
+    pub generation: u64,
 }
 
 /// How far the cursor must travel back inside the screen, in pixels, before
@@ -198,6 +206,7 @@ pub fn edge_detect(
         display,
         detector: EdgeDetector::new(topology),
         mode: EdgeMode::Idle,
+        generation: 0,
         mode_rx,
         crossings_tx,
         poll_interval,
@@ -210,6 +219,12 @@ pub struct EdgeDetectDriver {
     display: Arc<dyn DisplayInfo>,
     detector: EdgeDetector,
     mode: EdgeMode,
+    /// How many mode updates have been applied. Stamped on every crossing
+    /// so a consumer can tell one detected under the current control state
+    /// from one that queued behind a state change (see
+    /// [`EdgeCrossing::generation`]). The sender counts its own updates, so
+    /// the two counts agree without a wider channel type.
+    generation: u64,
     mode_rx: mpsc::Receiver<EdgeMode>,
     crossings_tx: mpsc::Sender<EdgeCrossing>,
     poll_interval: Duration,
@@ -229,7 +244,10 @@ impl EdgeDetectDriver {
                 update = self.mode_rx.recv() => {
                     let Some(mode) = update else { break }; // wiring gone
                     self.mode = mode;
-                    tracing::debug!(?mode, "edge: watching mode changed");
+                    // Saturating so a very long-lived process cannot wrap a
+                    // stale generation onto a current one.
+                    self.generation = self.generation.saturating_add(1);
+                    tracing::debug!(?mode, generation = self.generation, "edge: watching mode changed");
                     if mode != EdgeMode::Idle {
                         // Begin from the current cursor so a position
                         // already at the edge does not fire immediately.
@@ -304,11 +322,16 @@ impl EdgeDetectDriver {
                 position = position.value(),
                 cursor_x = cursor.x,
                 cursor_y = cursor.y,
+                generation = self.generation,
                 "edge: crossing detected"
             );
             if self
                 .crossings_tx
-                .send(EdgeCrossing { kind, position })
+                .send(EdgeCrossing {
+                    kind,
+                    position,
+                    generation: self.generation,
+                })
                 .await
                 .is_err()
             {
@@ -557,6 +580,23 @@ mod tests {
         display.set_cursor(at(0, 270)); // left edge
         let crossing = next_crossing(&mut crossings).await;
         assert_eq!(crossing.kind, CrossingKind::Return);
+    }
+
+    /// Every crossing is stamped with the number of mode updates the
+    /// detector had applied when it fired, so a consumer can tell a
+    /// crossing detected under the current control state from one that
+    /// queued behind a state change.
+    #[tokio::test]
+    async fn a_crossing_carries_the_mode_generation_it_was_detected_under() {
+        let (display, mode_tx, mut crossings) = rig(LinkSide::Left);
+        mode_tx.send(EdgeMode::Leaving).await.unwrap(); // generation 1
+        sleep(SETTLE).await;
+        mode_tx.send(EdgeMode::Returning).await.unwrap(); // generation 2
+        sleep(SETTLE).await;
+        display.set_cursor(at(1919, 540));
+        let crossing = next_crossing(&mut crossings).await;
+        assert_eq!(crossing.kind, CrossingKind::Return);
+        assert_eq!(crossing.generation, 2);
     }
 
     #[tokio::test]
