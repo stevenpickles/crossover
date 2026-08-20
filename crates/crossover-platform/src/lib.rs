@@ -1,5 +1,6 @@
 //! Platform abstraction traits for Crossover: clipboard, input capture and
-//! injection, display enumeration, cursor control, and secure storage.
+//! injection, display enumeration, cursor control, secure storage, and
+//! local network-link state.
 //!
 //! Trait definitions only — no OS dependencies. Platform crates such as
 //! `crossover-platform-windows` implement these traits; nothing above the
@@ -12,6 +13,7 @@ pub mod display;
 pub mod fakes;
 pub mod file_blob;
 pub mod input;
+pub mod link;
 pub mod secure_storage;
 pub mod service;
 pub mod spool;
@@ -31,6 +33,7 @@ pub use input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerButton,
     PointerEvent, SCROLL_UNITS_PER_DETENT, hid,
 };
+pub use link::{LinkState, LinkStateProbe, UnknownLinkStateProbe};
 pub use secure_storage::{SecureStorage, SecureStorageError};
 pub use service::{ServiceError, ServiceManager, ServiceStatus, UnsupportedServiceManager};
 pub use spool::{

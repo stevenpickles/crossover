@@ -24,6 +24,7 @@ use crossover_protocol::RawFrame;
 use crossover_protocol::hello::MessageType;
 use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore};
 
+use crate::link::LinkDiagnostics;
 use crate::net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionOptions, connect,
 };
@@ -194,6 +195,33 @@ pub enum DisconnectReason {
     ShutdownRequested,
 }
 
+impl DisconnectReason {
+    /// Whether a dead *local* network interface could produce this ending —
+    /// i.e. whether the link state is worth asking about (see [`crate::link`]).
+    ///
+    /// Two reasons qualify, because a wire that goes down mid-session
+    /// surfaces in exactly two shapes:
+    ///
+    /// - [`Self::Transport`] — the socket errors out. On Windows this is
+    ///   usually `WSAECONNRESET`, whose message blames "the remote host"
+    ///   for something the remote host did not do. This is the incident
+    ///   that motivated the field.
+    /// - [`Self::KeepaliveTimeout`] — nothing errors, nothing arrives.
+    ///   Silence is the other face of the same fault, and reading it as "the
+    ///   peer stopped answering" sends the reader to the wrong machine just
+    ///   as effectively.
+    ///
+    /// The rest do not: a protocol violation and a stalled event consumer
+    /// are decided from data already in hand, and [`Self::PeerClosed`] is a
+    /// clean shutdown handshake, which a link that has gone down cannot
+    /// deliver. Asking anyway would add a field whose value carries no
+    /// information — noise that dilutes the one line where it matters.
+    #[must_use]
+    pub fn may_be_a_local_link_failure(&self) -> bool {
+        matches!(self, Self::Transport { .. } | Self::KeepaliveTimeout)
+    }
+}
+
 /// What a supervisor (or [`run_session`]) reports to the application.
 #[derive(Debug)]
 pub enum SessionEvent {
@@ -307,6 +335,13 @@ async fn run_supervisor(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut attempt: u32 = 0;
+    // Where to point the link probe when an attempt never reaches a socket.
+    // Seeded from the configured address when it is already a literal, and
+    // upgraded to the address a session actually used as soon as one
+    // establishes — so a peer configured by hostname still gets a real
+    // answer for the reconnect attempts after its first session, which is
+    // exactly the stretch a NIC outage produces.
+    let mut peer_socket: Option<std::net::SocketAddr> = peer_addr.parse().ok();
     loop {
         if *shutdown.borrow() {
             break;
@@ -323,6 +358,7 @@ async fn run_supervisor(
         match connect(peer_addr.as_str(), &local, &config.session).await {
             Ok(session) => {
                 let info = session.info().clone();
+                peer_socket = session.link().peer().or(peer_socket);
                 if events
                     .send(SessionEvent::Established(info.clone()))
                     .await
@@ -361,12 +397,14 @@ async fn run_supervisor(
             }
             Err(error) => {
                 let retry_in = config.reconnect.delay_for_attempt(attempt);
-                tracing::warn!(
-                    peer_addr = %peer_addr,
-                    error = %error,
-                    retry_in_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
+                // "Connection refused" and "the local NIC is down" read
+                // identically from here; the probe separates them.
+                log_connect_failed(
+                    peer_addr.as_str(),
+                    &error,
+                    retry_in,
                     attempt,
-                    "connect failed; will retry"
+                    &LinkDiagnostics::new(peer_socket, config.session.link_probe.clone()),
                 );
                 if events
                     .send(SessionEvent::ConnectFailed {
@@ -423,6 +461,9 @@ pub async fn run_session(
     keepalive: &KeepaliveConfig,
 ) -> DisconnectReason {
     let session_id = session.info().session_id;
+    // Taken before the split consumes the session; asked only if the ending
+    // turns out to be one a dead local wire could have caused.
+    let link = session.link();
     let (mut reader, mut writer) = session.split();
     let mut last_rx = Instant::now();
     let mut write_health = WriteHealth::default();
@@ -516,20 +557,91 @@ pub async fn run_session(
     // hang on exactly the sessions that most need to end. The reason above is
     // already decided; this only tidies the socket.
     let _ = tokio::time::timeout(GRACEFUL_CLOSE_BUDGET, writer.close()).await;
-    match &reason {
-        DisconnectReason::ShutdownRequested => {
-            tracing::info!(session_id = %session_id, state = "closed", "session shut down");
-        }
-        other => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %other,
-                state = "disconnected",
-                "session ended"
-            );
-        }
-    }
+    log_session_end(session_id, &reason, &link);
     reason
+}
+
+/// Report a failed establishment attempt, naming the local link.
+///
+/// Unlike a session ending there is nothing to filter on: every way an
+/// attempt can fail — refused, unreachable, timed out — is equally
+/// producible by a local interface that is down, so the field is always
+/// worth carrying here.
+fn log_connect_failed(
+    peer_addr: &str,
+    error: &SessionError,
+    retry_in: Duration,
+    attempt: u32,
+    link: &LinkDiagnostics,
+) {
+    let retry_in_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX);
+    let local_link = link.state();
+    if local_link.blames_local_link() {
+        tracing::warn!(
+            peer_addr = %peer_addr,
+            error = %error,
+            local_link = local_link.as_field(),
+            retry_in_ms,
+            attempt,
+            "connect failed; local link is down, so the failure is local, not the peer; \
+             will retry"
+        );
+    } else {
+        tracing::warn!(
+            peer_addr = %peer_addr,
+            error = %error,
+            local_link = local_link.as_field(),
+            retry_in_ms,
+            attempt,
+            "connect failed; will retry"
+        );
+    }
+}
+
+/// Report the end of a session, naming the local link when the link is what
+/// can settle where the fault was (docs/ARCHITECTURE.md §10).
+///
+/// The probe is consulted only for endings a dead local interface could
+/// actually cause (see [`DisconnectReason::may_be_a_local_link_failure`]),
+/// and the `local_link` field appears only on those lines — a field whose
+/// value is always `unknown` on a protocol violation would be noise diluting
+/// the one line where it means something.
+fn log_session_end(session_id: Uuid, reason: &DisconnectReason, link: &LinkDiagnostics) {
+    if matches!(reason, DisconnectReason::ShutdownRequested) {
+        tracing::info!(session_id = %session_id, state = "closed", "session shut down");
+        return;
+    }
+    if !reason.may_be_a_local_link_failure() {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %reason,
+            state = "disconnected",
+            "session ended"
+        );
+        return;
+    }
+    let local_link = link.state();
+    if local_link.blames_local_link() {
+        // The line the whole slice exists for. The `error` field above it
+        // may well say "forcibly closed by the remote host"; this says, on
+        // the same record, that it was not.
+        tracing::warn!(
+            session_id = %session_id,
+            error = %reason,
+            local_link = local_link.as_field(),
+            state = "disconnected",
+            "session ended; local link is down, so the disconnect is local, not the peer \
+             (disregard any \"closed by the remote host\" in the error above)"
+        );
+    } else {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %reason,
+            local_link = local_link.as_field(),
+            state = "disconnected",
+            "session ended"
+        );
+    }
 }
 
 /// How the outbound direction has been behaving, across writes.
@@ -805,14 +917,18 @@ mod tests {
     use proptest::prelude::*;
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
+    use uuid::Uuid;
 
+    use crossover_platform::LinkState;
+    use crossover_platform::fakes::FakeLinkStateProbe;
     use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore, TrustedPeer};
 
     use super::{
         DisconnectReason, KeepaliveConfig, ReconnectPolicy, SessionEvent, SupervisorConfig,
-        run_session, supervise_outbound,
+        log_connect_failed, log_session_end, run_session, supervise_outbound,
     };
-    use crate::net::{LocalNode, SessionListener, SessionOptions};
+    use crate::link::LinkDiagnostics;
+    use crate::net::{LocalNode, SessionError, SessionListener, SessionOptions};
     use crate::outbound::outbound_channel;
 
     // --- keepalive configuration ---
@@ -850,6 +966,224 @@ mod tests {
         assert_eq!(ok.timeout(), Duration::from_secs(2));
         let default = KeepaliveConfig::default();
         assert!(default.interval() < default.timeout());
+    }
+
+    // --- disconnect diagnostics: the local link ---
+
+    /// A subscriber writing into a buffer, so a test can read the line a
+    /// maintainer would read.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` with everything it logs captured, and return the text.
+    fn captured(body: impl FnOnce()) -> String {
+        let sink = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8(bytes).expect("log output was not UTF-8")
+    }
+
+    /// The error the incident produced, verbatim: what Windows says when the
+    /// *local* NIC drops its link mid-session, on both machines at once.
+    fn wsaeconnreset() -> DisconnectReason {
+        DisconnectReason::Transport {
+            reason: "transport I/O failed: An existing connection was forcibly closed by the \
+                     remote host. (os error 10054)"
+                .to_owned(),
+        }
+    }
+
+    fn diagnostics(state: LinkState) -> (LinkDiagnostics, Arc<FakeLinkStateProbe>) {
+        let probe = Arc::new(FakeLinkStateProbe::answering(state));
+        let peer = "192.168.1.146:27677".parse().unwrap();
+        (LinkDiagnostics::new(Some(peer), Some(probe.clone())), probe)
+    }
+
+    /// The incident this slice exists for. Machine A's dock NIC dropped its
+    /// link; both peers logged "forcibly closed by the remote host", which
+    /// was false on both ends, and disproving it took a manual correlation
+    /// of two machines' Windows event logs. The log has to say it itself.
+    #[test]
+    fn a_transport_failure_over_a_dead_local_wire_is_named_as_local() {
+        let (link, probe) = diagnostics(LinkState::Down);
+        let output = captured(|| log_session_end(Uuid::nil(), &wsaeconnreset(), &link));
+
+        assert!(output.contains(r#"local_link="down""#), "{output}");
+        assert!(
+            output.contains("the disconnect is local, not the peer"),
+            "the line does not overturn the OS's misattribution: {output}"
+        );
+        // The original error is still there — the diagnosis corrects it, it
+        // does not hide it.
+        assert!(output.contains("os error 10054"), "{output}");
+        // Asked about this session's peer, not about "any interface".
+        assert_eq!(
+            probe.asked_about(),
+            vec!["192.168.1.146:27677".parse().unwrap()]
+        );
+    }
+
+    /// Silence is the other face of the same fault: with the wire down
+    /// nothing errors and nothing arrives, and "the peer stopped answering"
+    /// sends the reader to the wrong machine just as effectively.
+    #[test]
+    fn a_keepalive_timeout_over_a_dead_local_wire_is_named_as_local() {
+        let (link, _probe) = diagnostics(LinkState::Down);
+        let output = captured(|| {
+            log_session_end(Uuid::nil(), &DisconnectReason::KeepaliveTimeout, &link);
+        });
+        assert!(output.contains(r#"local_link="down""#), "{output}");
+        assert!(
+            output.contains("the disconnect is local, not the peer"),
+            "{output}"
+        );
+    }
+
+    /// A healthy local link records the fact and blames nobody: the field
+    /// is evidence either way, so it has to be present when it exonerates
+    /// this machine too.
+    #[test]
+    fn a_live_local_link_is_recorded_without_a_verdict() {
+        let (link, _probe) = diagnostics(LinkState::Up);
+        let output = captured(|| log_session_end(Uuid::nil(), &wsaeconnreset(), &link));
+
+        assert!(output.contains(r#"local_link="up""#), "{output}");
+        assert!(output.contains("session ended"), "{output}");
+        assert!(
+            !output.contains("not the peer"),
+            "a healthy link must not claim the disconnect was local: {output}"
+        );
+    }
+
+    /// A probe that cannot determine the state — no implementation on this
+    /// OS, no route, an internal failure it swallowed — says so, and says
+    /// nothing more. Not knowing must never read as "the local link was
+    /// fine", which is exactly the false confidence the incident created.
+    #[test]
+    fn a_probe_that_cannot_tell_degrades_to_unknown_and_accuses_nobody() {
+        let (link, _probe) = diagnostics(LinkState::Unknown);
+        let output = captured(|| log_session_end(Uuid::nil(), &wsaeconnreset(), &link));
+        assert!(output.contains(r#"local_link="unknown""#), "{output}");
+        assert!(!output.contains("not the peer"), "{output}");
+
+        // Same outcome with no probe wired at all (every non-Windows build
+        // today), and the line is otherwise unchanged.
+        let output = captured(|| {
+            log_session_end(Uuid::nil(), &wsaeconnreset(), &LinkDiagnostics::default());
+        });
+        assert!(output.contains(r#"local_link="unknown""#), "{output}");
+        assert!(output.contains("session ended"), "{output}");
+    }
+
+    /// The field is carried only where it could mean something. A protocol
+    /// violation is decided from bytes already in hand, and a clean peer
+    /// close is a handshake a dead wire cannot deliver — a permanently
+    /// uninformative `local_link` on those lines would dilute the one line
+    /// where it settles the question.
+    #[test]
+    fn endings_a_dead_wire_cannot_cause_do_not_carry_the_field() {
+        assert!(wsaeconnreset().may_be_a_local_link_failure());
+        assert!(DisconnectReason::KeepaliveTimeout.may_be_a_local_link_failure());
+        assert!(!DisconnectReason::PeerClosed.may_be_a_local_link_failure());
+        assert!(!DisconnectReason::ShutdownRequested.may_be_a_local_link_failure());
+        assert!(
+            !DisconnectReason::ProtocolViolation {
+                reason: "Hello after establishment".to_owned()
+            }
+            .may_be_a_local_link_failure()
+        );
+
+        let (link, probe) = diagnostics(LinkState::Down);
+        let output =
+            captured(|| log_session_end(Uuid::nil(), &DisconnectReason::PeerClosed, &link));
+        assert!(output.contains("session ended"), "{output}");
+        assert!(!output.contains("local_link"), "{output}");
+        assert!(
+            probe.asked_about().is_empty(),
+            "the probe was consulted for an ending it cannot explain"
+        );
+
+        // A local shutdown is not a failure at all: still info, still silent
+        // about the link.
+        let output =
+            captured(|| log_session_end(Uuid::nil(), &DisconnectReason::ShutdownRequested, &link));
+        assert!(output.contains("session shut down"), "{output}");
+        assert!(!output.contains("local_link"), "{output}");
+    }
+
+    /// The other half of the incident: once the link is down, every
+    /// reconnect attempt fails too, and "connection refused" reads exactly
+    /// like a peer that is switched off.
+    #[test]
+    fn a_connect_attempt_over_a_dead_local_wire_is_named_as_local() {
+        let error = SessionError::Io {
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        };
+        let (link, _probe) = diagnostics(LinkState::Down);
+        let output = captured(|| {
+            log_connect_failed(
+                "192.168.1.146:27677",
+                &error,
+                Duration::from_secs(4),
+                3,
+                &link,
+            );
+        });
+
+        assert!(output.contains(r#"local_link="down""#), "{output}");
+        assert!(
+            output.contains("the failure is local, not the peer"),
+            "{output}"
+        );
+        // The fields the retry story is told with are untouched.
+        assert!(output.contains("retry_in_ms=4000"), "{output}");
+        assert!(output.contains("attempt=3"), "{output}");
+
+        // With a healthy link the line stays the old one, plus the evidence.
+        let (link, _probe) = diagnostics(LinkState::Up);
+        let output = captured(|| {
+            log_connect_failed(
+                "192.168.1.146:27677",
+                &error,
+                Duration::from_secs(4),
+                3,
+                &link,
+            );
+        });
+        assert!(output.contains("connect failed; will retry"), "{output}");
+        assert!(output.contains(r#"local_link="up""#), "{output}");
+        assert!(!output.contains("not the peer"), "{output}");
     }
 
     // --- write health (pure) ---

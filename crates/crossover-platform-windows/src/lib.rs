@@ -23,6 +23,8 @@ pub mod file_blob;
 pub mod input;
 #[cfg(windows)]
 pub mod keymap;
+#[cfg(windows)]
+pub mod link;
 
 /// Bounded shutdown for the Win32 message-pump threads (see the module).
 /// Windows-gated with its callers: it logs through `tracing`, which is a
@@ -66,6 +68,8 @@ pub use file_blob::WindowsFileBlobBuilder;
 pub fn restore_system_cursors() {}
 #[cfg(windows)]
 pub use input::WindowsInputInjector;
+#[cfg(windows)]
+pub use link::WindowsLinkStateProbe;
 #[cfg(windows)]
 pub use secure_storage::DpapiSecureStorage;
 #[cfg(windows)]

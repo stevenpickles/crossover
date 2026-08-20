@@ -14,6 +14,7 @@ pub mod control_driver;
 pub mod edge_driver;
 pub mod file_blob;
 pub mod input;
+pub mod link;
 pub mod metrics;
 pub mod net;
 pub mod outbound;
@@ -40,6 +41,7 @@ pub use file_blob::{FALLBACK_ARCHIVE_NAME, wire_file_name};
 pub use input::{
     InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce, coalesce_input, hid,
 };
+pub use link::LinkDiagnostics;
 pub use metrics::{FrameClass, Metrics, Report};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,

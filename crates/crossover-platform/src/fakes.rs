@@ -6,6 +6,7 @@
 //! crate's own tests.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::clipboard::{
@@ -17,6 +18,7 @@ use crate::file_blob::{BlobNaming, FileBlob, FileBlobBuilder, FileBlobRefusal};
 use crate::input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerEvent,
 };
+use crate::link::{LinkState, LinkStateProbe};
 use crate::secure_storage::{SecureStorage, SecureStorageError};
 use crate::service::{ServiceError, ServiceManager, ServiceStatus};
 use crate::virtual_file::{VirtualFile, VirtualFileClipboard};
@@ -666,6 +668,48 @@ impl ServiceManager for FakeServiceManager {
         } else {
             Ok(ServiceStatus::NotInstalled)
         }
+    }
+}
+
+/// Scriptable [`LinkStateProbe`]: answers whatever a test set, and records
+/// which peer it was asked about.
+///
+/// The recorded peer is half the point. The trait's contract is *per peer* —
+/// the interface carrying this session, not "some interface somewhere" — so
+/// a test that only checked the answer would not notice a caller asking the
+/// wrong question.
+#[derive(Debug, Default)]
+pub struct FakeLinkStateProbe {
+    answer: Mutex<LinkState>,
+    asked_about: Mutex<Vec<SocketAddr>>,
+}
+
+impl FakeLinkStateProbe {
+    /// A probe that answers `answer` for every peer.
+    #[must_use]
+    pub fn answering(answer: LinkState) -> Self {
+        Self {
+            answer: Mutex::new(answer),
+            asked_about: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Change what the next queries answer.
+    pub fn set_answer(&self, answer: LinkState) {
+        *lock(&self.answer) = answer;
+    }
+
+    /// Every peer address the probe was asked about, in order.
+    #[must_use]
+    pub fn asked_about(&self) -> Vec<SocketAddr> {
+        lock(&self.asked_about).clone()
+    }
+}
+
+impl LinkStateProbe for FakeLinkStateProbe {
+    fn link_state(&self, peer: SocketAddr) -> LinkState {
+        lock(&self.asked_about).push(peer);
+        *lock(&self.answer)
     }
 }
 

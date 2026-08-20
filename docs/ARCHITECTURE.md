@@ -119,6 +119,7 @@ trait InputInjector       // synthesize input on this machine
 trait DisplayProvider     // enumerate displays, dimensions, positions, DPI
 trait CursorController    // query/set pointer position, hide/show
 trait SecureStorage       // protect private key material at rest
+trait LinkStateProbe      // is the local interface carrying this peer up?
 ```
 
 Guidelines:
@@ -181,6 +182,16 @@ Guidelines:
     than reaching Win32. Type is judged before size, so an oversized JPEG
     is refused for being a JPEG: the durable answer, where "too big"
     invites a smaller retry that must also fail.
+- `LinkStateProbe` is a **diagnostic** capability, not an operational one: it
+  is read on a failure path to label a log line and never gates, delays, or
+  reorders anything (see §10). Its contract is therefore unusually strict —
+  cheap, non-blocking, no `Result`, and no panic — and it answers three
+  values, because "could not tell" must stay distinguishable from "the local
+  link was fine". On Windows it is `GetBestInterfaceEx` (which interface
+  routes to *this* peer) plus `GetIfEntry2` (that interface's
+  `MediaConnectState` and `OperStatus`); platforms without an implementation
+  use `UnknownLinkStateProbe`, which answers `Unknown` rather than
+  pretending.
 - `InputCapture` on Windows is backed by two mechanisms rather than one
   (ADR 0007): low-level hooks, because only they can suppress an event
   locally, and Raw Input, because only it reports unaccelerated,
@@ -357,6 +368,11 @@ IDLE → CONNECTING → AUTHENTICATING → NEGOTIATING → ESTABLISHED
 - `ESTABLISHED` supervises keepalive, reconnect (FR-6.2), and channel
   backpressure. Loss of the session while `REMOTE` triggers the control
   transfer fallback above.
+- Every session captures a `LinkDiagnostics` at establishment — the peer
+  socket address it actually uses, plus the platform's `LinkStateProbe` —
+  so the disconnect record can name the *local* link state (§10). It is read
+  only on the way to a log line: `RECONNECT_WAIT` and its backoff are
+  identical whatever it says.
 
 ### 5.4 Outbound send path: two priority classes
 
@@ -752,7 +768,25 @@ profile (ADR 0011 addendum, 2026-08-19). Conventions:
 - **Canonical field names**, snake_case, reused verbatim across crates so
   log lines correlate: `peer_id`, `session_id`, `message_id`,
   `clipboard_id`, `protocol_version`, `state`, `latency_ms`, `error`,
-  `command`. Values go in fields; the event message is the human summary.
+  `command`, `local_link`. Values go in fields; the event message is the
+  human summary.
+- **A disconnect says which side broke.** `local_link` (`up` / `down` /
+  `unknown`, from `LinkStateProbe`) is carried by the two records where the
+  OS's own wording misleads: the session-end warning, and the
+  connect-attempt failure. It exists because a NIC that drops its physical
+  link ends the session on **both** machines with `An existing connection
+  was forcibly closed by the remote host` — false on both ends, and
+  disproving it once cost a manual correlation of two machines' event logs.
+  Rules that keep the field worth reading:
+  - It is asked only where a dead local interface is a possible cause — a
+    transport failure or a keepalive timeout. A protocol violation and a
+    clean peer close are not, so those lines carry no `local_link` at all
+    rather than a permanently uninformative one.
+  - `down` also changes the *message*, not just a field, so the conclusion
+    survives being read at a glance: `session ended; local link is down, so
+    the disconnect is local, not the peer`.
+  - `unknown` never reads as exoneration. `up` is evidence too, and is
+    recorded, but no line claims a local fault without `down`.
 - **Spans scope lifecycles**: one span per connection session (carrying
   `session_id` and `peer_id`), per clipboard transaction, per control
   transfer. Events inside inherit those fields — no re-stating.

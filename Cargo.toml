@@ -110,6 +110,16 @@ windows = { version = "0.62", features = [
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    # GetBestInterfaceEx + GetIfEntry2: which local interface carries a
+    # given peer, and is its media connected. Two kernel-table reads on the
+    # disconnect path, so a NIC that drops its link is not misreported as
+    # the peer closing the connection (docs/ARCHITECTURE.md §10).
+    "Win32_NetworkManagement_IpHelper",
+    # IF_OPER_STATUS / NET_IF_MEDIA_CONNECT_STATE, the two status fields of
+    # the interface row above.
+    "Win32_NetworkManagement_Ndis",
+    # SOCKADDR_IN/SOCKADDR_IN6: how a route lookup names its destination.
+    "Win32_Networking_WinSock",
     "Win32_Security",
     # SDDL and SetSecurityInfo: the spool root's explicit DACL and
     # mandatory integrity label (F15).
