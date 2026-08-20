@@ -627,9 +627,19 @@ pub async fn run(
     // priority lanes the mux drains independently (ADR 0013).
     let commands = merge_command_lanes(sync_commands, control_commands);
 
+    // How a disconnect finds out whether the local wire went down (the
+    // `local_link` field on session-end and connect-failure records).
+    let link_probe = crate::storage::open_link_state_probe();
+
     // Outbound role: supervised session with automatic reconnect.
-    let (handle, events) =
-        start_outbound(connect.as_ref(), &identity, &certified, &store, &metrics);
+    let (handle, events) = start_outbound(
+        connect.as_ref(),
+        &identity,
+        &certified,
+        &store,
+        &metrics,
+        &link_probe,
+    );
 
     spawn_command_mux(Arc::clone(&registry), commands, Some(Arc::clone(&metrics)));
 
@@ -666,6 +676,7 @@ pub async fn run(
             &fanout,
             &registry,
             &metrics,
+            &link_probe,
         ) => {}
         () = outbound_event_loop(
             events,
@@ -766,6 +777,7 @@ fn start_outbound(
     certified: &CertifiedIdentity,
     store: &TrustStore,
     metrics: &Arc<Metrics>,
+    link_probe: &Arc<dyn crossover_platform::LinkStateProbe>,
 ) -> (
     Option<Arc<crossover_core::supervision::SupervisorHandle>>,
     Option<mpsc::Receiver<SessionEvent>>,
@@ -776,6 +788,7 @@ fn start_outbound(
     println!("Maintaining an outbound session to {addr}.");
     let mut supervisor_config = SupervisorConfig::default();
     supervisor_config.session.metrics = Some(Arc::clone(metrics));
+    supervisor_config.session.link_probe = Some(Arc::clone(link_probe));
     let (handle, events) = supervise_outbound(
         addr.clone(),
         identity.clone(),
@@ -1703,6 +1716,9 @@ async fn dispatch_command(
     }
 }
 
+// Composition-root wiring: every argument is a distinct collaborator the run
+// loop already owns, and bundling them into a struct would only move the list.
+#[allow(clippy::too_many_arguments)]
 async fn listener_loop(
     listener: Option<&SessionListener>,
     identity: &DeviceIdentity,
@@ -1711,12 +1727,17 @@ async fn listener_loop(
     fanout: &SessionFanout,
     registry: &SessionRegistry,
     metrics: &Arc<Metrics>,
+    link_probe: &Arc<dyn crossover_platform::LinkStateProbe>,
 ) {
     let Some(listener) = listener else {
         return std::future::pending().await;
     };
     let options = SessionOptions {
         metrics: Some(Arc::clone(metrics)),
+        // The inbound role needs the same diagnostic as the outbound one:
+        // a dropped local wire ends both directions at once, and the
+        // listener's log was just as misleading during the incident.
+        link_probe: Some(Arc::clone(link_probe)),
         ..SessionOptions::default()
     };
     let keepalive = KeepaliveConfig::default();

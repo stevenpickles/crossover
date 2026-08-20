@@ -30,6 +30,24 @@ pub fn open_secure_storage() -> anyhow::Result<Box<dyn SecureStorage>> {
     }
 }
 
+/// Open the platform's local link-state probe (docs/ARCHITECTURE.md §10).
+///
+/// Infallible on every platform, unlike its neighbours here: this is a
+/// diagnostic, and a run that cannot tell whether its NIC is up is still a
+/// perfectly good run. Platforms with no implementation get the honest
+/// fallback, which answers `Unknown` and logs it as such — never `Up`.
+#[must_use]
+pub fn open_link_state_probe() -> std::sync::Arc<dyn crossover_platform::LinkStateProbe> {
+    #[cfg(windows)]
+    {
+        std::sync::Arc::new(crossover_platform_windows::WindowsLinkStateProbe)
+    }
+    #[cfg(not(windows))]
+    {
+        std::sync::Arc::new(crossover_platform::UnknownLinkStateProbe)
+    }
+}
+
 /// Open the platform clipboard provider.
 ///
 /// # Errors
