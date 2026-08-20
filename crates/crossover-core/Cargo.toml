@@ -27,6 +27,11 @@ proptest = { workspace = true }
 # `test-util` gives the paused clock the edge-transfer tests use to drive a
 # polling detector deterministically instead of sleeping on a real one.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# Disconnect diagnostics are *log lines*, so the tests that keep them
+# honest read the emitted line rather than an internal value: a subscriber
+# capturing into a buffer is the only way to assert what a maintainer will
+# actually see in the file (docs/ARCHITECTURE.md §10).
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
