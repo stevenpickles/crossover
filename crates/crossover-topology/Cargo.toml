@@ -1,0 +1,59 @@
+[package]
+name = "crossover-topology"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# ADR 0018 fixes this crate's dependency set, and the fixing is the point:
+# the layout editor is a GUI process that must share the model and the
+# config writer with the worker without linking the protocol, security, and
+# platform crates — no TLS stack, no input injector. That boundary is one a
+# reviewer verifies by reading this manifest and `cargo tree`, so nothing is
+# added here without amending the ADR. No I/O beyond the config and state
+# files, no sockets, no OS APIs.
+#
+# The DEFAULT graph is exactly `serde` + `thiserror` — the two below and
+# nothing more. That is what the ADR's dependency sentence fixes and what a
+# consumer of the model alone gets.
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+# The other two are optional and reached only through `config` below, so
+# they are in nobody's graph unless asked for: `toml_edit` for the TOML
+# section writer, `serde_json` for the state-file schema. (The ADR names
+# only `toml_edit`; its dated amendment records that versioned JSON needs a
+# JSON implementation and that the sentence describes the default graph.)
+#
+# `crossover-protocol` will depend on this crate for the wire shapes of
+# `MonitorTopology`, `LayoutSync`, and `EntryPoint` — not yet; those land on
+# a later branch — and will take the default graph. A protocol crate that
+# linked a TOML writer and a JSON parser would stop being the
+# dependency-light, socket-free crate ARCHITECTURE §3.1 requires.
+serde_json = { workspace = true, optional = true }
+toml_edit = { workspace = true, optional = true }
+
+# Non-optional here so `cargo test --workspace` — the CI gate, which enables
+# no extra features — still compiles and runs the `config` and `state`
+# suites: both modules are `cfg(any(test, feature = "config"))`, the same
+# shape `crossover-platform` uses for its `fakes`. Without this the writer
+# and the state schema would ship untested by the gate that guards them.
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+# The parser the worker actually reads the config with: a writer test that
+# read its own output back through `toml_edit` would only prove the writer
+# agrees with itself.
+toml = { workspace = true }
+toml_edit = { workspace = true }
+
+[features]
+# The on-disk halves: the `[layout]` config section writer and the
+# worker→editor state file. Non-default per ADR 0018 — the worker and the
+# editor enable it, the protocol crate does not.
+config = ["dep:toml_edit", "dep:serde_json"]
+
+[lints]
+workspace = true

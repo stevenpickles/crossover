@@ -78,6 +78,10 @@ crossover/
                                     #   TLS configuration
         crossover-platform/         # platform trait definitions (no OS deps)
         crossover-platform-windows/ # Win32 implementations
+        crossover-topology/         # the drawn layout model and its validation,
+                                    #   plus (behind the non-default `config`
+                                    #   feature) the [layout] config writer and
+                                    #   the worker→editor state-file schema
     tools/
         test-peer/                  # headless scriptable peer (see TESTING.md)
     tests/                          # cross-crate integration tests
@@ -88,14 +92,19 @@ crossover/
     docs/
 ```
 
-> **Phase 8 adds two members** ([ADR 0018](adr/0018-drawn-display-topology.md),
-> recorded ahead of the implementation): `crates/crossover-topology` — the
-> drawn-layout model, its validation, the config `[layout]` types and writer,
-> and the state-file schema — and a layout-editor binary under `apps/`, the
-> project's first GUI (its toolkit is the forthcoming ADR 0019). The crate
-> exists so the editor shares the model and writer without linking
-> core's protocol/security/platform graph; the tree above describes the
-> build until those land.
+> **Phase 8 adds two members** ([ADR 0018](adr/0018-drawn-display-topology.md)).
+> `crates/crossover-topology` — the drawn-layout model, its validation, the
+> config `[layout]` types and writer, and the state-file schema — is in the
+> tree above. Still ahead of the build: a layout-editor binary under `apps/`,
+> the project's first GUI (its toolkit is the forthcoming ADR 0019).
+>
+> The crate exists so the editor shares the model and writer without linking
+> core's protocol/security/platform graph, which is why its **default**
+> dependencies are exactly `serde` and `thiserror`. The non-default `config`
+> feature adds `toml_edit` (the format-preserving `[layout]` writer) and
+> `serde_json` (the state-file schema) — the ADR's dated amendment records
+> the second. `crossover-protocol` will gain a dependency edge on the default
+> graph when the v4 wire messages land; it has none yet.
 
 ### 3.1 Deliberately not separate crates (yet)
 
@@ -120,9 +129,10 @@ from Phase 0.
 > anticipate: not one of the candidates above, but a new boundary created by
 > [ADR 0018](adr/0018-drawn-display-topology.md) so the editor binary and the
 > worker share one layout model and one config writer. `crossover-protocol`
-> gains a dependency edge on it for the wire shapes, with the TOML writer
-> behind a non-default `config` cargo feature so the protocol crate stays as
-> dependency-light and socket-free as this section requires.
+> will gain a dependency edge on it for the wire shapes when those land, with
+> the TOML writer and the JSON state schema both behind a non-default
+> `config` cargo feature so the protocol crate stays as dependency-light and
+> socket-free as this section requires.
 
 ## 4. Platform abstraction layer
 

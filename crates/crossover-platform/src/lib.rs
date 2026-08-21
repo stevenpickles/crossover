@@ -24,7 +24,7 @@ pub use clipboard::{
     MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
 };
 pub use cursor::{CursorMask, CursorMaskError, NoopCursorMask};
-pub use display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
+pub use display::{CursorPoint, DisplayError, DisplayInfo, MonitorInfo, MonitorRect, Screen};
 pub use file_blob::{
     BlobNaming, FileBlob, FileBlobBuilder, FileBlobRefusal, MAX_ARCHIVE_DEPTH,
     MAX_CLIPBOARD_FILE_BYTES, UnsupportedFileBlobBuilder,

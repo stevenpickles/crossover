@@ -550,3 +550,11 @@ This ADR is the crate-creation record `adr/README.md` requires.
   ADR 0012) — the same shape as T21's local-process concern, contained the
   same way everything from this file always was: validated on load, before
   use.
+
+**Amendment (2026-08-20):** the `config` feature also carries `serde_json`,
+for the state-file schema this ADR places in the same crate — versioned
+JSON needs a JSON implementation, which the decision's dependency sentence
+did not name. That sentence describes the **default** graph, which remains
+`serde` and `thiserror`; `toml_edit` and `serde_json` are both what the
+non-default `config` feature adds, and `crossover-protocol` will take the
+default graph exactly as the decision intends.
