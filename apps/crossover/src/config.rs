@@ -232,13 +232,16 @@ pub enum LayoutSource {
     /// [`RunConfig::merge`]). Carries its own revision and origin
     /// (`Layout::revision`, `Layout::origin`).
     ///
-    /// Cannot drive the side-model `Topology` yet: the crossing engine
-    /// that consumes a drawn arrangement (the `CrossingMap` work) is a
-    /// later branch. Until it lands, `commands::build_seamless` leaves
-    /// seamless transfer off for an `Explicit` source, with a startup log
-    /// naming why — explicit control still works. The value is carried
-    /// through regardless, so the plumbing is shaped for the branch that
-    /// consumes it.
+    /// **Drives crossings.** `commands::build_seamless` turns it into an
+    /// identified crossing source (`crossover_core::explicit_crossing_source`),
+    /// so the seams are the ones the user drew and a crossing addresses
+    /// the peer's real screen at this layout's revision.
+    ///
+    /// One check happens there rather than here, because it needs a device
+    /// identity this loader does not have: a layout that places no screen
+    /// for *this* machine is a previous pairing's residue and turns
+    /// seamless off. The matching check against the *peer's* identity
+    /// needs a session, and lands with layout sync.
     Explicit(Layout),
 }
 

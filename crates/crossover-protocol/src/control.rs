@@ -50,20 +50,28 @@ pub enum Edge {
 /// along — replacing v3's bare fraction now that a machine can have more
 /// than one crossing edge.
 ///
-/// **Transitional (feature/147).** The side-model sender — today's code,
-/// still one linked edge pair (ADR 0009) — does not yet know a
-/// destination monitor id; that arrives only once a later branch lands
-/// `MonitorTopology` and `LayoutSync` and fills [`EntryPoint::monitor`]
-/// with a real device string. Until then `monitor` travels **empty**, and
-/// an empty `monitor` is valid and means "unaddressed": the receiver
-/// places the cursor against its own desktop-bounds edge matching `edge`,
-/// with `fraction` taken against those bounds. This is not a special case
-/// bolted on for the transition — it is *exactly* ADR 0018's degraded
-/// fallback for a monitor id the receiver does not recognize
-/// (docs/PROTOCOL.md §6.1's "cannot honour" clause), reached deliberately
-/// here, on every crossing, rather than by mismatch. A later branch simply
-/// starts filling `monitor` with real ids, at which point most crossings
-/// stop taking this path rather than the path itself changing.
+/// **Two kinds of sender, both legitimate.** A sender crossing by a
+/// **drawn** arrangement fills [`EntryPoint::monitor`] with the
+/// destination's real device string and stamps
+/// [`EntryPoint::layout_revision`] with the revision it derived from. A
+/// sender crossing by an **implicit** arrangement — the deprecated
+/// `--left`/`--right` side model (ADR 0009), still supported — has no
+/// destination id to give: the side model never learned anything about
+/// the peer's screens. It sends `monitor` **empty** and revision `0`, and
+/// that is a valid value meaning "unaddressed", not a placeholder awaiting
+/// a later branch.
+///
+/// An unaddressed entry point is not a special case bolted on beside the
+/// rules: it takes *exactly* ADR 0018's degraded placement for a monitor
+/// id the receiver cannot honour (docs/PROTOCOL.md §6.1's "cannot honour"
+/// clause) — the outermost local monitor on `edge`, `fraction` along that
+/// monitor's edge — reached deliberately, on every implicit crossing,
+/// rather than by mismatch. One path, two ways in, which is what keeps the
+/// side model's placement behaviour identical under this model.
+///
+/// The receiver never has to ask which kind of sender it is talking to:
+/// an empty `monitor` and an id it does not recognize resolve the same
+/// way, and so does a revision it does not hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryPoint {
     /// The destination monitor's id, or empty for "unaddressed" (above).
@@ -79,18 +87,20 @@ pub struct EntryPoint {
     /// its end. Resolution- and DPI-independent — the grantee maps it
     /// through its own geometry.
     pub fraction: u16,
-    /// The layout revision the sender derived this from. `0` when there is
-    /// no real layout (the transitional case above); a receiver holding a
-    /// different revision treats the entry point as unaddressed too (ADR
-    /// 0018) — expected, and brief, during an edit's propagation window.
+    /// The layout revision the sender derived this from. `0` for an
+    /// implicit arrangement, which has no drawn revision to name (above);
+    /// a receiver holding a different revision treats the entry point as
+    /// unaddressed too (ADR 0018) — expected, and brief, during an edit's
+    /// propagation window.
     pub layout_revision: u64,
 }
 
 impl EntryPoint {
     /// Build an "unaddressed" entry point — empty monitor, revision `0` —
-    /// the transitional case the type docs above explain in full. The one
-    /// constructor for it, so that reading is stated once rather than
-    /// wherever a crossing gets wrapped.
+    /// what a sender crossing by an implicit (`--left`/`--right`)
+    /// arrangement produces, and what the type docs above explain in full.
+    /// The one constructor for it, so that reading is stated once rather
+    /// than wherever a crossing gets wrapped.
     #[must_use]
     pub fn unaddressed(edge: Edge, fraction: u16) -> Self {
         Self {

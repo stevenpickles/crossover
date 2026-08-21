@@ -389,60 +389,80 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 /// returns notices as data specifically so this is the only place that
 /// does it, rather than every decision point inside `merge` emitting its
 /// own near-identical `tracing::warn!`/`eprintln!` pair.
+///
+/// **The wording lives in [`notice_log_message`] and
+/// [`notice_console_message`], not here.** This function only supplies the
+/// structured fields and emits. The split is deliberate and was bought the
+/// hard way: with the text inline, nothing could assert it, and the
+/// `ExplicitLayoutWins` arm went on telling users for a whole branch that
+/// this build could not drive a drawn layout — and advising them to delete
+/// it — after the branch that made it drive one. Text a test can read is
+/// text that cannot rot silently (NFR-3).
 fn render_config_notice(notice: &config::ConfigNotice) {
+    let message = notice_log_message(notice);
     match notice {
-        config::ConfigNotice::DeprecatedFlag { flag } => {
-            tracing::warn!(
-                flag,
-                "deprecated: draw an arrangement with `crossover layout` instead (ADR 0018)"
-            );
-            eprintln!(
-                "Warning: {flag} is deprecated; draw an arrangement with `crossover layout` \
-                 instead (ADR 0018)."
-            );
-        }
-        config::ConfigNotice::DeprecatedSideKey => {
-            tracing::warn!(
-                "deprecated: [seamless] side is retired by ADR 0018; draw an arrangement \
-                 with `crossover layout` instead"
-            );
-            eprintln!(
-                "Warning: [seamless] side is deprecated; draw an arrangement with \
-                 `crossover layout` instead (ADR 0018)."
-            );
-        }
+        config::ConfigNotice::DeprecatedFlag { flag } => tracing::warn!(flag, "{message}"),
+        config::ConfigNotice::DeprecatedSideKey => tracing::warn!("{message}"),
         config::ConfigNotice::ExplicitLayoutWins { overridden } => {
-            // Both facts, so the message cannot mislead: the layout wins,
-            // AND this build cannot drive it yet, so seamless is off
-            // either way until the layout engine lands.
-            tracing::warn!(
-                overridden,
-                "ignored: the config holds an explicit [layout], which wins over it (ADR \
-                 0018) — but this build's crossing engine predates the layout model, so \
-                 seamless stays off regardless until it lands; remove [layout] to fall back \
-                 to the side model"
-            );
-            eprintln!(
-                "Warning: {overridden} is ignored — the config already holds an explicit \
-                 [layout], which takes precedence (ADR 0018). This build's crossing engine \
-                 cannot drive a drawn layout yet, so seamless transfer stays OFF regardless, \
-                 until that engine lands; remove [layout] to fall back to the side model in \
-                 the meantime."
-            );
+            tracing::warn!(overridden, "{message}");
         }
         config::ConfigNotice::InvalidLayout { error } => {
-            tracing::warn!(
-                error = %error,
-                "the [layout] section is invalid; treating this run as having no layout \
-                 (seamless off, explicit control intact)"
-            );
-            eprintln!(
-                "Warning: the [layout] section in the config is invalid and is being ignored \
-                 for this run — seamless transfer is off, but explicit control still works: \
-                 {error}\nRun `crossover config` to see this diagnosis again, or fix it with \
-                 `crossover layout`."
-            );
+            tracing::warn!(error = %error, "{message}");
         }
+    }
+    eprintln!("{}", notice_console_message(notice));
+}
+
+/// The log wording for one notice, without its structured fields.
+///
+/// Lowercase and free of the values the fields already carry — house
+/// style for a tracing message.
+fn notice_log_message(notice: &config::ConfigNotice) -> String {
+    match notice {
+        config::ConfigNotice::DeprecatedFlag { .. } => {
+            "deprecated: draw an arrangement with `crossover layout` instead (ADR 0018)".to_owned()
+        }
+        config::ConfigNotice::DeprecatedSideKey => {
+            "deprecated: [seamless] side is retired by ADR 0018; draw an arrangement with \
+             `crossover layout` instead"
+                .to_owned()
+        }
+        config::ConfigNotice::ExplicitLayoutWins { .. } => {
+            "ignored: the config holds an explicit [layout], which wins over it and drives \
+             this run's crossings (ADR 0018)"
+                .to_owned()
+        }
+        config::ConfigNotice::InvalidLayout { .. } => {
+            "the [layout] section is invalid; treating this run as having no layout (seamless \
+             off, explicit control intact)"
+                .to_owned()
+        }
+    }
+}
+
+/// The console sentence for one notice — independently capitalized and
+/// punctuated, the house convention for a log/console pair, and carrying
+/// the values a reader at a terminal has no structured fields to read.
+fn notice_console_message(notice: &config::ConfigNotice) -> String {
+    match notice {
+        config::ConfigNotice::DeprecatedFlag { flag } => format!(
+            "Warning: {flag} is deprecated; draw an arrangement with `crossover layout` \
+             instead (ADR 0018)."
+        ),
+        config::ConfigNotice::DeprecatedSideKey => "Warning: [seamless] side is deprecated; draw \
+             an arrangement with `crossover layout` instead (ADR 0018)."
+            .to_owned(),
+        config::ConfigNotice::ExplicitLayoutWins { overridden } => format!(
+            "Warning: {overridden} is ignored — the config already holds an explicit [layout], \
+             which takes precedence (ADR 0018). The drawn arrangement is what this run crosses \
+             on; edit it with `crossover layout`."
+        ),
+        config::ConfigNotice::InvalidLayout { error } => format!(
+            "Warning: the [layout] section in the config is invalid and is being ignored for \
+             this run — seamless transfer is off, but explicit control still works: \
+             {error}\nRun `crossover config` to see this diagnosis again, or fix it with \
+             `crossover layout`."
+        ),
     }
 }
 
@@ -451,7 +471,7 @@ mod tests {
     use clap::Parser;
     use uuid::Uuid;
 
-    use super::{Cli, Command, PeersAction, ServiceAction};
+    use super::{Cli, Command, PeersAction, ServiceAction, config};
 
     // Catches invalid clap derive configurations (conflicting flags,
     // ambiguous subcommands) at test time instead of first invocation.
@@ -612,5 +632,76 @@ mod tests {
         // No default subcommand: running `crossover` bare must show usage,
         // not silently pick a behavior.
         assert!(Cli::try_parse_from(["crossover"]).is_err());
+    }
+
+    // ---- what the config notices actually say ----
+
+    /// The override notice must say the drawn layout **wins and drives**.
+    ///
+    /// This exists because the text it replaces said the opposite. While
+    /// the crossing engine really did predate the layout model, the arm
+    /// told the user seamless was off regardless and advised removing
+    /// `[layout]` to fall back to the side model. Once the layout drove
+    /// crossings, that advice became both false and destructive — delete
+    /// your arrangement to fix a thing that is not broken — and nothing
+    /// caught it, because no test read the words.
+    #[test]
+    fn the_override_notice_says_the_drawn_layout_drives_this_run() {
+        let notice = config::ConfigNotice::ExplicitLayoutWins {
+            overridden: "--right",
+        };
+        let log = super::notice_log_message(&notice);
+        let console = super::notice_console_message(&notice);
+
+        assert!(
+            log.contains("drives"),
+            "the log must say the layout drives the run: {log}"
+        );
+        assert!(
+            console.contains("--right") && console.contains("takes precedence"),
+            "the console line must name what was overridden and why: {console}"
+        );
+        for text in [&log, &console] {
+            assert!(
+                !text.contains("predates") && !text.contains("stays off") && !text.contains("OFF"),
+                "the notice still claims seamless is off: {text}"
+            );
+            assert!(
+                !text.contains("remove [layout]") && !text.contains("fall back"),
+                "the notice still advises deleting the user's arrangement: {text}"
+            );
+        }
+    }
+
+    /// Every notice renders something in both places, and the two follow
+    /// the house convention: a lowercase tracing message, a capitalized
+    /// console sentence. A missing arm would otherwise be an empty warning.
+    #[test]
+    fn every_config_notice_renders_in_both_places() {
+        use crossover_topology::LayoutError;
+
+        let notices = [
+            config::ConfigNotice::DeprecatedFlag { flag: "--left" },
+            config::ConfigNotice::DeprecatedSideKey,
+            config::ConfigNotice::ExplicitLayoutWins {
+                overridden: "[seamless] side",
+            },
+            config::ConfigNotice::InvalidLayout {
+                error: LayoutError::NoMonitors,
+            },
+        ];
+        for notice in &notices {
+            let log = super::notice_log_message(notice);
+            let console = super::notice_console_message(notice);
+            assert!(!log.is_empty() && !console.is_empty(), "{notice:?}");
+            assert!(
+                log.starts_with(|c: char| c.is_lowercase() || c == '['),
+                "a tracing message should not be capitalized: {log}"
+            );
+            assert!(
+                console.starts_with("Warning: "),
+                "a console notice should announce itself: {console}"
+            );
+        }
     }
 }
