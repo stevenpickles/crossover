@@ -88,6 +88,15 @@ crossover/
     docs/
 ```
 
+> **Phase 8 adds two members** ([ADR 0018](adr/0018-drawn-display-topology.md),
+> recorded ahead of the implementation): `crates/crossover-topology` — the
+> drawn-layout model, its validation, the config `[layout]` types and writer,
+> and the state-file schema — and a layout-editor binary under `apps/`, the
+> project's first GUI (its toolkit is the forthcoming ADR 0019). The crate
+> exists so the editor shares the model and writer without linking
+> core's protocol/security/platform graph; the tree above describes the
+> build until those land.
+
 ### 3.1 Deliberately not separate crates (yet)
 
 The baseline design prescribed twelve crates. We start with six and split
@@ -106,6 +115,14 @@ Creating or dissolving a crate is an ADR-level decision. The compile-time
 firewall that matters from day one is the **platform boundary** and the
 **protocol crate's independence** (testable without sockets) — both exist
 from Phase 0.
+
+> **Phase 8's `crossover-topology`** is the first split this table did not
+> anticipate: not one of the candidates above, but a new boundary created by
+> [ADR 0018](adr/0018-drawn-display-topology.md) so the editor binary and the
+> worker share one layout model and one config writer. `crossover-protocol`
+> gains a dependency edge on it for the wire shapes, with the TOML writer
+> behind a non-default `config` cargo feature so the protocol crate stays as
+> dependency-light and socket-free as this section requires.
 
 ## 4. Platform abstraction layer
 
@@ -738,10 +755,21 @@ mask = true                       # hide the local cursor while driving the peer
 
 Validated on load with actionable errors (unknown keys and unsupported
 `schema_version` are rejected); deterministic defaults; no private keys in
-this file (they live in `SecureStorage`). The two-machine model needs a
-single peer, so the peer is named inline under `[network]`; a richer
-`[peer.<name>]` / named-`[layout]` model can be added under a new
-`schema_version` if multi-peer arrangements arrive.
+this file (they live in `SecureStorage`).
+
+> **Phase 8 changes two things here** ([ADR 0018](adr/0018-drawn-display-topology.md),
+> recorded ahead of the implementation): `schema_version` moves to **2** and a
+> `[layout]` section — the drawn arrangement — replaces `[seamless] side`, with
+> a v1 file loading as an implicit layout that reproduces the old behaviour.
+> And "every CLI flag overrides its file counterpart" gains its one deliberate
+> exception: an **explicit** `[layout]` beats `--left` / `--right`, because the
+> service's saved command line (ADR 0011) would otherwise flatten a drawn
+> arrangement on every launch. The ADR carries the reasoning; the shape above
+> describes the build until that lands.
+
+The two-machine model needs a single peer, so the peer is named inline
+under `[network]`; a richer `[peer.<name>]` / named-`[layout]` model can be
+added under a new `schema_version` if multi-peer arrangements arrive.
 
 ## 9. Error-handling conventions
 
