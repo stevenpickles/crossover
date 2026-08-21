@@ -116,14 +116,18 @@ struct RunArgs {
     #[arg(long)]
     connect: Option<String>,
 
-    /// Seamless mode: this machine is the LEFT screen of a left–right
-    /// pair, so its right edge crosses to the peer (ADR 0009). The cursor
-    /// follows across the edge with no manual switch.
+    /// Deprecated: seamless mode, this machine is the LEFT screen of a
+    /// left–right pair, so its right edge crosses to the peer (ADR 0009).
+    /// The cursor follows across the edge with no manual switch. Draw an
+    /// arrangement with `crossover layout` instead (ADR 0018); an explicit
+    /// layout in the config wins over this flag.
     #[arg(long, conflicts_with = "right")]
     left: bool,
 
-    /// Seamless mode: this machine is the RIGHT screen, so its left edge
-    /// crosses to the peer.
+    /// Deprecated: seamless mode, this machine is the RIGHT screen, so its
+    /// left edge crosses to the peer. Draw an arrangement with `crossover
+    /// layout` instead (ADR 0018); an explicit layout in the config wins
+    /// over this flag.
     #[arg(long)]
     right: bool,
 
@@ -269,7 +273,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // Merge CLI flags over the startup config file: a flag present on
             // the command line wins; otherwise the file supplies the value
             // (Phase 6). `--name` is global, so it rides in from `cli`.
-            let effective = config::load_run_config()?.merge(config::CliRun {
+            // `load_run_config` is the one place `[layout]` is validated
+            // (ADR 0018); `merge` consumes that already-validated result and
+            // returns every warning it decided as data, rendered here, once.
+            let (effective, notices) = config::load_run_config()?.merge(config::CliRun {
                 name: cli.name,
                 listen: args.listen,
                 bind: args.bind,
@@ -278,13 +285,23 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 right: args.right,
                 no_cursor_mask: args.no_cursor_mask,
             });
+            for notice in &notices {
+                render_config_notice(notice);
+            }
             // Log the resolved role up front so a headless worker's log shows
-            // what it is trying to do (listen/dial/side), not just that it
-            // started — the fastest read on a "not connecting" soak.
+            // what it is trying to do (listen/dial/layout), not just that it
+            // started — the fastest read on a "not connecting" soak. The
+            // layout summary is the discriminant and a revision, not the
+            // full monitor list: this line stays one line even with a large
+            // drawn arrangement configured.
+            let layout_summary = effective
+                .layout_source
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), config::LayoutSource::summary);
             tracing::info!(
                 listen = effective.listen,
                 connect = ?effective.connect,
-                side = ?effective.side,
+                layout = %layout_summary,
                 "run configuration",
             );
             if !effective.listen && effective.connect.is_none() {
@@ -303,16 +320,12 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     .clone()
                     .unwrap_or_else(|| format!("0.0.0.0:{}", crossover_protocol::DEFAULT_PORT))
             });
-            let side = effective.side.map(|side| match side {
-                config::Side::Left => crossover_core::LinkSide::Left,
-                config::Side::Right => crossover_core::LinkSide::Right,
-            });
             let device_name = storage::resolve_device_name(effective.name);
             let result = commands::run(
                 &device_name,
                 listen_bind,
                 effective.connect,
-                side,
+                effective.layout_source,
                 effective.no_cursor_mask,
             )
             .await;
@@ -355,6 +368,69 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+/// Render one [`config::ConfigNotice`] into the log and stderr — the single
+/// place `crossover run` warns about a deprecated flag or key, an
+/// override, or a `[layout]` that failed validation. `config::merge`
+/// returns notices as data specifically so this is the only place that
+/// does it, rather than every decision point inside `merge` emitting its
+/// own near-identical `tracing::warn!`/`eprintln!` pair.
+fn render_config_notice(notice: &config::ConfigNotice) {
+    match notice {
+        config::ConfigNotice::DeprecatedFlag { flag } => {
+            tracing::warn!(
+                flag,
+                "deprecated: draw an arrangement with `crossover layout` instead (ADR 0018)"
+            );
+            eprintln!(
+                "Warning: {flag} is deprecated; draw an arrangement with `crossover layout` \
+                 instead (ADR 0018)."
+            );
+        }
+        config::ConfigNotice::DeprecatedSideKey => {
+            tracing::warn!(
+                "deprecated: [seamless] side is retired by ADR 0018; draw an arrangement \
+                 with `crossover layout` instead"
+            );
+            eprintln!(
+                "Warning: [seamless] side is deprecated; draw an arrangement with \
+                 `crossover layout` instead (ADR 0018)."
+            );
+        }
+        config::ConfigNotice::ExplicitLayoutWins { overridden } => {
+            // Both facts, so the message cannot mislead: the layout wins,
+            // AND this build cannot drive it yet, so seamless is off
+            // either way until the layout engine lands.
+            tracing::warn!(
+                overridden,
+                "ignored: the config holds an explicit [layout], which wins over it (ADR \
+                 0018) — but this build's crossing engine predates the layout model, so \
+                 seamless stays off regardless until it lands; remove [layout] to fall back \
+                 to the side model"
+            );
+            eprintln!(
+                "Warning: {overridden} is ignored — the config already holds an explicit \
+                 [layout], which takes precedence (ADR 0018). This build's crossing engine \
+                 cannot drive a drawn layout yet, so seamless transfer stays OFF regardless, \
+                 until that engine lands; remove [layout] to fall back to the side model in \
+                 the meantime."
+            );
+        }
+        config::ConfigNotice::InvalidLayout { error } => {
+            tracing::warn!(
+                error = %error,
+                "the [layout] section is invalid; treating this run as having no layout \
+                 (seamless off, explicit control intact)"
+            );
+            eprintln!(
+                "Warning: the [layout] section in the config is invalid and is being ignored \
+                 for this run — seamless transfer is off, but explicit control still works: \
+                 {error}\nRun `crossover config` to see this diagnosis again, or fix it with \
+                 `crossover layout`."
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -368,6 +444,29 @@ mod tests {
     fn cli_definition_is_internally_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// `--left`/`--right` are deprecated (ADR 0018), but still parse — a
+    /// script or a service registration that still names one keeps working
+    /// (`config::RunConfig::merge` is what actually retires them, by
+    /// turning an explicit `[layout]` into the winner).
+    #[test]
+    fn run_still_parses_the_deprecated_left_and_right_flags() {
+        let cli = Cli::try_parse_from(["crossover", "run", "--left"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run");
+        };
+        assert!(args.left);
+        assert!(!args.right);
+
+        let cli = Cli::try_parse_from(["crossover", "run", "--right"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run");
+        };
+        assert!(args.right);
+
+        // Still mutually exclusive.
+        assert!(Cli::try_parse_from(["crossover", "run", "--left", "--right"]).is_err());
     }
 
     #[test]

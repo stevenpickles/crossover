@@ -20,9 +20,9 @@ use crossover_core::supervision::{
 };
 use crossover_core::{
     ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
-    FileReceive, FileSend, FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics,
-    OutboundSender, SeamlessInputs, SessionCommand, SessionListener, SessionOptions, SyncEvent,
-    Topology, clipboard_sync, edge_detect, input_control, outbound_channel,
+    FileReceive, FileSend, FrameTarget, InputControlEvent, LocalNode, Metrics, OutboundSender,
+    SeamlessInputs, SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology,
+    clipboard_sync, edge_detect, input_control, outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
@@ -36,6 +36,7 @@ use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TrustStore, TrustedPeer,
 };
 
+use crate::config::LayoutSource;
 use crate::console::{self, ConsoleCommand};
 use crate::storage::{
     open_clipboard_provider, open_cursor_mask, open_display, open_file_blob_builder, open_input,
@@ -307,25 +308,44 @@ pub fn status(device_name: &str) -> anyhow::Result<()> {
 }
 
 /// A commented example config for `crossover config` to show when no file
-/// exists yet — the user can save it verbatim and edit.
-const EXAMPLE_CONFIG: &str = "\
-# Crossover startup configuration (sectioned, versioned). Any `crossover run`
-# flag can live here; a flag on the command line always overrides the file.
-schema_version = 1
+/// exists yet — the user can save it verbatim and edit. Schema 2: `[layout]`
+/// is what `crossover layout` writes (sketched here, commented out, since
+/// this build cannot draw one for you); `[seamless] side` is shown because
+/// it is what actually works today, deprecated but functional (ADR 0018).
+const EXAMPLE_CONFIG: &str = r#"# Crossover startup configuration (sectioned, versioned). Any `crossover run`
+# flag can live here; a flag on the command line always overrides the file
+# (except an explicit [layout], which wins over --left/--right — ADR 0018).
+schema_version = 2
 
 [device]
-name = \"machine-b\"
+name = "machine-b"
 
 [network]
-# connect = \"192.168.1.151:27677\"   # dial this peer
-listen = \"0.0.0.0:27677\"            # or accept inbound peers (presence = listen)
+# connect = "192.168.1.151:27677"   # dial this peer
+listen = "0.0.0.0:27677"            # or accept inbound peers (presence = listen)
 
 [seamless]
-side = \"right\"                      # \"left\" | \"right\"
+# Deprecated but functional (ADR 0018): still drives a left-right seamless
+# run today. Draw an arrangement instead with `crossover layout`, which
+# writes [layout] below and retires this section.
+side = "right"                      # "left" | "right"
+
+# [layout] is written by `crossover layout`, not hand-edited — this is the
+# shape it writes, for reference:
+# revision = 1
+# origin = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8"
+#
+# [[layout.monitor]]
+# device = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8"
+# id = '\\.\DISPLAY1'
+# x = 0
+# y = 0
+# width = 1920
+# height = 1080
 
 [cursor]
 # mask = false                       # default true; false = never hide the cursor
-";
+"#;
 
 /// `crossover config` — show where the startup config lives and its
 /// current settings, or an example when there is none (Phase 6).
@@ -338,8 +358,23 @@ pub fn config_show() -> anyhow::Result<()> {
     println!("  {}", path.display());
     println!();
     if path.exists() {
-        // Parse it first so a typo or bad value is reported, not hidden.
-        crate::config::load_run_config()?;
+        // Load and check it first so a typo, an unsupported schema, or a
+        // [layout]/schema_version contradiction is reported, not hidden —
+        // the same fatal checks `crossover run` applies at startup.
+        let loaded = crate::config::load_run_config()?;
+        // An invalid `[layout]` is not fatal to load — `crossover run`
+        // degrades to no layout and keeps going (ADR 0011's relaunch loop
+        // is the reason, see `crate::config`'s module docs) — but
+        // `crossover config` exists to be the check that catches this, so
+        // it is still reported loudly here even though the command itself
+        // succeeds.
+        if let Err(error) = &loaded.layout {
+            println!(
+                "WARNING: the [layout] section is invalid — `crossover run` would ignore it \
+                 (seamless off, explicit control intact): {error}"
+            );
+            println!();
+        }
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         println!("Current contents (parsed OK):");
@@ -504,16 +539,18 @@ pub fn layout() -> anyhow::Result<()> {
 /// outbound session alive with reconnect, and run the clipboard and
 /// input-control engines over whichever session is live. Console
 /// commands (`c` take control, `r` release) drive explicit control
-/// transfer (Phase 3, FR-5.1); with `--left`/`--right`, crossing the
-/// linked screen edge transfers control automatically (Phase 5, ADR
-/// 0009). Ctrl-C or `q` stops.
+/// transfer (Phase 3, FR-5.1); an implicit layout (deprecated
+/// `--left`/`--right`, Phase 5, ADR 0009) or an explicit one drawn with
+/// `crossover layout` (ADR 0018, once the crossing engine that consumes it
+/// lands) transfers control automatically on a linked edge. Ctrl-C or `q`
+/// stops.
 /// Bring up input control — capture/inject behind the platform traits, the
 /// control-transfer engine, cursor masking (ADR 0009), and, in seamless
 /// mode, the edge detector — spawning the driver, edge wiring, and notice
 /// printer. Returns the event sender and command receiver the session mux
 /// needs. Capture installs no hook until the first grant.
 fn setup_input_control(
-    side: Option<LinkSide>,
+    layout_source: Option<&LayoutSource>,
     metrics: &Arc<Metrics>,
     no_cursor_mask: bool,
 ) -> anyhow::Result<(mpsc::Sender<InputControlEvent>, CommandReceiver)> {
@@ -528,14 +565,15 @@ fn setup_input_control(
     };
     let display = open_display()?;
 
-    // Log the display and the configured seamless edge at startup (ADR
-    // 0009), so a soak report shows the geometry each side used.
-    log_display_and_edge(&*display, side);
+    // Log the display and the configured arrangement at startup (ADR 0009,
+    // ADR 0018), so a soak report shows the geometry each side used.
+    log_display_and_edge(&*display, layout_source);
 
-    // Seamless mode (--left/--right): a topology and an edge detector, plus
-    // the mode channel that keeps the detector in step with control state.
-    // Built before input_control so its mode sender can ride in.
-    let (seamless, edge_wiring) = build_seamless(side, &display);
+    // An implicit layout: a topology and an edge detector, plus the mode
+    // channel that keeps the detector in step with control state. Built
+    // before input_control so its mode sender can ride in. An explicit
+    // layout cannot drive this yet (see `build_seamless`).
+    let (seamless, edge_wiring) = build_seamless(layout_source, &display);
 
     let (control_driver, control_events, control_commands, control_notices) = input_control(
         capture,
@@ -599,7 +637,7 @@ pub async fn run(
     device_name: &str,
     listen_bind: Option<String>,
     connect: Option<String>,
-    side: Option<LinkSide>,
+    layout_source: Option<LayoutSource>,
     no_cursor_mask: bool,
 ) -> anyhow::Result<()> {
     let storage: Arc<dyn SecureStorage> = Arc::from(open_secure_storage()?);
@@ -638,7 +676,8 @@ pub async fn run(
 
     // Input control: capture/inject, the transfer engine, cursor masking,
     // and (in seamless mode) the edge detector.
-    let (control_events, control_commands) = setup_input_control(side, &metrics, no_cursor_mask)?;
+    let (control_events, control_commands) =
+        setup_input_control(layout_source.as_ref(), &metrics, no_cursor_mask)?;
 
     // Every live session, keyed by id, so the mux can route control and
     // input frames to the exact session the engine named and broadcast
@@ -1138,19 +1177,26 @@ fn merge_command_lanes(a: CommandReceiver, b: CommandReceiver) -> ClassifiedComm
     ClassifiedCommands { high, background }
 }
 
-/// Build the seamless wiring for a `--left`/`--right` run (ADR 0009): the
-/// [`SeamlessInputs`] the control driver takes, and the edge detector plus
-/// its crossing stream to spawn once the control driver is up. `(None,
-/// None)` for an explicit-only run.
+/// Build the seamless wiring for a run with an *implicit* layout (ADR
+/// 0009): the [`SeamlessInputs`] the control driver takes, and the edge
+/// detector plus its crossing stream to spawn once the control driver is
+/// up. `(None, None)` for an explicit-only run, an explicit-layout run, or
+/// no layout at all.
+///
+/// An [`LayoutSource::Explicit`] layout cannot drive this side-model
+/// [`Topology`] yet — the crossing engine that consumes a drawn arrangement
+/// (the `CrossingMap` work) is a later branch — so seamless transfer stays
+/// off for it, deliberately, rather than guessing a side from the drawing.
+/// `log_display_and_edge` is what tells the user why.
 type EdgeWiring = (EdgeDetectDriver, mpsc::Receiver<EdgeCrossing>);
 fn build_seamless(
-    side: Option<LinkSide>,
+    layout_source: Option<&LayoutSource>,
     display: &Arc<dyn DisplayInfo>,
 ) -> (Option<SeamlessInputs>, Option<EdgeWiring>) {
-    let Some(side) = side else {
+    let Some(LayoutSource::Implicit(side)) = layout_source else {
         return (None, None);
     };
-    let topology = Topology::new(side);
+    let topology = Topology::new(*side);
     let (edge_driver, edge_mode, crossings_rx) =
         edge_detect(Arc::clone(display), topology, EDGE_POLL_INTERVAL);
     let seamless = SeamlessInputs {
@@ -1190,10 +1236,29 @@ fn spawn_edge_wiring(
     });
 }
 
-/// Log the primary display's geometry and the configured seamless edge at
-/// startup (ADR 0009) — both structured (FR-7.3) and as a human line, so a
-/// soak report records the geometry each machine ran with.
-fn log_display_and_edge(display: &dyn DisplayInfo, side: Option<LinkSide>) {
+/// Logged when an explicit drawn layout is configured but this build's
+/// crossing engine cannot yet drive it (ADR 0018): `build_seamless` only
+/// knows how to drive the side-model [`Topology`] from a `LinkSide`, and
+/// the layout engine that replaces it (the `CrossingMap` work) is a later
+/// branch. Reachable only from a hand-written config today — the editor
+/// cannot save a `[layout]` yet (feature/152). Lowercase: a tracing message,
+/// house style.
+const EXPLICIT_LAYOUT_NOT_YET_DRIVEN_LOG: &str = "an explicit drawn layout is configured; this \
+     build's crossing engine predates it — seamless activates when the layout engine lands";
+
+/// The same fact as [`EXPLICIT_LAYOUT_NOT_YET_DRIVEN_LOG`], worded as a
+/// printed sentence rather than derived from it at runtime — independently
+/// capitalized and punctuated, the house convention for a log/console pair
+/// (see `main.rs`'s `render_config_notice` for the same convention applied
+/// to `ConfigNotice`).
+const EXPLICIT_LAYOUT_NOT_YET_DRIVEN_CONSOLE: &str = "An explicit drawn layout is configured; \
+     this build's crossing engine predates it — seamless activates when the layout engine \
+     lands.";
+
+/// Log the primary display's geometry and the configured arrangement at
+/// startup (ADR 0009, ADR 0018) — both structured (FR-7.3) and as a human
+/// line, so a soak report records the geometry each machine ran with.
+fn log_display_and_edge(display: &dyn DisplayInfo, layout_source: Option<&LayoutSource>) {
     let screen = match display.desktop_bounds() {
         Ok(screen) => screen,
         Err(error) => {
@@ -1202,29 +1267,48 @@ fn log_display_and_edge(display: &dyn DisplayInfo, side: Option<LinkSide>) {
             return;
         }
     };
-    if let Some(side) = side {
-        let edge = Topology::new(side).linked_edge();
-        tracing::info!(
-            width = screen.width,
-            height = screen.height,
-            ?side,
-            linked_edge = ?edge,
-            "virtual desktop and seamless edge"
-        );
-        println!(
-            "Desktop: {}x{} (all monitors). Seamless: {side:?} screen, crossing on its {edge:?} edge.",
-            screen.width, screen.height,
-        );
-    } else {
-        tracing::info!(
-            width = screen.width,
-            height = screen.height,
-            "virtual desktop; seamless transfer disabled"
-        );
-        println!(
-            "Desktop: {}x{} (all monitors). Seamless edge transfer off (pass --left or --right).",
-            screen.width, screen.height,
-        );
+    match layout_source {
+        Some(LayoutSource::Implicit(side)) => {
+            let edge = Topology::new(*side).linked_edge();
+            tracing::info!(
+                width = screen.width,
+                height = screen.height,
+                ?side,
+                linked_edge = ?edge,
+                "virtual desktop and seamless edge"
+            );
+            println!(
+                "Desktop: {}x{} (all monitors). Seamless: {side:?} screen, crossing on its \
+                 {edge:?} edge.",
+                screen.width, screen.height,
+            );
+        }
+        Some(LayoutSource::Explicit(layout)) => {
+            tracing::info!(
+                width = screen.width,
+                height = screen.height,
+                revision = layout.revision(),
+                origin = %layout.origin(),
+                monitors = layout.monitors().len(),
+                "{EXPLICIT_LAYOUT_NOT_YET_DRIVEN_LOG}"
+            );
+            println!(
+                "Desktop: {}x{} (all monitors). {EXPLICIT_LAYOUT_NOT_YET_DRIVEN_CONSOLE}",
+                screen.width, screen.height,
+            );
+        }
+        None => {
+            tracing::info!(
+                width = screen.width,
+                height = screen.height,
+                "virtual desktop; seamless transfer disabled"
+            );
+            println!(
+                "Desktop: {}x{} (all monitors). Seamless edge transfer off — draw an \
+                 arrangement with `crossover layout`, or pass the deprecated --left/--right.",
+                screen.width, screen.height,
+            );
+        }
     }
 }
 
