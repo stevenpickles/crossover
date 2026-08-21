@@ -883,6 +883,9 @@ With both machines running (Phase 5/6 setup), on machine A:
    arithmetic assumes wired 2.5 GbE; a figure taken over WiFi is measuring a
    different thing, and the 2026-08-16 reading (mean 1.94 ms, max 309.8 ms)
    was wireless. A reading without its link is not comparable to anything.
+   The wired reading that closed the criterion — and how the window was
+   verified clean before it was believed — is the input-latency section at
+   the end of this file.
 
    The block also attributes the wait:
 
@@ -1030,3 +1033,134 @@ input, no partial state — even though it was not itself a file transfer.
   correlating the two logs by timestamp during the worker-death
   investigation. Recommend NTP sync ahead of future soaks so cross-machine
   log correlation does not need manual offset arithmetic.
+
+## Phase 7 hardware validation: input latency on a wired link (two machines)
+
+This is the images section's step 5 measurement — queue-to-wire input
+latency under a saturating bulk transfer — taken on the link ADR 0013's
+arithmetic was written for. The 2026-08-16 reading failed the criterion
+(mean 1.94 ms, max 309.8 ms) but was taken over **WiFi**, so it could not
+distinguish "the chunking is too coarse" from "the link is slow", and the
+chunk size was held at 64 KiB pending exactly this run.
+
+Two things make this run different from the informal wired reading taken
+during the files session, and both are the point:
+
+- **The contention is on one writer.** The sending machine drove
+  interactive input *and* bulk file data over the same connection at the
+  same time. Bulk from a machine that is not also sending input measures
+  nothing about preemption.
+- **The window is verifiably clean.** A link drop inside the window puts a
+  reconnect stall into the maxima and quietly invalidates the reading.
+
+### Outcome: passed (2026-08-20 → 2026-08-21)
+
+Direct wired link, machine A (Intel I225-LMvP 2.5 GbE, dock-attached,
+listener, 192.168.3.20) ↔ machine B (10 GbE NIC, dialer, 192.168.3.10),
+negotiating 2.5 Gbps full duplex. Both machines ran `dev` at `f69afc8`
+(post-PR #48).
+
+### The procedure
+
+1. **B's service restarted at 00:04:06 UTC** so its cumulative counters
+   started from zero. That instant is the measurement start, T.
+2. **Ten distinct 200 MiB random-content files**, copied on B and pasted
+   onto A back-to-back between 00:04:34 and 00:05:13 UTC — 39 s in total,
+   ~1 s per delivery. Distinct content, so hash-dedup could not shortcut
+   any of them into a no-op.
+3. **Continuous input throughout**: B held control of A and kept mouse and
+   keyboard moving for the whole 39 s, so every transfer competed with live
+   input on B's writer.
+4. **Hands off afterwards** until the interim `execution metrics` line at
+   T+15 (00:19:07 UTC), which is the record read below.
+
+### Results
+
+B's interim metrics line at 2026-08-21T00:19:07Z: 4,558 input samples over
+4,561 input events, `frames_sent=36,732`, `bytes_sent=2,098,396,126`,
+`clipboard_files_sent=10`, `clipboard_file_sent_bytes=2,097,152,000`.
+File-delivery latency was p50 906 ms / p95 1080 ms.
+
+| | avg | max |
+|---|---|---|
+| socket accepting the bytes (`input_write`) | **0.019 ms** | **0.147 ms** |
+| waiting for the writer (`input_lane`) | 0.41 ms | 72.2 ms |
+| queue-to-wire, total (`input_queue`) | 0.43 ms | 72.2 ms |
+
+**Clean-window verification** (do this before believing any of the above):
+A's log shows one unbroken session spanning the whole T → T+15 window, and
+B reports `reconnect_attempts=0`. So every input sample coexisted with
+genuine transfer traffic and nothing else. An earlier attempt the same day
+**was** polluted — an environmental NIC link drop landed inside the window —
+and was discarded rather than reported.
+
+**Verdict: pass, and the chunk size is settled.** The worst socket write
+under full saturation was 0.147 ms — below the 0.21 ms ADR 0013 costs a
+*single* 64 KiB chunk at 2.5 GbE, and against 1.94 ms mean / 309.8 ms max
+over WiFi. The WiFi failure was the physical link, not the chunking design.
+**The 64 KiB chunk size stands** (maintainer, 2026-08-20), recorded in ADR
+0013's 2026-08-20 addendum and ARCHITECTURE.md §5.4; the writer-task
+redesign that measurement was meant to price is not warranted.
+
+### The one open observation
+
+A **single ~72 ms tail event** in the interactive lane, while socket writes
+stayed at or below 0.147 ms. That places it *before* the writer — a one-off
+scheduling or queueing stall — and not behind bulk bytes in the socket,
+which is the failure this measurement exists to catch. One outlier among
+4,558 samples, against averages of 0.41 ms (lane) and 0.43 ms (total); the
+operator perceived nothing at the time. Recorded as a future investigation
+in docs/ROADMAP.md's Phase 7 follow-ups, not as a blocker.
+
+### Also settled this session: the silent worker death is explained
+
+The 2026-08-19 02:05:38 UTC worker death on B — recorded above as an open
+observation with no root cause — **recurred on 2026-08-20 at 02:06 UTC**,
+this time with PR #43's durable supervision log running. It reads
+unambiguously: the worker exited **`0x40010004`
+(`DBG_TERMINATE_PROCESS`)** immediately after a session-change
+notification, and the service then recorded `reason=Logoff`. Windows was
+tearing the worker down at user logoff. **Environmental, not a crash** —
+which is why Windows Error Reporting had nothing on it and why the process
+left no panic behind. The fix-forward from the files session did exactly
+what it was built to do: the recurrence was diagnosable in one read.
+
+Two cosmetic follow-ups fall out of it, neither scheduled:
+
+- The service **relaunches the worker into the dying session** before it
+  sees `Logoff`, because it acts on the session-change notification first.
+  The relaunch fails harmlessly, but it is noise in the log at every
+  logoff.
+- `0x40010004` is **labelled `crashed=true`**, when at logoff it is Windows
+  terminating the worker deliberately. It misleads whoever reads the log
+  next.
+
+### Environmental: machine A's dock-attached NIC flaps
+
+Worth recording because it cost real investigation time and will again.
+Machine A's I225 NIC is attached through a USB4 dock and **flaps
+chronically**: Windows `e2fnexpress` events 27/57 across 2026-08-18 → 08-20
+match Crossover's session drops **to the second**, and the NIC itself logs
+corrected PCIe AER errors. Outages ran 4–20 s.
+
+Both peers had logged these as `10054` — "forcibly closed by the remote
+host" — which reads like the peer misbehaving and is why PR #48 added
+`local_link` diagnostics. **PR #48 is validated by this session**: A's
+session-end lines now stamp `local_link="up"` or `"down"`, and during this
+session they correctly showed `"up"` — the drops that evening were not A's
+wire. A session end that says `10054` with `local_link="down"` is your own
+NIC; one that says `10054` with `local_link="up"` is not.
+
+**Crossover's recovery behaved correctly through every one of these drops**:
+reconnect in ~10–11 s (dominated by 2.5 GbE autonegotiation, not by
+Crossover's backoff), no stuck input, no clipboard loops.
+
+### Operational notes
+
+- **Restart the service to zero the counters** before measuring. Every
+  metrics field is cumulative, so a run started from a long-lived worker
+  reports maxima belonging to some earlier event.
+- **Read the metrics on the machine you were driving *from***, and check
+  its `reconnect_attempts` and the *other* machine's session continuity
+  before trusting a maximum. That check is what separated this run from the
+  discarded one.
