@@ -567,7 +567,8 @@ that does not:
   ([PROTOCOL.md](PROTOCOL.md) §8), so a sender may use anything up to
   `MAX_CHUNK_BYTES` without negotiation or a protocol change. Held at
   64 KiB pending a wired measurement — ADR 0013's arithmetic assumed
-  2.5 GbE, where the same chunk is 0.21 ms rather than 124.
+  2.5 GbE, where the same chunk is 0.21 ms rather than 124 — and **left
+  there once that measurement was taken**, below.
 - **A faster link.** The measurement above is wireless; the design target
   is wired.
 - **Moving the writer to its own task does _not_ fix this**, though this
@@ -578,6 +579,24 @@ that does not:
   is a real but different problem. Genuine preemption mid-frame needs
   separate streams (QUIC) or a second connection, both considered and
   rejected in ADR 0013.
+
+**Re-measured wired, 2026-08-21.** The same instrumentation on a direct
+2.5 Gbps link, with one writer carrying continuous input and a bulk file
+stream at once (ten 200 MiB transfers back-to-back, 4,558 input frames
+timed): the socket took **0.019 ms** on average and **0.147 ms** at worst to
+accept an input frame's bytes, with the wait for the writer averaging
+0.41 ms and queue-to-wire totalling 0.43 ms average. The worst case is
+smaller than the 0.21 ms one 64 KiB chunk costs at this speed, so the
+in-flight-frame delay this section describes is real but sub-millisecond on
+the design link, and the WiFi figures above were the link rather than the
+chunk. **The chunk size therefore stays at 64 KiB** (maintainer, 2026-08-20;
+[ADR 0013](adr/0013-interactive-over-bulk-prioritization.md)'s 2026-08-20
+addendum), which closes the "pending a wired measurement" hold in the first
+bullet, and the writer-task work the third bullet already argued would not
+help has no latency case to make for it either. One tail of ~72 ms did occur
+in the lane *before* the writer while socket writes stayed at 0.147 ms or
+below — one sample in 4,558, tracked as a scheduling question in the
+roadmap's Phase 7 follow-ups, and not this section's effect.
 
 Session **teardown** has an ordering requirement that falls out of all this.
 When a session ends, its send path is retired — receiver dropped, registry
