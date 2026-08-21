@@ -141,6 +141,33 @@ impl LayoutRect {
         self.left().max(other.left()) < self.right().min(other.right())
             && self.top().max(other.top()) < self.bottom().min(other.bottom())
     }
+
+    /// Do these two rectangles **share an edge**, with a perpendicular
+    /// overlap of positive length?
+    ///
+    /// The exact complement of [`Self::overlaps`], and the shape of ADR
+    /// 0018's zero-tolerance adjacency: an edge coordinate is *identical*
+    /// and the two rectangles run alongside each other for a positive
+    /// distance. A one-unit gap is not an edge, an overlap is not an edge,
+    /// and a corner touch alone is not an edge — a cursor cannot cross a
+    /// point.
+    ///
+    /// This is the *predicate*, kept beside `overlaps` because the two are
+    /// one question asked twice and drifting them apart would be a
+    /// crossing the editor promises and the worker does not make. It is
+    /// **not** the crossing derivation: `crossover-core`'s `crossing.rs`
+    /// owns that — the spans, the sides, and which monitor a cursor lands
+    /// on — and remains the authority on what an adjacency *means*. A
+    /// later sweep is expected to have that derivation compute its
+    /// adjacency through here rather than restating it.
+    #[must_use]
+    pub fn abuts(self, other: Self) -> bool {
+        let vertical_overlap = self.top().max(other.top()) < self.bottom().min(other.bottom());
+        let horizontal_overlap = self.left().max(other.left()) < self.right().min(other.right());
+        let side_by_side = self.right() == other.left() || other.right() == self.left();
+        let stacked = self.bottom() == other.top() || other.bottom() == self.top();
+        (side_by_side && vertical_overlap) || (stacked && horizontal_overlap)
+    }
 }
 
 /// Which monitor, on which machine — the pair that identifies a placed
@@ -1382,6 +1409,68 @@ pub(crate) mod tests {
             prop_assert!(!a.overlaps(right_of));
             let below = LayoutRect { x, y: y + i32::try_from(height).unwrap(), width, height };
             prop_assert!(!a.overlaps(below));
+            // …and the same two placements are exactly what `abuts` says
+            // yes to: the two predicates partition the relationship.
+            prop_assert!(a.abuts(right_of));
+            prop_assert!(a.abuts(below));
         }
+
+        /// Abutment is symmetric, and never true of a pair that overlaps —
+        /// the complement `machines_touch` and the crossing derivation
+        /// both rely on.
+        #[test]
+        fn abutment_is_symmetric_and_never_coincides_with_overlap(
+            x in -1000i32..1000, y in -1000i32..1000,
+            width in 1u32..500, height in 1u32..500,
+            dx in -600i32..600, dy in -600i32..600,
+        ) {
+            let a = LayoutRect { x, y, width, height };
+            let b = LayoutRect { x: x + dx, y: y + dy, width, height };
+            prop_assert_eq!(a.abuts(b), b.abuts(a));
+            prop_assert!(!(a.abuts(b) && a.overlaps(b)));
+        }
+    }
+
+    /// Exact adjacency, with zero tolerance (ADR 0018) — a gap is not an
+    /// edge, an overlap is not an edge, and a shared corner is not an edge.
+    #[test]
+    fn abutment_is_exact_and_needs_a_perpendicular_overlap() {
+        let left = LayoutRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let touching = LayoutRect {
+            x: 100,
+            y: 50,
+            width: 100,
+            height: 100,
+        };
+        assert!(left.abuts(touching));
+        assert!(
+            !left.abuts(LayoutRect { x: 101, ..touching }),
+            "a gap is a gap"
+        );
+        assert!(
+            !left.abuts(LayoutRect { x: 99, ..touching }),
+            "an overlap is not an edge"
+        );
+        assert!(
+            !left.abuts(LayoutRect {
+                x: 100,
+                y: 100,
+                width: 100,
+                height: 100
+            }),
+            "touching at a corner alone is not a crossable edge"
+        );
+        // Stacked, not side by side: the other axis of the same rule.
+        assert!(left.abuts(LayoutRect {
+            x: 50,
+            y: 100,
+            width: 100,
+            height: 100
+        }));
     }
 }

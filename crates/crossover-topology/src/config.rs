@@ -44,13 +44,38 @@
 //! to keep stale rows alive would be the bug this replacement prevents.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::device::DeviceId;
 use crate::layout::{DevicePair, Layout, LayoutError, LayoutRect, RawPlacedMonitor};
+
+/// The config file's name, under `~/.crossover`.
+///
+/// Two binaries resolve this file and they must resolve the *same* one: the
+/// worker reads it at startup and on its ~2 s modification-time poll, and
+/// the layout editor writes it to hand an edit back (ADR 0018). They cannot
+/// share a `paths` module — ADR 0019 fixes the editor's dependency graph at
+/// the GUI stack and this crate — but they already share *this* crate, which
+/// is the one place that knows what a config file *is*. So the name lives
+/// here, with [`config_path_in`] to compose it, and neither binary spells it
+/// out: an editor writing `config.toml` while the worker read something else
+/// would look exactly like a save that did nothing.
+pub const CONFIG_FILE_NAME: &str = "config.toml";
+
+/// `<crossover_home>/config.toml`, from an already-resolved `~/.crossover`.
+///
+/// Takes the base directory rather than resolving it, because *where* a
+/// home directory comes from is each binary's own business (the worker
+/// inherits the console user's environment through the service; the editor
+/// is launched by the user) while *what the file is called* is this crate's
+/// — see [`CONFIG_FILE_NAME`].
+#[must_use]
+pub fn config_path_in(crossover_home: &Path) -> PathBuf {
+    crossover_home.join(CONFIG_FILE_NAME)
+}
 
 /// The config schema this build reads and writes (ADR 0018).
 ///
@@ -364,6 +389,30 @@ pub fn persist_layout(path: &Path, layout: &Layout) -> Result<(), PersistError> 
     })
 }
 
+/// The revision of the `[layout]` section in the config file at `path`, or
+/// `None` when there is not one to read.
+///
+/// Deliberately soft where [`persist_layout`] is strict: an absent file, an
+/// unreadable one, a file that is not TOML, a file with no `[layout]`, and
+/// a revision TOML could not have held are all the same answer — *nothing
+/// seen here*. The caller is the editor, deciding what revision to claim
+/// next (ADR 0018's `seen_max.saturating_add(1)`), and for that question
+/// every one of those cases means the same thing. A hard failure would be
+/// worse than useless: it would refuse to number an edit because of a file
+/// the write is about to refuse to touch anyway, and with a worse
+/// diagnostic than [`PersistError::Unparseable`]'s.
+///
+/// This is a *read* of the config file, so it stays beside the writer:
+/// nothing else in the tree should have to know that a revision lives at
+/// `layout.revision`.
+#[must_use]
+pub fn read_layout_revision(path: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let document: DocumentMut = text.parse().ok()?;
+    let revision = document.get("layout")?.get("revision")?.as_integer()?;
+    u64::try_from(revision).ok()
+}
+
 /// Retire the schema-1 `side` key, and the `[seamless]` table with it once
 /// nothing else lives there.
 ///
@@ -407,7 +456,7 @@ mod tests {
 
     use super::{
         CONFIG_SCHEMA_MIN_SUPPORTED, CONFIG_SCHEMA_VERSION, LayoutMonitorRow, LayoutSection,
-        PersistError, config_schema_supported, persist_layout,
+        PersistError, config_schema_supported, persist_layout, read_layout_revision,
     };
     use crate::device::DeviceId;
     use crate::layout::tests::{LOCAL, PEER, monitor, pair, side_by_side, valid_layout};
@@ -694,6 +743,29 @@ mod tests {
         let real = sandbox.path("config.toml");
         persist_layout(&real, &valid_layout()).unwrap();
         assert!(stray_files(&sandbox.0).is_empty());
+    }
+
+    /// The editor's `seen_max` half: what is already in the file, read
+    /// softly. Every way of not having a revision reads as `None`, which
+    /// is what makes "one past the highest anything has seen" answerable
+    /// on a fresh install, a schema-1 file, and a file somebody broke.
+    #[test]
+    fn the_existing_revision_reads_back_and_every_absence_reads_as_none() {
+        let sandbox = Sandbox::new("revision-read");
+        let path = sandbox.path("config.toml");
+        assert_eq!(read_layout_revision(&path), None, "an absent file");
+
+        persist_layout(&path, &valid_layout()).unwrap();
+        assert_eq!(read_layout_revision(&path), Some(7));
+
+        std::fs::write(&path, "schema_version = 1\n[seamless]\nside = \"left\"\n").unwrap();
+        assert_eq!(read_layout_revision(&path), None, "no [layout] at all");
+
+        std::fs::write(&path, "[layout\nrevision = 3\n").unwrap();
+        assert_eq!(read_layout_revision(&path), None, "not TOML");
+
+        std::fs::write(&path, "[layout]\nrevision = -1\n").unwrap();
+        assert_eq!(read_layout_revision(&path), None, "not a revision");
     }
 
     #[test]

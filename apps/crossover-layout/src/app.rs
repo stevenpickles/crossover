@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::render;
+use crate::render::{self, Chrome, CloseChoice};
+use crate::save;
 use crate::session::{SessionEvent, SessionTracker};
 use crate::state_file;
 
@@ -93,12 +94,48 @@ pub(crate) fn install_fonts(context: &egui::Context) {
     context.set_fonts(fonts);
 }
 
+/// The last save attempt's outcome, as the status bar says it.
+struct SaveStatus {
+    text: String,
+    failed: bool,
+}
+
+/// Why [`LayoutEditor::save`] wrote nothing.
+enum NotSaved {
+    /// There is no arrangement that has been changed — a scene nobody has
+    /// dragged, or one already written. Not a failure: nothing was asked
+    /// for that has not already happened.
+    NothingToSave,
+    /// A write was attempted and refused, or failed, with this chain.
+    Failed(String),
+}
+
+/// Where the window is in answering a close it intercepted.
+///
+/// One value rather than two booleans, because the pair had a fourth,
+/// meaningless combination (confirming *and* closing) that nothing
+/// prevented and every branch had to be read twice to rule out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseState {
+    /// No close is outstanding — the ordinary state.
+    Open,
+    /// A close was intercepted and the unsaved-changes dialog is up,
+    /// waiting on an answer.
+    Confirming,
+    /// A close has been agreed to and re-issued. Set *before* re-issuing,
+    /// so the interception does not catch its own answer and ask again —
+    /// the loop a naive "always intercept" would produce.
+    Closing,
+}
+
 /// Everything the editor knows: its current screen (with the grace-period
-/// bookkeeping `SessionTracker` adds), and when it last read the state file
-/// to get there.
+/// bookkeeping `SessionTracker` adds), when it last read the state file to
+/// get there, what the last save did, and where a close has got to.
 struct LayoutEditor {
     session: SessionTracker,
     last_poll: Instant,
+    status: Option<SaveStatus>,
+    close_state: CloseState,
 }
 
 impl LayoutEditor {
@@ -110,9 +147,131 @@ impl LayoutEditor {
         let mut editor = Self {
             session: SessionTracker::new(),
             last_poll: Instant::now(),
+            status: None,
+            close_state: CloseState::Open,
         };
         editor.poll();
         editor
+    }
+
+    /// Whether there is work that exists nowhere but this window — the
+    /// question a close has to ask.
+    ///
+    /// Exactly `SessionTracker`'s own answer, which is the same predicate
+    /// the state-file poll reconciles against (`session.rs`): an edit that
+    /// has not been written, a gesture still in the user's hand, or an edit
+    /// being held while the worker's empty state is on screen. A close
+    /// asking a *different* question than the poll answers is how one of
+    /// them ends up discarding what the other was protecting.
+    fn has_unsaved_work(&self) -> bool {
+        self.session.has_unsaved_work()
+    }
+
+    /// Write the arrangement to the config file, and report what happened
+    /// in the status bar. `true` when it landed.
+    ///
+    /// Success clears the dirty flag and opens the post-save hold
+    /// (`session.rs`); nothing else. The worker's own ~2 s config re-read
+    /// is what makes the edit live, and the state file this editor polls
+    /// will report the new revision when it does — so the loop closes
+    /// through the two files, with no rendezvous between the processes
+    /// (ADR 0018/0019).
+    ///
+    /// **A scene nobody has changed is not written.** The Save button is
+    /// already disabled for that, but the close dialog's "Save and close"
+    /// is not the same path, and a dialog that came up for a drag that
+    /// ended where it started would otherwise persist a *seed* — an
+    /// arrangement this editor invented and the user never accepted — as
+    /// though it had been drawn.
+    fn save(&mut self) -> bool {
+        // Settle any gesture first. A save can be asked for mid-drag (the
+        // close dialog answers a window closed without letting go), and an
+        // undropped drag is an arrangement that has not been committed.
+        if let Some(model) = self.session.savable_mut() {
+            model.end_drag();
+        }
+        let outcome = match self.session.savable_mut() {
+            Some(model) if !model.is_dirty() => Err(NotSaved::NothingToSave),
+            Some(model) => match save::save(model) {
+                Ok(revision) => {
+                    model.mark_saved(revision);
+                    Ok(revision)
+                }
+                Err(error) => Err(NotSaved::Failed(error.chain())),
+            },
+            None => Err(NotSaved::Failed(
+                "there is no arrangement to save".to_owned(),
+            )),
+        };
+        match outcome {
+            Ok(revision) => {
+                self.session.note_saved(revision);
+                tracing::info!(revision, "saved the drawn arrangement to the config file");
+                self.status = Some(SaveStatus {
+                    text: format!("Saved (revision {revision}). The worker picks it up shortly."),
+                    failed: false,
+                });
+                true
+            }
+            Err(NotSaved::NothingToSave) => {
+                self.status = Some(SaveStatus {
+                    text: "Nothing to save — the arrangement has not been changed.".to_owned(),
+                    failed: false,
+                });
+                false
+            }
+            Err(NotSaved::Failed(reason)) => {
+                tracing::warn!(reason = %reason, "the drawn arrangement could not be saved");
+                self.status = Some(SaveStatus {
+                    text: format!("Not saved — {reason}"),
+                    failed: true,
+                });
+                false
+            }
+        }
+    }
+
+    /// Let the close that was intercepted proceed.
+    fn close(&mut self, context: &egui::Context) {
+        self.close_state = CloseState::Closing;
+        context.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Act on what the frame reported the user clicked.
+    fn apply(&mut self, outcome: render::FrameOutcome, context: &egui::Context) {
+        if outcome.save_requested {
+            self.save();
+        }
+        match outcome.close_choice {
+            Some(CloseChoice::Save) => {
+                // A *failed* save keeps the dialog up with the reason in
+                // the status bar: closing anyway would discard the work the
+                // user just asked to keep. A save that wrote nothing
+                // because there was nothing to write leaves nothing to
+                // lose, so that close proceeds.
+                if self.save() || !self.has_unsaved_work() {
+                    self.close(context);
+                }
+            }
+            Some(CloseChoice::Discard) => self.close(context),
+            Some(CloseChoice::Cancel) => self.close_state = CloseState::Open,
+            None => {}
+        }
+    }
+
+    /// Re-check the close dialog's own premise, because the poll can
+    /// remove it: a re-pair discards the edit the dialog is asking about
+    /// (`session.rs`), and a question about work that no longer exists has
+    /// no honest answer.
+    ///
+    /// It dismisses itself rather than closing the window. The close was
+    /// already cancelled, and quietly closing now would hide the fact that
+    /// the edit went away — the user asked to close a window with work in
+    /// it, and what is in front of them no longer is that window.
+    fn dismiss_a_dialog_with_nothing_left_to_ask(&mut self) {
+        if self.close_state == CloseState::Confirming && !self.has_unsaved_work() {
+            self.close_state = CloseState::Open;
+        }
     }
 
     /// Re-read the state file, advance the session, and log exactly the
@@ -157,27 +316,229 @@ impl eframe::App for LayoutEditor {
         } else {
             ctx.request_repaint_after(POLL_INTERVAL.saturating_sub(elapsed));
         }
+
+        self.dismiss_a_dialog_with_nothing_left_to_ask();
+
+        // An unsaved arrangement is work that exists nowhere but this
+        // window: the config file is the only way an edit reaches the
+        // worker (ADR 0018), so closing without writing discards it
+        // silently. Cancel the close, ask, and let `apply` re-issue it.
+        // The test is the same one the poll reconciles against, so a close
+        // *mid-drag* — before the drop that would mark the scene dirty —
+        // is intercepted too.
+        if self.close_state != CloseState::Closing
+            && self.has_unsaved_work()
+            && ctx.input(|input| input.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_state = CloseState::Confirming;
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Shown first so it claims its strip of the window before the
-        // central panel takes the rest — window resize is handled entirely
-        // by `render.rs`'s `Viewport::fit`, recomputed from whatever area
-        // is left every frame, so there is nothing else to react to here.
-        egui::Panel::bottom("status_bar").show(ui, |ui| {
-            render::draw_status_bar(ui, self.session.session());
-        });
-        egui::CentralPanel::default().show(ui, |ui| {
-            render::draw_central(ui, self.session.session());
-        });
+        // `self.status` and `self.session` are disjoint fields, so the
+        // chrome may borrow one while the frame mutates the other — no
+        // per-frame copy of the status text is needed to satisfy anything.
+        let chrome = Chrome {
+            status: self
+                .status
+                .as_ref()
+                .map(|status| (status.text.as_str(), status.failed)),
+            confirming_close: self.close_state == CloseState::Confirming,
+        };
+        let outcome = render::draw_frame(ui, self.session.session_mut(), chrome);
+        let context = ui.ctx().clone();
+        self.apply(outcome, &context);
+    }
+}
+
+#[cfg(test)]
+impl LayoutEditor {
+    /// An editor around an already-prepared session, with **no state-file
+    /// read**.
+    ///
+    /// `new` polls, and a poll reads the real `~/.crossover`; a unit test
+    /// must neither depend on what is there nor be affected by it. The
+    /// tests below drive the close and save decisions, all of which are
+    /// answered before any filesystem is touched.
+    fn around(session: SessionTracker) -> Self {
+        Self {
+            session,
+            last_poll: Instant::now(),
+            status: None,
+            close_state: CloseState::Open,
+        }
+    }
+
+    /// What the status bar currently says, if anything.
+    fn status_text(&self) -> Option<&str> {
+        self.status.as_ref().map(|status| status.text.as_str())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::POLL_INTERVAL;
-    use crate::session::EditorSession;
-    use crate::test_support::painted_text;
+    use super::{CloseState, LayoutEditor, POLL_INTERVAL};
+    use crate::render::{CloseChoice, FrameOutcome};
+    use crate::session::{EditorSession, SessionTracker};
+    use crate::state_file::StateFileStatus;
+    use crate::test_support::{
+        LOCAL_DEVICE, arranged_document, document, drag_until_dirty, monitor_key, painted_text,
+        peer_state, unit_viewport,
+    };
+    use crossover_topology::DeviceId;
+    use eframe::egui;
+
+    /// An editor showing the fixture arrangement, having read it once.
+    fn editor() -> LayoutEditor {
+        let mut session = SessionTracker::new();
+        let _ = session.on_read(StateFileStatus::Fresh(arranged_document(0)));
+        LayoutEditor::around(session)
+    }
+
+    /// A context to hand `apply`. Nothing here opens a window: an
+    /// `egui::Context` is a value, and a viewport command sent to one with
+    /// no viewport is simply queued and never read.
+    fn context() -> egui::Context {
+        egui::Context::default()
+    }
+
+    /// A close mid-drag must be intercepted. The dirty flag is only set by
+    /// the *drop*, so an interception that asked about dirtiness alone
+    /// would let a window close silently over a gesture in the user's hand
+    /// — the same predicate mistake `session.rs`'s poll had.
+    #[test]
+    fn a_close_mid_drag_still_has_something_to_ask_about() {
+        let mut editor = editor();
+        assert!(!editor.has_unsaved_work(), "the fixture starts clean");
+
+        let model = editor.session.savable_mut().expect("a scene");
+        model.begin_drag(
+            &monitor_key(LOCAL_DEVICE, r"\\.\DISPLAY1"),
+            (10.0, 10.0),
+            unit_viewport(),
+        );
+        model.drag_to((10.0, 3_010.0));
+        assert!(!model.is_dirty(), "a drag in flight is not yet dirty");
+        assert!(
+            editor.has_unsaved_work(),
+            "but the close must still ask about it"
+        );
+    }
+
+    /// The dialog re-validates its premise: if a poll replaced the model
+    /// while it was up — a re-pair, which discards the edit — there is
+    /// nothing left to ask about, so it dismisses itself rather than
+    /// offering to save work that no longer exists.
+    #[test]
+    fn the_close_dialog_dismisses_itself_when_a_poll_removes_its_premise() {
+        let mut editor = editor();
+        drag_until_dirty(editor.session.savable_mut().expect("a scene"));
+        editor.close_state = CloseState::Confirming;
+
+        // Still dirty, so the question still stands.
+        editor.dismiss_a_dialog_with_nothing_left_to_ask();
+        assert_eq!(editor.close_state, CloseState::Confirming);
+
+        // A re-pair: a different machine at the other end discards the
+        // drawing (`session.rs`), and with it the dialog's premise.
+        let mut stranger = peer_state(true);
+        stranger.device = DeviceId::from_bytes([0x77; 16]);
+        let _ = editor
+            .session
+            .on_read(StateFileStatus::Fresh(document(Some(stranger), 1)));
+        assert!(!editor.has_unsaved_work());
+
+        editor.dismiss_a_dialog_with_nothing_left_to_ask();
+        assert_eq!(
+            editor.close_state,
+            CloseState::Open,
+            "a dialog with nothing to ask must not stay up"
+        );
+    }
+
+    /// A save with nothing to write **writes nothing**, and says so.
+    ///
+    /// The Save button is already disabled for an unedited scene, but the
+    /// close dialog's "Save and close" is a different path to the same
+    /// call. Without this guard it would persist a *seed* — an arrangement
+    /// this editor invented as a starting guess and the user never
+    /// accepted — into the worker's config file, on the strength of a
+    /// dialog that should not have been asking. The refusal happens before
+    /// any path is resolved, so this test touches no filesystem.
+    #[test]
+    fn a_save_with_nothing_to_write_refuses_rather_than_persisting_a_seed() {
+        let mut editor = editor();
+        let before = editor.session.savable_mut().expect("a scene").seen_revision;
+
+        assert!(!editor.save(), "nothing was written");
+        assert_eq!(
+            editor.status_text(),
+            Some("Nothing to save — the arrangement has not been changed."),
+            "the status bar must say why"
+        );
+        assert_eq!(
+            editor.session.savable_mut().expect("a scene").seen_revision,
+            before,
+            "a refused save records no revision"
+        );
+    }
+
+    /// "Save and close" on a scene with nothing to write still closes:
+    /// there is nothing left to lose, so keeping the window open would be
+    /// refusing to do the one thing the user asked for.
+    #[test]
+    fn save_and_close_with_nothing_to_write_still_closes() {
+        let mut editor = editor();
+        editor.close_state = CloseState::Confirming;
+        editor.apply(
+            FrameOutcome {
+                save_requested: false,
+                close_choice: Some(CloseChoice::Save),
+            },
+            &context(),
+        );
+        assert_eq!(editor.close_state, CloseState::Closing);
+    }
+
+    /// Cancel puts the window back exactly as it was — the close state is
+    /// reset, not left half-set for the next frame's interception to trip
+    /// over.
+    #[test]
+    fn cancelling_the_close_resets_the_state() {
+        let mut editor = editor();
+        drag_until_dirty(editor.session.savable_mut().expect("a scene"));
+        editor.close_state = CloseState::Confirming;
+        editor.apply(
+            FrameOutcome {
+                save_requested: false,
+                close_choice: Some(CloseChoice::Cancel),
+            },
+            &context(),
+        );
+        assert_eq!(editor.close_state, CloseState::Open);
+        assert!(
+            editor.has_unsaved_work(),
+            "cancelling keeps the work, obviously"
+        );
+    }
+
+    /// Discard closes without writing, and without asking again.
+    #[test]
+    fn discarding_closes_without_writing() {
+        let mut editor = editor();
+        drag_until_dirty(editor.session.savable_mut().expect("a scene"));
+        editor.close_state = CloseState::Confirming;
+        editor.apply(
+            FrameOutcome {
+                save_requested: false,
+                close_choice: Some(CloseChoice::Discard),
+            },
+            &context(),
+        );
+        assert_eq!(editor.close_state, CloseState::Closing);
+        assert!(editor.status_text().is_none(), "nothing was written");
+    }
 
     /// The empty state is still the first thing an editor with no worker
     /// says, reached through `EditorSession` and `render.rs` — this is the

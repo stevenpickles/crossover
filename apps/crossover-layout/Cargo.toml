@@ -47,10 +47,18 @@ tracing-subscriber = { workspace = true }
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
-# Property tests for the pure modules — model seeding, viewport round-trips
-# — the same crate every other property-tested crate in the workspace uses.
+# Property tests for the pure modules — model seeding, viewport round-trips,
+# snapping — the same crate every other property-tested crate in the
+# workspace uses.
 [dev-dependencies]
 proptest = { workspace = true }
+# Test-only, and for one purpose: reading a saved `config.toml` back with
+# the parser `apps/crossover` actually loads it with, rather than with the
+# `toml_edit` writer that produced it — which would only prove the writer
+# agrees with itself. `crossover-topology`'s own writer tests make the same
+# argument for the same dependency. Dev-only, so the runtime graph ADR 0019
+# fixes is untouched.
+toml = { workspace = true }
 
 [lints]
 workspace = true

@@ -235,6 +235,41 @@ build verdict — a live desktop can always interfere, and a red build
 that says nothing about Crossover is worse than no build at all.
 `tools/soak-report.py` summarizes the structured logs from both sides.
 
+## 3.2 The layout editor: what a human still has to look at
+
+`crossover-layout` is a window, and ADR 0019 chose egui so that almost none
+of it needs one: every screen the editor can show — the empty states, the
+drawn scene, the snap guides, the blocking and warning diagnostics, the
+Save button's enabled state, and the unsaved-changes dialog — is asserted
+headlessly in `cargo test` on all three OSes, through the same
+`render::draw_frame` the real window calls
+(`apps/crossover-layout/src/test_support.rs`). The snap arithmetic, the
+rigid-group drag, the scene→`Layout` round trip, and the revision
+assignment are ordinary unit and property tests beside them.
+
+What is left is what a headless pass structurally cannot answer: whether it
+*looks* right, whether it *feels* right, and whether the file it writes
+actually changes what the worker does. This is that list, run by hand per
+release and after any change to the editor.
+
+| # | Check | What a pass looks like |
+|---|-------|------------------------|
+| E-1 | **Opens crisply on a mixed-DPI desk.** Start `crossover layout` with the window on a 100% monitor, then drag the window onto a 150%/200% one and back | Text and rectangle strokes stay sharp on both, and the arrangement rescales to fit without stretching. This checks that the OS's DPI change reaches egui — the aspect ratio itself is `Viewport::fit`'s, and already proven |
+| E-2 | **Two physically-equal screens draw equal.** With a 4K monitor at 150% beside a 1080p at 100%, look at the two rectangles | They are the same size, because the seed is in DIPs (ADR 0018). A 4K screen drawn twice its neighbour's is the `scale_percent` seeding path broken |
+| E-3 | **Drag and snap feel right.** Drag one machine's group toward the other, slowly, from several units out; repeat zoomed in and zoomed out (resize the window) | The whole group moves rigidly; the snap catches about a pointer's width from the seam *at either zoom*; guides appear as it catches and the status bar names what caught (`Snapping …: edges meet`); nothing jitters, creeps, or slides away from the cursor while held |
+| E-4 | **Empty states against a real worker.** Close the editor, stop the worker (`crossover service stop`, or end `crossover run`), delete `~/.crossover/state/topology.json`, reopen the editor — then start the worker with the editor still open | The empty state names `crossover run` and `crossover service install`; within a couple of seconds of the worker starting, the canvas fills in on its own with no restart. Stopping the worker again leaves the last-known arrangement on screen marked `not responding`, rather than blanking |
+| E-5 | **Unsaved-close confirmation.** Drag something, then close the window | The dialog appears. **Cancel** leaves the window open with the drag intact; **Discard** closes and `config.toml` is unchanged; **Save and close** writes, then closes |
+| E-6 | **A save that cannot happen says why.** Make `~/.crossover/config.toml` unparseable (a stray `[`), then save | The status bar names the whole chain (`writing the config file failed: the existing config file is not valid TOML…`) and the file is left exactly as it was |
+| E-6b | **A save is not visibly undone while the worker catches up.** Drag something, save, then watch the canvas for five seconds without touching it | The arrangement stays exactly where it was saved. The editor re-reads the state file once a second and the worker only picks the edit up on its own ~2 s config poll, so for a few seconds the state file still describes the *old* arrangement — a snap-back in that window is indistinguishable from a save that silently failed, which is what `session.rs`'s post-save hold exists to prevent. The status bar keeps reporting the worker's real state (running/not responding, peer connected or not) throughout |
+| E-6c | **A display change lands while an edit is unsaved.** Drag something without saving, then plug in or unplug a monitor | The new screen appears within a second or two, alongside the arrangement the drag left — not after a save, and not instead of it. An unplugged one disappears the same way |
+| E-7 | **The loop closes: save → worker re-read → crossing matches the drawing.** With both machines running, draw an arrangement — including at least one case the side model could not express (a seam between two of *one* machine's own monitors, or an over/under placement) — save, and watch the worker's log | The worker adopts the new revision within a few seconds and with no restart, and the cursor then crosses **where the drawing says it does**, and nowhere else |
+
+E-7 is the interesting one, and it is deliberately **the soak's job** rather
+than this file's: it needs two machines, two desks' worth of real monitors,
+and a link, which is exactly what [SOAK.md](SOAK.md) is for and where the
+Phase 8 exit criteria are signed off. It is listed here so a release
+checklist run on a single machine knows it has *not* covered it.
+
 ## 4. Performance measurement
 
 Numeric latency targets are established by measurement (NFR-5).
