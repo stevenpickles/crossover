@@ -1,6 +1,17 @@
 # Crossover Roadmap
 
-> **Current phase: 8 — Dynamic Display Topology** (not yet started.)
+> **Current phase: 8 — Dynamic Display Topology** (in progress.)
+>
+> **Phase 8 progress (2026-08-20):** design recorded as
+> [ADR 0018](adr/0018-drawn-display-topology.md) (Accepted) — the drawn
+> layout in one shared coordinate space, edges derived from exact
+> adjacency, protocol v4, config schema v2, and the worker↔editor state
+> file. Deliverable 5's UI toolkit decision (ADR 0019) is still open. A
+> first implementation slice has landed (feature/147): `ControlRequest`
+> and `ControlRelease` carry the v4 `EntryPoint` shape and
+> `PROTOCOL_VERSION` moves to 4 — the protocol groundwork the rest of the
+> deliverables (the layout model itself, per-monitor edges, sync and
+> persistence, the editor) build on, none of which have started yet.
 >
 > Phase 7 (Rich Clipboard — images and files) closed 2026-08-20: the last
 > open exit criterion — **input latency bounded under a saturating
