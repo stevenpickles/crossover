@@ -117,9 +117,11 @@ crossover/
 > **default** dependencies are exactly `serde` and `thiserror`. The
 > non-default `config` feature adds `toml_edit` (the format-preserving
 > `[layout]` writer) and `serde_json` (the state-file schema) — the ADR's
-> dated amendment records the second. `crossover-protocol` will gain a
-> dependency edge on the default graph when the v4 wire messages land; it has
-> none yet.
+> dated amendment records the second. **`crossover-protocol` and
+> `crossover-core` both depend on the default graph** — protocol carries the
+> model types on the v4 wire, and core derives crossing spans from a layout
+> (`core::crossing`, ADR 0018) — and neither enables the feature, so neither
+> the TOML writer nor the JSON schema enters their trees.
 
 ### 3.1 Deliberately not separate crates (yet)
 

@@ -636,6 +636,7 @@ dependencies = [
  "crossover-platform",
  "crossover-protocol",
  "crossover-security",
+ "crossover-topology",
  "proptest",
  "thiserror 2.0.20",
  "tokio",

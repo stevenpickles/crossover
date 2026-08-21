@@ -11,6 +11,11 @@ repository.workspace = true
 crossover-platform = { workspace = true }
 crossover-protocol = { workspace = true }
 crossover-security = { workspace = true }
+# The drawn layout model (ADR 0018), for the crossing-span derivation in
+# `crossing`. The DEFAULT graph only — `serde` + `thiserror`, both already
+# here — because the `config` feature's `toml_edit`/`serde_json` belong to
+# the worker and the editor, not to a crate full of state machines.
+crossover-topology = { workspace = true }
 
 # The net module (docs/ARCHITECTURE.md §3.1: networking folded into
 # core::net until a second transport appears). State machines stay pure;
