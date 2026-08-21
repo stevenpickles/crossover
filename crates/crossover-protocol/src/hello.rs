@@ -59,6 +59,17 @@ pub enum MessageType {
     /// [`FeatureFlags::CHUNKED_CLIPBOARD`] — a peer that has not
     /// advertised it is never sent one.
     ClipboardChunk = 16,
+    /// Control: the sender's own live monitors, in its own local
+    /// coordinates (CONTROL class, ADR 0018, docs/PROTOCOL.md §6.2). Sent
+    /// after `Hello` and again whenever the local display configuration
+    /// changes. Base protocol at v4 — no feature bit, since a v3 peer is
+    /// already excluded at `Hello` by the `entry` shape change.
+    MonitorTopology = 17,
+    /// Control: the drawn arrangement describing both machines (CONTROL
+    /// class, ADR 0018, docs/PROTOCOL.md §6.2). Sent after `Hello` when the
+    /// sender holds an explicit layout, and on every edit. Base protocol at
+    /// v4, for the same reason as [`MessageType::MonitorTopology`].
+    LayoutSync = 18,
 }
 
 impl MessageType {
@@ -84,6 +95,8 @@ impl MessageType {
             14 => Some(Self::ControlResponse),
             15 => Some(Self::ControlRelease),
             16 => Some(Self::ClipboardChunk),
+            17 => Some(Self::MonitorTopology),
+            18 => Some(Self::LayoutSync),
             _ => None,
         }
     }
@@ -93,6 +106,63 @@ impl MessageType {
     pub const fn wire(self) -> u16 {
         self as u16
     }
+
+    /// Which of docs/PROTOCOL.md §4's four logical classes this message
+    /// type belongs to — the wire-level fact the table there states, made
+    /// queryable instead of re-transcribed at each site that needs it.
+    ///
+    /// This is one partition of the sixteen (now eighteen) message types;
+    /// it is not the *only* one this crate's callers need. `SendPriority`
+    /// (`crossover-core::outbound`), inbound routing
+    /// (`apps/crossover::commands::inbound_route`), and session dispatch
+    /// (`crossover-core::supervision::dispatch_frame`) each partition the
+    /// same types differently, for reasons specific to what they are
+    /// deciding — `ReleaseAllInput` is CONTROL class here but rides the
+    /// same High-priority lane and INPUT-driver route as `InputBatch`, for
+    /// instance. Each of those three notes that this accessor exists;
+    /// none of them is wrong to partition differently.
+    #[must_use]
+    pub const fn class(self) -> MessageClass {
+        match self {
+            Self::Hello
+            | Self::Ping
+            | Self::Pong
+            | Self::PairingStart
+            | Self::PairingConfirm
+            | Self::ReleaseAllInput
+            | Self::ControlRequest
+            | Self::ControlResponse
+            | Self::ControlRelease
+            | Self::MonitorTopology
+            | Self::LayoutSync => MessageClass::Control,
+            Self::InputBatch => MessageClass::Input,
+            Self::ClipboardOffer
+            | Self::ClipboardAccept
+            | Self::ClipboardDecline
+            | Self::ClipboardData
+            | Self::ClipboardApplied
+            | Self::ClipboardChunk => MessageClass::Clipboard,
+        }
+    }
+}
+
+/// One of docs/PROTOCOL.md §4's four logical message classes —
+/// [`MessageType::class`]'s return type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageClass {
+    /// Hello, control-transfer negotiation, display topology (§6.2),
+    /// keepalive, `ReleaseAllInput`, session management. Ordered within
+    /// the class, lossless.
+    Control,
+    /// Key transitions, pointer motion/buttons/scroll. Keys ordered within
+    /// the class and lossless; pointer motion coalescable (§6).
+    Input,
+    /// Clipboard transaction messages. Ordered within the class, lossless,
+    /// acknowledged.
+    Clipboard,
+    /// Latency probes, statistics. Best effort. Not yet used by any
+    /// defined message type.
+    Telemetry,
 }
 
 /// Operating-system family, informational (diagnostics, future
@@ -275,7 +345,7 @@ impl Hello {
 mod tests {
     use uuid::Uuid;
 
-    use super::{FeatureFlags, Hello, MAX_DEVICE_NAME_BYTES, MessageType, OsFamily};
+    use super::{FeatureFlags, Hello, MAX_DEVICE_NAME_BYTES, MessageClass, MessageType, OsFamily};
     use crate::ProtocolError;
     use crate::framing::{FrameDecoder, encode_frame};
 
@@ -396,6 +466,37 @@ mod tests {
             MessageType::ReleaseAllInput,
         ] {
             assert_eq!(MessageType::from_wire(ty.wire()), Some(ty));
+        }
+    }
+
+    /// One class per PROTOCOL.md §4's table, over every message type this
+    /// build knows — total, and pinned so a new message type is a
+    /// deliberate edit here rather than a silent gap.
+    #[test]
+    fn every_message_type_has_a_class() {
+        let expectations = [
+            (MessageType::Hello, MessageClass::Control),
+            (MessageType::Ping, MessageClass::Control),
+            (MessageType::Pong, MessageClass::Control),
+            (MessageType::PairingStart, MessageClass::Control),
+            (MessageType::PairingConfirm, MessageClass::Control),
+            (MessageType::ClipboardOffer, MessageClass::Clipboard),
+            (MessageType::ClipboardAccept, MessageClass::Clipboard),
+            (MessageType::ClipboardDecline, MessageClass::Clipboard),
+            (MessageType::ClipboardData, MessageClass::Clipboard),
+            (MessageType::ClipboardApplied, MessageClass::Clipboard),
+            (MessageType::ClipboardChunk, MessageClass::Clipboard),
+            (MessageType::InputBatch, MessageClass::Input),
+            (MessageType::ReleaseAllInput, MessageClass::Control),
+            (MessageType::ControlRequest, MessageClass::Control),
+            (MessageType::ControlResponse, MessageClass::Control),
+            (MessageType::ControlRelease, MessageClass::Control),
+            (MessageType::MonitorTopology, MessageClass::Control),
+            (MessageType::LayoutSync, MessageClass::Control),
+        ];
+        assert_eq!(expectations.len(), 18, "a message type is missing here");
+        for (ty, expected) in expectations {
+            assert_eq!(ty.class(), expected, "{ty:?} classified wrong");
         }
     }
 

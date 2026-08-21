@@ -29,8 +29,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::ProtocolError;
-use crate::decode_strict;
 use crate::hello::{FeatureFlags, MessageType};
+use crate::{decode_strict, encode};
 
 /// SHA-256 of clipboard content — the identity that dedup and loop
 /// prevention key on. Exposed so the engine hashes local observations
@@ -1451,12 +1451,6 @@ macro_rules! plain_payload {
 plain_payload!(ClipboardAccept, "ClipboardAccept");
 plain_payload!(ClipboardDecline, "ClipboardDecline");
 plain_payload!(ClipboardApplied, "ClipboardApplied");
-
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
-    postcard::to_stdvec(value).map_err(|e| ProtocolError::Encode {
-        reason: e.to_string(),
-    })
-}
 
 #[cfg(test)]
 mod tests {
