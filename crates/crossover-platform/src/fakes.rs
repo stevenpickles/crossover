@@ -13,7 +13,7 @@ use crate::clipboard::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
 };
 use crate::cursor::{CursorMask, CursorMaskError};
-use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
+use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorInfo, MonitorRect, Screen};
 use crate::file_blob::{BlobNaming, FileBlob, FileBlobBuilder, FileBlobRefusal};
 use crate::input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerEvent,
@@ -459,14 +459,31 @@ impl InputInjector for FakeInputInjector {
     }
 }
 
+/// The device string [`FakeDisplay`] mints for a monitor a test scripted
+/// by geometry alone.
+///
+/// Deliberately **not** spelled `\\.\DISPLAYn`. A fake that produced real
+/// Windows device strings would let a test pass here for a reason that
+/// exists only on Windows — an assertion accidentally matching the shape
+/// of one platform's names is exactly the coupling the platform boundary
+/// exists to prevent. `FAKE-DISPLAY-1` is obviously synthetic, is valid
+/// printable ASCII inside ADR 0018's byte bound, and is predictable, so a
+/// test that cares can name it without setting it.
+#[must_use]
+pub fn fake_monitor_id(index: usize) -> String {
+    format!("FAKE-DISPLAY-{}", index + 1)
+}
+
 /// In-memory [`DisplayInfo`] with a scriptable screen size and cursor, so
 /// edge-detection logic is exercisable with no real display.
 pub struct FakeDisplay {
     screen: Mutex<Screen>,
     cursor: Mutex<CursorPoint>,
-    /// The monitor layout. Defaults to a single monitor covering the whole
-    /// screen; multi-monitor tests override it via [`Self::set_monitors`].
-    monitors: Mutex<Vec<MonitorRect>>,
+    /// The monitor layout, ids and all. Defaults to a single monitor
+    /// covering the whole screen; multi-monitor tests override it via
+    /// [`Self::set_monitors`] (geometry only, ids synthesized) or
+    /// [`Self::set_monitor_layout`] (both).
+    monitors: Mutex<Vec<MonitorInfo>>,
     /// When set, both queries fail with this reason — the platform
     /// refusing to report geometry.
     fail: Mutex<Option<String>>,
@@ -480,11 +497,14 @@ impl FakeDisplay {
         Self {
             screen: Mutex::new(screen),
             cursor: Mutex::new(CursorPoint { x: 0, y: 0 }),
-            monitors: Mutex::new(vec![MonitorRect {
-                left: 0,
-                top: 0,
-                width: screen.width,
-                height: screen.height,
+            monitors: Mutex::new(vec![MonitorInfo {
+                id: Some(fake_monitor_id(0)),
+                rect: MonitorRect {
+                    left: 0,
+                    top: 0,
+                    width: screen.width,
+                    height: screen.height,
+                },
             }]),
             fail: Mutex::new(None),
         }
@@ -501,8 +521,61 @@ impl FakeDisplay {
         *lock(&self.screen) = screen;
     }
 
-    /// Replace the monitor layout, for multi-monitor edge-mapping tests.
+    /// Replace the monitor layout by geometry alone, for multi-monitor
+    /// edge-mapping tests. Tests written before monitors had identities
+    /// keep working unchanged.
+    ///
+    /// **A monitor that survives the change keeps its id.** A rectangle
+    /// present before and after is the same screen, and relabelling it
+    /// would model the one thing ADR 0018 chose device strings to avoid: a
+    /// screen whose identity silently moves when the list around it
+    /// changes. So surviving rectangles carry their id across (each
+    /// matched once, so duplicates stay distinct), and only genuinely new
+    /// ones are named — with the lowest [`fake_monitor_id`] index not
+    /// already in use, so a new monitor can never inherit a live
+    /// neighbour's name either.
     pub fn set_monitors(&self, monitors: Vec<MonitorRect>) {
+        let mut previous = lock(&self.monitors);
+        let mut unclaimed: Vec<MonitorInfo> = previous.clone();
+        let mut next: Vec<MonitorInfo> = monitors
+            .into_iter()
+            .map(|rect| {
+                // Same rectangle as one we had? Same screen, same id.
+                match unclaimed.iter().position(|held| held.rect == rect) {
+                    Some(index) => unclaimed.remove(index),
+                    None => MonitorInfo { id: None, rect },
+                }
+            })
+            .collect();
+
+        // Name the newcomers from the lowest index nothing else holds.
+        for index in 0.. {
+            if next.iter().all(|monitor| monitor.id.is_some()) {
+                break;
+            }
+            let candidate = fake_monitor_id(index);
+            if next
+                .iter()
+                .any(|monitor| monitor.id.as_deref() == Some(candidate.as_str()))
+            {
+                continue;
+            }
+            if let Some(unnamed) = next.iter_mut().find(|monitor| monitor.id.is_none()) {
+                unnamed.id = Some(candidate);
+            }
+        }
+        *previous = next;
+    }
+
+    /// Replace the monitor layout, ids and all — for a test that is about
+    /// identity: an id that changes across a re-enumeration, a monitor the
+    /// platform declines to name (`id: None`), a layout naming a monitor
+    /// this machine does not have, or an id the layout model will refuse.
+    ///
+    /// Whatever is given is stored verbatim, including `None` and including
+    /// ids [`Self::set_monitors`] would never mint — that is the point of
+    /// having both setters.
+    pub fn set_monitor_layout(&self, monitors: Vec<MonitorInfo>) {
         *lock(&self.monitors) = monitors;
     }
 
@@ -527,6 +600,16 @@ impl DisplayInfo for FakeDisplay {
     }
 
     fn monitors(&self) -> Result<Vec<MonitorRect>, DisplayError> {
+        self.guard()?;
+        // Geometry is never withheld for want of an id, exactly as the
+        // real backend must not withhold it.
+        Ok(lock(&self.monitors)
+            .iter()
+            .map(|monitor| monitor.rect)
+            .collect())
+    }
+
+    fn monitor_layout(&self) -> Result<Vec<MonitorInfo>, DisplayError> {
         self.guard()?;
         Ok(lock(&self.monitors).clone())
     }
@@ -1067,7 +1150,7 @@ mod tests {
 
 #[cfg(test)]
 mod display_tests {
-    use super::FakeDisplay;
+    use super::{FakeDisplay, fake_monitor_id};
     use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
 
     #[test]
@@ -1156,6 +1239,167 @@ mod display_tests {
             display.monitors(),
             Err(DisplayError::Unavailable { .. })
         ));
+    }
+
+    /// The identity half (ADR 0018): geometry-only scripting mints
+    /// synthetic ids, `monitors()` reports the same rectangles either way,
+    /// and a test that cares can name the ids itself — `None` included.
+    #[test]
+    fn monitor_identities_are_synthesized_or_scripted_and_never_gate_geometry() {
+        use crate::display::MonitorInfo;
+
+        let display = FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        });
+        assert_eq!(
+            display.monitor_layout().unwrap()[0].id.as_deref(),
+            Some("FAKE-DISPLAY-1")
+        );
+
+        let laptop = MonitorRect {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1200,
+        };
+        let external = MonitorRect {
+            left: 1920,
+            top: 0,
+            width: 2560,
+            height: 1440,
+        };
+        display.set_monitors(vec![laptop, external]);
+        let identified = display.monitor_layout().unwrap();
+        assert_eq!(
+            identified
+                .iter()
+                .map(|m| m.id.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec![fake_monitor_id(0), fake_monitor_id(1)]
+        );
+        // Geometry reports exactly the same monitors, so the two views
+        // cannot disagree about what exists.
+        assert_eq!(
+            display.monitors().unwrap(),
+            identified.iter().map(|m| m.rect).collect::<Vec<_>>()
+        );
+
+        // Scripted ids survive verbatim — including an id the layout model
+        // will refuse, and `None`, because "the platform would not name
+        // this screen" is a state the model above has to be able to see.
+        display.set_monitor_layout(vec![
+            MonitorInfo {
+                id: Some("DP-2".to_owned()),
+                rect: laptop,
+            },
+            MonitorInfo {
+                id: None,
+                rect: external,
+            },
+        ]);
+        let identified = display.monitor_layout().unwrap();
+        assert_eq!(identified[0].id.as_deref(), Some("DP-2"));
+        assert_eq!(identified[1].id, None);
+        // The unnamed monitor is still in the geometry list. This is the
+        // property that keeps an identity failure from moving the
+        // desktop's outer edge inward.
+        assert_eq!(display.monitors().unwrap(), vec![laptop, external]);
+
+        // A scripted failure surfaces on both queries.
+        display.fail_with("no display attached");
+        assert!(matches!(
+            display.monitor_layout(),
+            Err(DisplayError::Unavailable { .. })
+        ));
+        assert!(matches!(
+            display.monitors(),
+            Err(DisplayError::Unavailable { .. })
+        ));
+    }
+
+    /// A rectangle that survives a `set_monitors` keeps the id it had.
+    ///
+    /// Relabelling a surviving screen is the failure mode ADR 0018 chose
+    /// device strings to avoid, so the fake must not model it by accident:
+    /// a test that unplugs a monitor would otherwise see every *remaining*
+    /// screen silently renamed.
+    #[test]
+    fn a_surviving_monitor_keeps_its_id_across_a_geometry_change() {
+        let display = FakeDisplay::new(Screen {
+            width: 3840,
+            height: 1080,
+        });
+        let left = MonitorRect {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let middle = MonitorRect {
+            left: 1920,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let right = MonitorRect {
+            left: 3840,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+
+        display.set_monitors(vec![left, middle, right]);
+        let ids = |display: &FakeDisplay| -> Vec<Option<String>> {
+            display
+                .monitor_layout()
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect()
+        };
+        let before = ids(&display);
+        assert_eq!(
+            before,
+            vec![
+                Some(fake_monitor_id(0)),
+                Some(fake_monitor_id(1)),
+                Some(fake_monitor_id(2)),
+            ]
+        );
+
+        // Unplug the middle one: the survivors keep their names, and the
+        // list does not shuffle them down.
+        display.set_monitors(vec![left, right]);
+        assert_eq!(
+            ids(&display),
+            vec![before[0].clone(), before[2].clone()],
+            "unplugging a monitor renamed the ones that stayed"
+        );
+
+        // Plug a new one in: it gets the lowest free name — the one the
+        // departed monitor gave up — and never a live neighbour's.
+        display.set_monitors(vec![left, middle, right]);
+        let after = ids(&display);
+        assert_eq!(after[0], before[0]);
+        assert_eq!(after[2], before[2]);
+        assert_eq!(after[1], Some(fake_monitor_id(1)));
+
+        // Reordering the same rectangles moves the ids with them rather
+        // than reassigning by position.
+        display.set_monitors(vec![right, left, middle]);
+        assert_eq!(
+            ids(&display),
+            vec![after[2].clone(), after[0].clone(), after[1].clone()]
+        );
+
+        // Two identical rectangles are matched once each, so a duplicate
+        // cannot claim the same name twice.
+        display.set_monitors(vec![left, left]);
+        let duplicated = ids(&display);
+        assert_eq!(duplicated.len(), 2);
+        assert_ne!(duplicated[0], duplicated[1]);
+        assert!(duplicated.iter().all(Option::is_some));
     }
 }
 

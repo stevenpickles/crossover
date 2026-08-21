@@ -36,6 +36,14 @@ zip = { workspace = true }
 # stderr; the library itself installs no subscriber.
 [target.'cfg(windows)'.dev-dependencies]
 tracing-subscriber = { workspace = true }
+# Tests only, and deliberately not a real dependency: the display test
+# asserts that every `szDevice` this machine reports is a usable
+# `MonitorId` — ADR 0018's byte bound and printable-ASCII rule, imported
+# rather than restated so the two cannot drift. The platform crates stay
+# free of the layout model at build time; a platform trait that could only
+# report ids the model already accepts would have no way to say that a
+# machine's display configuration is unusable.
+crossover-topology = { workspace = true }
 
 # The workspace forbids unsafe_code (NFR-6). This crate is the designated
 # exception: Win32 FFI requires `unsafe`. The relaxation is local and
