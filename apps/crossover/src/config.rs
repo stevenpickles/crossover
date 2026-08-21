@@ -41,9 +41,14 @@
 //! A schema 1 file — or a schema 2 file with a lingering `[seamless] side`
 //! and no `[layout]` — still loads: it becomes an *implicit* layout that
 //! reproduces the old left–right behavior exactly ([`LayoutSource::Implicit`]).
-//! Nothing here ever writes `[layout]`; the upgrade to an explicit one
-//! happens on the first save, once the editor (feature/152) calls
-//! `crossover_topology::persist_layout`.
+//! Nothing *here* ever writes `[layout]`: this module only reads. The
+//! upgrade to an explicit one happens on the first write, and the first
+//! writer is [`crate::topology_sync`] adopting an arrangement drawn at the
+//! other desk — ADR 0018 is explicit that adoption counts, because on a
+//! two-machine pair the peer's edit is the user's edit, made at the other
+//! desk. So a file this module loaded as schema 1 can come back as schema 2
+//! with a `[layout]` and no `side`, and every check below is written to
+//! accept exactly what `crossover_topology::persist_layout` produces.
 //!
 //! **The version stamp must predict the semantics.** A file with `[layout]`
 //! but `schema_version` absent or `1` is a config-shape contradiction — the
@@ -219,10 +224,13 @@ pub struct CliRun {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayoutSource {
     /// The side named by `--left`/`--right`, or a lingering `[seamless]
-    /// side` with no `[layout]` in the file. Revision 0 in spirit, never
-    /// synced, never written back — the upgrade to an explicit `[layout]`
-    /// happens on the first write, which nothing on this branch performs
-    /// (feature/152 wires `crossover_topology::persist_layout` in).
+    /// side` with no `[layout]` in the file. Revision 0 in spirit, and
+    /// **never synced** — no `LayoutSync` is ever sent for it (ADR 0018),
+    /// so a `--left` run states its monitors to the peer and nothing else.
+    /// It is never written back either; the upgrade to an explicit
+    /// `[layout]` happens on the first write, which is
+    /// [`crate::topology_sync`] adopting the peer's arrangement (or, later,
+    /// an editor save).
     ///
     /// Drives `commands::build_seamless` exactly as a bare side always
     /// has: zero behavior change from every release before this one.

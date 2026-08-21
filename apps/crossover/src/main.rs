@@ -14,6 +14,7 @@ mod logging;
 mod paths;
 mod storage;
 mod topology_state;
+mod topology_sync;
 
 // Shared with `crossover-svc` so both binaries of one install report the same
 // identity (apps/build_identity.rs explains why it is an include, not a crate).

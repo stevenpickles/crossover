@@ -9,19 +9,28 @@
 //! *mechanism* — temp-file-and-rename, shared with `persist_layout`'s
 //! config-file write so the two do not keep independent copies of
 //! durability-critical code. This module is the *writer*: the heartbeat,
-//! the coalescing, and the two producers that keep the document current (a
-//! ~1 s poll of this machine's own displays, and the ~2 s config re-read
-//! beside `commands::apply_trust_changes`).
+//! the coalescing, and the producers that keep the document current.
 //!
-//! # Scope of this branch (feature/153)
+//! # Who writes what
 //!
-//! Only this machine's own facts are reported here: its identity, its live
-//! monitors, and the layout this run currently holds. **`peer` stays
-//! `None` for the life of this branch** — reporting the peer's last-known
-//! monitors needs the live sync/resolver work, which is the next branch's
-//! job. `commands::apply_config_changes` leaves the seam that branch
-//! connects: a `layout_changed` sender, offered every *changed* valid
-//! explicit layout, that this branch always passes as `None`.
+//! - **This machine's own half** — identity and live monitors — comes from
+//!   the ~1 s display poll here ([`watch_own_display`]).
+//! - **The peer's half** comes from [`crate::topology_sync`], which is the
+//!   only thing that knows who the peer is and what it reported: its
+//!   identity and connectedness at session establishment and loss, its
+//!   monitors from each `MonitorTopology`. The monitors are deliberately
+//!   **retained across a disconnect** with `connected: false` (ADR 0018) —
+//!   an editor that empties itself the moment the link drops is an editor
+//!   you cannot use to fix the link.
+//! - **The layout** comes from [`crate::topology_sync`] and *only* from
+//!   there — its *report* step, whatever the arrangement's origin: a
+//!   config edit picked up by the ~2 s re-read, or an adoption from the
+//!   peer. `commands::apply_config_changes` offers what it reads to the
+//!   hub and writes nothing here. That single ownership is load-bearing:
+//!   the config file is allowed to lag the run by a coalescing window, so
+//!   a config-driven writer would report an arrangement the worker is not
+//!   using — and the editor numbers its next save one past what this file
+//!   says. See `topology_sync`'s own docs for the full reasoning.
 //!
 //! # What "keep the last good" means here
 //!
@@ -41,7 +50,8 @@
 //!   good to fall back to, so it reports an empty list rather than a
 //!   truncated, falsely-complete one — both cases logged loudly.
 //! - **A config re-read that fails to parse or fails `[layout]`
-//!   validation** keeps the state file's last good layout (see
+//!   validation** offers nothing to the hub, so the run keeps the layout
+//!   it already holds and this file keeps reporting it (see
 //!   `commands::apply_config_changes`).
 
 use std::path::{Path, PathBuf};
@@ -54,8 +64,8 @@ use tokio::task::JoinHandle;
 use crossover_platform::{DisplayError, DisplayInfo};
 use crossover_topology::{
     AtomicWriteError, DeviceId, LayoutRect, LayoutState, LiveMonitor, MAX_MONITORS_PER_MACHINE,
-    MachineState, MonitorId, StateError, TOPOLOGY_STATE_VERSION, TopologyState, now_unix_millis,
-    serialize_state, write_atomic,
+    MachineState, MonitorId, PeerState, StateError, TOPOLOGY_STATE_VERSION, TopologyState,
+    now_unix_millis, serialize_state, write_atomic,
 };
 
 use crate::config::LayoutSource;
@@ -136,11 +146,100 @@ impl TopologyStateWriter {
         })
     }
 
+    /// Record who is at the other end and whether a session is up right
+    /// now (ADR 0018's `peer` half). Returns whether anything changed.
+    ///
+    /// A **different** peer clears the monitors, because the ones held
+    /// belonged to the previous machine and drawing them under a new name
+    /// would be a confident lie; the **same** peer keeps them, which is
+    /// what makes a reconnect seamless for the editor. `last_seen` moves
+    /// only while connected — it is "when the peer was last known good",
+    /// not "when this document was written" (that is `written_at`).
+    pub fn set_peer_session(&self, device: DeviceId, name: String, connected: bool) -> bool {
+        self.state.send_if_modified(|state| {
+            let monitors = match &state.peer {
+                Some(peer) if peer.device == device => peer.monitors.clone(),
+                _ => Vec::new(),
+            };
+            // Connected means "known good right now"; a disconnect keeps
+            // whatever the last good moment was, and a peer nobody has
+            // ever seen has no earlier moment to keep.
+            let last_seen = match &state.peer {
+                Some(peer) if !connected => peer.last_seen,
+                _ => now_unix_millis(),
+            };
+            let updated = PeerState {
+                device,
+                name,
+                connected,
+                last_seen,
+                monitors,
+            };
+            if state.peer.as_ref() == Some(&updated) {
+                return false;
+            }
+            state.peer = Some(updated);
+            state.written_at = now_unix_millis();
+            true
+        })
+    }
+
+    /// Mark `device` connected or not without changing anything else — the
+    /// disconnect half, which deliberately keeps the last-known monitors so
+    /// the editor stays usable while the link is down (ADR 0018).
+    ///
+    /// **Named, not implied.** A session ending is not necessarily the
+    /// session of the peer this document currently describes: a run can
+    /// hold an inbound and an outbound session at once, and a re-pair can
+    /// replace the named peer while the old session is still tearing down.
+    /// A disconnect that marked "the peer" offline without checking which
+    /// peer it was would report the wrong machine as down — so a device
+    /// this document does not name is a no-op, as is no peer at all.
+    pub fn set_peer_connected(&self, device: DeviceId, connected: bool) -> bool {
+        self.state.send_if_modified(|state| {
+            let Some(peer) = &mut state.peer else {
+                return false;
+            };
+            if peer.device != device || peer.connected == connected {
+                return false;
+            }
+            peer.connected = connected;
+            if connected {
+                peer.last_seen = now_unix_millis();
+            }
+            state.written_at = now_unix_millis();
+            true
+        })
+    }
+
+    /// Record what the peer last said it has attached (its
+    /// `MonitorTopology`). Ignored for a device that is not the peer this
+    /// document currently names, so a frame arriving as a session is being
+    /// replaced cannot attach one machine's screens to another's name.
+    /// Returns whether anything changed.
+    pub fn set_peer_monitors(&self, device: DeviceId, monitors: Vec<LiveMonitor>) -> bool {
+        self.state.send_if_modified(|state| {
+            let Some(peer) = &mut state.peer else {
+                return false;
+            };
+            if peer.device != device || peer.monitors == monitors {
+                return false;
+            }
+            peer.monitors = monitors;
+            peer.last_seen = now_unix_millis();
+            state.written_at = now_unix_millis();
+            true
+        })
+    }
+
     /// Replace the reported layout, if `layout` differs from what is
-    /// already held (ADR 0018's content-equality no-op — this is what
-    /// keeps a worker's own future adoption-writes from echoing into a
-    /// worker↔peer sync loop once the hub branch lands). Returns whether
-    /// anything changed.
+    /// already held (ADR 0018's content-equality no-op — one of the things
+    /// that keeps the worker's own adoption-writes from echoing into a
+    /// worker↔peer sync loop). Returns whether anything changed.
+    ///
+    /// Called only by [`crate::topology_sync`], which owns this field: see
+    /// that module's docs, and `commands::apply_config_changes`, for why
+    /// the config poll must **not** write it.
     pub fn set_layout(&self, layout: Option<LayoutState>) -> bool {
         self.state.send_if_modified(|state| {
             if state.layout == layout {
@@ -269,8 +368,8 @@ pub fn initial_state(
             name,
             monitors,
         },
-        // The hub branch fills this in as sessions come and go; this
-        // branch never has a peer to report.
+        // Filled in by `crate::topology_sync` as sessions come and go;
+        // a run that has not yet seen one has no peer to report.
         peer: None,
         layout: layout_state_of(layout_source),
     }
@@ -289,7 +388,7 @@ fn layout_state_of(layout_source: Option<&LayoutSource>) -> Option<LayoutState> 
 
 /// Why this machine's live monitors could not be reported this cycle.
 #[derive(Debug)]
-enum LiveMonitorsError {
+pub enum LiveMonitorsError {
     /// The platform could not enumerate monitors at all.
     Unavailable(DisplayError),
     /// More monitors than [`MAX_MONITORS_PER_MACHINE`] were enumerated.
@@ -298,7 +397,12 @@ enum LiveMonitorsError {
     TooManyMonitors { count: usize },
 }
 
-/// This machine's live monitors, in the state file's shape.
+/// This machine's live monitors, in the state file's shape — and, since
+/// ADR 0018's layout sync, in `MonitorTopology`'s too
+/// ([`crate::topology_sync`] converts one to the other field for field).
+/// One implementation, so the desk the peer is told about and the desk the
+/// editor draws cannot disagree, and so the per-machine cap is refused in
+/// exactly one place.
 ///
 /// The per-machine cap is checked against the **raw** enumerated count,
 /// before anything is built or filtered — bound before allocation, as
@@ -319,7 +423,7 @@ enum LiveMonitorsError {
 /// [`LiveMonitorsError`] — the caller decides what "nothing new to report"
 /// means for it (empty at startup, keep the last known list on an ongoing
 /// poll; see this module's header).
-fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, LiveMonitorsError> {
+pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, LiveMonitorsError> {
     let monitors = display
         .monitor_layout()
         .map_err(LiveMonitorsError::Unavailable)?;
@@ -375,9 +479,14 @@ fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, LiveMoni
     Ok(live)
 }
 
-/// Poll this machine's own displays for a change and keep `writer` current
-/// (ADR 0018) — deliberately separate from edge detection's own re-read on
-/// display change (feature/107), which this task does not touch.
+/// Poll this machine's own displays for a change, keep `writer` current and
+/// tell the layout-sync hub (ADR 0018) — deliberately separate from edge
+/// detection's own re-read on display change (feature/107), which this task
+/// does not touch.
+///
+/// The hub is pinged only on a **real** change, because that is what
+/// `set_monitors`'s content-equality gate reports: a poll that finds
+/// nothing new must not put a `MonitorTopology` on the wire once a second.
 ///
 /// A failure — transient enumeration trouble, or too many monitors to
 /// report — leaves the writer's monitor list exactly as it was: see this
@@ -390,6 +499,7 @@ fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, LiveMoni
 pub async fn watch_own_display(
     display: std::sync::Arc<dyn DisplayInfo>,
     writer: std::sync::Arc<TopologyStateWriter>,
+    topology: tokio::sync::mpsc::Sender<crate::topology_sync::TopologyEvent>,
 ) -> ! {
     let mut ticker = tokio::time::interval(DISPLAY_POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -404,6 +514,12 @@ pub async fn watch_own_display(
                 }
                 if writer.set_monitors(monitors) {
                     tracing::info!("topology state: local display configuration changed");
+                    // The peer needs to know too: its editor draws this
+                    // desk, and layout validation tells a real device
+                    // string from a fiction (ADR 0018).
+                    let _ = topology
+                        .send(crate::topology_sync::TopologyEvent::LocalDisplayChanged)
+                        .await;
                 }
             }
             Err(LiveMonitorsError::Unavailable(error)) => {
@@ -721,7 +837,15 @@ mod tests {
         let writer = Arc::new(TopologyStateWriter::start(path.clone(), state));
 
         let display_dyn: Arc<dyn DisplayInfo> = display.clone();
-        let poll = tokio::spawn(watch_own_display(display_dyn, Arc::clone(&writer)));
+        // The hub's queue is a bystander here: these tests are about the
+        // state file, and the ping the poll sends on a change is the
+        // layout-sync module's own test.
+        let (topology_tx, _topology_rx) = tokio::sync::mpsc::channel(8);
+        let poll = tokio::spawn(watch_own_display(
+            display_dyn,
+            Arc::clone(&writer),
+            topology_tx,
+        ));
 
         display.set_monitors(vec![
             MonitorRect {
@@ -773,7 +897,15 @@ mod tests {
         let writer = Arc::new(TopologyStateWriter::start(path.clone(), state));
 
         let display_dyn: Arc<dyn DisplayInfo> = display.clone();
-        let poll = tokio::spawn(watch_own_display(display_dyn, Arc::clone(&writer)));
+        // The hub's queue is a bystander here: these tests are about the
+        // state file, and the ping the poll sends on a change is the
+        // layout-sync module's own test.
+        let (topology_tx, _topology_rx) = tokio::sync::mpsc::channel(8);
+        let poll = tokio::spawn(watch_own_display(
+            display_dyn,
+            Arc::clone(&writer),
+            topology_tx,
+        ));
 
         // Let the poll observe the healthy display at least once.
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;

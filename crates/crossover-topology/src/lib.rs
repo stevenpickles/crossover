@@ -29,13 +29,12 @@
 //!   needs a JSON implementation and that the sentence describes the
 //!   default graph.)
 //!
-//! The worker and the editor enable `config`. `crossover-protocol` **will**
-//! depend on this crate — for the wire shapes of `MonitorTopology`,
-//! `LayoutSync`, and `EntryPoint`, so the model and its validation have one
-//! definition instead of a wire copy and a config copy that can drift — and
-//! will take the default graph, staying as dependency-light and socket-free
-//! as `docs/ARCHITECTURE.md` §3.1 requires. That edge is not in the tree
-//! yet: the wire messages land on a later branch.
+//! The worker and the editor enable `config`. `crossover-protocol` depends
+//! on this crate — for the wire shapes of `MonitorTopology`, `LayoutSync`,
+//! and `EntryPoint`, so the model and its validation have one definition
+//! instead of a wire copy and a config copy that can drift — and takes the
+//! default graph, staying as dependency-light and socket-free as
+//! `docs/ARCHITECTURE.md` §3.1 requires.
 //!
 //! Both feature-gated modules are also compiled for this crate's own tests,
 //! so the CI gate — which enables no extra features — exercises them
