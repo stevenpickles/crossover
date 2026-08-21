@@ -58,18 +58,30 @@ Rules:
 crossover/
     Cargo.toml                      # workspace root
     apps/
-        build_identity.rs           # shared by both build scripts: resolves the
+        build_identity.rs           # shared by every build script: resolves the
                                     #   build version/commit/channel and emits it
         build_info.rs               # shared module: the BuildInfo the binaries
                                     #   report (`crossover version`). Source
                                     #   includes, not a crate, so the service
-                                    #   binary gains no dependency edge.
+                                    #   and editor binaries gain no dependency
+                                    #   edge.
         crossover/                  # the binary: CLI, config, wiring, worker
         crossover-svc/              # the service daemon (ADR 0011): a minimal
                                     #   Windows LocalSystem launcher. Depends
                                     #   ONLY on crossover-platform-windows —
                                     #   never on core/protocol/security — so the
                                     #   privileged process links no network code.
+        crossover-layout/           # the display layout editor (ADR 0019): an
+                                    #   egui/eframe window the user opens on
+                                    #   demand. Today it depends on the GUI
+                                    #   stack alone; the canvas branch adds
+                                    #   crossover-topology, and nothing else of
+                                    #   ours ever — so the GUI graph stays out
+                                    #   of the worker, and the worker's out of
+                                    #   it.
+    assets/
+        branding/                   # icon and logo, stamped into the binaries
+        fonts/                      # the editor's embedded faces + provenance
     crates/
         crossover-protocol/         # wire messages, framing, validation
         crossover-core/             # state machines, clipboard + input engines,
@@ -92,19 +104,22 @@ crossover/
     docs/
 ```
 
-> **Phase 8 adds two members** ([ADR 0018](adr/0018-drawn-display-topology.md)).
-> `crates/crossover-topology` — the drawn-layout model, its validation, the
-> config `[layout]` types and writer, and the state-file schema — is in the
-> tree above. Still ahead of the build: a layout-editor binary under `apps/`,
-> the project's first GUI (its toolkit is the forthcoming ADR 0019).
+> **Phase 8 adds two members**, both in the tree above.
+> `crates/crossover-topology` ([ADR 0018](adr/0018-drawn-display-topology.md))
+> is the drawn-layout model, its validation, the config `[layout]` types and
+> writer, and the state-file schema. `apps/crossover-layout`
+> ([ADR 0019](adr/0019-layout-editor-toolkit.md)) is the editor binary; today
+> it depends on the GUI stack alone, and the canvas branch adds
+> `crossover-topology`.
 >
-> The crate exists so the editor shares the model and writer without linking
-> core's protocol/security/platform graph, which is why its **default**
-> dependencies are exactly `serde` and `thiserror`. The non-default `config`
-> feature adds `toml_edit` (the format-preserving `[layout]` writer) and
-> `serde_json` (the state-file schema) — the ADR's dated amendment records
-> the second. `crossover-protocol` will gain a dependency edge on the default
-> graph when the v4 wire messages land; it has none yet.
+> The crate exists so the editor shares the model and writer with the worker
+> without linking core's protocol/security/platform graph, which is why its
+> **default** dependencies are exactly `serde` and `thiserror`. The
+> non-default `config` feature adds `toml_edit` (the format-preserving
+> `[layout]` writer) and `serde_json` (the state-file schema) — the ADR's
+> dated amendment records the second. `crossover-protocol` will gain a
+> dependency edge on the default graph when the v4 wire messages land; it has
+> none yet.
 
 ### 3.1 Deliberately not separate crates (yet)
 

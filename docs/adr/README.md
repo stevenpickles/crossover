@@ -68,14 +68,17 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0017](0017-protocol-version-3.md) | Protocol v3: the file descriptor changes every offer's layout, so the version and its floor both move; no back-compatibility with v2 | Accepted |
 | [0016](0016-image-interchange-format.md) | Image interchange: the receiver names the format, the sender produces it; PNG is the baseline and receivers never decode (cross-platform) | Proposed |
 | [0018](0018-drawn-display-topology.md) | Display topology is a drawn layout in one shared coordinate space; edges derived from adjacency, protocol v4, a `crossover-topology` crate (Phase 8) | Accepted (supersedes 0009's topology) |
+| [0019](0019-layout-editor-toolkit.md) | The layout editor is an egui/eframe application in its own on-demand, user-session binary, `apps/crossover-layout` (Phase 8) | Accepted |
 
 ## Known decisions awaiting an ADR
 
-**The layout editor's UI toolkit** (Phase 8, deliverable 5). The editor is
-the project's first GUI, and the toolkit is a core-library selection — the
-first trigger above. To be recorded as **ADR 0019**.
+None outstanding. The layout editor's **UI toolkit** — the entry this section
+carried while Phase 8 was being designed — is decided in
+[0019](0019-layout-editor-toolkit.md) (Accepted): egui through eframe, in a
+separate user-session binary whose dependency graph excludes every core,
+protocol, security, and platform crate.
 
-Resolved previously: the files/folders **filesystem-write surface** sketched in
+The files/folders **filesystem-write surface** sketched in
 0014 is now designed in [0015](0015-spooled-virtual-file-paste.md) (Accepted) —
 eager verified transfer into a bounded internal spool, disposed of by pasting a
 virtual file list, superseding the drop-folder model 0014 sketched and 0015's
