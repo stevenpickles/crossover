@@ -758,11 +758,16 @@ transaction logic, control transfer) remain in Crossover code.
 
 The startup config file (`~/.crossover/config.toml`) is sectioned and versioned
 so it can evolve without breaking a hand-edited file. Every field is optional
-and every CLI flag overrides its file counterpart. (Config and logs live under
+and every CLI flag overrides its file counterpart, **with one deliberate
+exception**: an explicit `[layout]` beats `--left` / `--right`, because the
+service's saved command line (ADR 0011) would otherwise flatten a drawn
+arrangement back to a side on every launch — the flags still win over an
+*implicit* layout, where there is nothing to lose ([ADR
+0018](adr/0018-drawn-display-topology.md)). (Config and logs live under
 `~/.crossover`; secrets stay DPAPI-encrypted under `%LOCALAPPDATA%\Crossover`.)
 
 ```toml
-schema_version = 1
+schema_version = 2
 
 [device]
 name = "workstation-left"
@@ -771,26 +776,40 @@ name = "workstation-left"
 listen = "0.0.0.0:27677"          # present = accept inbound peers (default port, ADR 0004)
 connect = "192.168.1.25:27677"    # dial this peer
 
-[seamless]
-side = "right"                    # "left" | "right" — this machine's screen side
+[layout]
+revision = 3
+origin = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8"
+
+[[layout.monitor]]
+device = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8"
+id = '\\.\DISPLAY1'
+x = 0
+y = 0
+width = 1920
+height = 1080
 
 [cursor]
 mask = true                       # hide the local cursor while driving the peer
 ```
 
-Validated on load with actionable errors (unknown keys and unsupported
-`schema_version` are rejected); deterministic defaults; no private keys in
-this file (they live in `SecureStorage`).
+Validated on load with actionable errors: unknown keys and an unsupported
+`schema_version` are rejected outright, and so is a `[layout]` whose
+`schema_version` cannot predict it (absent or `1` with `[layout]` present) —
+a config-shape contradiction, the same class as an unknown key. A `[layout]`
+that is well-formed TOML but semantically invalid (overlap, a bad device, an
+empty list) is different: it degrades the run to no layout — seamless off,
+explicit control intact — with a loud warning rather than a fatal error,
+because `crossover run` is what the background service relaunches on every
+crash (ADR 0011), and a fatal config error there is an infinite relaunch loop
+that loses all sharing, not just the drawn one. `crossover config` still
+surfaces the same invalidity loudly, as the check it exists to be. Deterministic
+defaults; no private keys in this file (they live in `SecureStorage`).
 
-> **Phase 8 changes two things here** ([ADR 0018](adr/0018-drawn-display-topology.md),
-> recorded ahead of the implementation): `schema_version` moves to **2** and a
-> `[layout]` section — the drawn arrangement — replaces `[seamless] side`, with
-> a v1 file loading as an implicit layout that reproduces the old behaviour.
-> And "every CLI flag overrides its file counterpart" gains its one deliberate
-> exception: an **explicit** `[layout]` beats `--left` / `--right`, because the
-> service's saved command line (ADR 0011) would otherwise flatten a drawn
-> arrangement on every launch. The ADR carries the reasoning; the shape above
-> describes the build until that lands.
+`schema_version = 1` — a bare `[seamless] side`, with no `[layout]` — still
+loads, as an *implicit* layout reproducing the pre-ADR-0018 left–right
+behaviour exactly; so does a schema-2 file with a lingering `side` and no
+`[layout]` yet. `--left` / `--right` and `[seamless] side` are deprecated but
+functional for exactly this migration.
 
 The two-machine model needs a single peer, so the peer is named inline
 under `[network]`; a richer `[peer.<name>]` / named-`[layout]` model can be
