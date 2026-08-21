@@ -20,10 +20,11 @@ use crossover_core::supervision::{
     supervise_outbound,
 };
 use crossover_core::{
-    ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
-    FileReceive, FileSend, FrameTarget, InputControlEvent, LocalNode, Metrics, OutboundSender,
-    SeamlessInputs, SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology,
-    clipboard_sync, edge_detect, implicit_crossing_source, input_control, outbound_channel,
+    ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, CrossingMap, EdgeCrossing,
+    EdgeDetectDriver, FileReceive, FileSend, FrameTarget, InputControlEvent, LocalNode, Metrics,
+    OutboundSender, SeamlessInputs, SessionCommand, SessionListener, SessionOptions, SyncEvent,
+    clipboard_sync, edge_detect, explicit_crossing_source, implicit_crossing_source, input_control,
+    outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
@@ -553,9 +554,8 @@ pub fn layout() -> anyhow::Result<()> {
 /// commands (`c` take control, `r` release) drive explicit control
 /// transfer (Phase 3, FR-5.1); an implicit layout (deprecated
 /// `--left`/`--right`, Phase 5, ADR 0009) or an explicit one drawn with
-/// `crossover layout` (ADR 0018, once the crossing engine that consumes it
-/// lands) transfers control automatically on a linked edge. Ctrl-C or `q`
-/// stops.
+/// `crossover layout` (ADR 0018) transfers control automatically on a
+/// crossing span. Ctrl-C or `q` stops.
 /// Bring up input control — capture/inject behind the platform traits, the
 /// control-transfer engine, cursor masking (ADR 0009), and, in seamless
 /// mode, the edge detector — spawning the driver, edge wiring, and notice
@@ -583,21 +583,27 @@ fn setup_input_control(
     };
     let display = open_display()?;
 
-    // Log the display and the configured arrangement at startup (ADR 0009,
-    // ADR 0018), so a soak report shows the geometry each side used.
-    log_display_and_edge(&*display, layout_source);
+    // The arrangement — implicit or drawn — as the crossing source both the
+    // detector and cursor placement derive through, plus the mode channel
+    // that keeps the detector in step with control state. Built before
+    // `input_control` so its mode sender can ride in, and before the log so
+    // the startup line reports the crossings this machine really has rather
+    // than the configuration it was asked for (ADR 0018).
+    let seamless = build_seamless(layout_source, local, &display);
 
-    // An implicit layout: a topology and an edge detector, plus the mode
-    // channel that keeps the detector in step with control state. Built
-    // before input_control so its mode sender can ride in. An explicit
-    // layout cannot drive this yet (see `build_seamless`).
-    let (seamless, edge_wiring) = build_seamless(layout_source, local, &display);
+    // Log the display and the derived arrangement at startup (ADR 0009,
+    // ADR 0018), so a soak report shows what each side actually ran with.
+    log_display_and_edge(&*display, layout_source, seamless.as_ref().map(|s| &*s.map));
 
+    let (inputs, edge_wiring) = match seamless {
+        Some(seamless) => (Some(seamless.inputs), Some(seamless.wiring)),
+        None => (None, None),
+    };
     let (control_driver, control_events, control_commands, control_notices) = input_control(
         capture,
         injector,
         cursor_mask,
-        seamless,
+        inputs,
         ControlConfig::default(),
     );
     tokio::spawn(control_driver.run());
@@ -1299,12 +1305,15 @@ fn merge_command_lanes(a: CommandReceiver, b: CommandReceiver) -> ClassifiedComm
     ClassifiedCommands { high, background }
 }
 
-/// Build the seamless wiring for a run with an *implicit* layout (ADR
-/// 0009, expressed as a drawn arrangement per ADR 0018): the
-/// [`SeamlessInputs`] the control driver takes, and the edge detector plus
-/// its crossing stream to spawn once the control driver is up.
-/// `(None, None)` for an explicit-only run, an explicit-layout run, no
-/// layout at all, or a display that will not enumerate.
+/// Build the seamless wiring for a run that has an arrangement — implicit
+/// (ADR 0009's side, expressed as a drawn layout per ADR 0018) or explicit
+/// (a drawn `[layout]`): the [`SeamlessInputs`] the control driver takes,
+/// the derived map for the startup log, and the edge detector plus its
+/// crossing stream to spawn once the control driver is up.
+///
+/// All-`None` for an explicit-only run, no layout at all, a display that
+/// will not enumerate, or a drawn layout that does not describe this
+/// machine (below).
 ///
 /// **The implicit path derives from geometry alone**
 /// ([`implicit_crossing_source`]), so nothing about what the platform can
@@ -1314,26 +1323,76 @@ fn merge_command_lanes(a: CommandReceiver, b: CommandReceiver) -> ClassifiedComm
 /// The only way this turns seamless off is the display refusing to report
 /// its monitors at all.
 ///
-/// A [`LayoutSource::Explicit`] layout is still not driven: the control
-/// wiring that carries a drawn arrangement's entry points is a later
-/// branch, so seamless transfer stays off for it deliberately rather than
-/// flattening a drawing back to a side. `log_display_and_edge` is what
-/// tells the user why.
+/// **The explicit path matches by device string**
+/// ([`explicit_crossing_source`]) — that is the mechanism, not a cost — and
+/// one thing is checked before it is trusted at all.
+///
+/// # The stale-device rule, at this branch's stage
+///
+/// A drawn layout names two machines. A layout left behind by a **previous
+/// pairing** names two machines that are not this pair, and ADR 0018 says
+/// such a layout is rejected with a diagnostic and treated as no layout:
+/// seamless off, explicit control intact. The repair is redrawing after the
+/// new pairing, never a guess about whose rectangles were whose.
+///
+/// What is checkable *here* is the half that needs no peer: **this run's
+/// own device id must appear in the layout.** Config load already checked
+/// the layout is a well-formed arrangement of the pair its own bytes imply
+/// ([`crate::config::RunConfig::merge`]), so what is left is whether that
+/// pair is *ours* — and only one end of it is knowable before a session
+/// exists.
+///
+/// A layout naming this machine but the **wrong peer** therefore survives
+/// this check, and it is worth being exact about what that costs, because
+/// it is less than it sounds. Crossings still fire on the seams the user
+/// drew, and control still transfers to whichever peer this run is
+/// actually connected to: the session decides that, not the layout. What
+/// degrades is **placement**, and only on the far side — the entry point
+/// names a monitor belonging to a machine that is not the one receiving
+/// it, so the receiver cannot honour the id, falls back to its
+/// desktop-bounds edge, and warns once per crossing (docs/PROTOCOL.md
+/// §6.1). Noisy and wrong-looking, never a lost or divided grant. The
+/// check that catches it needs the peer's identity, so it lands with
+/// layout sync, where the full [`crossover_topology::DevicePair`] test
+/// belongs.
 type EdgeWiring = (EdgeDetectDriver, mpsc::Receiver<EdgeCrossing>);
+struct Seamless {
+    inputs: SeamlessInputs,
+    /// The arrangement as derived at startup, for the log line — the very
+    /// map the detector begins with, not a second derivation of it.
+    map: Arc<CrossingMap>,
+    wiring: EdgeWiring,
+}
+
 fn build_seamless(
     layout_source: Option<&LayoutSource>,
     local: DeviceId,
     display: &Arc<dyn DisplayInfo>,
-) -> (Option<SeamlessInputs>, Option<EdgeWiring>) {
-    let Some(LayoutSource::Implicit(side)) = layout_source else {
-        return (None, None);
+) -> Option<Seamless> {
+    let source = match layout_source? {
+        LayoutSource::Implicit(side) => implicit_crossing_source(*side, local),
+        LayoutSource::Explicit(layout) => {
+            if layout.monitors_for(local).next().is_none() {
+                tracing::warn!(
+                    revision = layout.revision(),
+                    origin = %layout.origin(),
+                    "seamless: the drawn layout places no screen for this machine — it belongs to \
+                     a different pairing; edge transfer is off"
+                );
+                println!(
+                    "Seamless edge transfer off: the drawn layout describes other machines. \
+                     Redraw it with `crossover layout` after pairing. Explicit control (`c` / \
+                     `r`) still works."
+                );
+                return None;
+            }
+            explicit_crossing_source(layout.clone(), local)
+        }
     };
-    let side = *side;
     // One derivation at startup, through the same source the detector
     // re-derives with — so there is a single derivation path rather than a
     // startup copy that could drift from it — and its result *is* the
-    // detector's initial map.
-    let source = implicit_crossing_source(side, local);
+    // detector's initial map and the startup log's subject.
     let live = match source.read(&**display) {
         Ok(live) => live,
         Err(error) => {
@@ -1345,19 +1404,25 @@ fn build_seamless(
                 "Seamless edge transfer off: the display could not be enumerated. Explicit \
                  control (`c` / `r`) still works."
             );
-            return (None, None);
+            return None;
         }
     };
     let map = Arc::new(source.derive(&live));
-    let topology = Topology::new(side);
-    let (edge_driver, edge_mode, crossings_rx) =
-        edge_detect(Arc::clone(display), map, source, EDGE_POLL_INTERVAL);
-    let seamless = SeamlessInputs {
-        topology,
-        display: Arc::clone(display),
-        edge_mode,
-    };
-    (Some(seamless), Some((edge_driver, crossings_rx)))
+    let (edge_driver, edge_mode, crossings_rx) = edge_detect(
+        Arc::clone(display),
+        Arc::clone(&map),
+        source.clone(),
+        EDGE_POLL_INTERVAL,
+    );
+    Some(Seamless {
+        inputs: SeamlessInputs {
+            crossings: source,
+            display: Arc::clone(display),
+            edge_mode,
+        },
+        map,
+        wiring: (edge_driver, crossings_rx),
+    })
 }
 
 /// Run the edge detector and forward its crossings into the control driver
@@ -1372,16 +1437,17 @@ fn spawn_edge_wiring(
         while let Some(crossing) = crossings.recv().await {
             // The generation rides along so the control driver can drop a
             // crossing whose control state has since changed (ADR 0009).
-            // Only the fraction is threaded through today; the destination
-            // the crossing also carries (`DetectedCrossing::target`) is what
-            // the next branch turns into a wire `EntryPoint` (ADR 0018).
+            // The crossing itself travels whole — destination, position and
+            // the revision it was derived under — because it is already
+            // everything a wire `EntryPoint` needs (ADR 0018); nothing on
+            // the way in re-derives or re-addresses it.
             let event = match crossing.kind {
                 CrossingKind::Leave => InputControlEvent::EdgeLeave {
-                    position: crossing.crossing.position,
+                    crossing: crossing.crossing,
                     generation: crossing.generation,
                 },
                 CrossingKind::Return => InputControlEvent::EdgeReturn {
-                    position: crossing.crossing.position,
+                    crossing: crossing.crossing,
                     generation: crossing.generation,
                 },
             };
@@ -1392,29 +1458,25 @@ fn spawn_edge_wiring(
     });
 }
 
-/// Logged when an explicit drawn layout is configured but this build's
-/// crossing engine cannot yet drive it (ADR 0018): `build_seamless` only
-/// knows how to drive the side-model [`Topology`] from a `LinkSide`, and
-/// the layout engine that replaces it (the `CrossingMap` work) is a later
-/// branch. Reachable only from a hand-written config today — the editor
-/// cannot save a `[layout]` yet (feature/152). Lowercase: a tracing message,
-/// house style.
-const EXPLICIT_LAYOUT_NOT_YET_DRIVEN_LOG: &str = "an explicit drawn layout is configured; this \
-     build's crossing engine predates it — seamless activates when the layout engine lands";
-
-/// The same fact as [`EXPLICIT_LAYOUT_NOT_YET_DRIVEN_LOG`], worded as a
-/// printed sentence rather than derived from it at runtime — independently
-/// capitalized and punctuated, the house convention for a log/console pair
-/// (see `main.rs`'s `render_config_notice` for the same convention applied
-/// to `ConfigNotice`).
-const EXPLICIT_LAYOUT_NOT_YET_DRIVEN_CONSOLE: &str = "An explicit drawn layout is configured; \
-     this build's crossing engine predates it — seamless activates when the layout engine \
-     lands.";
-
-/// Log the primary display's geometry and the configured arrangement at
-/// startup (ADR 0009, ADR 0018) — both structured (FR-7.3) and as a human
-/// line, so a soak report records the geometry each machine ran with.
-fn log_display_and_edge(display: &dyn DisplayInfo, layout_source: Option<&LayoutSource>) {
+/// Log the primary display's geometry and the crossings the configured
+/// arrangement actually produces, at startup (ADR 0009, ADR 0018) — both
+/// structured (FR-7.3) and as a human line, so a soak report records what
+/// each machine ran with.
+///
+/// `map` is the arrangement **as derived against this machine's real
+/// screens**, or `None` when there is no arrangement or it could not be
+/// derived. That distinction is the point of logging the derived spans
+/// rather than the configuration: a `--left` run and a drawn layout used to
+/// print a side or a revision, neither of which says whether any seam
+/// exists. A layout naming a screen this machine no longer has produces no
+/// spans, and the difference between "seamless is configured" and "seamless
+/// can currently cross" is exactly what a report of a transfer that did not
+/// happen needs to settle.
+fn log_display_and_edge(
+    display: &dyn DisplayInfo,
+    layout_source: Option<&LayoutSource>,
+    map: Option<&CrossingMap>,
+) {
     let screen = match display.desktop_bounds() {
         Ok(screen) => screen,
         Err(error) => {
@@ -1423,48 +1485,67 @@ fn log_display_and_edge(display: &dyn DisplayInfo, layout_source: Option<&Layout
             return;
         }
     };
-    match layout_source {
-        Some(LayoutSource::Implicit(side)) => {
-            let edge = Topology::new(*side).linked_edge();
-            tracing::info!(
-                width = screen.width,
-                height = screen.height,
-                ?side,
-                linked_edge = ?edge,
-                "virtual desktop and seamless edge"
-            );
-            println!(
-                "Desktop: {}x{} (all monitors). Seamless: {side:?} screen, crossing on its \
-                 {edge:?} edge.",
-                screen.width, screen.height,
-            );
-        }
-        Some(LayoutSource::Explicit(layout)) => {
-            tracing::info!(
-                width = screen.width,
-                height = screen.height,
-                revision = layout.revision(),
-                origin = %layout.origin(),
-                monitors = layout.monitors().len(),
-                "{EXPLICIT_LAYOUT_NOT_YET_DRIVEN_LOG}"
-            );
-            println!(
-                "Desktop: {}x{} (all monitors). {EXPLICIT_LAYOUT_NOT_YET_DRIVEN_CONSOLE}",
-                screen.width, screen.height,
-            );
-        }
-        None => {
-            tracing::info!(
-                width = screen.width,
-                height = screen.height,
-                "virtual desktop; seamless transfer disabled"
-            );
+    let Some(map) = map else {
+        // The console gets the same two-way split the log does, for a
+        // sharper reason than tidiness: when an arrangement *was*
+        // configured, `build_seamless` has already printed the specific
+        // reason it could not be applied — a display that would not
+        // enumerate, a layout belonging to another pairing. Following that
+        // with "draw an arrangement with `crossover layout`" tells a user
+        // who has one that they have none, contradicting the line directly
+        // above it. So the generic guidance prints only when there is
+        // genuinely nothing configured; otherwise the specific reason
+        // already on screen stands alone.
+        let reason = match layout_source {
+            None => "no arrangement is configured",
+            Some(_) => "the configured arrangement could not be applied",
+        };
+        tracing::info!(
+            width = screen.width,
+            height = screen.height,
+            arrangement = layout_source.map_or("none".to_owned(), LayoutSource::summary),
+            "virtual desktop; seamless transfer disabled: {reason}"
+        );
+        if layout_source.is_none() {
             println!(
                 "Desktop: {}x{} (all monitors). Seamless edge transfer off — draw an \
                  arrangement with `crossover layout`, or pass the deprecated --left/--right.",
                 screen.width, screen.height,
             );
+        } else {
+            println!(
+                "Desktop: {}x{} (all monitors). Seamless edge transfer off — see the reason \
+                 above.",
+                screen.width, screen.height,
+            );
         }
+        return;
+    };
+    let spans = map.describe_spans();
+    tracing::info!(
+        width = screen.width,
+        height = screen.height,
+        arrangement = layout_source.map_or("none".to_owned(), LayoutSource::summary),
+        revision = map.revision(),
+        crossings = spans,
+        span_count = map.span_count(),
+        "virtual desktop and the crossings this arrangement gives it"
+    );
+    if map.is_inert() {
+        println!(
+            "Desktop: {}x{} (all monitors). Seamless: {} is configured but no screen here \
+             crosses anywhere — {spans}.",
+            screen.width,
+            screen.height,
+            layout_source.map_or("an arrangement".to_owned(), LayoutSource::summary),
+        );
+    } else {
+        println!(
+            "Desktop: {}x{} (all monitors). Seamless: {} crossing span(s) — {spans}.",
+            screen.width,
+            screen.height,
+            map.span_count(),
+        );
     }
 }
 
@@ -2528,22 +2609,168 @@ mod tests {
         ];
         for layout in layouts {
             display.set_monitor_layout(layout.clone());
-            let (seamless, wiring) = build_seamless(Some(&implicit), LOCAL, &handle);
+            let seamless = build_seamless(Some(&implicit), LOCAL, &handle)
+                .unwrap_or_else(|| panic!("identity decided whether seamless ran, for {layout:?}"));
             assert!(
-                seamless.is_some() && wiring.is_some(),
-                "identity decided whether seamless ran, for {layout:?}"
+                !seamless.map.is_inert(),
+                "the side model found no crossing at all, for {layout:?}"
             );
+            // Whatever the platform named, an implicit arrangement reports
+            // nothing: no device, no monitor, revision 0.
+            assert_eq!(seamless.map.revision(), 0);
+            for span in seamless.map.spans() {
+                assert_eq!(span.target().device, None);
+                assert_eq!(span.target().monitor, None);
+            }
         }
 
         // A display that will not enumerate at all is the one refusal.
         display.fail_with("no display");
-        let (seamless, wiring) = build_seamless(Some(&implicit), LOCAL, &handle);
-        assert!(seamless.is_none() && wiring.is_none());
+        assert!(build_seamless(Some(&implicit), LOCAL, &handle).is_none());
 
         // And no layout at all stays off, as it always did.
         display.clear_failure();
-        let (seamless, wiring) = build_seamless(None, LOCAL, &handle);
-        assert!(seamless.is_none() && wiring.is_none());
+        assert!(build_seamless(None, LOCAL, &handle).is_none());
+    }
+
+    /// A **drawn** layout drives crossings, which is what this branch
+    /// turned on: `build_seamless` builds an identified source from it, the
+    /// derived map names the peer's real screens, and it carries the
+    /// layout's own revision onto every crossing.
+    ///
+    /// The test that used to stand here asserted the opposite — that an
+    /// explicit layout was *not* driven and printed a "not yet" line. Its
+    /// intent (an explicit layout must not be silently flattened back to a
+    /// side) is preserved by asserting what the spans actually say.
+    #[test]
+    fn a_drawn_layout_drives_crossings() {
+        use crossover_platform::fakes::FakeDisplay;
+        use crossover_platform::{DisplayInfo, MonitorInfo, MonitorRect, Screen};
+        use crossover_topology::{
+            DeviceId, DevicePair, Layout, LayoutRect, MonitorId, PlacedMonitor,
+        };
+
+        use super::{LayoutSource, build_seamless};
+
+        const LOCAL: DeviceId = DeviceId::from_bytes([0x11; 16]);
+        const PEER: DeviceId = DeviceId::from_bytes([0x22; 16]);
+        const REVISION: u64 = 9;
+
+        let placed = |device: DeviceId, id: &str, x: i32| PlacedMonitor {
+            device,
+            id: MonitorId::new(id).unwrap(),
+            rect: LayoutRect {
+                x,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        };
+        let pair = DevicePair::new(LOCAL, PEER).unwrap();
+        let layout = Layout::new(
+            REVISION,
+            LOCAL,
+            vec![placed(LOCAL, "MINE", 0), placed(PEER, "THEIRS", 1920)],
+            &pair,
+        )
+        .unwrap();
+
+        let display = Arc::new(FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        }));
+        display.set_monitor_layout(vec![MonitorInfo {
+            id: Some("MINE".to_owned()),
+            rect: MonitorRect {
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+        }]);
+        let handle = Arc::clone(&display) as Arc<dyn DisplayInfo>;
+
+        let source = LayoutSource::Explicit(layout.clone());
+        let seamless =
+            build_seamless(Some(&source), LOCAL, &handle).expect("a drawn layout must drive");
+        assert_eq!(seamless.map.revision(), REVISION);
+        assert_eq!(seamless.map.span_count(), 1);
+        let span = &seamless.map.spans()[0];
+        assert_eq!(span.target().device, Some(PEER));
+        assert_eq!(
+            span.target().monitor.as_ref().map(MonitorId::as_str),
+            Some("THEIRS")
+        );
+        // Receiver's terms: the span sits on this machine's `Right` edge
+        // and the cursor arrives on the peer's `Left`.
+        assert_eq!(span.edge(), crossover_core::Edge::Right);
+        assert_eq!(span.target().edge, crossover_core::Edge::Left);
+
+        // A screen this machine no longer has is not a refusal: the
+        // arrangement stands, it simply gives no crossings, and the log
+        // line says so rather than the run failing.
+        display.set_monitor_layout(vec![MonitorInfo {
+            id: Some("SOMETHING-ELSE".to_owned()),
+            rect: MonitorRect {
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+        }]);
+        let seamless =
+            build_seamless(Some(&source), LOCAL, &handle).expect("still a configured arrangement");
+        assert!(seamless.map.is_inert());
+    }
+
+    /// The stale-device rule at this branch's stage (ADR 0018): a drawn
+    /// layout that places no screen for *this* machine is the residue of a
+    /// previous pairing, so seamless stays off rather than crossing by an
+    /// arrangement that describes other desks. The full pair check needs
+    /// the peer's identity and lands with layout sync.
+    #[test]
+    fn a_layout_naming_other_machines_turns_seamless_off() {
+        use crossover_platform::fakes::FakeDisplay;
+        use crossover_platform::{DisplayInfo, Screen};
+        use crossover_topology::{
+            DeviceId, DevicePair, Layout, LayoutRect, MonitorId, PlacedMonitor,
+        };
+
+        use super::{LayoutSource, build_seamless};
+
+        const LOCAL: DeviceId = DeviceId::from_bytes([0x11; 16]);
+        const STRANGER_A: DeviceId = DeviceId::from_bytes([0x33; 16]);
+        const STRANGER_B: DeviceId = DeviceId::from_bytes([0x44; 16]);
+
+        let placed = |device: DeviceId, id: &str, x: i32| PlacedMonitor {
+            device,
+            id: MonitorId::new(id).unwrap(),
+            rect: LayoutRect {
+                x,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        };
+        // A perfectly valid layout — of two machines that are not this one.
+        let pair = DevicePair::new(STRANGER_A, STRANGER_B).unwrap();
+        let layout = Layout::new(
+            3,
+            STRANGER_A,
+            vec![placed(STRANGER_A, "A", 0), placed(STRANGER_B, "B", 1920)],
+            &pair,
+        )
+        .unwrap();
+
+        let display = Arc::new(FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        }));
+        let handle = Arc::clone(&display) as Arc<dyn DisplayInfo>;
+        assert!(
+            build_seamless(Some(&LayoutSource::Explicit(layout)), LOCAL, &handle).is_none(),
+            "a layout from a previous pairing must not drive crossings"
+        );
     }
 
     #[test]
