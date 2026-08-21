@@ -53,7 +53,7 @@ use crate::control::{
 use crate::edge_driver::{EdgeMode, EdgeModeUpdate};
 use crate::input::InputEvent;
 use crate::outbound::{CommandReceiver, CommandSender, command_lanes};
-use crate::topology::{EdgeFraction, MonitorRect, Topology};
+use crate::topology::{Edge, EdgeFraction, MonitorRect, Topology};
 
 /// How often, while controlling, the driver polls the platform for a
 /// lost capture (R-2) and for the release escape gesture (ADR 0008). One
@@ -425,22 +425,19 @@ impl InputControlDriver {
                     position,
                     generation,
                 } => {
-                    if !self.edge_crossing_is_current(generation, "leave") {
+                    let Some(event) = self.edge_leave_event(position, generation) else {
                         continue;
-                    }
-                    // Same session choice as a console take-control, plus
-                    // where the cursor crossed (ADR 0009).
-                    let session = self.sessions.last().copied().unwrap_or_else(Uuid::nil);
-                    ControlEvent::EdgeLeave { session, position }
+                    };
+                    event
                 }
                 InputControlEvent::EdgeReturn {
                     position,
                     generation,
                 } => {
-                    if !self.edge_crossing_is_current(generation, "return") {
+                    let Some(event) = self.edge_return_event(position, generation) else {
                         continue;
-                    }
-                    ControlEvent::EdgeReturn { position }
+                    };
+                    event
                 }
                 InputControlEvent::RequestTimeout {
                     session,
@@ -607,6 +604,46 @@ impl InputControlDriver {
             mode,
             generation: self.edge_mode_generation,
         });
+    }
+
+    /// This machine's own linked edge (ADR 0009), for stamping an
+    /// edge-driven crossing's wire `EntryPoint.edge` (v4, ADR 0018,
+    /// feature/147) — see [`ControlEvent::EdgeLeave`]'s doc for why the
+    /// sender's own edge is what travels rather than the peer's.
+    /// `Edge::Left` without a configured topology, which an edge crossing
+    /// cannot occur without in practice; defensive only.
+    fn linked_edge(&self) -> Edge {
+        self.seamless
+            .as_ref()
+            .map_or(Edge::Left, |seamless| seamless.topology.linked_edge())
+    }
+
+    /// The engine event for a leave crossing, or `None` for a stale one
+    /// (`process`'s translation for [`InputControlEvent::EdgeLeave`]).
+    fn edge_leave_event(&self, position: EdgeFraction, generation: u64) -> Option<ControlEvent> {
+        if !self.edge_crossing_is_current(generation, "leave") {
+            return None;
+        }
+        // Same session choice as a console take-control, plus where the
+        // cursor crossed (ADR 0009).
+        let session = self.sessions.last().copied().unwrap_or_else(Uuid::nil);
+        Some(ControlEvent::EdgeLeave {
+            session,
+            position,
+            edge: self.linked_edge(),
+        })
+    }
+
+    /// The engine event for a return crossing, or `None` for a stale one
+    /// (`process`'s translation for [`InputControlEvent::EdgeReturn`]).
+    fn edge_return_event(&self, position: EdgeFraction, generation: u64) -> Option<ControlEvent> {
+        if !self.edge_crossing_is_current(generation, "return") {
+            return None;
+        }
+        Some(ControlEvent::EdgeReturn {
+            position,
+            edge: self.linked_edge(),
+        })
     }
 
     /// Whether a crossing detected under `generation` still describes the
@@ -983,8 +1020,9 @@ mod tests {
     use crossover_platform::{CursorMask, DisplayInfo, InputCapture, InputInjector, Screen};
     use crossover_protocol::hello::MessageType;
     use crossover_protocol::{
-        ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, InputBatch,
-        RawFrame, ReleaseAllInput, WireButton, WireInputEvent,
+        ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, EntryPoint,
+        InputBatch, RawFrame, ReleaseAllInput, WireButton, WireInputEvent,
+        control::Edge as WireEdge,
     };
 
     use super::{InputControlEvent, input_control};
@@ -993,6 +1031,17 @@ mod tests {
     use crate::edge_driver::{CrossingKind, EdgeMode, EdgeModeUpdate, REARM_MARGIN};
     use crate::input::{InputEvent, KeyEvent, PointerButton, PointerEvent, hid};
     use crate::topology::{CursorPoint, EdgeFraction, LinkSide, MonitorRect, Topology};
+
+    /// A wire [`EntryPoint`] for a test that only needs a round-trippable,
+    /// decodable position — via [`EntryPoint::unaddressed`], the
+    /// "unaddressed" reading (feature/147, ADR 0018). `edge` is `Left`:
+    /// the rig is a left-member topology, whose linked edge is `Right`
+    /// (ADR 0009), so the receiver's-terms wire edge is its mirror
+    /// (docs/PROTOCOL.md §6.1) — though placement in these tests is
+    /// driven by `fraction` alone, never by `edge`.
+    fn entry_point(fraction: EdgeFraction) -> EntryPoint {
+        EntryPoint::unaddressed(WireEdge::Left, fraction.to_wire())
+    }
 
     const HD: Screen = Screen {
         width: 1920,
@@ -1315,7 +1364,7 @@ mod tests {
 
         // The peer hands control back across the edge, carrying where it left.
         let release = ControlRelease {
-            entry: Some(EdgeFraction::new(0.5).to_wire()),
+            entry: Some(entry_point(EdgeFraction::new(0.5))),
         };
         rig.events
             .send(frame(
@@ -1389,7 +1438,7 @@ mod tests {
         // so the cursor stays visible.
         let take = ControlRequest {
             request_id: 1,
-            entry: Some(EdgeFraction::new(0.5).to_wire()),
+            entry: Some(entry_point(EdgeFraction::new(0.5))),
         };
         rig.events
             .send(frame(
@@ -1422,7 +1471,7 @@ mod tests {
         // The user comes back — a fresh grant — so the cursor shows again.
         let re_enter = ControlRequest {
             request_id: 2,
-            entry: Some(EdgeFraction::new(0.5).to_wire()),
+            entry: Some(entry_point(EdgeFraction::new(0.5))),
         };
         rig.events
             .send(frame(
@@ -1451,7 +1500,7 @@ mod tests {
         // Be controlled, then return → hidden, and no longer controlled.
         let take = ControlRequest {
             request_id: 1,
-            entry: Some(EdgeFraction::new(0.5).to_wire()),
+            entry: Some(entry_point(EdgeFraction::new(0.5))),
         };
         rig.events
             .send(frame(
@@ -2147,7 +2196,7 @@ mod tests {
         let position = EdgeFraction::new(0.5);
         let request = ControlRequest {
             request_id: 1,
-            entry: Some(position.to_wire()),
+            entry: Some(entry_point(position)),
         };
         rig.events
             .send(frame(
@@ -2190,7 +2239,7 @@ mod tests {
                 MessageType::ControlRequest,
                 ControlRequest {
                     request_id: 1,
-                    entry: Some(EdgeFraction::new(0.5).to_wire()),
+                    entry: Some(entry_point(EdgeFraction::new(0.5))),
                 }
                 .encode_payload()
                 .unwrap(),
@@ -2281,7 +2330,7 @@ mod tests {
                 MessageType::ControlRequest,
                 ControlRequest {
                     request_id: 2,
-                    entry: Some(EdgeFraction::new(0.5).to_wire()),
+                    entry: Some(entry_point(EdgeFraction::new(0.5))),
                 }
                 .encode_payload()
                 .unwrap(),

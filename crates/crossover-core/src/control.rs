@@ -39,13 +39,13 @@ use std::time::Duration;
 use crossover_protocol::hello::MessageType;
 use crossover_protocol::input::MAX_INPUT_BATCH_EVENTS;
 use crossover_protocol::{
-    ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, InputBatch,
-    ProtocolError, ReleaseAllInput, WireButton, WireInputEvent,
+    ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, EntryPoint,
+    InputBatch, ProtocolError, ReleaseAllInput, WireButton, WireInputEvent,
 };
 use uuid::Uuid;
 
 use crate::input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce_input};
-use crate::topology::EdgeFraction;
+use crate::topology::{Edge, EdgeFraction};
 
 /// Tuning for the negotiation.
 #[derive(Debug, Clone)]
@@ -121,6 +121,10 @@ pub enum ControlEvent {
         session: Uuid,
         /// Where the cursor crossed, as a fraction of the edge.
         position: EdgeFraction,
+        /// This machine's own crossing edge (ADR 0009). `wire_entry_point`
+        /// mirrors it to the receiver's terms before it reaches the wire
+        /// — see its doc.
+        edge: Edge,
     },
     /// The cursor returned to the linked edge while a peer controls this
     /// machine: reclaim control, carrying where the cursor left so the
@@ -129,6 +133,9 @@ pub enum ControlEvent {
     EdgeReturn {
         /// Where the cursor crossed, as a fraction of the edge.
         position: EdgeFraction,
+        /// This machine's own crossing edge — see [`Self::EdgeLeave`]'s
+        /// `edge` field doc.
+        edge: Edge,
     },
     /// A session reached `ESTABLISHED`.
     SessionEstablished {
@@ -182,9 +189,13 @@ pub enum InboundControl {
     Request(ControlRequest),
     /// Peer answered our request.
     Response(ControlResponse),
-    /// Peer ended the control relationship, carrying an edge-return
-    /// position when the reclaim came from a crossing (ADR 0009).
-    Release(Option<u16>),
+    /// Peer ended the control relationship, carrying an [`EntryPoint`]
+    /// (v4, ADR 0018) when the reclaim came from a crossing (ADR 0009).
+    /// Mirrors [`Self::Request`]'s shape — the full wire type travels
+    /// through undecomposed; `on_peer_release` extracts `.fraction` at
+    /// the point it's used (see `wire_entry_point`'s doc for why only the
+    /// fraction is consulted today).
+    Release(Option<EntryPoint>),
     /// Input to replay here.
     Batch(InputBatch),
     /// Release everything this machine believes it has applied.
@@ -229,10 +240,11 @@ pub enum OutboundControl {
     Request(ControlRequest),
     /// Answer a request.
     Response(ControlResponse),
-    /// End the relationship, carrying an edge-return position when the
-    /// reclaim came from a crossing (ADR 0009); `None` for an explicit
-    /// hand-back or console revoke.
-    Release(Option<u16>),
+    /// End the relationship. `wire_entry_point` is the one place the
+    /// engine builds the `EntryPoint` a crossing carries; every other
+    /// path sends a bare `ControlRelease { entry: None }` (console
+    /// hand-back, cancel, capture loss, or undoing a stray grant).
+    Release(ControlRelease),
     /// A batch of captured input.
     Batch(InputBatch),
     /// Tell the peer to release everything it applied for us.
@@ -250,10 +262,7 @@ impl OutboundControl {
         match self {
             Self::Request(m) => Ok((MessageType::ControlRequest.wire(), m.encode_payload()?)),
             Self::Response(m) => Ok((MessageType::ControlResponse.wire(), m.encode_payload()?)),
-            Self::Release(entry) => Ok((
-                MessageType::ControlRelease.wire(),
-                ControlRelease { entry: *entry }.encode_payload()?,
-            )),
+            Self::Release(m) => Ok((MessageType::ControlRelease.wire(), m.encode_payload()?)),
             Self::Batch(m) => Ok((MessageType::InputBatch.wire(), m.encode_payload()?)),
             Self::ReleaseAll(m) => Ok((MessageType::ReleaseAllInput.wire(), m.encode_payload()?)),
         }
@@ -427,11 +436,13 @@ impl ControlEngine {
     pub fn handle(&mut self, event: ControlEvent) -> Vec<ControlAction> {
         match event {
             ControlEvent::UserRequestControl { session } => self.on_request(session, None),
-            ControlEvent::EdgeLeave { session, position } => {
-                self.on_request(session, Some(position))
-            }
+            ControlEvent::EdgeLeave {
+                session,
+                position,
+                edge,
+            } => self.on_request(session, Some((position, edge))),
             ControlEvent::UserRelease => self.on_release(None),
-            ControlEvent::EdgeReturn { position } => self.on_release(Some(position)),
+            ControlEvent::EdgeReturn { position, edge } => self.on_release(Some((position, edge))),
             ControlEvent::SessionEstablished { session } => {
                 self.established.insert(session);
                 Vec::new()
@@ -451,8 +462,13 @@ impl ControlEngine {
 
     /// Request control of `session`, whether triggered by the console
     /// (`entry` is `None`) or by an edge crossing (`entry` carries where
-    /// the cursor left, for the peer to place its cursor).
-    fn on_request(&mut self, session: Uuid, entry: Option<EdgeFraction>) -> Vec<ControlAction> {
+    /// the cursor left and this machine's own linked edge, for the peer
+    /// to place its cursor).
+    fn on_request(
+        &mut self,
+        session: Uuid,
+        entry: Option<(EdgeFraction, Edge)>,
+    ) -> Vec<ControlAction> {
         let blocked = if !self.established.contains(&session) {
             Some(RequestBlocked::NoSession)
         } else if self.controlled.is_some() {
@@ -479,7 +495,7 @@ impl ControlEngine {
                 session,
                 message: OutboundControl::Request(ControlRequest {
                     request_id,
-                    entry: entry.map(EdgeFraction::to_wire),
+                    entry: entry.map(|(fraction, edge)| wire_entry_point(fraction, edge)),
                 }),
             },
             ControlAction::ScheduleRequestTimeout {
@@ -493,9 +509,10 @@ impl ControlEngine {
 
     /// End whichever control relationship exists. `entry` is `Some` only
     /// for an edge-return revoke, carrying where the reclaiming cursor
-    /// left so the controller places its own cursor (ADR 0009); the
-    /// console paths (hand-back, cancel, plain revoke) pass `None`.
-    fn on_release(&mut self, entry: Option<EdgeFraction>) -> Vec<ControlAction> {
+    /// left and this machine's own linked edge, so the controller places
+    /// its own cursor (ADR 0009); the console paths (hand-back, cancel,
+    /// plain revoke) pass `None`.
+    fn on_release(&mut self, entry: Option<(EdgeFraction, Edge)>) -> Vec<ControlAction> {
         // Ending outbound control takes precedence over revoking inbound:
         // the outbound relationship is the one the user just initiated,
         // and the two axes end independently across successive presses.
@@ -517,7 +534,7 @@ impl ControlEngine {
                     },
                     ControlAction::Send {
                         session,
-                        message: OutboundControl::Release(None),
+                        message: OutboundControl::Release(ControlRelease { entry: None }),
                     },
                     ControlAction::Notify(ControlNotice::ControlEnded(
                         ControlEndReason::HandedBack,
@@ -551,7 +568,9 @@ impl ControlEngine {
                     }
                     actions.push(ControlAction::Send {
                         session: controlled.session,
-                        message: OutboundControl::Release(entry.map(EdgeFraction::to_wire)),
+                        message: OutboundControl::Release(ControlRelease {
+                            entry: entry.map(|(fraction, edge)| wire_entry_point(fraction, edge)),
+                        }),
                     });
                     actions.push(ControlAction::Notify(ControlNotice::PeerControlRevoked));
                     actions
@@ -601,7 +620,7 @@ impl ControlEngine {
         }
         actions.push(ControlAction::Send {
             session: controlled.session,
-            message: OutboundControl::Release(None),
+            message: OutboundControl::Release(ControlRelease { entry: None }),
         });
         actions.push(ControlAction::Notify(notice));
         actions
@@ -700,7 +719,7 @@ impl ControlEngine {
             },
             ControlAction::Send {
                 session,
-                message: OutboundControl::Release(None),
+                message: OutboundControl::Release(ControlRelease { entry: None }),
             },
             ControlAction::Notify(ControlNotice::ControlEnded(ControlEndReason::CaptureLost)),
         ]
@@ -728,7 +747,7 @@ impl ControlEngine {
             vec![
                 ControlAction::Send {
                     session,
-                    message: OutboundControl::Release(None),
+                    message: OutboundControl::Release(ControlRelease { entry: None }),
                 },
                 ControlAction::Notify(ControlNotice::RequestTimedOut),
             ]
@@ -739,15 +758,15 @@ impl ControlEngine {
 
     fn on_peer(&mut self, session: Uuid, message: InboundControl) -> Vec<ControlAction> {
         match message {
-            InboundControl::Request(request) => self.on_peer_request(session, request),
+            InboundControl::Request(request) => self.on_peer_request(session, &request),
             InboundControl::Response(response) => self.on_peer_response(session, response),
-            InboundControl::Release(entry) => self.on_peer_release(session, entry),
+            InboundControl::Release(entry) => self.on_peer_release(session, entry.as_ref()),
             InboundControl::Batch(batch) => self.on_peer_batch(session, &batch),
             InboundControl::ReleaseAll(_) => self.on_peer_release_all(session),
         }
     }
 
-    fn on_peer_request(&mut self, session: Uuid, request: ControlRequest) -> Vec<ControlAction> {
+    fn on_peer_request(&mut self, session: Uuid, request: &ControlRequest) -> Vec<ControlAction> {
         // A request means this peer knows the prior grant ended and is
         // re-negotiating, so the drop-in-flight grace no longer applies to
         // it — any input after this must again come via a fresh grant.
@@ -803,7 +822,7 @@ impl ControlEngine {
     /// the mode changes a first grant produces; without that, the refresh's
     /// own placement fires a return and revokes the grant just re-issued
     /// (ADR 0009 addendum, 2026-08-19).
-    fn refresh_grant(&mut self, session: Uuid, request: ControlRequest) -> Vec<ControlAction> {
+    fn refresh_grant(&mut self, session: Uuid, request: &ControlRequest) -> Vec<ControlAction> {
         let mut previous = self
             .controlled
             .take()
@@ -822,7 +841,7 @@ impl ControlEngine {
     /// sequence on every grant it is given (`on_peer_response`); a stale
     /// high-water mark would read the new grant's first batch as a
     /// regression and terminate an honest session.
-    fn grant(&mut self, session: Uuid, request: ControlRequest) -> Vec<ControlAction> {
+    fn grant(&mut self, session: Uuid, request: &ControlRequest) -> Vec<ControlAction> {
         self.controlled = Some(Controlled {
             session,
             applied_sequence: 0,
@@ -838,9 +857,13 @@ impl ControlEngine {
         // An edge-driven request carries where the peer's cursor left;
         // place ours at the matching height on the entry edge so the
         // pointer appears to cross seamlessly (ADR 0009). A console
-        // request carries none.
-        if let Some(raw) = request.entry {
-            actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(raw)));
+        // request carries none. Only the fraction is consulted today —
+        // see `wire_entry_point`'s doc for what the monitor and edge are
+        // for.
+        if let Some(entry) = &request.entry {
+            actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(
+                entry.fraction,
+            )));
         }
         actions.push(ControlAction::Notify(ControlNotice::PeerTookControl));
         actions
@@ -854,7 +877,7 @@ impl ControlEngine {
             if verdict == ControlVerdict::Granted {
                 vec![ControlAction::Send {
                     session,
-                    message: OutboundControl::Release(None),
+                    message: OutboundControl::Release(ControlRelease { entry: None }),
                 }]
             } else {
                 Vec::new()
@@ -906,7 +929,7 @@ impl ControlEngine {
         }
     }
 
-    fn on_peer_release(&mut self, session: Uuid, entry: Option<u16>) -> Vec<ControlAction> {
+    fn on_peer_release(&mut self, session: Uuid, entry: Option<&EntryPoint>) -> Vec<ControlAction> {
         // Is `session` the peer controlling us handing back?
         if self
             .controlled
@@ -935,8 +958,13 @@ impl ControlEngine {
             self.outbound = Outbound::Local;
             self.sent_state = InputState::new();
             let mut actions = vec![ControlAction::StopCapture];
-            if let Some(raw) = entry {
-                actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(raw)));
+            // Only the fraction is consulted today — see
+            // `wire_entry_point`'s doc for what the monitor and edge are
+            // for.
+            if let Some(entry) = entry {
+                actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(
+                    entry.fraction,
+                )));
             }
             actions.push(ControlAction::Notify(ControlNotice::ControlEnded(
                 ControlEndReason::Revoked,
@@ -1006,6 +1034,22 @@ impl ControlEngine {
             Vec::new()
         }
     }
+}
+
+/// Wrap a side-model crossing into the wire `EntryPoint` (v4, ADR 0018),
+/// via [`EntryPoint::unaddressed`] — see its doc, and the type's, for what
+/// an empty monitor and a zero revision mean to the receiver.
+///
+/// `edge` is *this machine's own* crossing edge (ADR 0009's `LinkSide`),
+/// but `EntryPoint.edge` is specified in the **receiver's** terms
+/// (docs/PROTOCOL.md §6.1): the edge the cursor *arrives* on the far
+/// side, not the one it left on this one. A left member's linked edge is
+/// `Right`; the cursor lands on the right member's `Left`. So the wire
+/// value is [`Edge::opposite`], never `edge` itself — this is the one
+/// place that mirroring happens, and every caller here and in
+/// `crossover-core`'s tests relies on it having happened here.
+fn wire_entry_point(fraction: EdgeFraction, edge: Edge) -> EntryPoint {
+    EntryPoint::unaddressed(edge.opposite().to_wire(), fraction.to_wire())
 }
 
 /// Every held button and key drained as release events to inject — the
@@ -1099,17 +1143,18 @@ mod tests {
     use proptest::prelude::*;
     use uuid::Uuid;
 
+    use crossover_protocol::control::Edge as WireEdge;
     use crossover_protocol::{
-        ControlRequest, ControlResponse, ControlVerdict, DenyReason, InputBatch, ReleaseAllInput,
-        WireButton, WireInputEvent,
+        ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, EntryPoint,
+        InputBatch, ReleaseAllInput, WireButton, WireInputEvent,
     };
 
     use super::{
         ControlAction, ControlConfig, ControlEndReason, ControlEngine, ControlEvent, ControlNotice,
-        InboundControl, OutboundControl, RequestBlocked,
+        InboundControl, OutboundControl, RequestBlocked, wire_entry_point,
     };
     use crate::input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, hid};
-    use crate::topology::EdgeFraction;
+    use crate::topology::{Edge, EdgeFraction};
 
     /// The session the single-session tests operate on.
     const SESSION: Uuid = Uuid::from_bytes([0xA1; 16]);
@@ -1280,7 +1325,9 @@ mod tests {
         })));
         assert_eq!(
             actions,
-            vec![send(OutboundControl::Release(None))],
+            vec![send(OutboundControl::Release(ControlRelease {
+                entry: None
+            }))],
             "a grant nobody is waiting for must be explicitly released"
         );
         assert!(!engine.is_controlling());
@@ -1340,7 +1387,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                send(OutboundControl::Release(None)),
+                send(OutboundControl::Release(ControlRelease { entry: None })),
                 ControlAction::Notify(ControlNotice::RequestTimedOut),
             ]
         );
@@ -1466,7 +1513,7 @@ mod tests {
 
         let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
             request_id: 2,
-            entry: Some(EdgeFraction::new(0.25).to_wire()),
+            entry: Some(wire_entry_point(EdgeFraction::new(0.25), Edge::Left)),
         })));
         assert!(
             granted(&actions),
@@ -1608,7 +1655,7 @@ mod tests {
                 send(OutboundControl::ReleaseAll(ReleaseAllInput {
                     after_sequence: 1,
                 })),
-                send(OutboundControl::Release(None)),
+                send(OutboundControl::Release(ControlRelease { entry: None })),
                 ControlAction::Notify(ControlNotice::ControlEnded(ControlEndReason::HandedBack)),
             ]
         );
@@ -1627,7 +1674,11 @@ mod tests {
                 after_sequence: 1,
             })))
         );
-        assert!(actions.contains(&send(OutboundControl::Release(None))));
+        assert!(
+            actions.contains(&send(OutboundControl::Release(ControlRelease {
+                entry: None
+            })))
+        );
         assert!(!engine.is_controlling());
 
         // Not controlling: further loss reports are noise.
@@ -1792,7 +1843,7 @@ mod tests {
                     button: PointerButton::Middle,
                     pressed: false,
                 }]),
-                send(OutboundControl::Release(None)),
+                send(OutboundControl::Release(ControlRelease { entry: None })),
                 ControlAction::Notify(ControlNotice::PeerControlRevoked),
             ]
         );
@@ -1823,7 +1874,7 @@ mod tests {
                     button: PointerButton::Left,
                     pressed: false,
                 }]),
-                send(OutboundControl::Release(None)),
+                send(OutboundControl::Release(ControlRelease { entry: None })),
                 ControlAction::Notify(ControlNotice::PeerControlLostToDesktop),
             ]
         );
@@ -1862,7 +1913,7 @@ mod tests {
                     button: PointerButton::Left,
                     pressed: false,
                 }]),
-                send(OutboundControl::Release(None)),
+                send(OutboundControl::Release(ControlRelease { entry: None })),
                 ControlAction::Notify(ControlNotice::PeerControlReclaimedLocally),
             ]
         );
@@ -1986,7 +2037,7 @@ mod tests {
             actions,
             vec![ControlAction::Send {
                 session: OTHER,
-                message: OutboundControl::Release(None),
+                message: OutboundControl::Release(ControlRelease { entry: None }),
             }],
             "a grant from the wrong session must be undone against it"
         );
@@ -2030,7 +2081,7 @@ mod tests {
                 ControlAction::Send {
                     message: OutboundControl::Request(r),
                     ..
-                } => Some(*r),
+                } => Some(r.clone()),
                 _ => None,
             })
             .expect("no request sent")
@@ -2040,11 +2091,20 @@ mod tests {
     fn an_edge_leave_requests_control_carrying_the_crossing_position() {
         let mut engine = established_engine();
         let position = EdgeFraction::new(0.5);
+        // This machine is a left member, so it crosses on its own `Right`
+        // edge — but docs/PROTOCOL.md §6.1 states `EntryPoint.edge` in the
+        // *receiver's* terms: the edge the cursor arrives on the far
+        // side, `Left`. Pinned as a literal `WireEdge` constant, not built
+        // via `wire_entry_point`, so an inverted mapping fails this test.
         let actions = engine.handle(ControlEvent::EdgeLeave {
             session: SESSION,
             position,
+            edge: Edge::Right,
         });
-        assert_eq!(sent_request(&actions).entry, Some(position.to_wire()));
+        assert_eq!(
+            sent_request(&actions).entry,
+            Some(EntryPoint::unaddressed(WireEdge::Left, position.to_wire()))
+        );
         // A console request carries no position, but is otherwise identical.
         let mut engine = established_engine();
         let actions = engine.handle(ControlEvent::UserRequestControl { session: SESSION });
@@ -2056,7 +2116,7 @@ mod tests {
         let mut engine = established_engine();
         let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
             request_id: 1,
-            entry: Some(EdgeFraction::new(0.25).to_wire()),
+            entry: Some(wire_entry_point(EdgeFraction::new(0.25), Edge::Left)),
         })));
         assert!(granted(&actions));
         let placed = placed_cursor(&actions).expect("no cursor placed on an edge grant");
@@ -2079,24 +2139,35 @@ mod tests {
         // carrying where the cursor left on the release.
         let mut engine = controlled_engine();
         let position = EdgeFraction::new(0.75);
-        let actions = engine.handle(ControlEvent::EdgeReturn { position });
+        let actions = engine.handle(ControlEvent::EdgeReturn {
+            position,
+            edge: Edge::Right,
+        });
         let release_entry = actions
             .iter()
             .find_map(|a| match a {
                 ControlAction::Send {
-                    message: OutboundControl::Release(entry),
+                    message: OutboundControl::Release(m),
                     ..
-                } => Some(*entry),
+                } => Some(m.entry.clone()),
                 _ => None,
             })
             .expect("no release sent on return");
-        assert_eq!(release_entry, Some(position.to_wire()));
+        // Mirrored to `Left`, pinned as a literal `WireEdge` — see the
+        // leave test above for why this is not built via
+        // `wire_entry_point`.
+        assert_eq!(
+            release_entry,
+            Some(EntryPoint::unaddressed(WireEdge::Left, position.to_wire()))
+        );
         assert!(!engine.is_controlled());
 
         // Controller side: receiving that release stops capture and places
         // its own cursor at the matching height (ADR 0009).
         let mut controller = controlling_engine();
-        let actions = controller.handle(peer(InboundControl::Release(Some(position.to_wire()))));
+        let actions = controller.handle(peer(InboundControl::Release(Some(
+            EntryPoint::unaddressed(WireEdge::Left, position.to_wire()),
+        ))));
         assert!(actions.contains(&ControlAction::StopCapture));
         let placed = placed_cursor(&actions).expect("controller did not place its cursor");
         assert!((placed - 0.75).abs() < 1e-4, "placed at {placed}");
@@ -2159,7 +2230,7 @@ mod tests {
                     Some(match message {
                         OutboundControl::Request(r) => InboundControl::Request(r),
                         OutboundControl::Response(r) => InboundControl::Response(r),
-                        OutboundControl::Release(entry) => InboundControl::Release(entry),
+                        OutboundControl::Release(m) => InboundControl::Release(m.entry),
                         OutboundControl::Batch(b) => InboundControl::Batch(b),
                         OutboundControl::ReleaseAll(r) => InboundControl::ReleaseAll(r),
                     })
@@ -2205,6 +2276,7 @@ mod tests {
         let actions = b.handle(ControlEvent::EdgeLeave {
             session: SESSION,
             position: crossing,
+            edge: Edge::Right,
         });
         let request_id = sent_request_id(&actions);
         to_a.extend(wire_messages(actions));
@@ -2222,6 +2294,7 @@ mod tests {
         let actions = b.handle(ControlEvent::EdgeLeave {
             session: SESSION,
             position: crossing,
+            edge: Edge::Right,
         });
         to_a.extend(wire_messages(actions));
 
