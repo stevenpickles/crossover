@@ -175,6 +175,7 @@ pub fn read_state_file() -> StateFileStatus {
 #[cfg(test)]
 mod tests {
     use super::{RawRead, StateFileStatus, UnreadableReason, classify, read_raw};
+    use crate::test_support::Sandbox;
     use crossover_topology::{
         HEARTBEAT_STALE_AFTER_MS, LayoutRect, LayoutState, LiveMonitor, MachineState, MonitorId,
         PeerState, TOPOLOGY_STATE_VERSION, TopologyState, serialize_state,
@@ -212,34 +213,6 @@ mod tests {
                 monitors: vec![live(r"\\.\DISPLAY1")],
             }),
             layout: None,
-        }
-    }
-
-    /// A private directory removed on drop — the house substitute for a
-    /// `tempfile` dependency (`crossover-topology::config`'s test `Sandbox`).
-    struct Sandbox(std::path::PathBuf);
-
-    impl Sandbox {
-        fn new(label: &str) -> Self {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "crossover-layout-{label}-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&dir).expect("sandbox");
-            Self(dir)
-        }
-
-        fn path(&self, leaf: &str) -> std::path::PathBuf {
-            self.0.join(leaf)
-        }
-    }
-
-    impl Drop for Sandbox {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

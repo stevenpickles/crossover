@@ -2,16 +2,30 @@
 
 > **Current phase: 8 — Dynamic Display Topology** (in progress.)
 >
-> **Phase 8 progress (2026-08-20):** design recorded as
-> [ADR 0018](adr/0018-drawn-display-topology.md) (Accepted) — the drawn
+> **Phase 8 progress (2026-08-21):** both design decisions are recorded and
+> **Accepted** — [ADR 0018](adr/0018-drawn-display-topology.md) (the drawn
 > layout in one shared coordinate space, edges derived from exact
-> adjacency, protocol v4, config schema v2, and the worker↔editor state
-> file. Deliverable 5's UI toolkit decision (ADR 0019) is still open. A
-> first implementation slice has landed (feature/147): `ControlRequest`
-> and `ControlRelease` carry the v4 `EntryPoint` shape and
-> `PROTOCOL_VERSION` moves to 4 — the protocol groundwork the rest of the
-> deliverables (the layout model itself, per-monitor edges, sync and
-> persistence, the editor) build on, none of which have started yet.
+> adjacency, protocol v4, config schema v2, the worker↔editor state file)
+> and, for deliverable 5, [ADR 0019](adr/0019-layout-editor-toolkit.md)
+> (egui through eframe, in its own on-demand user-session binary,
+> `apps/crossover-layout`, which the service never touches).
+>
+> Implementation is well past groundwork. Landed so far: the v4
+> `EntryPoint` protocol shape and `PROTOCOL_VERSION` 4 (feature/147); the
+> `crossover-topology` crate — the layout model, its validation, the
+> format-preserving config writer, and the state-file schema; the worker's
+> publication of `~/.crossover/state/topology.json` and its re-read of the
+> editor's edits (feature/153); crossing spans derived from the drawn
+> layout rather than a side (feature/148); and the editor itself — its
+> crate and window (feature/154), its screens and canvas (feature/155),
+> and the rigid-group drag, exact snapping, validation diagnostics and the
+> save that writes `[layout]` back to `config.toml` (feature/156).
+>
+> **Not yet done:** deliverable 3's cross-machine half — one layout that
+> both machines agree on, travelling over the session and resolving
+> disagreement by newest-revision-wins — and the exit criteria, which are
+> hardware work on two desks (docs/SOAK.md, and docs/TESTING.md §3.2's E-7
+> for the loop this phase exists to close).
 >
 > Phase 7 (Rich Clipboard — images and files) closed 2026-08-20: the last
 > open exit criterion — **input latency bounded under a saturating

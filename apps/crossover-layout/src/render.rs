@@ -6,14 +6,26 @@
 //! harness relies on directly.
 //!
 //! Colors are never hardcoded: the two machines' hues come from rotating
-//! the current [`egui::Style`]'s own selection color, so the canvas reads
+//! the current [`egui::Style`]'s own selection color, and a diagnostic
+//! borrows the style's own error and warning colors, so the canvas reads
 //! correctly in both light and dark visuals without a light/dark branch of
 //! its own.
+//!
+//! # The canvas is where dragging happens
+//!
+//! ADR 0019 chose an immediate-mode toolkit precisely so that "hit-testing,
+//! dragging, and snapping are arithmetic inside the code that paints the
+//! frame" rather than a widget with its own state machine to keep in step
+//! with the model. [`draw_central`] is that code: it hit-tests the pointer
+//! against the scene, hands the drag to [`Model`]'s pure operations, and
+//! paints the result — including the guides the snap produced and the red
+//! outlines validation asked for.
 
 use eframe::egui::{self, Color32};
 
-use crate::model::{DrawnMonitor, MachineGroup, Model};
+use crate::model::{Diagnostics, DrawnMonitor, MachineGroup, Model, Severity};
 use crate::session::{EditorSession, Freshness};
+use crate::snap::{Axis, Guide};
 use crate::viewport::Viewport;
 
 /// Screen-space margin around the drawn arrangement, so a monitor's stroke
@@ -39,8 +51,86 @@ const UNPLACED_FILL_ALPHA: f32 = 0.10;
 /// still clearly outlined rather than invisible.
 const UNPLACED_STROKE_ALPHA: f32 = 0.55;
 
+/// Stroke width for a monitor a blocking diagnostic names — heavier than
+/// the ordinary outline, so an offender is obvious without reading the
+/// status bar.
+const OFFENDER_STROKE_WIDTH: f32 = 2.5;
+
+/// Everything the frame draws that is not the scene or the session: the
+/// last save's outcome, and whether the close-confirmation is up.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Chrome<'a> {
+    /// The last save attempt's outcome, if there has been one: the line to
+    /// show, and whether it is a failure (painted in the style's error
+    /// color) rather than a success.
+    ///
+    /// One field rather than a line and a flag beside it, because "is this
+    /// an error" is only answerable when there is a line to ask it about —
+    /// a separate boolean has a meaningless state (an error with nothing to
+    /// say) that nothing prevents.
+    pub status: Option<(&'a str, bool)>,
+    /// Whether the "you have unsaved changes" dialog is showing.
+    pub confirming_close: bool,
+}
+
+/// What the user asked for during a frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameOutcome {
+    /// The Save button was clicked.
+    pub save_requested: bool,
+    /// A button in the close-confirmation was clicked.
+    pub close_choice: Option<CloseChoice>,
+}
+
+/// The three answers to "you have unsaved changes".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseChoice {
+    /// Write the arrangement, then close.
+    Save,
+    /// Close without writing.
+    Discard,
+    /// Stay open.
+    Cancel,
+}
+
+/// Paint one whole frame — toolbar, status bar, canvas, and the
+/// close-confirmation when it is up — and report what was clicked.
+///
+/// One entry point rather than three, so `app.rs` and the headless test
+/// harness paint the *same* frame in the same panel order: a screen that
+/// only the real window can produce is a screen the ordinary `cargo test`
+/// gate cannot assert on, which is exactly the hole ADR 0019 chose egui to
+/// avoid.
+pub fn draw_frame(
+    ui: &mut egui::Ui,
+    session: &mut EditorSession,
+    chrome: Chrome<'_>,
+) -> FrameOutcome {
+    let mut outcome = FrameOutcome::default();
+    // The two edge panels claim their strips before the central panel
+    // takes the rest — the one order that leaves all three any space.
+    egui::Panel::top("toolbar").show(ui, |ui| {
+        outcome.save_requested = draw_toolbar(ui, session);
+    });
+    egui::Panel::bottom("status_bar").show(ui, |ui| {
+        draw_status_bar(ui, session, chrome);
+    });
+    egui::CentralPanel::default().show(ui, |ui| {
+        draw_central(ui, session);
+    });
+    if chrome.confirming_close {
+        let context = ui.ctx().clone();
+        outcome.close_choice = draw_close_confirm(&context);
+    }
+    outcome
+}
+
 /// Paint whatever `session` currently is into the central area.
-pub fn draw_central(ui: &mut egui::Ui, session: &EditorSession) {
+///
+/// Takes the session by `&mut` because the canvas is where dragging
+/// happens (module doc): the pointer's effect on the arrangement is
+/// computed in the same pass that paints it.
+pub fn draw_central(ui: &mut egui::Ui, session: &mut EditorSession) {
     match session {
         EditorSession::Loading => draw_loading(ui),
         EditorSession::NoWorker { reason } => draw_no_worker(ui, reason.as_deref()),
@@ -49,12 +139,121 @@ pub fn draw_central(ui: &mut egui::Ui, session: &EditorSession) {
     }
 }
 
-/// Paint the bottom status line: freshness and peer state, in one row.
-pub fn draw_status_bar(ui: &mut egui::Ui, session: &EditorSession) {
+/// The top strip: the Save button, and what the arrangement's state is.
+///
+/// Save is enabled by exactly [`Model::can_save`] — something to write,
+/// and nothing blocking — so the button's own state is the answer to "may
+/// this be saved", not a second opinion about it.
+fn draw_toolbar(ui: &mut egui::Ui, session: &EditorSession) -> bool {
+    let mut clicked = false;
     ui.horizontal(|ui| {
         ui.add_space(6.0);
-        ui.label(status_line(session));
+        let model = session.model();
+        let enabled = model.is_some_and(Model::can_save);
+        clicked = ui.add_enabled(enabled, egui::Button::new("Save")).clicked();
+        let Some(model) = model else {
+            return;
+        };
+        if model.diagnostics().blocks_save() {
+            ui.label("Cannot be saved yet");
+        } else if model.is_dirty() {
+            ui.label("Unsaved changes");
+        } else {
+            ui.label("Drag a machine's screens to arrange them.");
+        }
     });
+    clicked
+}
+
+/// Paint the bottom status line: freshness and peer state, whatever
+/// validation has to say, and the last save's outcome.
+pub fn draw_status_bar(ui: &mut egui::Ui, session: &EditorSession, chrome: Chrome<'_>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(6.0);
+        ui.label(status_line(session));
+        if let Some(model) = session.model() {
+            if let Some(phrase) = snapping_phrase(model) {
+                ui.separator();
+                ui.label(phrase);
+            }
+            if let Some((severity, message)) = model.diagnostics().headline() {
+                ui.separator();
+                ui.colored_label(severity_color(severity, ui.visuals()), message);
+            }
+        }
+        if let Some((text, failed)) = chrome.status {
+            ui.separator();
+            let color = if failed {
+                ui.visuals().error_fg_color
+            } else {
+                ui.visuals().text_color()
+            };
+            ui.colored_label(color, text);
+        }
+    });
+}
+
+/// What the drag currently in progress has snapped to, if anything —
+/// named, because a rectangle that jumped a few units should say why.
+fn snapping_phrase(model: &Model) -> Option<String> {
+    let drag = model.drag()?;
+    let guides = drag.guides();
+    if guides.is_empty() {
+        return None;
+    }
+    let mut kinds: Vec<&str> = Vec::new();
+    for guide in guides {
+        let phrase = guide.kind.describe();
+        if !kinds.contains(&phrase) {
+            kinds.push(phrase);
+        }
+    }
+    let machine = model
+        .groups()
+        .find(|group| group.device == drag.device())
+        .map_or("this machine", |group| group.name.as_str());
+    Some(format!("Snapping {machine}: {}", kinds.join(", ")))
+}
+
+/// Blocking borrows the style's error color, a warning its warning color —
+/// both already chosen for the current light or dark visuals.
+fn severity_color(severity: Severity, visuals: &egui::Visuals) -> Color32 {
+    match severity {
+        Severity::Blocking => visuals.error_fg_color,
+        Severity::Warning => visuals.warn_fg_color,
+    }
+}
+
+/// The unsaved-changes dialog: a real modal, so the window cannot be
+/// closed out from under the question it is asking.
+///
+/// ADR 0018 makes the config file the only way an edit reaches the worker,
+/// which means an editor closed with unsaved changes silently discards
+/// work that looks, on screen, exactly like work that was saved. Hence the
+/// interception.
+fn draw_close_confirm(context: &egui::Context) -> Option<CloseChoice> {
+    let mut choice = None;
+    egui::Modal::new(egui::Id::new("crossover-layout-unsaved")).show(context, |ui| {
+        ui.heading("Save this arrangement before closing?");
+        ui.add_space(8.0);
+        ui.label(
+            "The arrangement you drew has not been written to the config file, so the \
+             worker is still using the one it already had.",
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.button("Save and close").clicked() {
+                choice = Some(CloseChoice::Save);
+            }
+            if ui.button("Discard").clicked() {
+                choice = Some(CloseChoice::Discard);
+            }
+            if ui.button("Cancel").clicked() {
+                choice = Some(CloseChoice::Cancel);
+            }
+        });
+    });
+    choice
 }
 
 fn status_line(session: &EditorSession) -> String {
@@ -161,7 +360,7 @@ fn draw_state_file_unusable(ui: &mut egui::Ui, reason: &str) {
 
 /// A worker is reporting, but no peer has ever connected: this machine's
 /// own monitors are drawn, with a banner in place of a peer group.
-fn draw_waiting_for_peer(ui: &mut egui::Ui, model: &Model) {
+fn draw_waiting_for_peer(ui: &mut egui::Ui, model: &mut Model) {
     ui.add_space(6.0);
     ui.vertical_centered(|ui| {
         ui.heading("Waiting for a peer to connect");
@@ -175,34 +374,43 @@ fn draw_waiting_for_peer(ui: &mut egui::Ui, model: &Model) {
 }
 
 /// The canvas: both machines' monitors, to scale, filling the rest of the
-/// available area.
-fn draw_scene(ui: &mut egui::Ui, model: &Model) {
+/// available area — and the drag that rearranges them.
+fn draw_scene(ui: &mut egui::Ui, model: &mut Model) {
     if let Some(reason) = &model.rejected_layout {
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             ui.small(format!(
-                "The saved arrangement could not be used ({reason}) — this is a starting guess instead."
+                "The saved arrangement could not be used ({reason}) — this is a starting guess instead. Drag it into shape and save."
             ));
         });
     } else if model.seeded {
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             ui.small(
-                "This is a starting guess, not a saved arrangement — dragging and saving arrive in a later release.",
+                "This is a starting guess, not a saved arrangement — drag the machines together and save it.",
             );
         });
     }
 
     let canvas_size = ui.available_size();
-    let (response, painter) = ui.allocate_painter(canvas_size, egui::Sense::hover());
+    let (response, painter) = ui.allocate_painter(canvas_size, egui::Sense::click_and_drag());
     let canvas_rect = response.rect;
 
-    let bounds = model.bounds();
-    let viewport = Viewport::fit(
-        bounds,
-        (canvas_rect.width(), canvas_rect.height()),
-        CANVAS_PADDING,
+    // A drag keeps the transform it started with: refitting mid-drag would
+    // rescale the picture under the pointer, which moves the group again
+    // (see `Drag::viewport`).
+    let viewport = model.drag().map_or_else(
+        || {
+            Viewport::fit(
+                model.bounds(),
+                (canvas_rect.width(), canvas_rect.height()),
+                CANVAS_PADDING,
+            )
+        },
+        crate::model::Drag::viewport,
     );
+
+    apply_pointer(model, &response, viewport, canvas_rect.min);
 
     let local_hue = base_hsva(ui.visuals());
     let peer_hue = rotated(local_hue);
@@ -215,6 +423,7 @@ fn draw_scene(ui: &mut egui::Ui, model: &Model) {
         &model.local,
         local_hue,
         authoritative_scene,
+        model.diagnostics(),
         ui,
     );
     if let Some(peer) = &model.peer {
@@ -225,7 +434,78 @@ fn draw_scene(ui: &mut egui::Ui, model: &Model) {
             peer,
             peer_hue,
             authoritative_scene,
+            model.diagnostics(),
             ui,
+        );
+    }
+    if let Some(drag) = model.drag() {
+        paint_guides(&painter, canvas_rect.min, &viewport, drag.guides(), ui);
+    }
+}
+
+/// Turn this frame's pointer state into the model's pure drag operations.
+///
+/// The whole interaction is three calls and no state of its own: the model
+/// owns what is being dragged and from where, so nothing here can disagree
+/// with it about a drag in progress.
+fn apply_pointer(
+    model: &mut Model,
+    response: &egui::Response,
+    viewport: Viewport,
+    canvas_origin: egui::Pos2,
+) {
+    let point = |position: egui::Pos2| {
+        viewport.to_layout((position.x - canvas_origin.x, position.y - canvas_origin.y))
+    };
+    if response.drag_started() {
+        if let Some(position) = response.interact_pointer_pos() {
+            let grabbed = point(position);
+            if let Some(target) = model.monitor_at(grabbed) {
+                model.begin_drag(&target, grabbed, viewport);
+            }
+        }
+    } else if response.dragged() {
+        if let Some(position) = response.interact_pointer_pos() {
+            model.drag_to(point(position));
+        }
+    } else if response.drag_stopped() {
+        model.end_drag();
+    }
+}
+
+/// The lines a snap produced, drawn across both rectangles that agreed.
+fn paint_guides(
+    painter: &egui::Painter,
+    canvas_origin: egui::Pos2,
+    viewport: &Viewport,
+    guides: &[Guide],
+    ui: &egui::Ui,
+) {
+    let color = ui.visuals().strong_text_color();
+    for guide in guides {
+        let (from, to) = match guide.axis {
+            Axis::X => (
+                (guide.position, guide.span.0),
+                (guide.position, guide.span.1),
+            ),
+            Axis::Y => (
+                (guide.span.0, guide.position),
+                (guide.span.1, guide.position),
+            ),
+        };
+        // An abutment is the snap that creates a crossing, so it draws
+        // heavier than a line-up that only tidies the picture.
+        let width = if guide.kind == crate::snap::SnapKind::Abut {
+            2.0
+        } else {
+            1.0
+        };
+        painter.line_segment(
+            [
+                to_absolute(viewport, canvas_origin, from),
+                to_absolute(viewport, canvas_origin, to),
+            ],
+            egui::Stroke::new(width, color),
         );
     }
 }
@@ -255,6 +535,7 @@ fn paint_group(
     group: &MachineGroup,
     hue: egui::ecolor::Hsva,
     authoritative_scene: bool,
+    diagnostics: &Diagnostics,
     ui: &egui::Ui,
 ) {
     let stroke_color: Color32 = hue.into();
@@ -305,7 +586,15 @@ fn paint_group(
         // wholly seeded scene draws every monitor the ordinary way; its
         // banner above already says the whole thing is provisional.
         let unplaced = authoritative_scene && !monitor.authoritative;
-        let (fill, stroke) = if unplaced {
+        let offending = diagnostics.offends(group.device, &monitor.id);
+        let (fill, stroke) = if offending {
+            // A blocking diagnostic outranks every other cue: this is the
+            // rectangle standing between the user and a save.
+            (
+                fill_color,
+                egui::Stroke::new(OFFENDER_STROKE_WIDTH, ui.visuals().error_fg_color),
+            )
+        } else if unplaced {
             (ghost_fill, egui::Stroke::new(1.0, ghost_stroke))
         } else {
             (fill_color, egui::Stroke::new(1.5, stroke_color))
@@ -344,9 +633,40 @@ fn to_absolute(viewport: &Viewport, origin: egui::Pos2, point: (f64, f64)) -> eg
 
 #[cfg(test)]
 mod tests {
+    use super::Chrome;
     use crate::model::Model;
     use crate::session::{EditorSession, Freshness};
-    use crate::test_support::{document, live_monitor, painted_text, peer_state};
+    use crate::test_support::{
+        LOCAL_DEVICE, PEER_DEVICE, arranged_document, document, live_monitor, monitor_key, paint,
+        paint_settled, painted_text, peer_state, unit_viewport,
+    };
+    use crossover_topology::{DeviceId, MonitorId};
+
+    fn editing(model: Model) -> EditorSession {
+        EditorSession::Editing {
+            model,
+            staleness: Freshness::Fresh,
+            peer_connected: true,
+        }
+    }
+
+    fn key(device: DeviceId) -> crossover_topology::MonitorKey {
+        monitor_key(device, r"\\.\DISPLAY1")
+    }
+
+    /// The saved side-by-side arrangement, with the peer's group picked up
+    /// and nudged: the nudge is inside the snap threshold, so it settles
+    /// back onto the seam and the guides that say so are live.
+    fn mid_snapped_drag() -> Model {
+        let mut model = Model::from_state(&arranged_document(0));
+        model.begin_drag(&key(PEER_DEVICE), (2_000.0, 100.0), unit_viewport());
+        model.drag_to((2_006.0, 100.0));
+        assert!(
+            !model.drag().expect("dragging").guides().is_empty(),
+            "the fixture must actually snap"
+        );
+        model
+    }
 
     #[test]
     fn loading_paints_without_panicking_and_says_so() {
@@ -546,5 +866,132 @@ mod tests {
         let painted = painted_text(&session);
         assert!(painted.contains("could not be used"), "{painted}");
         assert!(painted.contains("starting guess instead"), "{painted}");
+    }
+
+    /// A drag that snapped draws its guides and names what it snapped to.
+    /// The line count is compared against the same frame with no drag at
+    /// all, because separators are line segments too — the difference is
+    /// what the guides added.
+    #[test]
+    fn a_snapped_drag_paints_its_guides_and_names_them() {
+        let still = paint(
+            &editing(Model::from_state(&arranged_document(0))),
+            Chrome::default(),
+        );
+        let model = mid_snapped_drag();
+        let guides = model.drag().expect("dragging").guides().len();
+        let dragging = paint(&editing(model), Chrome::default());
+
+        assert!(
+            dragging.line_segments >= still.line_segments + guides,
+            "{} lines with {guides} guides vs {} without",
+            dragging.line_segments,
+            still.line_segments
+        );
+        assert!(dragging.says("Snapping"), "{}", dragging.text);
+        assert!(dragging.says("edges meet"), "{}", dragging.text);
+        // The machine being dragged is named, not "something moved".
+        assert!(dragging.says("laptop"), "{}", dragging.text);
+    }
+
+    /// A blocking diagnostic says what is wrong and that it cannot be
+    /// saved — the toolbar and the status bar agree, and the offending
+    /// screens are outlined (asserted through the model, which is what
+    /// decides the stroke).
+    #[test]
+    fn an_overlap_is_reported_and_refuses_the_save() {
+        let mut model = Model::from_state(&arranged_document(0));
+        model.begin_drag(&key(LOCAL_DEVICE), (100.0, 100.0), unit_viewport());
+        model.drag_to((600.0, 100.0));
+        model.end_drag();
+        assert!(!model.can_save());
+        assert!(
+            model
+                .diagnostics()
+                .offends(LOCAL_DEVICE, &MonitorId::new(r"\\.\DISPLAY1").unwrap())
+        );
+
+        let painted = paint(&editing(model), Chrome::default());
+        assert!(painted.says("Cannot be saved yet"), "{}", painted.text);
+        assert!(painted.says("overlap"), "{}", painted.text);
+        assert!(painted.says("Save"), "{}", painted.text);
+    }
+
+    /// A warning is shown in its own right, and the save stays offered.
+    #[test]
+    fn a_disconnected_arrangement_warns_and_still_offers_the_save() {
+        let mut model = Model::from_state(&arranged_document(0));
+        model.begin_drag(&key(LOCAL_DEVICE), (100.0, 100.0), unit_viewport());
+        model.drag_to((100.0, 6_000.0));
+        model.end_drag();
+        assert!(model.can_save());
+
+        let painted = paint(&editing(model), Chrome::default());
+        assert!(painted.says("do not touch"), "{}", painted.text);
+        assert!(painted.says("Unsaved changes"), "{}", painted.text);
+    }
+
+    /// The clean, saved state says what to do rather than nothing.
+    #[test]
+    fn an_unedited_arrangement_invites_a_drag() {
+        let painted = paint(
+            &editing(Model::from_state(&arranged_document(0))),
+            Chrome::default(),
+        );
+        assert!(painted.says("Drag a machine's screens"), "{}", painted.text);
+    }
+
+    /// The unsaved-changes dialog offers all three answers, and says what
+    /// discarding would cost. Painted through `paint_settled`, because a
+    /// modal is an `Area` and egui sizes a new one invisibly on its first
+    /// frame — see that function's docs.
+    #[test]
+    fn the_close_confirmation_offers_save_discard_and_cancel() {
+        let painted = paint_settled(
+            &editing(Model::from_state(&arranged_document(0))),
+            Chrome {
+                confirming_close: true,
+                ..Chrome::default()
+            },
+        );
+        assert!(
+            painted.says("Save this arrangement before closing?"),
+            "{}",
+            painted.text
+        );
+        assert!(painted.says("Save and close"), "{}", painted.text);
+        assert!(painted.says("Discard"), "{}", painted.text);
+        assert!(painted.says("Cancel"), "{}", painted.text);
+        assert!(painted.says("worker is still using"), "{}", painted.text);
+    }
+
+    /// A save's outcome — success or the whole error chain — reaches the
+    /// status bar, which is the only place a windowed process can report
+    /// one (NFR-3).
+    #[test]
+    fn the_status_bar_carries_the_last_saves_outcome() {
+        let session = editing(Model::from_state(&arranged_document(0)));
+        let saved = paint(
+            &session,
+            Chrome {
+                status: Some(("Saved (revision 5). The worker picks it up shortly.", false)),
+                ..Chrome::default()
+            },
+        );
+        assert!(saved.says("Saved (revision 5)"), "{}", saved.text);
+
+        let failed = paint(
+            &session,
+            Chrome {
+                status: Some((
+                    "Not saved — writing the config file failed: the existing config file \
+                     is not valid TOML; refusing to overwrite it",
+                    true,
+                )),
+                ..Chrome::default()
+            },
+        );
+        assert!(failed.says("Not saved"), "{}", failed.text);
+        assert!(failed.says("not valid TOML"), "{}", failed.text);
     }
 }

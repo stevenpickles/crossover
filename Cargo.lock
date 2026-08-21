@@ -653,6 +653,7 @@ dependencies = [
  "crossover-topology",
  "eframe",
  "proptest",
+ "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

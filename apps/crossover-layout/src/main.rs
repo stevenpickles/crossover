@@ -14,9 +14,10 @@
 //! diagnostic a console-less release binary otherwise has nowhere to put
 //! (see `Cargo.toml`). Everything it exchanges with the worker travels
 //! through files: the state file the worker publishes at
-//! `~/.crossover/state/`, which this branch reads, and the `[layout]` section
-//! of `config.toml`, which a future branch writes (ADR 0018). So the editor
-//! runs at plain integrity, needs no elevation, and is a process the service
+//! `~/.crossover/state/`, which it reads once a second, and the `[layout]`
+//! section of `config.toml`, which it writes when the user saves and which
+//! the worker re-reads on its own ~2 s poll (ADR 0018). So the editor runs
+//! at plain integrity, needs no elevation, and is a process the service
 //! never starts, stops, or knows about.
 
 // Windows gives a console-subsystem process a console window, and one started
@@ -40,7 +41,9 @@ mod logging;
 mod model;
 mod paths;
 mod render;
+mod save;
 mod session;
+mod snap;
 mod state_file;
 #[cfg(test)]
 mod test_support;
