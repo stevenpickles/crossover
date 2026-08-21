@@ -263,6 +263,11 @@ pub struct Metrics {
     input_events_received: AtomicU64,
     key_events_sent: AtomicU64,
     key_events_received: AtomicU64,
+
+    // ---- display topology (ADR 0018) ----
+    layout_adopted_from_peer: AtomicU64,
+    layout_sent: AtomicU64,
+    layout_rejected: AtomicU64,
 }
 
 impl Metrics {
@@ -524,6 +529,32 @@ impl Metrics {
         self.key_events_received.fetch_add(keys, Ordering::Relaxed);
     }
 
+    // ---- display topology (ADR 0018) ----
+
+    /// An arrangement drawn at the other desk won and was adopted here —
+    /// a peer-driven change to where this machine hands control away, so
+    /// it is counted as well as logged (docs/SECURITY.md T23).
+    pub fn record_layout_adopted(&self) {
+        self.layout_adopted_from_peer
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A `LayoutSync` was put on the wire — at session establishment, on a
+    /// local edit, or as the answer that supersedes a peer's older
+    /// arrangement.
+    pub fn record_layout_sent(&self) {
+        self.layout_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A well-formed `LayoutSync` was refused as semantically impossible
+    /// (docs/PROTOCOL.md §6.2, §7's graduated rule): it named a device
+    /// that is not this session's pair, or was not a believable
+    /// arrangement of that pair. Never adopted, always logged, and charged
+    /// here as the protocol violation it is.
+    pub fn record_layout_rejected(&self) {
+        self.layout_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read every counter into a plain, orderless snapshot for rendering.
     #[must_use]
     pub fn snapshot(&self) -> Report {
@@ -616,6 +647,9 @@ impl Metrics {
             input_events_received: load(&self.input_events_received),
             key_events_sent: load(&self.key_events_sent),
             key_events_received: load(&self.key_events_received),
+            layout_adopted_from_peer: load(&self.layout_adopted_from_peer),
+            layout_sent: load(&self.layout_sent),
+            layout_rejected: load(&self.layout_rejected),
         }
     }
 }
@@ -754,6 +788,14 @@ pub struct Report {
     pub key_events_sent: u64,
     /// Of the received input events, how many were key events.
     pub key_events_received: u64,
+    /// Arrangements drawn at the other desk that won and were adopted here
+    /// (ADR 0018).
+    pub layout_adopted_from_peer: u64,
+    /// `LayoutSync` messages put on the wire.
+    pub layout_sent: u64,
+    /// Well-formed `LayoutSync` messages refused as semantically
+    /// impossible (docs/PROTOCOL.md §6.2).
+    pub layout_rejected: u64,
 }
 
 impl Report {
@@ -814,6 +856,9 @@ impl Report {
             input_queue_samples = self.input_queue_samples,
             input_events_sent = self.input_events_sent,
             input_events_received = self.input_events_received,
+            layout_adopted_from_peer = self.layout_adopted_from_peer,
+            layout_sent = self.layout_sent,
+            layout_rejected = self.layout_rejected,
             "execution metrics"
         );
     }
@@ -866,6 +911,27 @@ impl Report {
             ),
             _ => Ok(()),
         }
+    }
+
+    /// The display-topology block (ADR 0018), printed only by a run that
+    /// actually synced an arrangement.
+    ///
+    /// A run with no drawn layout — the deprecated side model, or nothing
+    /// at all — never sends, adopts, or refuses one, and three zeroes
+    /// would say only that the feature exists. A run that saw *any* of the
+    /// three prints all three, including the zeroes: "2 sent, 0 adopted, 0
+    /// rejected" is the line that separates a healthy sync from an
+    /// unreported one, and a rejection count that only appears when
+    /// non-zero is a rejection count nobody thinks to look for.
+    fn write_layout(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.layout_sent + self.layout_adopted_from_peer + self.layout_rejected == 0 {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "  layout:     {} sent, {} adopted from the peer, {} rejected",
+            self.layout_sent, self.layout_adopted_from_peer, self.layout_rejected,
+        )
     }
 
     fn write_clipboard(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1020,6 +1086,7 @@ impl fmt::Display for Report {
                 self.capture_losses
             )?;
         }
+        self.write_layout(f)?;
         self.write_input(f)
     }
 }

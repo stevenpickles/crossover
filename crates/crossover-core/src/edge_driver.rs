@@ -435,10 +435,27 @@ impl EdgeDetector {
 /// read. That is one *definition* of the derivation with two call sites at
 /// different cadences, rather than a derived map published from one to the
 /// other — which would be a second, independently-aged copy of a pure
-/// function's result. It is also the shape the layout-sync branch needs:
-/// what changes when a peer's arrangement is adopted is the layout, so a
-/// source closure reading it from a `watch` reaches both consumers with no
-/// further wiring.
+/// function's result. It is also what makes layout sync (ADR 0018) a
+/// wiring change rather than a rebuild: what changes when a peer's
+/// arrangement is adopted is the *layout*, and a source closure reading it
+/// from a `watch` ([`live_crossing_source`]) reaches both consumers at
+/// once.
+///
+/// # The publication counter
+///
+/// A display change is visible to the driver — it compares the monitors it
+/// just read against the ones its map was derived from. A **layout**
+/// change is not: the same screens can produce entirely different seams
+/// under a newly adopted arrangement, with no pixel having moved. So a
+/// source that can change underneath the run declares a
+/// [`publication`](Self::publication) counter that increases every time it
+/// does, and the driver re-derives whenever it moves. A fixed arrangement
+/// reports `0` forever and the check is a comparison of two zeroes.
+///
+/// The counter is deliberately not the layout's own revision: two
+/// arrangements can share a revision and differ (ADR 0018's simultaneous
+/// edit at both desks, resolved by origin), and a check that missed that
+/// case would leave the detector crossing by the arrangement that lost.
 ///
 /// # Why the fidelity is declared rather than assumed
 ///
@@ -459,15 +476,20 @@ impl EdgeDetector {
 pub struct CrossingSource {
     derive: Arc<DeriveFn>,
     reads_identity: bool,
+    publication: Arc<PublicationFn>,
 }
 
 /// The derivation itself: live monitors in, the crossings they give out.
 type DeriveFn = dyn Fn(&[MonitorInfo]) -> CrossingMap + Send + Sync;
 
+/// Which publication of the arrangement the derivation would currently use.
+type PublicationFn = dyn Fn() -> u64 + Send + Sync;
+
 impl std::fmt::Debug for CrossingSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CrossingSource")
             .field("reads_identity", &self.reads_identity)
+            .field("publication", &self.publication())
             .finish_non_exhaustive()
     }
 }
@@ -483,6 +505,7 @@ impl CrossingSource {
         Self {
             derive: Arc::new(derive),
             reads_identity: false,
+            publication: Arc::new(|| 0),
         }
     }
 
@@ -496,7 +519,27 @@ impl CrossingSource {
         Self {
             derive: Arc::new(derive),
             reads_identity: true,
+            publication: Arc::new(|| 0),
         }
+    }
+
+    /// Declare that this source's *arrangement* can change while the run
+    /// is live, and how to tell: `publication` returns a value that
+    /// increases every time it does (see the type docs).
+    ///
+    /// Must be cheap — the driver calls it on every poll — and must never
+    /// block: reading a `watch` is exactly the intended shape.
+    #[must_use]
+    pub fn republished_by(mut self, publication: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.publication = Arc::new(publication);
+        self
+    }
+
+    /// Which publication of the arrangement a derivation right now would
+    /// use. `0`, always, for a source whose arrangement is fixed.
+    #[must_use]
+    pub fn publication(&self) -> u64 {
+        (self.publication)()
     }
 
     /// The map these monitors give.
@@ -525,6 +568,38 @@ impl CrossingSource {
                 .collect())
         }
     }
+
+    /// Derive, **paired with the publication it was derived under** — the
+    /// only correct way to obtain both.
+    ///
+    /// Reading the publication *after* deriving would record a layout the
+    /// map does not describe: a publication landing in between would be
+    /// stamped as already applied, and the detector would keep crossing by
+    /// the arrangement that lost, permanently and silently. Reading it
+    /// first can at worst record a stale number, which costs one redundant
+    /// re-derivation on the next poll — the safe direction to be wrong in.
+    ///
+    /// So the two never travel apart: [`edge_detect`] takes this pair, and
+    /// [`EdgeDetectDriver`] rebuilds through it.
+    #[must_use]
+    pub fn derive_current(&self, live: &[MonitorInfo]) -> DerivedCrossings {
+        let publication = self.publication();
+        DerivedCrossings {
+            publication,
+            map: Arc::new(self.derive(live)),
+        }
+    }
+}
+
+/// A crossing map together with the [`CrossingSource::publication`] it was
+/// derived under — see [`CrossingSource::derive_current`] for why the two
+/// are one value rather than two.
+#[derive(Debug, Clone)]
+pub struct DerivedCrossings {
+    /// Which publication of the arrangement produced [`Self::map`].
+    pub publication: u64,
+    /// The crossings themselves.
+    pub map: Arc<CrossingMap>,
 }
 
 /// The side model as a crossing source: geometry in, one unaddressed span
@@ -609,13 +684,76 @@ pub fn implicit_crossing_source(side: LinkSide, local: DeviceId) -> CrossingSour
 /// The degradation is logged rather than silent, because "seamless quietly
 /// stopped working" is the report that cannot be diagnosed afterwards
 /// (NFR-3).
+///
+/// # Who uses this, honestly
+///
+/// **Not the worker.** `crossover run` builds
+/// [`live_crossing_source`] instead, because a drawn arrangement *can*
+/// change under a live run — the peer draws one at the other desk and this
+/// machine adopts it (ADR 0018). What is left for this constructor is the
+/// genuinely fixed case: the rigs in this crate's own tests, which want an
+/// arrangement that cannot move under them. It is kept rather than folded
+/// into those rigs because "a source over one fixed layout" is a real and
+/// obvious thing to want, and because expressing it here — as the live
+/// source with its sender dropped — is what keeps there being exactly one
+/// derivation path to test.
 #[must_use]
 pub fn explicit_crossing_source(layout: Layout, local: DeviceId) -> CrossingSource {
+    // A run whose arrangement cannot change is the same thing as one whose
+    // `watch` never receives a second value, so this is the live source
+    // with its sender dropped rather than a second copy of the derivation.
+    // `watch::Receiver::borrow` keeps answering after the sender is gone,
+    // and the publication counter therefore stays at 0 forever.
+    let (sender, layouts) = watch::channel(LiveLayout {
+        publication: 0,
+        layout,
+    });
+    drop(sender);
+    live_crossing_source(layouts, local)
+}
+
+/// The drawn arrangement in force right now, and which publication put it
+/// there (ADR 0018's layout sync).
+///
+/// The counter travels **inside** the `watch` value rather than beside it,
+/// for the same reason [`EdgeModeUpdate`]'s generation does: a `watch`
+/// coalesces, so a counter kept at either end would drift the moment two
+/// publications collapsed into one. Carried, it cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveLayout {
+    /// Increases on every publication. The publisher owns it; nothing here
+    /// derives it from the layout, because two different arrangements can
+    /// share a revision (ADR 0018's origin tiebreak).
+    pub publication: u64,
+    /// The arrangement to cross by.
+    pub layout: Layout,
+}
+
+/// A drawn arrangement that the run can **replace while it is live** — what
+/// adopting a peer's `LayoutSync` publishes to (ADR 0018).
+///
+/// Identical to [`explicit_crossing_source`] in every respect except that
+/// the layout is read from `layouts` on each derivation rather than
+/// captured: the detector re-derives when the publication counter moves
+/// (see [`CrossingSource`]'s docs), and `control_driver`'s placement path
+/// derives fresh every time it places a cursor, so both consumers pick up
+/// an adopted arrangement with no further wiring.
+#[must_use]
+pub fn live_crossing_source(
+    layouts: watch::Receiver<LiveLayout>,
+    local: DeviceId,
+) -> CrossingSource {
+    let publications = layouts.clone();
     CrossingSource::identified(move |live| {
-        let map = crate::crossing::derive(&layout, local, live);
+        // One borrow, so the revision named in the diagnostic below is the
+        // one the map was actually derived from even if a publication
+        // lands mid-derivation.
+        let held = layouts.borrow().clone();
+        let map = crate::crossing::derive(&held.layout, local, live);
         if map.is_inert() {
             tracing::warn!(
-                revision = layout.revision(),
+                revision = held.layout.revision(),
+                publication = held.publication,
                 monitors = live.len(),
                 "edge: none of this machine's live screens matches the drawn arrangement; \
                  crossing by cursor is off until one does (local input, the console, and the \
@@ -624,17 +762,22 @@ pub fn explicit_crossing_source(layout: Layout, local: DeviceId) -> CrossingSour
         }
         map
     })
+    .republished_by(move || publications.borrow().publication)
 }
 
-/// Build an edge-detection driver over `map`, polling `display` every
+/// Build an edge-detection driver over `initial`, polling `display` every
 /// `poll_interval` and re-deriving through `source` whenever the display
-/// configuration changes. Returns the driver (spawn
+/// configuration or the arrangement changes. Returns the driver (spawn
 /// [`EdgeDetectDriver::run`]), a sender the control wiring uses to publish
 /// the [`EdgeModeUpdate`], and a receiver of detected [`EdgeCrossing`]s.
+///
+/// `initial` is a [`DerivedCrossings`] rather than a bare map so the
+/// caller cannot hand over a map and a publication that do not belong
+/// together — see [`CrossingSource::derive_current`].
 #[must_use]
 pub fn edge_detect(
     display: Arc<dyn DisplayInfo>,
-    map: Arc<CrossingMap>,
+    initial: DerivedCrossings,
     source: CrossingSource,
     poll_interval: Duration,
 ) -> (
@@ -644,10 +787,12 @@ pub fn edge_detect(
 ) {
     let (mode_tx, mode_rx) = watch::channel(EdgeModeUpdate::initial());
     let (crossings_tx, crossings_rx) = mpsc::channel(8);
+    let DerivedCrossings { publication, map } = initial;
     let driver = EdgeDetectDriver {
         display,
         source,
         detector: EdgeDetector::new(map),
+        arrangement: publication,
         mode: EdgeMode::Idle,
         generation: 0,
         mode_rx,
@@ -663,6 +808,12 @@ pub struct EdgeDetectDriver {
     display: Arc<dyn DisplayInfo>,
     source: CrossingSource,
     detector: EdgeDetector,
+    /// The [`CrossingSource::publication`] the current map was derived
+    /// under (ADR 0018's layout sync). The detector's own snapshot catches
+    /// a *geometry* change; this catches an *arrangement* change, which
+    /// moves every seam without moving a pixel and so is invisible to it.
+    /// Constant for a run whose layout cannot change.
+    arrangement: u64,
     mode: EdgeMode,
     /// The generation of the mode currently applied, stamped on every
     /// crossing so a consumer can tell one detected under the current
@@ -763,11 +914,21 @@ impl EdgeDetectDriver {
         let Ok(cursor) = self.display.cursor_position() else {
             return;
         };
-        if self.detector.layout_changed(&live) {
+        if self.stale(&live) {
             self.rederive(&live, cursor);
         } else {
             self.detector.prime(cursor);
         }
+    }
+
+    /// Does the map need rebuilding — because the *geometry* moved
+    /// (the detector's own snapshot), or because the *arrangement* was
+    /// republished underneath it (ADR 0018)?
+    ///
+    /// Both are "the seams are not where this map says", and both are
+    /// answered the same way: re-derive, re-prime, emit nothing.
+    fn stale(&self, live: &[MonitorInfo]) -> bool {
+        self.detector.layout_changed(live) || self.source.publication() != self.arrangement
     }
 
     /// The live monitors, at the fidelity this run's source needs, with a
@@ -806,12 +967,18 @@ impl EdgeDetectDriver {
     /// second query to fail and no way to end up holding new geometry with
     /// an old arrangement.
     fn rederive(&mut self, live: &[MonitorInfo], cursor: CursorPoint) {
-        let map = Arc::new(self.source.derive(live));
+        // Through `derive_current`, which is what pairs the map with the
+        // publication it belongs to — and what makes the ordering between
+        // those two reads impossible to get wrong here.
+        let DerivedCrossings { publication, map } = self.source.derive_current(live);
         tracing::debug!(
             monitors = live.len(),
             spans = map.span_count(),
-            "edge: crossing map re-derived for the new display configuration"
+            revision = map.revision(),
+            publication,
+            "edge: crossing map re-derived"
         );
+        self.arrangement = publication;
         self.detector.adopt(map, live, cursor);
     }
 
@@ -828,14 +995,16 @@ impl EdgeDetectDriver {
                 return true;
             }
         };
-        if self.detector.layout_changed(&live) {
+        if self.stale(&live) {
             tracing::debug!(
                 monitors = live.len(),
-                "edge: the display configuration changed; re-deriving and re-priming"
+                "edge: the display configuration or the arrangement changed; re-deriving \
+                 and re-priming"
             );
             self.rederive(&live, cursor);
-            // Never a crossing on the tick the geometry moved: an interior
-            // column can become a seam without the cursor moving at all.
+            // Never a crossing on the tick the arrangement moved: an
+            // interior column can become a seam without the cursor moving
+            // at all.
             return true;
         }
         if let Some(detected) = self.detector.observe(cursor, &live) {
@@ -909,7 +1078,8 @@ mod tests {
 
     use super::{
         CrossingKind, DetectedCrossing, EdgeCrossing, EdgeDetector, EdgeMode, EdgeModeUpdate,
-        REARM_MARGIN, edge_detect, implicit_crossing_source,
+        LiveLayout, REARM_MARGIN, edge_detect, explicit_crossing_source, implicit_crossing_source,
+        live_crossing_source,
     };
     use crate::crossing::{CrossingMap, derive};
     use crate::topology::{
@@ -1697,10 +1867,10 @@ mod tests {
         // The worker's own wiring: one construction of the implicit source,
         // one derivation from it for the initial map.
         let source = implicit_crossing_source(side, LOCAL);
-        let map = Arc::new(source.derive(&source.read(&*display).unwrap()));
+        let initial = source.derive_current(&source.read(&*display).unwrap());
         let (driver, mode_tx, crossings_rx) = edge_detect(
             Arc::clone(&display) as Arc<dyn DisplayInfo>,
-            map,
+            initial,
             source,
             Duration::from_millis(5),
         );
@@ -1713,6 +1883,214 @@ mod tests {
             },
             crossings_rx,
         )
+    }
+
+    // ---- a live arrangement, replaced under a running detector ----------
+
+    /// The wiring layout sync needs (ADR 0018): a drawn arrangement read
+    /// from a `watch`, so adopting the peer's changes where this machine
+    /// crosses **without a restart**.
+    ///
+    /// `A` is this machine's only screen. The published arrangement decides
+    /// which of its edges is a seam: first the peer sits to the right, so
+    /// the right column crosses and the left one does not; then the peer is
+    /// published to the left, and the two swap.
+    fn live_rig(
+        peer_on_the_right: bool,
+    ) -> (
+        Arc<FakeDisplay>,
+        watch::Sender<LiveLayout>,
+        Modes,
+        mpsc::Receiver<EdgeCrossing>,
+    ) {
+        let display = Arc::new(FakeDisplay::new(HD));
+        display.set_monitor_layout(vec![live("A", 0, 0, 1920, 1080)]);
+        display.set_cursor(MIDDLE);
+        let (publisher, layouts) = watch::channel(LiveLayout {
+            publication: 0,
+            layout: two_desk_layout(1, peer_on_the_right),
+        });
+        let source = live_crossing_source(layouts, LOCAL);
+        let initial = source.derive_current(&source.read(&*display).unwrap());
+        let (driver, mode_tx, crossings_rx) = edge_detect(
+            Arc::clone(&display) as Arc<dyn DisplayInfo>,
+            initial,
+            source,
+            Duration::from_millis(5),
+        );
+        tokio::spawn(driver.run());
+        (
+            display,
+            publisher,
+            Modes {
+                tx: mode_tx,
+                generation: 0,
+            },
+            crossings_rx,
+        )
+    }
+
+    /// This machine's screen `A` at the origin, with the peer's `B` drawn
+    /// on one side or the other.
+    fn two_desk_layout(revision: u64, peer_on_the_right: bool) -> Layout {
+        let peer_x = if peer_on_the_right { 1920 } else { -1920 };
+        let monitors = vec![
+            PlacedMonitor {
+                device: LOCAL,
+                id: MonitorId::new("A").unwrap(),
+                rect: LayoutRect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            PlacedMonitor {
+                device: PEER,
+                id: MonitorId::new("B").unwrap(),
+                rect: LayoutRect {
+                    x: peer_x,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+        ];
+        let pair = DevicePair::new(LOCAL, PEER).unwrap();
+        Layout::new(revision, PEER, monitors, &pair).unwrap()
+    }
+
+    /// A source over a fixed arrangement reports publication `0` forever,
+    /// so the driver's staleness check is two zeroes and costs nothing.
+    #[test]
+    fn a_fixed_arrangement_never_republishes() {
+        let source = explicit_crossing_source(two_desk_layout(4, true), LOCAL);
+        assert_eq!(source.publication(), 0);
+        assert_eq!(source.publication(), 0);
+        // And the implicit path likewise.
+        assert_eq!(
+            implicit_crossing_source(LinkSide::Left, LOCAL).publication(),
+            0
+        );
+    }
+
+    /// Publishing a new arrangement moves the counter the driver watches,
+    /// and the derivation that follows it is the new arrangement's.
+    #[test]
+    fn a_publication_moves_the_counter_and_the_derivation() {
+        let (publisher, layouts) = watch::channel(LiveLayout {
+            publication: 0,
+            layout: two_desk_layout(1, true),
+        });
+        let source = live_crossing_source(layouts, LOCAL);
+        let screens = [live("A", 0, 0, 1920, 1080)];
+        assert_eq!(source.publication(), 0);
+        assert_eq!(source.derive(&screens).revision(), 1);
+
+        publisher
+            .send(LiveLayout {
+                publication: 1,
+                layout: two_desk_layout(9, false),
+            })
+            .unwrap();
+        assert_eq!(source.publication(), 1);
+        assert_eq!(source.derive(&screens).revision(), 9);
+    }
+
+    /// The property the counter exists for, which a revision comparison
+    /// would miss: two arrangements can share a revision and differ (ADR
+    /// 0018's simultaneous edit at both desks, resolved by origin). The
+    /// publication still moves, so the detector still re-derives.
+    #[tokio::test]
+    async fn an_adopted_arrangement_moves_the_seam_under_a_running_detector() {
+        let (display, publisher, mut modes, mut crossings) = live_rig(true);
+        modes.set(EdgeMode::Leaving);
+        sleep(SETTLE).await;
+
+        // The peer is drawn to the right: the right column crosses.
+        display.set_cursor(at(1919, 540));
+        assert_eq!(
+            next_crossing(&mut crossings).await.kind,
+            CrossingKind::Leave
+        );
+
+        // Back to the middle, then to the left column: no seam there yet.
+        display.set_cursor(MIDDLE);
+        sleep(SETTLE).await;
+        display.set_cursor(at(0, 540));
+        assert!(
+            timeout(Duration::from_millis(200), crossings.recv())
+                .await
+                .is_err(),
+            "a column with no drawn peer across it fired a crossing"
+        );
+
+        // The peer's arrangement arrives and is adopted: same revision,
+        // different content, published under a fresh publication.
+        publisher
+            .send(LiveLayout {
+                publication: 1,
+                layout: two_desk_layout(1, false),
+            })
+            .unwrap();
+        sleep(SETTLE).await;
+
+        // The left column is the seam now…
+        display.set_cursor(MIDDLE);
+        sleep(SETTLE).await;
+        display.set_cursor(at(0, 540));
+        let crossing = next_crossing(&mut crossings).await;
+        assert_eq!(crossing.kind, CrossingKind::Leave);
+        assert_eq!(
+            crossing
+                .crossing
+                .target
+                .monitor
+                .as_ref()
+                .map(MonitorId::as_str),
+            Some("B")
+        );
+        assert_eq!(crossing.crossing.target.edge, Edge::Right);
+
+        // …and the right column is not.
+        display.set_cursor(MIDDLE);
+        sleep(SETTLE).await;
+        display.set_cursor(at(1919, 540));
+        assert!(
+            timeout(Duration::from_millis(200), crossings.recv())
+                .await
+                .is_err(),
+            "the superseded arrangement is still crossing"
+        );
+    }
+
+    /// A publication is a re-derivation, never a crossing: every seam moves
+    /// at once under a cursor that has not moved, exactly as a display
+    /// change does — so the tick that adopts must re-prime rather than read
+    /// a moved seam as an arrival.
+    #[tokio::test]
+    async fn adopting_an_arrangement_under_a_parked_cursor_fires_nothing() {
+        let (display, publisher, mut modes, mut crossings) = live_rig(true);
+        modes.set(EdgeMode::Leaving);
+        sleep(SETTLE).await;
+
+        // Park on the left column — interior under the arrangement in
+        // force, a seam under the one about to be published.
+        display.set_cursor(at(0, 540));
+        sleep(SETTLE).await;
+        publisher
+            .send(LiveLayout {
+                publication: 1,
+                layout: two_desk_layout(2, false),
+            })
+            .unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(200), crossings.recv())
+                .await
+                .is_err(),
+            "adopting an arrangement transferred control by itself"
+        );
     }
 
     #[tokio::test]

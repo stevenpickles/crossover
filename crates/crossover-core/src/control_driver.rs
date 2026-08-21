@@ -1296,10 +1296,9 @@ mod tests {
         injector.follow(Arc::clone(&display));
         let (edge_mode_tx, detection) = if detect {
             let live = source.read(&*display).expect("a fake display");
-            let map = Arc::new(source.derive(&live));
             let (edge_driver, mode_tx, crossings) = crate::edge_driver::edge_detect(
                 Arc::clone(&display) as Arc<dyn DisplayInfo>,
-                map,
+                source.derive_current(&live),
                 source.clone(),
                 EDGE_POLL,
             );
