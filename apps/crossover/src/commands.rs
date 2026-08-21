@@ -23,7 +23,7 @@ use crossover_core::{
     ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
     FileReceive, FileSend, FrameTarget, InputControlEvent, LocalNode, Metrics, OutboundSender,
     SeamlessInputs, SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology,
-    clipboard_sync, edge_detect, input_control, outbound_channel,
+    clipboard_sync, edge_detect, implicit_crossing_source, input_control, outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
@@ -561,11 +561,17 @@ pub fn layout() -> anyhow::Result<()> {
 /// mode, the edge detector — spawning the driver, edge wiring, and notice
 /// printer. Returns the event sender and command receiver the session mux
 /// needs. Capture installs no hook until the first grant.
+///
+/// `identity` is here for the arrangement, not for the network: a crossing
+/// map is derived for a named local device (ADR 0018), and this run's
+/// device id is what names it.
 fn setup_input_control(
     layout_source: Option<&LayoutSource>,
+    identity: &DeviceIdentity,
     metrics: &Arc<Metrics>,
     no_cursor_mask: bool,
 ) -> anyhow::Result<(mpsc::Sender<InputControlEvent>, CommandReceiver)> {
+    let local = DeviceId::from_bytes(*identity.device_id().as_bytes());
     let (capture, injector) = open_input()?;
     // Diagnostic switch: run without masking to isolate cursor behavior
     // from control transfer (ADR 0009).
@@ -585,7 +591,7 @@ fn setup_input_control(
     // channel that keeps the detector in step with control state. Built
     // before input_control so its mode sender can ride in. An explicit
     // layout cannot drive this yet (see `build_seamless`).
-    let (seamless, edge_wiring) = build_seamless(layout_source, &display);
+    let (seamless, edge_wiring) = build_seamless(layout_source, local, &display);
 
     let (control_driver, control_events, control_commands, control_notices) = input_control(
         capture,
@@ -768,7 +774,7 @@ pub async fn run(
     // Input control: capture/inject, the transfer engine, cursor masking,
     // and (in seamless mode) the edge detector.
     let (control_events, control_commands) =
-        setup_input_control(layout_source.as_ref(), &metrics, no_cursor_mask)?;
+        setup_input_control(layout_source.as_ref(), &identity, &metrics, no_cursor_mask)?;
 
     // Topology state: what the layout editor needs to draw (ADR 0018) — own
     // facts only on this branch; see `topology_state`'s module docs.
@@ -1294,27 +1300,58 @@ fn merge_command_lanes(a: CommandReceiver, b: CommandReceiver) -> ClassifiedComm
 }
 
 /// Build the seamless wiring for a run with an *implicit* layout (ADR
-/// 0009): the [`SeamlessInputs`] the control driver takes, and the edge
-/// detector plus its crossing stream to spawn once the control driver is
-/// up. `(None, None)` for an explicit-only run, an explicit-layout run, or
-/// no layout at all.
+/// 0009, expressed as a drawn arrangement per ADR 0018): the
+/// [`SeamlessInputs`] the control driver takes, and the edge detector plus
+/// its crossing stream to spawn once the control driver is up.
+/// `(None, None)` for an explicit-only run, an explicit-layout run, no
+/// layout at all, or a display that will not enumerate.
 ///
-/// An [`LayoutSource::Explicit`] layout cannot drive this side-model
-/// [`Topology`] yet — the crossing engine that consumes a drawn arrangement
-/// (the `CrossingMap` work) is a later branch — so seamless transfer stays
-/// off for it, deliberately, rather than guessing a side from the drawing.
-/// `log_display_and_edge` is what tells the user why.
+/// **The implicit path derives from geometry alone**
+/// ([`implicit_crossing_source`]), so nothing about what the platform can
+/// or cannot *name* decides whether seamless transfer runs. That matters
+/// here rather than only in core: a display adapter the OS declines to name
+/// is ordinary hardware, and the side model has worked on it since Phase 5.
+/// The only way this turns seamless off is the display refusing to report
+/// its monitors at all.
+///
+/// A [`LayoutSource::Explicit`] layout is still not driven: the control
+/// wiring that carries a drawn arrangement's entry points is a later
+/// branch, so seamless transfer stays off for it deliberately rather than
+/// flattening a drawing back to a side. `log_display_and_edge` is what
+/// tells the user why.
 type EdgeWiring = (EdgeDetectDriver, mpsc::Receiver<EdgeCrossing>);
 fn build_seamless(
     layout_source: Option<&LayoutSource>,
+    local: DeviceId,
     display: &Arc<dyn DisplayInfo>,
 ) -> (Option<SeamlessInputs>, Option<EdgeWiring>) {
     let Some(LayoutSource::Implicit(side)) = layout_source else {
         return (None, None);
     };
-    let topology = Topology::new(*side);
+    let side = *side;
+    // One derivation at startup, through the same source the detector
+    // re-derives with — so there is a single derivation path rather than a
+    // startup copy that could drift from it — and its result *is* the
+    // detector's initial map.
+    let source = implicit_crossing_source(side, local);
+    let live = match source.read(&**display) {
+        Ok(live) => live,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "seamless: the display would not enumerate its monitors; edge transfer is off"
+            );
+            println!(
+                "Seamless edge transfer off: the display could not be enumerated. Explicit \
+                 control (`c` / `r`) still works."
+            );
+            return (None, None);
+        }
+    };
+    let map = Arc::new(source.derive(&live));
+    let topology = Topology::new(side);
     let (edge_driver, edge_mode, crossings_rx) =
-        edge_detect(Arc::clone(display), topology, EDGE_POLL_INTERVAL);
+        edge_detect(Arc::clone(display), map, source, EDGE_POLL_INTERVAL);
     let seamless = SeamlessInputs {
         topology,
         display: Arc::clone(display),
@@ -1335,13 +1372,16 @@ fn spawn_edge_wiring(
         while let Some(crossing) = crossings.recv().await {
             // The generation rides along so the control driver can drop a
             // crossing whose control state has since changed (ADR 0009).
+            // Only the fraction is threaded through today; the destination
+            // the crossing also carries (`DetectedCrossing::target`) is what
+            // the next branch turns into a wire `EntryPoint` (ADR 0018).
             let event = match crossing.kind {
                 CrossingKind::Leave => InputControlEvent::EdgeLeave {
-                    position: crossing.position,
+                    position: crossing.crossing.position,
                     generation: crossing.generation,
                 },
                 CrossingKind::Return => InputControlEvent::EdgeReturn {
-                    position: crossing.position,
+                    position: crossing.crossing.position,
                     generation: crossing.generation,
                 },
             };
@@ -2433,6 +2473,78 @@ mod tests {
     use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore, TrustedPeer};
 
     use super::{SessionRegistry, age, registry_lock, revoked_session_ids};
+
+    /// A `--left` run must not start depending on what the platform can
+    /// *name*. The side model picks its crossing edge by position and
+    /// reports an unaddressed destination, so a screen the OS declines to
+    /// name — a USB display adapter, say — and two screens reporting one
+    /// device string are both ordinary hardware here, not refusals. The one
+    /// thing that does turn seamless off is a display that will not
+    /// enumerate at all, and even that is a log rather than a panic.
+    #[test]
+    fn the_implicit_path_needs_geometry_and_never_identity() {
+        use crossover_platform::fakes::FakeDisplay;
+        use crossover_platform::{DisplayInfo, MonitorInfo, MonitorRect, Screen};
+        use crossover_topology::DeviceId;
+
+        use super::{LayoutSource, build_seamless};
+        use crossover_core::LinkSide;
+
+        const LOCAL: DeviceId = DeviceId::from_bytes([0x11; 16]);
+        let implicit = LayoutSource::Implicit(LinkSide::Left);
+        let rect = |left: i32| MonitorRect {
+            left,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let display = Arc::new(FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        }));
+        let handle = Arc::clone(&display) as Arc<dyn DisplayInfo>;
+
+        // Named, unnamed, and two screens claiming one device string: all
+        // three are geometry the side model can cross on.
+        let layouts = [
+            vec![MonitorInfo {
+                id: Some("NAMED".to_owned()),
+                rect: rect(0),
+            }],
+            vec![MonitorInfo {
+                id: None,
+                rect: rect(0),
+            }],
+            vec![
+                MonitorInfo {
+                    id: Some("DUP".to_owned()),
+                    rect: rect(0),
+                },
+                MonitorInfo {
+                    id: Some("DUP".to_owned()),
+                    rect: rect(1920),
+                },
+            ],
+        ];
+        for layout in layouts {
+            display.set_monitor_layout(layout.clone());
+            let (seamless, wiring) = build_seamless(Some(&implicit), LOCAL, &handle);
+            assert!(
+                seamless.is_some() && wiring.is_some(),
+                "identity decided whether seamless ran, for {layout:?}"
+            );
+        }
+
+        // A display that will not enumerate at all is the one refusal.
+        display.fail_with("no display");
+        let (seamless, wiring) = build_seamless(Some(&implicit), LOCAL, &handle);
+        assert!(seamless.is_none() && wiring.is_none());
+
+        // And no layout at all stays off, as it always did.
+        display.clear_failure();
+        let (seamless, wiring) = build_seamless(None, LOCAL, &handle);
+        assert!(seamless.is_none() && wiring.is_none());
+    }
 
     #[test]
     fn revoked_sessions_are_those_whose_peer_left_the_trust_store() {
