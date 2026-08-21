@@ -1048,6 +1048,12 @@ mod tests {
         height: 1080,
     };
 
+    /// This machine's identity, for the rig's implicit arrangement. Only
+    /// the *shape* matters here — an implicit crossing is unaddressed, so
+    /// no identity from it ever reaches a message.
+    const RIG_LOCAL: crossover_topology::DeviceId =
+        crossover_topology::DeviceId::from_bytes([0x11; 16]);
+
     /// The session the single-session tests operate on.
     const SESSION: Uuid = Uuid::from_bytes([0xA1; 16]);
     /// A distinct concurrent session, for the cross-session mediation tests.
@@ -1093,9 +1099,15 @@ mod tests {
         // has geometry to map through; most tests never trigger it.
         let topology = Topology::new(LinkSide::Left);
         let (edge_mode_tx, detection) = if detect {
+            // The worker's own construction, not a copy of it: the side
+            // model as a geometry-only crossing source (ADR 0018).
+            let source = crate::edge_driver::implicit_crossing_source(LinkSide::Left, RIG_LOCAL);
+            let live = source.read(&*display).expect("a fake display");
+            let map = Arc::new(source.derive(&live));
             let (edge_driver, mode_tx, crossings) = crate::edge_driver::edge_detect(
                 Arc::clone(&display) as Arc<dyn DisplayInfo>,
-                topology,
+                map,
+                source,
                 EDGE_POLL,
             );
             (mode_tx, Some((edge_driver, crossings)))
@@ -1127,11 +1139,11 @@ mod tests {
                 while let Some(crossing) = crossings.recv().await {
                     let event = match crossing.kind {
                         CrossingKind::Leave => InputControlEvent::EdgeLeave {
-                            position: crossing.position,
+                            position: crossing.crossing.position,
                             generation: crossing.generation,
                         },
                         CrossingKind::Return => InputControlEvent::EdgeReturn {
-                            position: crossing.position,
+                            position: crossing.crossing.position,
                             generation: crossing.generation,
                         },
                     };

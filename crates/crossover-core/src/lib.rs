@@ -39,8 +39,8 @@ pub use crossing::{
     LayoutSpan, MappedMonitor, SpanId, derive as derive_crossings, from_link_side,
 };
 pub use edge_driver::{
-    CrossingKind, EdgeCrossing, EdgeDetectDriver, EdgeDetector, EdgeMode, EdgeModeUpdate,
-    edge_detect,
+    CrossingKind, CrossingSource, DetectedCrossing, EdgeCrossing, EdgeDetectDriver, EdgeDetector,
+    EdgeMode, EdgeModeUpdate, edge_detect, implicit_crossing_source,
 };
 pub use file_blob::{FALLBACK_ARCHIVE_NAME, wire_file_name};
 pub use input::{

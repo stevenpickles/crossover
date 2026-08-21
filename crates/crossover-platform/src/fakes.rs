@@ -585,6 +585,14 @@ impl FakeDisplay {
         *lock(&self.fail) = Some(reason.to_owned());
     }
 
+    /// Start answering again — the other half of [`Self::fail_with`], for a
+    /// test about *recovery* rather than about failure. A test that only
+    /// ever fails a display cannot tell a component that survived an outage
+    /// from one that quietly wedged itself during it.
+    pub fn clear_failure(&self) {
+        *lock(&self.fail) = None;
+    }
+
     fn guard(&self) -> Result<(), DisplayError> {
         match lock(&self.fail).clone() {
             Some(reason) => Err(DisplayError::Unavailable { reason }),

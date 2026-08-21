@@ -20,6 +20,29 @@
 //! links to the right member's left edge. The drawn arrangement that
 //! supersedes it (ADR 0018) is derived in [`crate::crossing`], which speaks
 //! all four [`Edge`]s.
+//!
+//! # What still uses [`Topology`], and what stopped
+//!
+//! **Detection has moved off it.** [`crate::edge_driver`] measures against
+//! a [`crate::crossing::CrossingMap`], derived from the drawn arrangement
+//! — which for a `--left`/`--right` run is the *implicit* layout
+//! [`crate::crossing::from_link_side`] builds, so the behaviour is
+//! unchanged and the model is not.
+//!
+//! What remains is **cursor placement on arrival**: `control_driver`'s
+//! `SeamlessInputs` still holds a `Topology` and still calls
+//! [`Topology::entering`] to place an incoming cursor, and still reads
+//! [`Topology::linked_edge`] for the edge it reports on the wire. Both go
+//! when the control wiring learns to carry an `EntryPoint` — the arriving
+//! monitor, its edge, and the fraction — and place through
+//! [`crate::crossing::CrossingMap::arrive`] instead. Until then this module
+//! is not dead code, and deleting the parts detection no longer needs would
+//! break placement rather than tidy anything.
+//!
+//! [`Edge`], [`EdgeFraction`], [`last_index`] and [`edge_monitor_index`]
+//! outlive the side model regardless: the drawn arrangement is built on all
+//! four, and they live here so there is exactly one implementation of
+//! per-edge pixel geometry in the crate.
 
 /// Which member of the left–right pair this machine is — the `--left` /
 /// `--right` configuration (ADR 0009).
@@ -136,6 +159,24 @@ impl Edge {
         }
     }
 
+    /// How far *along* this edge of `monitor` the cursor sits, in pixels
+    /// from the edge's start, together with the edge's own length.
+    ///
+    /// The lateral counterpart to [`inset_of`](Self::inset_of): that one
+    /// measures perpendicular to the edge, this one along it. Unlike
+    /// [`fraction_along`](Self::fraction_along) it does **not** refuse a
+    /// cursor outside the monitor's extent — it reports *how far* outside,
+    /// which is what a lateral margin test needs
+    /// ([`crate::crossing::CrossingMap::clear_of`]).
+    ///
+    /// Saturating, for the same reason `inset_of` is.
+    pub(crate) fn offset_along(self, monitor: MonitorRect, cursor: CursorPoint) -> (i32, u32) {
+        match self {
+            Self::Left | Self::Right => (cursor.y.saturating_sub(monitor.top), monitor.height),
+            Self::Top | Self::Bottom => (cursor.x.saturating_sub(monitor.left), monitor.width),
+        }
+    }
+
     /// How far *along* this edge of `monitor` the cursor sits, as a
     /// fraction of the edge — or `None` if the cursor is outside the
     /// monitor's extent along it.
@@ -148,10 +189,7 @@ impl Edge {
         monitor: MonitorRect,
         cursor: CursorPoint,
     ) -> Option<EdgeFraction> {
-        let (offset, extent) = match self {
-            Self::Left | Self::Right => (cursor.y.saturating_sub(monitor.top), monitor.height),
-            Self::Top | Self::Bottom => (cursor.x.saturating_sub(monitor.left), monitor.width),
-        };
+        let (offset, extent) = self.offset_along(monitor, cursor);
         (offset >= 0 && offset <= last_index(extent))
             .then(|| EdgeFraction::from_pixel(offset, extent))
     }
