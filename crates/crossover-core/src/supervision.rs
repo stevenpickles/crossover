@@ -797,6 +797,13 @@ async fn write_bounded(
 
 /// Dispatch one inbound frame: control messages are handled here, app
 /// frames become events. `Some(reason)` ends the session.
+///
+/// This partitions by what the *session layer itself* must answer or
+/// reject versus what it merely forwards — not by docs/PROTOCOL.md §4's
+/// class, which `MessageType::class` reports directly; several
+/// CONTROL-class types (`ControlRequest`, `MonitorTopology`, …) fall
+/// through to the forwarded bucket here because this layer has no
+/// business with their content, only with session establishment.
 async fn dispatch_frame(
     frame: crossover_protocol::RawFrame,
     writer: &mut crate::net::SessionWriter,
@@ -832,8 +839,13 @@ async fn dispatch_frame(
         Some(MessageType::PairingStart | MessageType::PairingConfirm) => {
             violation("pairing message on an established session")
         }
-        // Clipboard, input, and control-transfer traffic belongs to the
-        // engines, which consume it as Frame events.
+        // Clipboard, input, control-transfer, and display-topology traffic
+        // belongs to the engines, which consume it as Frame events.
+        // `MonitorTopology`/`LayoutSync` (ADR 0018) are CONTROL class
+        // (docs/PROTOCOL.md §4) but, like the control-transfer messages
+        // beside them, carry no session-establishment meaning this layer
+        // needs to act on — dispatch and validation are the topology
+        // engine's, once that engine exists.
         Some(
             MessageType::ClipboardOffer
             | MessageType::ClipboardAccept
@@ -845,7 +857,9 @@ async fn dispatch_frame(
             | MessageType::ReleaseAllInput
             | MessageType::ControlRequest
             | MessageType::ControlResponse
-            | MessageType::ControlRelease,
+            | MessageType::ControlRelease
+            | MessageType::MonitorTopology
+            | MessageType::LayoutSync,
         )
         // Not a control message: the application owns dispatch (and
         // validity) of everything else.

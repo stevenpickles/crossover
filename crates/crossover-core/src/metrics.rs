@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::hello::{MessageClass, MessageType};
 
 use crate::supervision::DisconnectReason;
 
@@ -101,12 +101,16 @@ impl FrameClass {
                 | MessageType::ClipboardApplied,
             ) => Self::Clipboard,
             Some(MessageType::InputBatch | MessageType::ReleaseAllInput) => Self::Input,
-            Some(
-                MessageType::ControlRequest
-                | MessageType::ControlResponse
-                | MessageType::ControlRelease,
-            ) => Self::Control,
-            None => Self::Other,
+            // Everything left that `MessageType::class` reports as
+            // docs/PROTOCOL.md §4's CONTROL class: control-transfer
+            // negotiation and display topology (ADR 0018) — negotiating
+            // crossing geometry, not application content. Keepalive and
+            // setup are CONTROL class too, but the two arms above already
+            // claimed them for this finer-grained report, and
+            // `ReleaseAllInput` for the same reason rides `Self::Input`
+            // here rather than `Self::Control`.
+            Some(ty) if ty.class() == MessageClass::Control => Self::Control,
+            Some(_) | None => Self::Other,
         }
     }
 }
