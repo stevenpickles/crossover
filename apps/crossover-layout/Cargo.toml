@@ -1,0 +1,28 @@
+[package]
+name = "crossover-layout"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The editor is a plain-integrity, on-demand, user-launched window (ADR 0019).
+# It never touches the network, the clipboard, the input path, or the trust
+# store, so it deliberately does NOT depend on crossover-core, -protocol,
+# -security, or any platform crate: the GUI stack and (from the canvas branch)
+# `crossover-topology` are the whole graph. That exclusion is the structural
+# half of ADR 0019 — a reviewer verifies it by reading this manifest and
+# `cargo tree`, exactly as ADR 0011 intended for `crossover-svc`.
+[dependencies]
+eframe = { workspace = true }
+
+# Windows-only: stamp the icon and the version resource into
+# crossover-layout.exe (build.rs), so the third shipped binary identifies
+# itself in Explorer and to the packaging script's consistency check without
+# being run. A *build* dependency, so the runtime graph above is untouched.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[lints]
+workspace = true
