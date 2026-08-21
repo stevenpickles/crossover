@@ -49,12 +49,13 @@ struct Cli {
 
 // Two of these verbs are also spelled out in another binary: the layout
 // editor's empty state tells the user to run `crossover run` or `crossover
-// service install` (apps/crossover-layout/src/app.rs, which carries the
-// matching note). Renaming either here without changing that text leaves the
-// editor naming a command that no longer exists. Sharing the strings would
-// mean a crate between the two binaries for four words, which ADR 0019's
-// dependency rule makes a poor trade — so the coupling is deliberately held
-// by these two comments and the editor's test.
+// service install` (apps/crossover-layout/src/render.rs's
+// `draw_worker_never_run`, which carries the matching note). Renaming either
+// here without changing that text leaves the editor naming a command that no
+// longer exists. Sharing the strings would mean a crate between the two
+// binaries for four words, which ADR 0019's dependency rule makes a poor
+// trade — so the coupling is deliberately held by these two comments and the
+// editor's test.
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run Crossover in the foreground (clipboard sync arrives in Phase 2).
