@@ -1164,3 +1164,636 @@ Crossover's backoff), no stuck input, no clipboard loops.
   its `reconnect_attempts` and the *other* machine's session continuity
   before trusting a maximum. That check is what separated this run from the
   discarded one.
+
+## Phase 8 soak: the drawn display topology (two machines)
+
+These are the Phase 8 exit criteria, and the loop the phase exists to close:
+an arrangement **drawn** at one desk decides where the cursor crosses at
+both. Everything up to the OS and the wire is hermetic — the layout model
+and its validation, the adjacency derivation, per-span hysteresis, the
+`(revision, origin)` resolver and its hash tiebreak, and every screen the
+editor can paint (docs/TESTING.md §3.2, ADR 0019's headless pass). What
+only two desks can show is whether the picture matches the desk: whether
+the seams the user drew are the seams the cursor finds, whether a dock, an
+unplug or a monitor going to sleep moves them correctly under a live
+session, and whether two machines that disagree converge where a human can
+see it happen.
+
+docs/TESTING.md §3.2's **E-7 is this section's Pass 1**, and is listed
+there precisely so a single-machine release checklist knows it has not
+covered it. E-1 to E-6c are the single-machine editor checks and are *not*
+repeated here — run them first, on machine A, because a broken canvas
+wastes a two-desk session.
+
+### Setup
+
+The standing pair, unchanged from Phase 6/7: machine **A** (development
+machine, `192.168.1.151`, **two monitors**, mixed DPI) listens; machine
+**B** (`192.168.1.146`, one monitor) dials. Both under the background
+service (ADR 0011), which is how the pair actually runs.
+
+Five things to do before starting, each of which has cost time when
+skipped:
+
+1. **Build both machines from the same commit.** Protocol v4 raises the
+   floor as well as the ceiling (ADR 0018, ADR 0017's rule), so a v3 peer
+   is refused at `Hello` with a version-range mismatch and the session
+   never establishes. A mixed pair does not connect at all — that is the
+   designed behaviour, not a fault to debug.
+2. **Install all three binaries.** `crossover.exe`, `crossover-svc.exe`
+   and now `crossover-layout.exe`, which must sit **beside**
+   `crossover.exe`: `crossover layout` resolves the editor as a sibling of
+   the running executable and never consults `PATH` (ADR 0019). A missing
+   editor is a clear error naming the path it looked at.
+3. **Write down which physical screen is which device string**, on both
+   machines. Every diagnostic in this section names `\\.\DISPLAY1` and
+   friends, never "the left one", because the device string is what the
+   layout is keyed on (ADR 0018). `crossover layout`'s canvas labels each
+   rectangle with it; note them against the monitors on the desk.
+4. **NTP-sync both machines.** Carried forward from the files session: a
+   ~0.9 s skew made cross-machine log correlation manual arithmetic, and
+   this section correlates two logs constantly.
+5. **Know the three log sinks.** The worker's own log is
+   `~/.crossover/logs/crossover.<date>.log`; the service's supervision log
+   is `%ProgramData%\Crossover\logs`; and — new this phase — the **editor**
+   writes to `~/.crossover/logs` too (ADR 0019's 2026-08-21 amendment),
+   because a release editor is a GUI-subsystem binary with no console to
+   report to. A diagnostic from any of the three binaries of one install
+   lands in one directory.
+
+**One thing to settle before the first check, because half the diagnostics
+below come in pairs.** Most layout messages are dual-channel: a `tracing`
+line with structured fields, and a plain sentence on the console. Under the
+background service the worker **has no console** (SOAK's own Phase 6
+limitation — it is launched with no window and its output goes to `NUL`,
+ADR 0011), so the console halves are visible only in a **foreground
+`crossover run`**. Under the service, read the log; the two carry the same
+facts, and only the log is guaranteed. The same applies to the `c` / `r`
+console commands, which do not exist under the service — the both-Control
+escape does, because it lives in the key path rather than the console.
+
+If a check below wants both halves, run that machine in the foreground for
+it. Everything else in this section is designed to be read out of
+`~/.crossover/logs`.
+
+Most checks below are read out of the worker log. The two greps used
+throughout:
+
+```powershell
+$log = "$env:USERPROFILE\.crossover\logs\crossover.*.log"
+Select-String 'layout sync:|topology:' $log | Select-Object -Last 40
+Select-String 'display topology changed|edge:|control: ' $log | Select-Object -Last 40
+```
+
+The run's metrics block also carries a topology line, printed by any run
+that sent, adopted or refused an arrangement — and printing all three
+counts including the zeroes, so an unreported sync is visible:
+
+```
+  layout:     2 sent, 1 adopted from the peer, 0 rejected
+```
+
+---
+
+### Pass 0 — the implicit regression (nothing drawn yet)
+
+**Exit criterion 5** (no regression in seamless transfer's existing
+guarantees), and the baseline everything after it is measured against. Run
+the pair exactly as Phase 6/7 left it: both machines on the deprecated side
+model, A `--left` (or `[seamless] side = "left"`), B `--right`. Nothing in
+this pass may differ from Phase 6/7 behaviour.
+
+**Expect deprecation warnings, and read them as a pass, not a fault.** A
+flag produces, at `warn` in the log and — in a foreground run only — on
+stderr:
+
+```
+deprecated: draw an arrangement with `crossover layout` instead (ADR 0018)   flag="--left"
+Warning: --left is deprecated; draw an arrangement with `crossover layout` instead (ADR 0018).
+```
+
+A `[seamless] side` key in the config file produces the same pair worded
+for the key (`deprecated: [seamless] side is retired by ADR 0018; …`). One
+warning per run per source. Their **absence** is the anomaly here, not
+their presence.
+
+| # | Check | What a pass looks like |
+|---|-------|-------------------|
+| 0.1 | **Cross A → B.** Drive A's cursor into the outer right edge of A's desktop | Control transfers on its own; B's cursor appears at B's left edge at the matching height; A's pointer freezes. Exactly as Phase 5 |
+| 0.2 | **Cross back.** Drive B's cursor into B's left edge | Control returns; A's pointer comes back at the matching height. Repeat a dozen times, mouse only |
+| 0.3 | **A's internal seam stays inert.** Drive across the seam between A's two monitors, both directions, several times | Nothing transfers. The side model's one-desktop treatment is intact, and this is the behaviour Pass 1 will deliberately change |
+| 0.4 | **The escape chord.** While A controls B, press both Control keys | Control returns instantly; no Control lands on B; A's keyboard is alive |
+| 0.5 | **Cursor mask.** Watch the cursor through a dozen cycles | Exactly one cursor, on the machine being driven. No cycle leaves none for more than a moment; local input on a hidden-but-not-driving machine restores it |
+| 0.6 | **Dock/undock and worker crash-relaunch.** Undock A (or unplug its second monitor), cross, replug; then `Stop-Process` A's `crossover.exe` | `display topology changed; the crossing spans follow the new layout` appears within a health tick, with no transfer firing by itself; the service relaunches the worker within ~1 s (`%ProgramData%\Crossover\logs`); the session re-establishes with no re-pairing |
+
+*A failure in this pass, in any of its shapes:* a crossing that does not
+fire or does not return; a stuck key, button, or hidden cursor after any
+cycle; a transfer firing by itself across the dock/undock in 0.6; a
+relaunch that does not happen or that needs a re-pair; or A's internal seam
+in 0.3 transferring anything at all.
+
+**A failure in Pass 0 stops the session**: it is a regression against a
+closed phase, and nothing measured after it would mean anything.
+
+---
+
+### Pass 1 — the drawn layout (E-7)
+
+**Exit criteria 1 and 2.** This is the pass the phase exists for. Draw the
+real desk, save it, watch it reach the other machine, then check that the
+cursor crosses where the drawing says and nowhere else.
+
+#### 1.1 Draw it
+
+On **A**, `crossover layout`. Drag A's group and B's group into the
+arrangement the monitors physically sit in, and **snap the seams** — the
+status bar names each catch (`Snapping machine-b: edges meet`), and
+abutment is exact with zero tolerance (ADR 0018), so a seam that did not
+visibly snap is a wall. Then Save.
+
+*A pass:* the Save button was enabled (`Unsaved changes`, not `Cannot be
+saved yet`), and the status bar reports
+`Saved (revision N). The worker picks it up shortly.` The editor log
+carries `saved the drawn arrangement to the config file` with `revision`.
+
+*A failure:* a blocking diagnostic that names no rectangle, a snap that
+catches nothing at either zoom, or a rectangle that creeps away from the
+pointer while held (E-3's single-machine check, escalating here).
+
+#### 1.2 The worker re-reads it — no restart
+
+*Log line, on A, within ~2 s* (the config modification-time poll):
+
+```
+topology: config re-read picked up a changed layout   revision=N origin=…
+layout sync: the config file now names a newer arrangement   revision=N origin=…
+```
+
+*A failure:* nothing within a few seconds, or
+`topology: config re-read has an invalid [layout]; keeping the last good one`
+— the editor wrote something the worker will not take, which is a defect in
+the pair of them, not a user error.
+
+#### 1.3 The `LayoutSync` goes out
+
+*Log line, on A:*
+
+```
+layout sync: stated this machine's arrangement to the peer   session=… revision=N origin=…
+```
+
+and `layout: 1 sent, …` in the next metrics record.
+
+#### 1.4 B adopts it, observably at both ends
+
+*Log line, on B* — the adoption, in one of **three** shapes. Which one
+depends on whether B held an arrangement of its own, and on whether the
+narration rate limit is open:
+
+```
+layout sync: adopted the peer's arrangement; this machine held none   adopted_revision=N adopted_origin=…
+layout sync: adopted the peer's arrangement; the one this machine held is superseded
+    adopted_revision=N adopted_origin=… superseded_revision=M superseded_origin=…
+layout sync: adopted the peer's arrangement (narration rate-limited)
+    adopted_revision=N adopted_origin=…
+```
+
+The first two are at `warn`/`info` and carry a matching console sentence in
+a foreground run (`Adopted the display arrangement drawn on the peer
+(revision N)…`). **The third is at `debug` and has no console half**: one
+narration per five seconds is allowed, and the rest are still recorded, one
+level down. Rapid editing will reach it — check 3.3 and any burst of saves
+— and **a quiet adoption must not be read as a missing one**. Turn the log
+level up (`RUST_LOG=debug`) for any pass that edits quickly, or the
+adoptions after the first will look like silence.
+
+At `debug`, `layout sync: resolved the peer's arrangement` names the
+resolution label and both keys, which is the line to read when a resolution
+surprises you.
+
+**On a first-ever adoption onto an implicit run, B also logs the honest
+cost** (ADR 0018's 2026-08-21 amendment):
+
+```
+layout sync: this run crosses by no drawn arrangement, so the adopted one takes
+effect at the next start (it is saved to the config now)
+```
+
+That is not a failure. Restart B's worker once and continue — it applies
+once per machine, not per edit, and it is why this pass restarts B before
+1.6.
+
+#### 1.5 B's config is upgraded and persisted
+
+*Check on B:* `crossover config` shows `schema_version = 2`, a `[layout]`
+section with `revision = N` and the same `origin`, **and no `[seamless]
+side` key** — adoption counts as the first write, which is what performs
+the schema 1 → 2 upgrade. Comments and other sections must survive
+verbatim (`toml_edit`, not serialize-and-truncate).
+
+*A failure:* a lost comment, a mangled `[network]` section, or a `side` key
+still present alongside `[layout]`.
+
+#### 1.6 The seam the side model could not express
+
+Draw **B between A's two monitors** (`A1 | B | A2`), save, and let both
+sides adopt. Then drive A's cursor from A1 into what used to be an internal
+seam.
+
+*A pass:* control transfers to B at that seam; driving on into B's right
+edge crosses to **A2**; and A1's *outer* left edge — a wall in this drawing
+— transfers nothing. This is deliverable 2, and it is the single check that
+most clearly separates this phase from ADR 0009.
+
+*A failure:* the crossing still happens only at A's outer desktop edge (the
+worker is still on the side model — check 1.2 and 1.4 again), or the seam
+fires but the cursor arrives on the wrong screen (`control: no live monitor
+here is named by the arriving entry point…`, below).
+
+#### 1.7 A three-monitor corner
+
+Draw one deliberately: stack A1 above A2 and place B to the right so its
+left edge meets the point where A1's bottom-right corner touches A2's
+top-right corner. Save, adopt, then approach that exact corner from each of
+the three screens, slowly, several times.
+
+*A pass:* every approach resolves to exactly one destination, the same one
+each time from the same direction. Spans are half-open `[start, end)`, so
+the shared coordinate belongs to exactly one span by arithmetic — a corner
+that answers differently on different approaches is the failure this
+check exists for.
+
+*A failure:* an approach that fires nothing, or one that alternates
+destinations.
+
+#### 1.8 Mixed DPI: 40 % in, 40 % out
+
+**Exit criterion 2**, and the one to measure rather than eyeball. With A's
+4K monitor at 150 % beside B's 1080p at 100 % (or whatever this desk's
+mismatch is), put a **physical ruler or a taped mark at 40 % down the
+drawn seam** on the source monitor. Cross there, five times, from each
+side.
+
+*A pass:* the cursor arrives within a few percent of 40 % down the
+destination edge, every time, in both directions. The mapping is
+proportional through the *drawn* edges — units cancel and no scale factor
+enters (ADR 0018) — so a systematic offset is a real defect, not rounding.
+
+*A failure to recognize specifically:* an arrival that is correct on the
+tall monitor and wrong on the short one is the desktop-bounding-box
+mapping leaking back in (docs/PROTOCOL.md §6.1's "the fraction is taken
+against that **monitor**, not against the box"). Capture the `control:
+placing cursor at the arriving entry point` debug line — it carries
+`monitor`, `edge`, `fraction`, `revision`, `x`, `y`, which is enough to do
+the arithmetic by hand.
+
+#### 1.9 Rapid crossings at a span boundary (the bounce class)
+
+The Phase 7 files session found the edge-transfer bounce (PR #44); per-span
+hysteresis is where that property now lives, and a regression reproduces
+the oscillation. On a **multi-span edge** — 1.6's `A1 | B | A2` has one, and
+1.7's corner has two adjacent spans — do three things at the boundary:
+
+1. **Wiggle across it laterally**, staying hugged against the edge, sliding
+   from one span into its neighbour. *Nothing should fire*: lateral motion
+   clears nothing, so the neighbour was never armed.
+2. **Cross deliberately, twenty times in a row**, alternating spans.
+3. **Park the cursor on the entry column** after a crossing and let a hand
+   tremor work on it for ten seconds.
+
+*A pass:* deliberate crossings remain instant; the wiggle and the tremor
+produce no transfer at all; zero control-request timeouts and zero
+`AlreadyControlled` denials over the twenty crossings.
+
+*A failure:* take/revoke cycles in the hundreds of milliseconds — the
+`REARM_MARGIN` (24 px, perpendicular) is not being applied per span.
+
+#### 1.10 An inert edge portion — part of an edge is a wall
+
+Draw B so it abuts only **part** of A1's facing edge (a short monitor
+against a tall one, offset vertically). Save and adopt.
+
+*A pass:* pushing the cursor at the abutting portion crosses; pushing at
+the portion above or below it does nothing at all, repeatedly, and the
+cursor simply stops at the desktop boundary. Connectivity is deliberately
+not required (ADR 0018) and a free edge is a legal drawing, not an error.
+
+*A failure:* a crossing from the non-abutting portion — a tolerance has
+crept into the derivation, which is exactly what ADR 0018 refused.
+
+---
+
+### Pass 2 — the arrangement changing under a live run
+
+**Exit criterion 3**: a display added, removed, or rearranged at runtime
+updates the layout **without a restart and without a stuck cursor** —
+feature/107's property, with considerably more to get wrong now that a
+screen carries spans rather than the desktop carrying one edge.
+
+| # | Check | What a pass looks like |
+|---|-------|-------------------|
+| 2.1 | **Undock / replug mid-session, cursor local.** With the drawn arrangement live, unplug A's second monitor, then replug | Within a health tick: `display topology changed; the crossing spans follow the new layout` with `monitors` and `crossings`. **No transfer fires by itself** — the detector re-derives and re-primes, never emits, across a layout change. Crossing works immediately afterwards at whatever seams survive, with no restart |
+| 2.2 | **Undock mid-control** (this machine is *being driven*) | The cursor mask stays blanked through the change (the re-assert), and the grant is still endable: the both-Control escape at the controller returns control, and genuine local input on the controlled machine reclaims to neutral. **No stuck key, no stuck button, no cursor left hidden** — this is criterion 5 inside criterion 3, and it is release-blocking |
+| 2.3 | **Monitor power-off instead of unplug.** Power the monitor off, wait a minute, power it on | Record what *this* hardware does, per link type: over DisplayPort the monitor usually leaves the layout (same as unplug); over HDMI Windows often keeps it, in which case the desktop genuinely still extends there and the spans staying put is correct. The Phase 6 residual, now re-measured against a drawn layout |
+| 2.4 | **The editor reflects it live.** Leave `crossover layout` open on A throughout 2.1 | The new screen appears within a second or two, and an unplugged one disappears the same way — **alongside** an unsaved drag, not instead of it (E-6c, here against a real second machine) |
+| 2.5 | **A partially unmatched arrangement.** Power off or unplug the monitor a drawn span depends on, and leave it off | The drawn-but-absent monitor **keeps its place** on the canvas but loses its native-resolution line from the label — the mirror of the ghosted `(unplaced)` treatment a *live* monitor the drawing does not place would get. The worker logs the degradation rather than going quiet. Crossings through that screen's spans stop; every other span keeps working. Nothing is *rejected* — an arrangement legitimately names screens that are not attached right now (ADR 0018's 2026-08-21 amendment), which is what lets a drawing survive an undock |
+
+*A failure in this pass:* a transfer firing by itself on a layout change
+(the detector re-derived but did not re-prime — a moved edge must never be
+an arrival); a cursor left hidden after 2.2, or a grant that cannot be
+ended by any surviving route; crossings that stop working entirely after a
+change and only return on a restart; an editor that needs a save before a
+docked monitor appears, or that drops an unsaved drag to show one; or a
+change that produces no `display topology changed` line at all, which makes
+every later symptom undiagnosable.
+
+The lines Pass 2 is anchored to, all from the worker log:
+
+```
+display topology changed; the crossing spans follow the new layout   monitors=[…] crossings=…
+edge: none of this machine's live screens matches the drawn arrangement; crossing by
+  cursor is off until one does (local input, the console, and the escape gesture still
+  end a grant)                                                revision=… publication=… monitors=…
+edge: the display stopped reporting its monitors; seamless detection is suspended
+  until it answers again
+edge: the display is answering again; seamless detection resumes
+```
+
+and, when a whole desk goes unmatched at the moment of adoption:
+
+```
+layout sync: the adopted arrangement names none of this machine's attached screens, so
+  nothing here crosses anywhere until one of them comes back   revision=… drawn=[…] attached=[…]
+```
+
+**During any edit's propagation window, expect degraded placement and read
+it as designed.** For the few seconds between one machine adopting a new
+revision and the other doing so, crossings carry an `EntryPoint` stamped
+with a revision the receiver does not hold, and the receiver says so:
+
+```
+control: the entry point was derived from a layout revision this machine does not hold;
+  placing on the desktop-bounds edge instead — the transfer itself is unaffected
+                              monitor=… sender_revision=… local_revision=… edge=…
+control: no live monitor here is named by the arriving entry point; placing on the
+  desktop-bounds edge instead — the transfer itself is unaffected
+```
+
+Placement degrades; **control never does**. A grant that fails, splits, or
+hangs in that window is a real defect; a cursor landing at the desktop edge
+instead of the drawn one, briefly, is not.
+
+---
+
+### Pass 3 — disagreement, and surviving a restart
+
+**Exit criterion 4**: the arrangement survives restart, and two machines
+that disagree **resolve observably** rather than silently mis-crossing.
+
+#### 3.1 Edit on B while A is disconnected
+
+Pull B's network (disable the adapter). With the link down, open
+`crossover layout` on **B** — it must stay usable, drawing the peer's
+last-known monitors with `connected: false`, which is exactly what ADR 0018
+retains them for — draw a visibly different arrangement, and save. Then
+re-enable the adapter.
+
+*A pass, on reconnect:* the newer revision wins on both machines, and
+**the loser says so in full**. On A:
+
+```
+layout sync: adopted the peer's arrangement; the one this machine held is superseded
+    adopted_revision=… adopted_origin=… superseded_revision=… superseded_origin=…
+```
+
+If instead A's arrangement is the newer one, B's save is the loser and B
+logs the mirror image (and says it on the console too, in a foreground
+run):
+
+```
+layout sync: the arrangement just saved to the config file is superseded by a newer one
+  this run already holds; it will not be used
+    adopted_revision=… adopted_origin=… superseded_revision=… superseded_origin=…
+```
+
+*A failure:* the two machines end up crossing by different arrangements
+with nothing in either log saying which won — that is precisely the silent
+mis-crossing the criterion forbids. Confirm convergence behaviourally too:
+after the dust settles, a crossing at a seam that exists in only one of the
+two arrangements must behave the same way from both ends.
+
+#### 3.2 Restart both
+
+Reboot A and B (or `Restart-Service Crossover` on each).
+
+*A pass:* both come back crossing by the same arrangement, with no editor
+run and no re-pairing. `crossover config` on each shows the same
+`revision`/`origin`. Cross a few times at a drawn seam to confirm
+behaviourally, not just on disk.
+
+*A failure:* either machine coming back on the side model (the `[layout]`
+section was lost, or `schema_version` regressed), the two disagreeing on
+`revision` with neither re-syncing, or an arrangement that is right on disk
+but not in force — crossing still happening at the old outer edge, which
+means the startup path read the file and did not publish it.
+
+#### 3.3 Revision numbering advances past what was adopted
+
+Open the editor on the machine that **lost** 3.1, drag something, and save.
+
+*A pass:* the new save's revision is one past the highest revision either
+file has seen — so it beats the adopted one and propagates, rather than
+tying with it. Watch the far machine adopt it.
+
+*A failure:* a save that numbers *into* a revision already adopted. Two
+different arrangements at one revision is the anomaly the hash tiebreak
+exists to survive, not a state to reach on purpose; if it happens, the log
+says so and the sighting is worth a defect:
+
+```
+layout sync: two different arrangements claim the same revision and origin; resolving
+  by content hash (ADR 0018)
+```
+
+---
+
+### Pass 4 — adversarial-adjacent
+
+Not a security test — a hostile *trusted* peer stays out of scope
+(SECURITY.md §6) — but the failure modes a real desk actually produces:
+half-written files, a stopped worker, an editor left open across a crash.
+The property under test throughout is **degrade, don't die**.
+
+#### 4.1 Hand-corrupt A's config mid-run
+
+With everything running, open `~/.crossover/config.toml` on A and break
+it in three escalating ways, restoring between each:
+
+1. **A stray `[`** — the file is not TOML at all.
+2. **A structurally invalid `[layout]`** — two monitors given the same `id`
+   within one device, or a `width = 0`.
+3. **A `[layout]` naming a device this machine is not paired with** — the
+   residue of a re-pair.
+
+*A pass, in order:*
+
+```
+topology: config re-read failed; keeping the last good configuration
+topology: config re-read has an invalid [layout]; keeping the last good one
+layout sync: the config file names an arrangement of machines this run is not connected
+  to; it is not used (redraw it with `crossover layout` after pairing)
+```
+
+Each warns **once per failure streak**, not once per 2 s tick, and the run
+keeps crossing by the last good arrangement throughout. Restore the file
+and confirm the warning state clears and the arrangement is re-read.
+
+*A failure:* the worker exits, stops crossing, or repeats a warning every
+tick. A worker that dies on a bad config is a worker the service will
+relaunch into the same bad config — an ADR 0011 relaunch loop, which is why
+this degradation exists.
+
+#### 4.2 Delete the state file under a running editor
+
+With `crossover layout` open on A, delete
+`~/.crossover/state/topology.json`.
+
+*A pass:* the editor keeps the drawn arrangement on screen for a few
+consecutive bad reads (the grace period), then demotes honestly to the
+empty state — `Worker: not running`, or `Worker: state file unreadable —
+<reason>` when the file is present but unusable. The editor log records the
+transition exactly once:
+
+```
+the worker's state file could not be used            reason=…
+no drawn arrangement survived the read-failure grace period; showing the empty state
+```
+
+Then let the worker's next write recreate it: the canvas fills back in on
+its own, with `the worker's state file is readable again` logged once.
+Repeat with the file *present but corrupt* (truncate it, or bump its
+version field by hand) — the reason must **name why**, not just report
+absence.
+
+*A failure:* a blank canvas with no reason given, a demotion that flashes
+on a single transient read, or a log line once per second.
+
+#### 4.3 Kill the worker under an unsaved editor edit
+
+With an unsaved drag on screen in the editor, `Stop-Process` A's
+`crossover.exe`.
+
+*A pass:* the state file stays where it is, so its heartbeat simply goes
+quiet — the editor keeps drawing the last report and says
+`not responding — showing its last report`, **with the unsaved edit
+intact**. The service relaunches the worker within ~1 s; the editor's
+status returns to running and the edit is *still* there. Save it then, and
+confirm the freshly relaunched worker picks it up (1.2's line).
+
+*A failure:* the edit is discarded, or the editor blanks. A demotion is
+allowed to lose facts about the worker; it must never lose the user's
+drawing. (An edit **is** correctly discarded by one event, and only one: a
+*different* peer appearing, which is a re-pair.)
+
+---
+
+### Known residuals to watch
+
+Named here rather than discovered mid-session. None of these is a defect to
+be surprised by; each is a decision with a cost, and the soak's job is to
+find out whether the cost is real on this hardware.
+
+- **The inert-while-`Returning` window — the strong fix is deliberately not
+  implemented.** A machine that is *being controlled* reclaims by crossing
+  a span; a crossing map with no spans therefore removes that particular
+  reclaim path. `crossover-core`'s `CrossingMap::inert` names three ways a
+  caller may honour the contract, and the explicit-layout source takes
+  route 3 — reclaim paths that never ran through spans — rather than route
+  1, retaining the previous map's spans for the `Returning` direction. The
+  surviving exits are: **genuine local input** on the controlled machine
+  (`ControlEvent::LocalInputReclaim`), **`r` at the controller's console**,
+  **both Control keys at the controller**, and **disconnect**. Note that
+  under the background service the second of those is **not available** —
+  the worker has no console — so on a service-launched pair the real exits
+  are local input, the escape chord, and disconnect. The honest
+  caveat is on the first of them: the local-input detection re-baselines the
+  system input tick after every injection the peer makes, so *while the
+  controller is actively driving*, a local event can be re-baselined past
+  before a poll observes it — it resolves the moment the controller pauses.
+
+  **Provoke this once, deliberately.** On an explicit drawn arrangement,
+  with A driving B, unplug (or power off) the monitor B's crossing span
+  depends on **mid-grant**, while A keeps the mouse moving continuously.
+  Then try to get B back with local input alone, and time it. Record: how
+  long it took, whether pausing A's mouse for a second resolved it
+  immediately, and whether the escape chord still worked (and `r`, if this
+  provocation is run with A in the foreground rather than under the
+  service). **If a
+  user is genuinely unable to reclaim in that window, route 1 is the change
+  to make**, and it belongs in `CrossingMap::inert` where the span ids live
+  — the NOTE in that function says so, and this soak is the evidence it
+  asks for.
+
+- **One restart before a first-ever adopted arrangement drives the
+  cursor.** A run holding no drawn arrangement — an implicit
+  `--left`/`--right` run, or seamless off — adopts and persists a layout the
+  peer sends, but has no live crossing source for the publication to
+  replace, so it begins crossing by it at the *next* start (ADR 0018's
+  2026-08-21 amendment). It applies **once per machine, not per edit**, and
+  it is logged at the moment it applies (`…takes effect at the next start
+  (it is saved to the config now)`). Check 1.4 restarts B for exactly this;
+  do not read the restart as a workaround for a bug.
+
+- **Degraded placement during an edit's propagation window is expected and
+  diagnosed.** For the few seconds between one machine adopting a revision
+  and the other doing so, a crossing carries an `EntryPoint` the receiver
+  cannot honour and the cursor lands on the desktop-bounds edge instead of
+  the drawn one, with `control: the entry point was derived from a layout
+  revision this machine does not hold…`. Placement degrades; the grant does
+  not. Count them if they are frequent — a *steady* stream outside an edit
+  window means the two machines are not converging, which is Pass 3's
+  business.
+
+- **A saved arrangement whose screens are all absent is inert, not
+  rejected.** The rule "a monitor neither peer has reported" was removed
+  from the rejection list (ADR 0018 / PROTOCOL.md §6.2, amended
+  2026-08-21) because it would make a drawing forget the desk on every
+  undock. What is owed instead is observability, and check 2.5 is where it
+  is verified.
+
+- **Carried from earlier phases, unchanged:** injection into an elevated
+  window may be swallowed (UIPI, R-1); an application with its own Home/End
+  handling interprets forwarded shifted navigation its own way (Phase 4);
+  and there is still no inbound preemption of a genuinely saturated
+  same-driver queue (Phase 7, PR #46).
+
+---
+
+### Exit criteria → checks
+
+Every Phase 8 exit criterion in docs/ROADMAP.md, and the checks that sign
+it off. A criterion with no passing check is a criterion not met,
+whatever else the session showed.
+
+| docs/ROADMAP.md Phase 8 exit criterion | Checks |
+|---|---|
+| A layout drawn in the editor produces crossings that match it, **including a seam between two monitors of the same machine** and **a corner where three monitors meet** | 1.1–1.4 (the loop closes), **1.6** (the same-machine seam), **1.7** (the three-way corner), 1.9 (span boundaries), 1.10 (an inert edge portion). Baseline contrast: 0.3 |
+| Mixed DPI and mixed resolution behave: a pointer leaving a 4K monitor at 40 % of its edge arrives at 40 % of the adjacent edge, whatever the scaling | **1.8** (measured with a ruler, both directions). Single-machine companion: docs/TESTING.md §3.2 E-2 |
+| A display added, removed, or rearranged at runtime updates the layout **without a restart and without a stuck cursor** | **2.1** (cursor local), **2.2** (mid-control — the stuck-cursor half), 2.3 (power-off vs. unplug), 2.4 (editor live), 2.5 (partially unmatched). Baseline: 0.6 |
+| The arrangement **survives restart**, and two machines that disagree **resolve observably** rather than silently mis-crossing | **3.1** (disagreement, both diagnostics), **3.2** (restart), 3.3 (revision numbering), 1.5 (persisted and upgraded), 4.1 (a config that cannot be trusted degrades rather than mis-crossing) |
+| No regression in seamless transfer's existing guarantees: control returns at the reverse edge, no stuck keys, no cursor left hidden | **All of Pass 0** (0.1–0.6), plus 2.2 (mid-control change), 1.9 (no bounce), 4.2 (the editor stays diagnosable when the worker's report goes away), 4.3 (worker death mid-edit). Clipboard sync must also keep working throughout — copy across at points in every pass |
+
+### The standing rule
+
+Anything this session finds becomes **fix commits on this branch, or a
+recorded follow-up with its evidence** — and only then does the
+current-phase marker in docs/ROADMAP.md move. That is the order every
+previous phase closed in, and it is the reason the marker is worth
+believing.
+
+Record the outcome in the Phase 8 exit-criteria notes (docs/ROADMAP.md):
+which arrangements were drawn (including the same-machine seam and the
+three-way corner), the measured 40 % arrival error, how many crossings ran
+at a span boundary and whether any bounced, what happened on each runtime
+display change, how the disagreement resolved and how long it took, and —
+specifically — what the inert-while-`Returning` provocation showed.

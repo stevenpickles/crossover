@@ -793,6 +793,35 @@ Exit criteria:
 - No regression in seamless transfer's existing guarantees: control returns
   at the reverse edge, no stuck keys, no cursor left hidden.
 
+**Implementation complete, validation pending (2026-08-21).** Every
+deliverable above is built and merged to `dev` — the drawn topology model
+and its crossing derivation, per-monitor edges, cross-machine `LayoutSync`
+with its `(revision, origin)` resolver, config schema v2 persistence, and
+the editor — through feature/156 and feature/152 (PRs #50–#62). What is
+left is the part no CI run can do: the exit criteria above are two-desk
+hardware work.
+
+**The runbook for it is [SOAK.md](SOAK.md)'s Phase 8 section**, written
+against the standing pair (A, two monitors, `192.168.1.151`; B,
+`192.168.1.146`). It is ordered as five passes — an implicit-side-model
+regression baseline, the drawn layout and its geometry (which is
+docs/TESTING.md §3.2's **E-7**, deliberately deferred to the soak), runtime
+display change, disagreement and restart, and the degrade-don't-die cases —
+and it closes with an explicit criterion→check table, so every criterion
+above maps to at least one named check. Its "known residuals to watch"
+subsection names five things the soak should expect rather than discover,
+three of them this phase's own: the inert-while-`Returning` window whose
+strong fix is deliberately not implemented (the soak provokes it once, on
+purpose), the one-restart cost of a first-ever adopted arrangement on a run
+holding no drawn layout (ADR 0018's 2026-08-21 amendment), and degraded
+cursor placement inside an edit's propagation window — plus a saved
+arrangement whose screens are all absent deriving inert rather than being
+rejected, and the caveats carried forward from earlier phases.
+
+**The phase closes on that soak's completion, not before**, and anything it
+finds becomes a fix or a recorded follow-up first. The current-phase marker
+at the top of this file moves only then.
+
 ## Phase 9 — Cross-Platform Validation
 
 **Goal:** prove the architecture is genuinely portable.
