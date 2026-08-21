@@ -10,12 +10,35 @@ repository.workspace = true
 # The editor is a plain-integrity, on-demand, user-launched window (ADR 0019).
 # It never touches the network, the clipboard, the input path, or the trust
 # store, so it deliberately does NOT depend on crossover-core, -protocol,
-# -security, or any platform crate: the GUI stack and (from the canvas branch)
-# `crossover-topology` are the whole graph. That exclusion is the structural
-# half of ADR 0019 — a reviewer verifies it by reading this manifest and
-# `cargo tree`, exactly as ADR 0011 intended for `crossover-svc`.
+# -security, or any platform crate: the GUI stack, `crossover-topology`, and
+# the `tracing` family (below) are the whole graph. That exclusion is the
+# structural half of ADR 0019 — a reviewer verifies it by reading this
+# manifest and `cargo tree`, exactly as ADR 0011 intended for `crossover-svc`.
 [dependencies]
 eframe = { workspace = true }
+# The layout model, its validation, and the worker's state-file schema (ADR
+# 0018). The `config` feature is what pulls the state-file (de)serializer in
+# — ADR 0018/0019's graph invariant names this crate and this feature
+# explicitly as the one exception to "no other Crossover crate": the editor
+# reads `~/.crossover/state/topology.json` through it, and reads nothing
+# else Crossover-shaped. It never enables the crate's TOML writer path
+# beyond what `config` already brings — saving a layout is the next branch's.
+crossover-topology = { workspace = true, features = ["config"] }
+
+# The editor's one diagnostic sink (NFR-3), added by ADR 0019's dated
+# logging amendment: a release build is a GUI-subsystem process with no
+# console (this manifest's header), so a state-file read failure needs
+# somewhere else to go. `logging.rs` installs a minimal, file-only
+# subscriber into `~/.crossover/logs` — the same directory
+# `apps/crossover/src/logging.rs` and `apps/crossover-svc`'s equivalent
+# already write to. `tracing` itself costs nothing new: `winit` (under
+# `eframe`) already pulls it in transitively, so this only makes an
+# existing edge direct; `tracing-subscriber` and `tracing-appender` are the
+# genuinely new part, and the smallest pair that makes a console-less
+# release binary diagnosable at all.
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # Windows-only: stamp the icon and the version resource into
 # crossover-layout.exe (build.rs), so the third shipped binary identifies
@@ -23,6 +46,11 @@ eframe = { workspace = true }
 # being run. A *build* dependency, so the runtime graph above is untouched.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# Property tests for the pure modules — model seeding, viewport round-trips
+# — the same crate every other property-tested crate in the workspace uses.
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true

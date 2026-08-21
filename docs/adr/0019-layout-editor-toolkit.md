@@ -286,3 +286,40 @@ the dependency policy answer — not a lint one.
 - **The editor's screens are unit-testable, headless, in the ordinary gate**
   on all three OSes — which is what keeps this GUI inside the Definition of
   Done rather than beside it.
+
+**Amendment (2026-08-21):** the editor's read of the worker's state file
+turned up a diagnosability gap this ADR's original dependency graph could
+not fill: `crossover-layout` is a GUI-subsystem binary in release builds
+(the consequence above), so a run with no console attached — an ordinary
+release install, launched from Explorer or `crossover layout` — has
+**nowhere to report** a state file it could not use (a version mismatch, a
+torn or hand-edited document). `eprintln!` reaches such a console when one
+exists and reaches nothing otherwise, which is the wrong trade for a
+diagnostic NFR-3 requires: silence about *why* the editor is showing an
+empty canvas is exactly the failure mode this branch's read-and-classify
+work exists to avoid.
+
+The fix is `apps/crossover-layout/src/logging.rs`: a minimal, **file-only**
+`tracing-subscriber` installation into `~/.crossover/logs`, the same
+directory `apps/crossover/src/logging.rs` and its `crossover-svc`
+counterpart already write to, so a diagnostic from any of the three
+binaries of one install ends up in one place. No console layer (useless in
+the one build configuration that needed a sink at all), no panic hook
+(unlike the other two binaries, this one's `main.rs` already reports its
+one fatal failure mode — no window — by other means, and a panic inside
+egui's own paint loop is not a case this amendment adds handling for).
+
+This adds three direct dependencies, and the honest accounting is that only
+two of them are new: `tracing` was already transitively present —
+`winit`, under `eframe`, depends on it — so naming it directly turns an
+existing edge into a declared one rather than adding to the dependency
+graph a `cargo tree` diff would show. `tracing-subscriber` and
+`tracing-appender` are the genuinely new part, and the smallest pair that
+makes a release build's diagnostics reach a file at all; both are already
+in `deny.toml`'s allow-list and already audited daily, since `apps/crossover`
+and `apps/crossover-svc` have depended on them since Phase 0. The sentence
+this ADR's "dependency graph" section states — "the GUI stack and
+`crossover-topology`, and on no other Crossover crate" — is unaffected:
+these are the same first-party-free family the other two binaries already
+carry, not a fourth Crossover crate and not a new supply-chain relationship
+this tree has not already accepted.
