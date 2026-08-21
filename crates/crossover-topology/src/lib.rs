@@ -59,6 +59,8 @@ pub mod monitor;
 // which enables no extra features, still compiles and runs their suites —
 // the shape `crossover-platform` uses for its `fakes` module.
 #[cfg(any(test, feature = "config"))]
+pub mod atomic_write;
+#[cfg(any(test, feature = "config"))]
 pub mod config;
 #[cfg(any(test, feature = "config"))]
 pub mod state;
@@ -72,6 +74,8 @@ pub use layout::{
 };
 pub use monitor::{MAX_MONITOR_ID_BYTES, MonitorId, MonitorIdError, validate_monitor_id};
 
+#[cfg(any(test, feature = "config"))]
+pub use atomic_write::{AtomicWriteError, temp_path, write_atomic};
 #[cfg(any(test, feature = "config"))]
 pub use config::{
     CONFIG_SCHEMA_MIN_SUPPORTED, CONFIG_SCHEMA_VERSION, LayoutMonitorRow, LayoutSection,

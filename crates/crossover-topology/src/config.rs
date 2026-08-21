@@ -44,7 +44,7 @@
 //! to keep stale rows alive would be the bug this replacement prevents.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
@@ -314,39 +314,6 @@ pub enum PersistError {
     },
 }
 
-/// Where the write lands before it becomes the config file.
-///
-/// Beside the target, on the same volume — `rename` across volumes is a
-/// copy, and a copy is not atomic. The rename then decides which of two
-/// concurrent writers wins, atomically, with no window in which the file
-/// is half a document.
-///
-/// The name carries **two** discriminators and both are load-bearing. The
-/// process id separates the worker adopting a peer's arrangement from the
-/// editor saving one. A process-wide counter separates two writes inside
-/// *one* process: the worker's adoption path is driven by network input
-/// and a future editor-triggered write is not, so two of them can be in
-/// flight on the same runtime — and sharing a temporary name would have
-/// one truncating the other's half-written file and then renaming that
-/// over the real config, which is the exact failure the temp-and-rename
-/// exists to prevent. Monotonic, so no two calls in this process collide
-/// however they interleave.
-fn temp_path(path: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    let name = path.file_name().map_or_else(
-        || String::from("config.toml"),
-        |n| n.to_string_lossy().into_owned(),
-    );
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    directory.join(format!(
-        "{name}.{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
 /// Write `layout` into the config file at `path`, preserving everything
 /// else in it (ADR 0018).
 ///
@@ -356,10 +323,11 @@ fn temp_path(path: &Path) -> PathBuf {
 /// byte for byte. An absent file is created; its containing directory is
 /// created with it.
 ///
-/// The write is atomic: the new document lands in a temporary file beside
-/// the target and is then renamed over it, so a reader — the worker's own
-/// ~2 s modification-time poll included — sees a whole document or the
-/// previous one, never a half-written one.
+/// The write is atomic ([`crate::atomic_write::write_atomic`]): the new
+/// document lands in a temporary file beside the target and is then
+/// renamed over it, so a reader — the worker's own ~2 s modification-time
+/// poll included — sees a whole document or the previous one, never a
+/// half-written one.
 ///
 /// # Errors
 ///
@@ -385,22 +353,15 @@ pub fn persist_layout(path: &Path, layout: &Layout) -> Result<(), PersistError> 
     retire_seamless(&mut document);
     document["layout"] = Item::Table(layout_table(layout, revision));
 
-    let rendered = document.to_string();
-    if let Some(directory) = path.parent()
-        && !directory.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(directory)
-            .map_err(|source| PersistError::CreateDirectory { source })?;
-    }
-    let temporary = temp_path(path);
-    std::fs::write(&temporary, rendered).map_err(|source| PersistError::Write { source })?;
-    if let Err(source) = std::fs::rename(&temporary, path) {
-        // Best-effort cleanup; the original failure is the diagnostic, and
-        // the real file is still whatever it was.
-        let _ = std::fs::remove_file(&temporary);
-        return Err(PersistError::Replace { source });
-    }
-    Ok(())
+    crate::atomic_write::write_atomic(path, &document.to_string()).map_err(|error| match error {
+        crate::atomic_write::AtomicWriteError::CreateDirectory { source } => {
+            PersistError::CreateDirectory { source }
+        }
+        crate::atomic_write::AtomicWriteError::Write { source } => PersistError::Write { source },
+        crate::atomic_write::AtomicWriteError::Replace { source } => {
+            PersistError::Replace { source }
+        }
+    })
 }
 
 /// Retire the schema-1 `side` key, and the `[seamless]` table with it once
@@ -446,7 +407,7 @@ mod tests {
 
     use super::{
         CONFIG_SCHEMA_MIN_SUPPORTED, CONFIG_SCHEMA_VERSION, LayoutMonitorRow, LayoutSection,
-        PersistError, config_schema_supported, persist_layout, temp_path,
+        PersistError, config_schema_supported, persist_layout,
     };
     use crate::device::DeviceId;
     use crate::layout::tests::{LOCAL, PEER, monitor, pair, side_by_side, valid_layout};
@@ -723,27 +684,15 @@ mod tests {
         assert!(written.contains("[layout]"), "{written}");
     }
 
-    /// The temp file sits beside the target — same directory, so the
-    /// rename is a rename and not a cross-volume copy — and is gone once
-    /// the write lands.
+    /// Nothing survives beside the target once `persist_layout` returns —
+    /// the write is atomic. The temp-file naming discipline itself
+    /// (process id, per-process counter, `.tmp` suffix) is
+    /// `crate::atomic_write`'s own test now that both writers share it.
     #[test]
-    fn the_temporary_file_is_a_sibling_and_never_survives() {
-        let path = Path::new("/some/where/config.toml");
-        let temporary = temp_path(path);
-        assert_eq!(temporary.parent(), path.parent());
-        let name = temporary
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert!(name.starts_with("config.toml."), "{name}");
-        assert!(name.rsplit('.').next() == Some("tmp"), "{name}");
-        assert!(name.contains(&std::process::id().to_string()), "{name}");
-
+    fn nothing_survives_beside_the_target_after_a_write() {
         let sandbox = Sandbox::new("atomic");
         let real = sandbox.path("config.toml");
         persist_layout(&real, &valid_layout()).unwrap();
-        assert!(!temp_path(&real).exists());
         assert!(stray_files(&sandbox.0).is_empty());
     }
 
