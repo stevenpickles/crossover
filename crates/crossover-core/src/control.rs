@@ -44,8 +44,8 @@ use crossover_protocol::{
 };
 use uuid::Uuid;
 
+use crate::edge_driver::DetectedCrossing;
 use crate::input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce_input};
-use crate::topology::{Edge, EdgeFraction};
 
 /// Tuning for the negotiation.
 #[derive(Debug, Clone)]
@@ -112,30 +112,26 @@ pub enum ControlEvent {
     /// hand back control they hold, cancel a pending request, or revoke
     /// a peer's grant over this machine (the escape hatch).
     UserRelease,
-    /// The cursor crossed the linked edge while this machine controls
+    /// The cursor crossed a crossing span while this machine controls
     /// itself: request control of `session`, carrying where the cursor
-    /// left so the peer can place its own cursor (ADR 0009). The
-    /// edge-driven twin of [`Self::UserRequestControl`].
+    /// arrives on the peer so it can place its own cursor (ADR 0009, ADR
+    /// 0018). The edge-driven twin of [`Self::UserRequestControl`].
     EdgeLeave {
         /// The session to request control of.
         session: Uuid,
-        /// Where the cursor crossed, as a fraction of the edge.
-        position: EdgeFraction,
-        /// This machine's own crossing edge (ADR 0009). `wire_entry_point`
-        /// mirrors it to the receiver's terms before it reaches the wire
-        /// — see its doc.
-        edge: Edge,
+        /// Where the crossing lands, already in the **receiver's** terms —
+        /// see [`DetectedCrossing`], and `wire_entry_point` for why
+        /// nothing on this path mirrors an edge.
+        crossing: DetectedCrossing,
     },
-    /// The cursor returned to the linked edge while a peer controls this
-    /// machine: reclaim control, carrying where the cursor left so the
-    /// controller's cursor reappears at the matching height (ADR 0009).
-    /// The edge-driven twin of [`Self::UserRelease`] in its revoke role.
+    /// The cursor returned to a crossing span while a peer controls this
+    /// machine: reclaim control, carrying where the cursor arrives on the
+    /// controller so its cursor reappears at the matching place (ADR 0009,
+    /// ADR 0018). The edge-driven twin of [`Self::UserRelease`] in its
+    /// revoke role.
     EdgeReturn {
-        /// Where the cursor crossed, as a fraction of the edge.
-        position: EdgeFraction,
-        /// This machine's own crossing edge — see [`Self::EdgeLeave`]'s
-        /// `edge` field doc.
-        edge: Edge,
+        /// Where the crossing lands — see [`Self::EdgeLeave`]'s field.
+        crossing: DetectedCrossing,
     },
     /// A session reached `ESTABLISHED`.
     SessionEstablished {
@@ -192,9 +188,8 @@ pub enum InboundControl {
     /// Peer ended the control relationship, carrying an [`EntryPoint`]
     /// (v4, ADR 0018) when the reclaim came from a crossing (ADR 0009).
     /// Mirrors [`Self::Request`]'s shape — the full wire type travels
-    /// through undecomposed; `on_peer_release` extracts `.fraction` at
-    /// the point it's used (see `wire_entry_point`'s doc for why only the
-    /// fraction is consulted today).
+    /// through undecomposed, all the way to the driver that resolves it
+    /// against local geometry.
     Release(Option<EntryPoint>),
     /// Input to replay here.
     Batch(InputBatch),
@@ -335,9 +330,12 @@ pub enum ControlNotice {
 /// What the engine asks the driver to do. Order within the returned
 /// `Vec` is the required execution order.
 ///
-/// Not `Eq`: [`ControlAction::PlaceCursor`] carries a floating-point
-/// fraction. Equality is still available for assertions via `PartialEq`.
-#[derive(Debug, PartialEq)]
+/// `Eq` since ADR 0018: [`ControlAction::PlaceCursor`] used to carry a
+/// floating-point fraction and now carries the wire `EntryPoint`, whose
+/// position is the `u16` the peer will actually receive — so every field
+/// of every action is exactly comparable, and a test asserting on one is
+/// asserting on the bytes rather than on a rounding.
+#[derive(Debug, PartialEq, Eq)]
 pub enum ControlAction {
     /// Send this message to a specific session.
     Send {
@@ -352,11 +350,17 @@ pub enum ControlAction {
     StopCapture,
     /// Inject these events into this machine, pointer and key interleaved.
     Inject(Vec<InputEvent>),
-    /// Place this machine's cursor at the given normalized position along
-    /// the linked (entry) edge, as control arrives or returns here — the
-    /// driver maps the fraction through the local display's geometry and
-    /// injects an absolute move (ADR 0009).
-    PlaceCursor(EdgeFraction),
+    /// Place this machine's cursor at the arriving entry point, as control
+    /// arrives or returns here (ADR 0009, ADR 0018).
+    ///
+    /// The **whole wire value** travels, not a fraction extracted from it,
+    /// because the driver needs all four fields to decide: the monitor id
+    /// and the revision say whether this entry point can be honoured at
+    /// all, and the edge says where the degraded placement goes when it
+    /// cannot (docs/PROTOCOL.md §6.1). The engine deliberately does not
+    /// make that decision itself — it holds no geometry, and placement
+    /// failures must never reach the control state.
+    PlaceCursor(EntryPoint),
     /// Arrange a [`ControlEvent::RequestTimeout`] after `delay`.
     ScheduleRequestTimeout {
         /// The session the request went to.
@@ -436,13 +440,11 @@ impl ControlEngine {
     pub fn handle(&mut self, event: ControlEvent) -> Vec<ControlAction> {
         match event {
             ControlEvent::UserRequestControl { session } => self.on_request(session, None),
-            ControlEvent::EdgeLeave {
-                session,
-                position,
-                edge,
-            } => self.on_request(session, Some((position, edge))),
+            ControlEvent::EdgeLeave { session, crossing } => {
+                self.on_request(session, Some(&crossing))
+            }
             ControlEvent::UserRelease => self.on_release(None),
-            ControlEvent::EdgeReturn { position, edge } => self.on_release(Some((position, edge))),
+            ControlEvent::EdgeReturn { crossing } => self.on_release(Some(&crossing)),
             ControlEvent::SessionEstablished { session } => {
                 self.established.insert(session);
                 Vec::new()
@@ -462,12 +464,11 @@ impl ControlEngine {
 
     /// Request control of `session`, whether triggered by the console
     /// (`entry` is `None`) or by an edge crossing (`entry` carries where
-    /// the cursor left and this machine's own linked edge, for the peer
-    /// to place its cursor).
+    /// the cursor arrives on the peer, for it to place its cursor).
     fn on_request(
         &mut self,
         session: Uuid,
-        entry: Option<(EdgeFraction, Edge)>,
+        entry: Option<&DetectedCrossing>,
     ) -> Vec<ControlAction> {
         let blocked = if !self.established.contains(&session) {
             Some(RequestBlocked::NoSession)
@@ -495,7 +496,7 @@ impl ControlEngine {
                 session,
                 message: OutboundControl::Request(ControlRequest {
                     request_id,
-                    entry: entry.map(|(fraction, edge)| wire_entry_point(fraction, edge)),
+                    entry: entry.map(wire_entry_point),
                 }),
             },
             ControlAction::ScheduleRequestTimeout {
@@ -509,10 +510,10 @@ impl ControlEngine {
 
     /// End whichever control relationship exists. `entry` is `Some` only
     /// for an edge-return revoke, carrying where the reclaiming cursor
-    /// left and this machine's own linked edge, so the controller places
-    /// its own cursor (ADR 0009); the console paths (hand-back, cancel,
-    /// plain revoke) pass `None`.
-    fn on_release(&mut self, entry: Option<(EdgeFraction, Edge)>) -> Vec<ControlAction> {
+    /// arrives on the controller so it places its own cursor (ADR 0009,
+    /// ADR 0018); the console paths (hand-back, cancel, plain revoke) pass
+    /// `None`.
+    fn on_release(&mut self, entry: Option<&DetectedCrossing>) -> Vec<ControlAction> {
         // Ending outbound control takes precedence over revoking inbound:
         // the outbound relationship is the one the user just initiated,
         // and the two axes end independently across successive presses.
@@ -569,7 +570,7 @@ impl ControlEngine {
                     actions.push(ControlAction::Send {
                         session: controlled.session,
                         message: OutboundControl::Release(ControlRelease {
-                            entry: entry.map(|(fraction, edge)| wire_entry_point(fraction, edge)),
+                            entry: entry.map(wire_entry_point),
                         }),
                     });
                     actions.push(ControlAction::Notify(ControlNotice::PeerControlRevoked));
@@ -817,7 +818,7 @@ impl ControlEngine {
     ///
     /// A refresh does not change `is_controlled`, so the edge mode does not
     /// change either — and an edge-driven one still places the cursor on
-    /// the linked column, which is the *trigger* column. The driver
+    /// a crossing span, which is also a *trigger* seam. The driver
     /// therefore re-primes the detector on every `PlaceCursor`, not only on
     /// the mode changes a first grant produces; without that, the refresh's
     /// own placement fires a return and revokes the grant just re-issued
@@ -854,16 +855,14 @@ impl ControlEngine {
                 verdict: ControlVerdict::Granted,
             }),
         }];
-        // An edge-driven request carries where the peer's cursor left;
-        // place ours at the matching height on the entry edge so the
-        // pointer appears to cross seamlessly (ADR 0009). A console
-        // request carries none. Only the fraction is consulted today —
-        // see `wire_entry_point`'s doc for what the monitor and edge are
-        // for.
+        // An edge-driven request says where the peer's cursor arrives on
+        // *this* machine; place ours there so the pointer appears to cross
+        // seamlessly (ADR 0009, ADR 0018). A console request carries none.
+        // The whole entry point goes to the driver, which owns the
+        // geometry and the degraded fallback — the engine never inspects
+        // it, so no placement problem can reach the control state.
         if let Some(entry) = &request.entry {
-            actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(
-                entry.fraction,
-            )));
+            actions.push(ControlAction::PlaceCursor(entry.clone()));
         }
         actions.push(ControlAction::Notify(ControlNotice::PeerTookControl));
         actions
@@ -958,13 +957,9 @@ impl ControlEngine {
             self.outbound = Outbound::Local;
             self.sent_state = InputState::new();
             let mut actions = vec![ControlAction::StopCapture];
-            // Only the fraction is consulted today — see
-            // `wire_entry_point`'s doc for what the monitor and edge are
-            // for.
+            // The whole entry point goes to the driver — see `grant`.
             if let Some(entry) = entry {
-                actions.push(ControlAction::PlaceCursor(EdgeFraction::from_wire(
-                    entry.fraction,
-                )));
+                actions.push(ControlAction::PlaceCursor(entry.clone()));
             }
             actions.push(ControlAction::Notify(ControlNotice::ControlEnded(
                 ControlEndReason::Revoked,
@@ -1036,20 +1031,49 @@ impl ControlEngine {
     }
 }
 
-/// Wrap a side-model crossing into the wire `EntryPoint` (v4, ADR 0018),
-/// via [`EntryPoint::unaddressed`] — see its doc, and the type's, for what
-/// an empty monitor and a zero revision mean to the receiver.
+/// Turn a detected crossing into the wire `EntryPoint` (v4, ADR 0018) —
+/// the one place the engine builds one.
 ///
-/// `edge` is *this machine's own* crossing edge (ADR 0009's `LinkSide`),
-/// but `EntryPoint.edge` is specified in the **receiver's** terms
-/// (docs/PROTOCOL.md §6.1): the edge the cursor *arrives* on the far
-/// side, not the one it left on this one. A left member's linked edge is
-/// `Right`; the cursor lands on the right member's `Left`. So the wire
-/// value is [`Edge::opposite`], never `edge` itself — this is the one
-/// place that mirroring happens, and every caller here and in
-/// `crossover-core`'s tests relies on it having happened here.
-fn wire_entry_point(fraction: EdgeFraction, edge: Edge) -> EntryPoint {
-    EntryPoint::unaddressed(edge.opposite().to_wire(), fraction.to_wire())
+/// # Where the mirroring is, and why not here
+///
+/// `EntryPoint.edge` is specified in the **receiver's** terms
+/// (docs/PROTOCOL.md §6.1): the edge the cursor *arrives* on the far side,
+/// not the one it left on this one. That mirroring happens exactly once,
+/// and it happens in [`crate::crossing::derive`], which records every
+/// span's target edge as [`crate::topology::Edge::opposite`] of the local
+/// edge the span lies on. By the time a [`DetectedCrossing`] exists the
+/// mirroring is done, so this function **copies the edge through**.
+///
+/// It reads as a removal — the pre-0018 side-model wrapper called
+/// `opposite()` right here — but the two are the same operation moved to
+/// where the geometry is known, and they agree wherever both can be
+/// computed. A left member's linked edge is `Right`; the old path sent
+/// `Right.opposite()` = `Left`, and the implicit arrangement's single span
+/// sits on `Right` with target edge `Left`. A second `opposite()` here
+/// would now mirror it *back*, placing the peer's cursor on the wrong side
+/// of its screen — which is why this is stated rather than left to be
+/// re-derived.
+///
+/// # Addressed and unaddressed
+///
+/// A target naming a monitor produces a full entry point, stamped with the
+/// revision the crossing was derived under. A target naming none is ADR
+/// 0018's *unaddressed* case and goes through [`EntryPoint::unaddressed`],
+/// which fixes the revision at `0` — consistent by construction rather
+/// than by coincidence, since an unaddressed target can only come from an
+/// implicit arrangement and an implicit arrangement's revision *is* `0`.
+fn wire_entry_point(crossing: &DetectedCrossing) -> EntryPoint {
+    let edge = crossing.target.edge.to_wire();
+    let fraction = crossing.position.to_wire();
+    match &crossing.target.monitor {
+        Some(monitor) => EntryPoint {
+            monitor: monitor.as_str().to_owned(),
+            edge,
+            fraction,
+            layout_revision: crossing.layout_revision,
+        },
+        None => EntryPoint::unaddressed(edge, fraction),
+    }
 }
 
 /// Every held button and key drained as release events to inject — the
@@ -1151,8 +1175,10 @@ mod tests {
 
     use super::{
         ControlAction, ControlConfig, ControlEndReason, ControlEngine, ControlEvent, ControlNotice,
-        InboundControl, OutboundControl, RequestBlocked, wire_entry_point,
+        InboundControl, OutboundControl, RequestBlocked,
     };
+    use crate::crossing::CrossTarget;
+    use crate::edge_driver::DetectedCrossing;
     use crate::input::{InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, hid};
     use crate::topology::{Edge, EdgeFraction};
 
@@ -1513,7 +1539,7 @@ mod tests {
 
         let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
             request_id: 2,
-            entry: Some(wire_entry_point(EdgeFraction::new(0.25), Edge::Left)),
+            entry: Some(unaddressed_entry(0.25)),
         })));
         assert!(
             granted(&actions),
@@ -1526,8 +1552,11 @@ mod tests {
             }])),
             "the refreshed grant must drain what the old one left held: {actions:?}"
         );
-        let placed = placed_cursor(&actions).expect("no cursor placed on a refreshed edge grant");
-        assert!((placed - 0.25).abs() < 1e-4, "placed at {placed}");
+        assert_eq!(
+            placed_entry(&actions),
+            Some(unaddressed_entry(0.25)),
+            "the refreshed grant must place at the entry point the retry carried"
+        );
         assert!(engine.is_controlled());
 
         // The peer restarts its send sequence with the fresh grant, so the
@@ -2067,11 +2096,59 @@ mod tests {
 
     // ---- seamless edge transfer (ADR 0009) ----
 
-    fn placed_cursor(actions: &[ControlAction]) -> Option<f64> {
+    /// The wire entry point a grant or release asks the driver to place
+    /// the cursor at — the whole value, so an assertion is on the bytes the
+    /// peer sent rather than on a fraction extracted from them.
+    fn placed_entry(actions: &[ControlAction]) -> Option<EntryPoint> {
         actions.iter().find_map(|a| match a {
-            ControlAction::PlaceCursor(f) => Some(f.value()),
+            ControlAction::PlaceCursor(entry) => Some(entry.clone()),
             _ => None,
         })
+    }
+
+    /// An **unaddressed** wire entry point arriving on the receiver's
+    /// `Left` edge — what an implicit (`--left`/`--right`) sender puts on
+    /// the wire, on every crossing (ADR 0018).
+    fn unaddressed_entry(fraction: f64) -> EntryPoint {
+        EntryPoint::unaddressed(WireEdge::Left, EdgeFraction::new(fraction).to_wire())
+    }
+
+    /// A detected crossing from an **implicit** arrangement: no
+    /// destination named, revision 0, arriving on the receiver's `edge`.
+    ///
+    /// `edge` is the receiver's, already: `crossing::derive` mirrors the
+    /// local edge to the facing one when it builds the span, so a left
+    /// member's `Right`-edge span carries `Edge::Left` here. The engine
+    /// must copy that through untouched — see `wire_entry_point`.
+    fn unaddressed_crossing(fraction: f64, edge: Edge) -> DetectedCrossing {
+        DetectedCrossing {
+            target: CrossTarget {
+                device: None,
+                monitor: None,
+                edge,
+            },
+            position: EdgeFraction::new(fraction),
+            layout_revision: 0,
+        }
+    }
+
+    /// A detected crossing from a **drawn** arrangement: the peer's screen
+    /// named, and the revision it was derived under.
+    fn drawn_crossing(
+        monitor: &str,
+        edge: Edge,
+        fraction: f64,
+        layout_revision: u64,
+    ) -> DetectedCrossing {
+        DetectedCrossing {
+            target: CrossTarget {
+                device: Some(crossover_topology::DeviceId::from_bytes([0x22; 16])),
+                monitor: Some(crossover_topology::MonitorId::new(monitor).expect("a valid id")),
+                edge,
+            },
+            position: EdgeFraction::new(fraction),
+            layout_revision,
+        }
     }
 
     fn sent_request(actions: &[ControlAction]) -> ControlRequest {
@@ -2087,23 +2164,41 @@ mod tests {
             .expect("no request sent")
     }
 
+    /// An implicit crossing goes out unaddressed, and its edge is the
+    /// *receiver's* (docs/PROTOCOL.md §6.1).
+    ///
+    /// The engine's own share of that: it must copy the target edge onto
+    /// the wire **unchanged**. A left member's span sits on its own
+    /// `Right` edge and `crossing::derive` records the facing `Left` as
+    /// the target, so `Left` is what arrives here and `Left` is what must
+    /// go out. Pinned as a literal `WireEdge`, never built by calling the
+    /// code under test, so a re-introduced `opposite()` and an inverted
+    /// `to_wire` both fail.
+    ///
+    /// What this test does **not** cover is the pairing itself — that a
+    /// `Right`-edge seam yields a `Left` target in the first place. That
+    /// belongs to the derivation and is pinned there
+    /// (`crossing`'s `a_cursor_on_two_edges_at_once_...`, in both axes),
+    /// and end to end over a real detector by `control_driver`'s
+    /// `a_drawn_seam_sends_a_fully_addressed_entry_point`, which starts
+    /// from a cursor on a `Right`-edge seam and asserts `WireEdge::Left`
+    /// on the frame. The two halves together are the whole chain; this one
+    /// alone would pass on a sender that mirrored twice.
     #[test]
     fn an_edge_leave_requests_control_carrying_the_crossing_position() {
         let mut engine = established_engine();
-        let position = EdgeFraction::new(0.5);
-        // This machine is a left member, so it crosses on its own `Right`
-        // edge — but docs/PROTOCOL.md §6.1 states `EntryPoint.edge` in the
-        // *receiver's* terms: the edge the cursor arrives on the far
-        // side, `Left`. Pinned as a literal `WireEdge` constant, not built
-        // via `wire_entry_point`, so an inverted mapping fails this test.
         let actions = engine.handle(ControlEvent::EdgeLeave {
             session: SESSION,
-            position,
-            edge: Edge::Right,
+            crossing: unaddressed_crossing(0.5, Edge::Left),
         });
         assert_eq!(
             sent_request(&actions).entry,
-            Some(EntryPoint::unaddressed(WireEdge::Left, position.to_wire()))
+            Some(EntryPoint {
+                monitor: String::new(),
+                edge: WireEdge::Left,
+                fraction: EdgeFraction::new(0.5).to_wire(),
+                layout_revision: 0,
+            })
         );
         // A console request carries no position, but is otherwise identical.
         let mut engine = established_engine();
@@ -2111,16 +2206,44 @@ mod tests {
         assert_eq!(sent_request(&actions).entry, None);
     }
 
+    /// A **drawn** crossing carries the peer's real screen and the
+    /// revision it was derived under, and still does not mirror its edge.
+    ///
+    /// The literals are the whole test: a span on this machine's `Bottom`
+    /// edge arrives on the peer's `Top`, which is a shape the side model
+    /// could not express at all — so a mirroring bug here cannot hide
+    /// behind Left/Right symmetry the way it could before ADR 0018.
+    #[test]
+    fn a_drawn_edge_leave_carries_the_destination_and_the_revision() {
+        let mut engine = established_engine();
+        let actions = engine.handle(ControlEvent::EdgeLeave {
+            session: SESSION,
+            crossing: drawn_crossing(r"\\.\DISPLAY2", Edge::Top, 0.25, 7),
+        });
+        assert_eq!(
+            sent_request(&actions).entry,
+            Some(EntryPoint {
+                monitor: r"\\.\DISPLAY2".to_owned(),
+                edge: WireEdge::Top,
+                fraction: EdgeFraction::new(0.25).to_wire(),
+                layout_revision: 7,
+            })
+        );
+    }
+
     #[test]
     fn granting_an_edge_request_places_the_cursor_at_the_entry_fraction() {
         let mut engine = established_engine();
         let actions = engine.handle(peer(InboundControl::Request(ControlRequest {
             request_id: 1,
-            entry: Some(wire_entry_point(EdgeFraction::new(0.25), Edge::Left)),
+            entry: Some(unaddressed_entry(0.25)),
         })));
         assert!(granted(&actions));
-        let placed = placed_cursor(&actions).expect("no cursor placed on an edge grant");
-        assert!((placed - 0.25).abs() < 1e-4, "placed at {placed}");
+        assert_eq!(
+            placed_entry(&actions),
+            Some(unaddressed_entry(0.25)),
+            "the grant must hand the driver the entry point it was asked for"
+        );
         assert!(engine.is_controlled());
 
         // A console grant places nothing.
@@ -2130,7 +2253,7 @@ mod tests {
             entry: None,
         })));
         assert!(granted(&actions));
-        assert!(placed_cursor(&actions).is_none());
+        assert!(placed_entry(&actions).is_none());
     }
 
     #[test]
@@ -2140,8 +2263,7 @@ mod tests {
         let mut engine = controlled_engine();
         let position = EdgeFraction::new(0.75);
         let actions = engine.handle(ControlEvent::EdgeReturn {
-            position,
-            edge: Edge::Right,
+            crossing: unaddressed_crossing(0.75, Edge::Left),
         });
         let release_entry = actions
             .iter()
@@ -2153,9 +2275,9 @@ mod tests {
                 _ => None,
             })
             .expect("no release sent on return");
-        // Mirrored to `Left`, pinned as a literal `WireEdge` — see the
-        // leave test above for why this is not built via
-        // `wire_entry_point`.
+        // The receiver's `Left`, pinned as a literal `WireEdge` — see the
+        // leave test above for why this is not built by calling the code
+        // under test.
         assert_eq!(
             release_entry,
             Some(EntryPoint::unaddressed(WireEdge::Left, position.to_wire()))
@@ -2169,15 +2291,18 @@ mod tests {
             EntryPoint::unaddressed(WireEdge::Left, position.to_wire()),
         ))));
         assert!(actions.contains(&ControlAction::StopCapture));
-        let placed = placed_cursor(&actions).expect("controller did not place its cursor");
-        assert!((placed - 0.75).abs() < 1e-4, "placed at {placed}");
+        assert_eq!(
+            placed_entry(&actions),
+            Some(unaddressed_entry(0.75)),
+            "the controller did not place its cursor at the returning entry point"
+        );
         assert!(!controller.is_controlling());
 
         // A console revoke/hand-back carries no position, so no placement.
         let mut controller = controlling_engine();
         let actions = controller.handle(peer(InboundControl::Release(None)));
         assert!(actions.contains(&ControlAction::StopCapture));
-        assert!(placed_cursor(&actions).is_none());
+        assert!(placed_entry(&actions).is_none());
     }
 
     // ---- graceful transition: the revoke race (ADR 0009) ----
@@ -2269,14 +2394,13 @@ mod tests {
         let mut to_a: Vec<InboundControl> = Vec::new();
         let mut to_b: Vec<InboundControl> = Vec::new();
         let mut b_notices: Vec<ControlNotice> = Vec::new();
-        let crossing = EdgeFraction::new(0.5);
+        let crossing = unaddressed_crossing(0.5, Edge::Left);
 
         // 1. B's cursor reaches the linked edge: request #1 goes out. A is
         //    busy behind its own inbound queue and does not process it yet.
         let actions = b.handle(ControlEvent::EdgeLeave {
             session: SESSION,
-            position: crossing,
-            edge: Edge::Right,
+            crossing: crossing.clone(),
         });
         let request_id = sent_request_id(&actions);
         to_a.extend(wire_messages(actions));
@@ -2293,8 +2417,7 @@ mod tests {
         // 3. Back on local control, B crosses the edge again: request #2.
         let actions = b.handle(ControlEvent::EdgeLeave {
             session: SESSION,
-            position: crossing,
-            edge: Edge::Right,
+            crossing: crossing.clone(),
         });
         to_a.extend(wire_messages(actions));
 
@@ -2354,6 +2477,93 @@ mod tests {
                 "A terminated the session that legitimately holds its grant: {actions:?}"
             );
         }
+    }
+
+    /// A full drawn round trip across two engines: B crosses onto A's
+    /// named screen, A grants and is asked to place there; A's user
+    /// reclaims by crossing back onto B's named screen, and B is asked to
+    /// place there.
+    ///
+    /// The point is the **pair of entry points**, asserted as literals.
+    /// Each names the *other* machine's screen and the edge the cursor
+    /// arrives on there, and both carry the one revision the arrangement
+    /// has — so a mirroring bug, an id swap, or a lost revision is a
+    /// failure here, on the path a real transfer takes, rather than
+    /// something only the unit tests could catch.
+    #[test]
+    fn two_engines_exchange_drawn_entry_points_in_the_receiver_s_terms() {
+        const REVISION: u64 = 12;
+        let mut a = established_engine(); // A holds the screen "A-RIGHT"
+        let mut b = established_engine(); // B holds the screen "B-LEFT"
+
+        // 1. B's cursor reaches the seam and arrives on A's screen, at A's
+        //    left edge. B requests control of A.
+        let out = b.handle(ControlEvent::EdgeLeave {
+            session: SESSION,
+            crossing: drawn_crossing("A-RIGHT", Edge::Left, 0.25, REVISION),
+        });
+        let request = sent_request(&out);
+        assert_eq!(
+            request.entry,
+            Some(EntryPoint {
+                monitor: "A-RIGHT".to_owned(),
+                edge: WireEdge::Left,
+                fraction: EdgeFraction::new(0.25).to_wire(),
+                layout_revision: REVISION,
+            }),
+            "B addressed the crossing in its own terms rather than A's"
+        );
+
+        // 2. A grants, and is asked to place its cursor at exactly what B
+        //    sent — the engine passes the wire value through untouched, so
+        //    the driver decides what it can honour.
+        let granted_actions = a.handle(peer(InboundControl::Request(request)));
+        assert!(granted(&granted_actions));
+        assert_eq!(placed_entry(&granted_actions), request_entry(&out));
+        assert!(a.is_controlled());
+
+        // 2b. The grant reaches B, which starts driving.
+        for message in wire_messages(granted_actions) {
+            let _ = b.handle(peer(message));
+        }
+        assert!(b.is_controlling());
+
+        // 3. A's user reclaims by crossing back, arriving on B's screen at
+        //    B's right edge — the mirror of step 1, and the same revision.
+        let back = a.handle(ControlEvent::EdgeReturn {
+            crossing: drawn_crossing("B-LEFT", Edge::Right, 0.25, REVISION),
+        });
+        let release_entry = back
+            .iter()
+            .find_map(|action| match action {
+                ControlAction::Send {
+                    message: OutboundControl::Release(m),
+                    ..
+                } => Some(m.entry.clone()),
+                _ => None,
+            })
+            .expect("no release sent on the return");
+        assert_eq!(
+            release_entry,
+            Some(EntryPoint {
+                monitor: "B-LEFT".to_owned(),
+                edge: WireEdge::Right,
+                fraction: EdgeFraction::new(0.25).to_wire(),
+                layout_revision: REVISION,
+            })
+        );
+        assert!(!a.is_controlled());
+
+        // 4. B stops capturing and places on the screen A named.
+        let closing = b.handle(peer(InboundControl::Release(release_entry.clone())));
+        assert!(closing.contains(&ControlAction::StopCapture));
+        assert_eq!(placed_entry(&closing), release_entry);
+        assert!(!b.is_controlling());
+    }
+
+    /// The `entry` of the request an action list sends.
+    fn request_entry(actions: &[ControlAction]) -> Option<EntryPoint> {
+        sent_request(actions).entry
     }
 
     #[test]

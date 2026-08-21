@@ -12,11 +12,18 @@
 //! flag per [`SpanId`]. A `--left`/`--right` run reaches it through
 //! [`from_link_side`], which expresses the side model *as* a layout — one
 //! span on one edge, going somewhere unaddressed — so the swap onto this
-//! model cost the side model no behaviour at all. What has **not** moved
-//! yet is the far end: the control wiring still places an arriving cursor
-//! through [`crate::topology::Topology`] rather than through
-//! [`CrossingMap::arrive`], and still sends a bare fraction rather than an
-//! `EntryPoint`.
+//! model cost the side model no behaviour at all.
+//!
+//! Both ends of a crossing now run through here. Leaving is
+//! [`CrossingMap::leave`] and the detector's rising edge over it. Arriving
+//! is [`CrossingMap::enter`] for an entry point this machine can honour —
+//! the wire carries a monitor id, an edge and a fraction, which is exactly
+//! that function's shape — and [`CrossingMap::outer_entry`] for ADR 0018's
+//! degraded case, the pre-v4 placement retained under that name.
+//! [`CrossingMap::arrive`] is the same lookup for a caller holding a
+//! [`CrossTarget`] instead of a wire id; nothing in the running worker
+//! takes that shape, so it exists for the equivalence tests, which follow
+//! a span's own target from one machine's map into the other's.
 //!
 //! # Two coordinate spaces, and the fraction between them
 //!
@@ -92,7 +99,9 @@ use crossover_topology::{
     DeviceId, DevicePair, Layout, LayoutError, LayoutRect, MonitorId, RawPlacedMonitor,
 };
 
-use crate::topology::{Edge, EdgeFraction, LinkSide, edge_monitor_index, last_index};
+use crate::topology::{
+    Edge, EdgeFraction, LinkSide, edge_monitor_index, last_index, outer_monitor_index,
+};
 
 /// A half-open interval `[start, end)` along one axis of the shared layout
 /// space, in layout units (ADR 0018).
@@ -328,14 +337,25 @@ impl SpanId {
     }
 }
 
-/// A crossing about to be handed to the peer: which span fired, and how far
-/// along the destination edge.
+/// A crossing named against the map that produced it: which span fired,
+/// and how far along the destination edge.
 ///
-/// Deliberately all-`Copy`: this is produced on the detector's poll path,
-/// and the destination it names — a device string — is fetched by reference
-/// from the map at the moment a message is actually built
-/// ([`CrossingMap::span`] then [`CrossSpan::target`]), rather than cloned
-/// on every poll that happens to touch an edge.
+/// All-`Copy`, because it names its span by [`SpanId`] rather than
+/// carrying the destination by value. That made it the poll path's return
+/// type before this branch; it no longer is. The detector emits
+/// [`crate::edge_driver::DetectedCrossing`] instead, which resolves the
+/// destination *at detection time* and pays one device-string clone on the
+/// rare tick that fires — because a span id is only meaningful in the map
+/// that produced it, and a crossing outlives that map while it queues on a
+/// channel through a display change. That trade is stated in full on
+/// `DetectedCrossing`.
+///
+/// What remains here is [`CrossingMap::leave`]'s answer: the pure
+/// "what does a cursor at this position cross, and where along it",
+/// with no history and no hysteresis. The equivalence tests use it to
+/// compare one machine's departure against the other's arrival without
+/// building a wire message, and the id is exactly right there — both maps
+/// are alive and in scope.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Departure {
     /// The span the cursor crossed.
@@ -353,6 +373,7 @@ pub struct Departure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossingMap {
     local: DeviceId,
+    revision: u64,
     monitors: Vec<MappedMonitor>,
     spans: Vec<CrossSpan>,
 }
@@ -363,6 +384,20 @@ impl CrossingMap {
     #[must_use]
     pub fn local(&self) -> DeviceId {
         self.local
+    }
+
+    /// The revision of the arrangement this map was derived from — what a
+    /// departing crossing stamps onto its wire `EntryPoint`, and what an
+    /// arriving one is checked against (ADR 0018, docs/PROTOCOL.md §6.1).
+    ///
+    /// `0` for an implicit (side-model) arrangement and for
+    /// [`CrossingMap::inert`], because neither is an arrangement anyone
+    /// drew: `0` is exactly the revision `EntryPoint::unaddressed` sends,
+    /// so an unaddressed crossing and an implicit map agree by
+    /// construction rather than by two constants happening to match.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// A map of these live monitors with **no crossings at all**: the
@@ -387,13 +422,31 @@ impl CrossingMap {
     /// defect this project treats a stuck key as.
     ///
     /// So a caller that may substitute this map while a grant is live owes
-    /// one of two things: keep the previous map's spans alive for the
-    /// `Returning` direction, or force a release (`ReleaseAllInput` and
-    /// back to `LOCAL`) as it substitutes. The implicit side-model source
-    /// sidesteps the question by construction — it derives from geometry
-    /// alone, so no plug event can make it refuse — and the explicit
-    /// layout source that the control wiring will grow must answer it
-    /// explicitly.
+    /// one of three things:
+    ///
+    /// 1. keep the previous map's spans alive for the `Returning`
+    ///    direction,
+    /// 2. force a release (`ReleaseAllInput` and back to `LOCAL`) as it
+    ///    substitutes, or
+    /// 3. rely on a reclaim path that does not run through spans at all.
+    ///
+    /// The implicit side-model source sidesteps the question by
+    /// construction — it derives from geometry alone, so no plug event can
+    /// make it refuse. The explicit layout source
+    /// ([`crate::edge_driver::explicit_crossing_source`]) takes route 3 and
+    /// says so, naming each surviving exit and, honestly, the one window in
+    /// which the first of them can be starved.
+    ///
+    /// **NOTE, for the soak.** Route 1 is the strong fix, and it is
+    /// deliberately *not* implemented yet. Route 3's main exit —
+    /// `ControlEvent::LocalInputReclaim` — re-baselines the system input
+    /// tick after every injection the controlling peer makes, so while that
+    /// peer is actively driving, a local event can be re-baselined past
+    /// before a poll observes it; it resolves as soon as the peer pauses.
+    /// If a soak ever shows a user unable to get their machine back in that
+    /// window, retaining the prior map's spans for `Returning` is the
+    /// change to make, and it belongs here rather than in the source: the
+    /// two maps must be reconciled where the span ids live.
     ///
     /// The remaining reachable route here is geometry no layout model can
     /// express at all (a monitor past `MAX_MONITOR_EXTENT`, or no monitors
@@ -403,6 +456,7 @@ impl CrossingMap {
         let identities = usable_identities(live);
         Self {
             local,
+            revision: 0,
             monitors: live
                 .iter()
                 .zip(identities)
@@ -441,6 +495,85 @@ impl CrossingMap {
     #[must_use]
     pub fn span(&self, span: SpanId) -> Option<&CrossSpan> {
         self.spans.get(span.0)
+    }
+
+    /// One line naming every crossing this arrangement gives, per monitor:
+    /// the screen, how many spans it carries, and for each the local edge
+    /// it lies on and where it goes.
+    ///
+    /// **The diagnostics line a soak reads**, written once and used by both
+    /// the startup log and the display-change log, so the two say the same
+    /// thing in the same shape and a soak report can be diffed across a
+    /// dock event. It replaces the side model's `side`/`linked_edge` pair,
+    /// which could describe one edge and can describe a drawn arrangement
+    /// not at all.
+    ///
+    /// Compact on purpose — one line, no rectangles. Anyone who needs the
+    /// geometry has `crossover config` and the topology state file; what a
+    /// log line has to answer is "which seams exist right now, and where do
+    /// they go", which is exactly the question a transfer that did not
+    /// happen raises.
+    ///
+    /// A monitor with no spans is still listed, as `NAME[none]`: "this
+    /// screen crosses nowhere" is an answer, and omitting it would leave a
+    /// reader unable to tell it from a screen the arrangement never
+    /// mentioned.
+    ///
+    /// Names only device strings and edges — no clipboard content, no key
+    /// material, nothing user-authored (invariant 6). A monitor id printed
+    /// here has passed [`MonitorId`]'s printable-ASCII validation, whether
+    /// it came from the platform or off the wire.
+    ///
+    /// # Length
+    ///
+    /// Bounded by construction at today's caps: at most
+    /// `MAX_MONITORS_PER_MACHINE` (16) live screens, each with at most
+    /// four edges times the peer's screens' spans, and each id at most
+    /// `MAX_MONITOR_ID_BYTES` (64) — a few kilobytes at the absolute
+    /// worst, and two lines a run in practice (startup, and each display
+    /// change). No truncation is applied, deliberately: a diagnostic that
+    /// elides the span you are looking for is worse than a long line.
+    /// **If layout sync ever makes this fire per adoption rather than per
+    /// display change, cap it** — the natural cap is per monitor, keeping
+    /// the count and eliding the span list past a handful, since the count
+    /// is what a reader scans for first.
+    #[must_use]
+    pub fn describe_spans(&self) -> String {
+        if self.monitors.is_empty() {
+            return "no monitors".to_owned();
+        }
+        self.monitors
+            .iter()
+            .enumerate()
+            .map(|(index, monitor)| {
+                let name = monitor
+                    .id
+                    .as_ref()
+                    .map_or_else(|| "<unnamed>".to_owned(), |id| id.as_str().to_owned());
+                let spans: Vec<String> = self
+                    .spans
+                    .iter()
+                    .filter(|span| span.monitor == index)
+                    .map(|span| {
+                        let target = span
+                            .target
+                            .monitor
+                            .as_ref()
+                            .map_or("<unaddressed>", MonitorId::as_str);
+                        format!("{:?}->{target}:{:?}", span.edge, span.target.edge)
+                    })
+                    .collect();
+                if spans.is_empty() {
+                    // Not `NAME[0: ]`: a trailing space before the bracket
+                    // reads as a truncated list rather than an empty one,
+                    // which is the opposite of what it means.
+                    format!("{name}[none]")
+                } else {
+                    format!("{name}[{}: {}]", spans.len(), spans.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Is there nowhere to cross? True for an arrangement that places no
@@ -495,15 +628,19 @@ impl CrossingMap {
     /// `monitor`, `edge` and `fraction` — that monitor's live facing edge,
     /// `fraction` of the way along it.
     ///
+    /// **The production arrival path.** A wire `EntryPoint` carries
+    /// exactly these three fields, so this is what `control_driver`
+    /// resolves one through.
+    ///
     /// `None` if no live monitor carries that id, which is ADR 0018's
-    /// degraded case: the caller falls back to desktop-bounds placement
-    /// with a diagnostic, and the grant proceeds regardless. Cursor
-    /// placement is a nicety; control correctness never depends on it.
+    /// degraded case: the caller falls back to
+    /// [`outer_entry`](Self::outer_entry) with a diagnostic, and the grant
+    /// proceeds regardless. Cursor placement is a nicety; control
+    /// correctness never depends on it.
     ///
     /// A [`CrossTarget`] whose `monitor` is `None` is the *same* degraded
-    /// case, decided one step earlier — see [`CrossingMap::arrive`], which
-    /// is how a caller should follow a target rather than by unwrapping the
-    /// option itself.
+    /// case, decided one step earlier — see [`CrossingMap::arrive`], the
+    /// target-shaped sibling of this function.
     ///
     /// The fraction is taken against the **whole** live edge, mirroring
     /// [`CrossSpan::target_edge`] on the sending side. Neither end consults
@@ -530,9 +667,64 @@ impl CrossingMap {
     /// live here. Both are the one degraded case, and collapsing them here
     /// is what keeps a caller from having to unwrap
     /// [`CrossTarget::monitor`] and invent a story for `None`.
+    ///
+    /// **[`enter`](Self::enter) is what the running worker calls**, because
+    /// a crossing reaches the far machine as a wire `EntryPoint` — a
+    /// monitor id, an edge, a fraction — not as a [`CrossTarget`]. This is
+    /// the convenience for a caller that has the target *in hand*, which
+    /// is the equivalence tests: they take one machine's span target and
+    /// follow it straight into the other machine's map, without a wire
+    /// round trip in between. Keeping it means those tests exercise the
+    /// same lookup production does rather than an inlined copy of it.
     #[must_use]
     pub fn arrive(&self, target: &CrossTarget, fraction: EdgeFraction) -> Option<CursorPoint> {
         self.enter(target.monitor.as_ref()?, target.edge, fraction)
+    }
+
+    /// ADR 0018's **degraded** placement: `fraction` of the way along
+    /// `edge` of the monitor whose `edge` lies on the outer boundary of
+    /// this machine's desktop.
+    ///
+    /// Reached whenever an arriving `EntryPoint` cannot be honoured — it
+    /// names no monitor at all (an implicit sender), names one this machine
+    /// does not have, or carries a layout revision this machine does not
+    /// hold — and, per docs/PROTOCOL.md §6.1, the grant or release proceeds
+    /// normally either way. Cursor placement is a nicety; control
+    /// correctness never depends on it.
+    ///
+    /// It is **exactly the pre-v4 placement**, which is the point: an
+    /// implicit `--left`/`--right` run reaches this on every crossing, so
+    /// this function is what makes ADR 0018 cost the side model nothing.
+    /// Two details carry over from ADR 0009 unchanged, and both matter:
+    ///
+    /// - The monitor is chosen by [`outer_monitor_index`], the one selector
+    ///   the side model's own edge monitor came from, ties included.
+    /// - The fraction is taken against **that monitor's** edge, not the
+    ///   desktop bounding box's. They are the same line; the box is taller
+    ///   whenever a shorter monitor sits beside a taller one, and mapping
+    ///   through it lands the cursor at the wrong height (ADR 0009's
+    ///   2026-08-09 refinement, which mapping "against the bounds" would
+    ///   silently undo).
+    ///
+    /// `None` only for a map with no monitors, which no real display
+    /// reports — so a caller that cannot place simply does not, and the
+    /// transfer is unaffected.
+    ///
+    /// **That empty case is the one deliberate divergence from the
+    /// oracle.** `Topology::entering` answered a monitorless layout with
+    /// `CursorPoint { x: 0, y: 0 }` — a fabricated origin, indistinguishable
+    /// from a real placement at the top-left of a real screen. Returning
+    /// `None` instead lets the caller log "the display reports no monitors"
+    /// and move the cursor nowhere, which is the honest outcome and the
+    /// one ADR 0018's "never a guess" rule asks for. Nothing observable
+    /// changes on any machine that has a display: the equivalence tests
+    /// pin the two functions equal for every non-empty geometry, and this
+    /// case is unreachable from a real platform.
+    #[must_use]
+    pub fn outer_entry(&self, edge: Edge, fraction: EdgeFraction) -> Option<CursorPoint> {
+        let index = outer_monitor_index(edge, self.monitors.iter().map(MappedMonitor::live))?;
+        let monitor = self.monitors.get(index)?;
+        Some(edge.entry_point(monitor.live, fraction))
     }
 
     /// Is the cursor clear of `span`'s edge by more than `margin` pixels —
@@ -841,6 +1033,10 @@ fn derive_with(
 
     CrossingMap {
         local,
+        // An implicit arrangement's `Layout` is built at revision 0
+        // (`from_link_side`), so this reads the same `0` the wire's
+        // `EntryPoint::unaddressed` sends without a second constant.
+        revision: layout.revision(),
         monitors,
         spans,
     }
@@ -1028,7 +1224,7 @@ fn scaffold(live: &[MonitorRect]) -> Vec<MonitorInfo> {
 ///
 /// One local rectangle — the **monitor on the linked edge**, meaning the
 /// outermost one in the linked direction, chosen by the same selector
-/// [`crate::topology::Topology`] uses ([`edge_monitor_index`]) — and one
+/// the side model used ([`edge_monitor_index`]) — and one
 /// peer rectangle mirroring it across that edge. The result is a single
 /// span covering the whole of that monitor's linked edge, whose target is
 /// the mirror's opposite edge: precisely the side model's one linked edge
@@ -1454,6 +1650,22 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(map.leave(corner).unwrap(), chosen);
         }
+
+        // The arrival edges, as literals, in both axes. The east span is
+        // the horizontal case the side model could also express; the south
+        // one is the case it could not, and it is the one that would catch
+        // a mirroring bug written as "always flip Left/Right". A cursor
+        // leaving this machine's `Bottom` arrives on the peer's `Top`, and
+        // nothing downstream mirrors either again (see `wire_entry_point`).
+        let spans = map.spans();
+        assert_eq!(spans[0].edge(), Edge::Right);
+        assert_eq!(spans[0].target().edge, Edge::Left);
+        assert_eq!(spans[1].edge(), Edge::Bottom);
+        assert_eq!(
+            spans[1].target().edge,
+            Edge::Top,
+            "a cursor leaving downward must arrive on the peer's top edge"
+        );
     }
 
     // ---- the fraction chain across mismatched pixels ----
@@ -1706,12 +1918,26 @@ mod tests {
         assert_eq!(unnamed_map.spans()[0].target().monitor, None);
     }
 
-    /// Both selectors break a tie the same way — the property that keeps a
-    /// crossing span attached to the screen the side model measures
-    /// against. Two screens stacked in the same columns tie on the sort key
-    /// and differ in height, so a disagreement is observable.
+    /// **Every** caller of the edge-monitor selector picks the same screen,
+    /// ties included — the property that keeps a crossing span attached to
+    /// the screen an arriving cursor is placed against.
+    ///
+    /// Since ADR 0018 there is one selector ([`outer_monitor_index`]) with
+    /// three callers, so this does not compare two implementations: it
+    /// compares the three *uses*, which is where a mismatch would actually
+    /// come from. Each reaches the choice by a different route —
+    ///
+    /// - the **derivation**, which attaches a span to a monitor index,
+    /// - the **degraded placement** (`outer_entry`), where every implicit
+    ///   crossing lands,
+    /// - the **oracle** (`Topology::entering`), the pre-0018 behaviour,
+    ///
+    /// — so a refactor that changed the edge, the tie rule, or the side →
+    /// edge mapping for one of them shows up here. Two screens stacked in
+    /// the same columns tie on the sort key and differ in height, so a
+    /// disagreement is observable in the placed row.
     #[test]
-    fn both_edge_monitor_selectors_break_a_tie_the_same_way() {
+    fn every_edge_monitor_selection_agrees_on_the_same_screen() {
         let screens = [
             live("UPPER", 0, 0, 1000, 600),
             live("LOWER", 0, 600, 1000, 400),
@@ -1727,7 +1953,14 @@ mod tests {
             let corner = Topology::new(side).entering(EdgeFraction::new(0.0), &rects);
             assert_eq!(
                 corner.y, chosen.top,
-                "{side:?}: the two selectors chose different screens"
+                "{side:?}: the derivation and the oracle chose different screens"
+            );
+            // And the degraded placement — the one that actually runs on an
+            // implicit crossing — agrees with both.
+            assert_eq!(
+                map.outer_entry(side.linked_edge(), EdgeFraction::new(0.0)),
+                Some(corner),
+                "{side:?}: degraded placement chose a different screen"
             );
         }
     }
@@ -2011,6 +2244,21 @@ mod tests {
                         side.linked_edge().entry_point(edge_monitor, fraction),
                         topology.entering(fraction, &rects),
                         "{side:?} placed differently at {raw}"
+                    );
+                    // And the *production* arrival path agrees with the
+                    // oracle too. Every implicit crossing travels
+                    // unaddressed, so `outer_entry` is what actually places
+                    // an arriving cursor on a `--left`/`--right` run — the
+                    // job `Topology::entering` used to do. This fixture is
+                    // one where a bounding box would answer differently:
+                    // the two screens are 2400 and 2160 tall, so the box is
+                    // 2400 while the edge monitor may be either, and taking
+                    // the fraction against the box fails here at every raw
+                    // value but 0.0.
+                    assert_eq!(
+                        map.outer_entry(side.linked_edge(), fraction),
+                        Some(topology.entering(fraction, &rects)),
+                        "{side:?} degraded placement diverged from the side model at {raw}"
                     );
                 }
 

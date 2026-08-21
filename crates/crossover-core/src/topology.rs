@@ -15,34 +15,33 @@
 //! The crossing position never travels as pixels. It is a fraction of the
 //! edge monitor's height, so two machines of different resolution and
 //! per-monitor DPI need no shared coordinate space — each maps the fraction
-//! through its own geometry (ADR 0009). The [`Topology`] here models
+//! through its own geometry (ADR 0009). The side model here models
 //! exactly one linked edge pair, left–right: the left member's right edge
 //! links to the right member's left edge. The drawn arrangement that
 //! supersedes it (ADR 0018) is derived in [`crate::crossing`], which speaks
 //! all four [`Edge`]s.
 //!
-//! # What still uses [`Topology`], and what stopped
+//! # The side model's geometry type is gone
 //!
-//! **Detection has moved off it.** [`crate::edge_driver`] measures against
-//! a [`crate::crossing::CrossingMap`], derived from the drawn arrangement
-//! — which for a `--left`/`--right` run is the *implicit* layout
-//! [`crate::crossing::from_link_side`] builds, so the behaviour is
+//! **Detection moved off it** (ADR 0018): [`crate::edge_driver`] measures
+//! against a [`crate::crossing::CrossingMap`], derived from the drawn
+//! arrangement — which for a `--left`/`--right` run is the *implicit*
+//! layout [`crate::crossing::from_link_side`] builds, so the behaviour is
 //! unchanged and the model is not.
 //!
-//! What remains is **cursor placement on arrival**: `control_driver`'s
-//! `SeamlessInputs` still holds a `Topology` and still calls
-//! [`Topology::entering`] to place an incoming cursor, and still reads
-//! [`Topology::linked_edge`] for the edge it reports on the wire. Both go
-//! when the control wiring learns to carry an `EntryPoint` — the arriving
-//! monitor, its edge, and the fraction — and place through
-//! [`crate::crossing::CrossingMap::arrive`] instead. Until then this module
-//! is not dead code, and deleting the parts detection no longer needs would
-//! break placement rather than tidy anything.
+//! **Placement moved off it too** (this branch): `control_driver`'s
+//! `SeamlessInputs` carries the run's [`crate::edge_driver::CrossingSource`]
+//! and places an arriving `EntryPoint` through
+//! [`crate::crossing::CrossingMap::enter`], falling back to
+//! [`crate::crossing::CrossingMap::outer_entry`] for the degraded case ADR
+//! 0018 specifies. Nothing in the running worker holds a `Topology` any
+//! more, so the type survives only under `#[cfg(test)]`, as the oracle the
+//! span model is required to agree with.
 //!
-//! [`Edge`], [`EdgeFraction`], [`last_index`] and [`edge_monitor_index`]
-//! outlive the side model regardless: the drawn arrangement is built on all
-//! four, and they live here so there is exactly one implementation of
-//! per-edge pixel geometry in the crate.
+//! [`Edge`], [`EdgeFraction`], [`last_index`], [`outer_monitor_index`] and
+//! [`edge_monitor_index`] outlive the side model regardless: the drawn
+//! arrangement is built on all of them, and they live here so there is
+//! exactly one implementation of per-edge pixel geometry in the crate.
 
 /// Which member of the left–right pair this machine is — the `--left` /
 /// `--right` configuration (ADR 0009).
@@ -124,6 +123,20 @@ impl Edge {
             Self::Right => crossover_protocol::control::Edge::Right,
             Self::Top => crossover_protocol::control::Edge::Top,
             Self::Bottom => crossover_protocol::control::Edge::Bottom,
+        }
+    }
+
+    /// [`to_wire`](Self::to_wire)'s inverse — how a receiver reads an
+    /// arriving `EntryPoint.edge`, which docs/PROTOCOL.md §6.1 states in
+    /// the **receiver's own terms**: this is one of *its* monitors' edges,
+    /// so no mirroring happens here or anywhere on the way in.
+    #[must_use]
+    pub fn from_wire(edge: crossover_protocol::control::Edge) -> Self {
+        match edge {
+            crossover_protocol::control::Edge::Left => Self::Left,
+            crossover_protocol::control::Edge::Right => Self::Right,
+            crossover_protocol::control::Edge::Top => Self::Top,
+            crossover_protocol::control::Edge::Bottom => Self::Bottom,
         }
     }
 
@@ -327,67 +340,130 @@ pub(crate) fn last_index(size: u32) -> i32 {
     i32::try_from(size.saturating_sub(1)).unwrap_or(i32::MAX)
 }
 
-/// Which monitor sits on `side`'s linked edge — the outermost one in the
-/// linked direction (the rightmost for a left member, the leftmost for a
-/// right member) — as an index into `monitors`. `None` only for an empty
-/// list, which a real display never reports.
+/// Which monitor's `edge` lies on the **outer boundary of the desktop** in
+/// that direction — the leftmost screen for [`Edge::Left`], the bottommost
+/// for [`Edge::Bottom`], and so on — as an index into `monitors`. `None`
+/// only for an empty list, which a real display never reports.
 ///
-/// **The one selector.** Both the side model ([`Topology::edge_monitor`])
-/// and the implicit-layout bridge (`crate::crossing::from_link_side`) call
-/// this, because two implementations of "which screen is the edge one"
-/// that disagreed would attach a crossing span to a different physical
-/// screen than the detector measures against. Generic over an iterator of
-/// rectangles so a caller holding richer monitor records need not copy them
-/// into a scratch vector to ask.
+/// **The one selector**, and it answers two questions that have to give
+/// the same screen:
+///
+/// - which monitor the side model's linked edge belongs to
+///   ([`edge_monitor_index`], and through it the implicit-layout bridge
+///   `crate::crossing::from_link_side`) — two implementations that
+///   disagreed would attach a crossing span to a different physical screen
+///   than the detector measures against;
+/// - where ADR 0018's **degraded** placement lands an entry point this
+///   machine cannot honour (`crate::crossing::CrossingMap::outer_entry`) —
+///   the "desktop-bounds edge matching `EntryPoint.edge`" of
+///   docs/PROTOCOL.md §6.1.
+///
+/// The fraction is taken against *that monitor's* edge rather than against
+/// the desktop bounding box, which is ADR 0009's 2026-08-09 refinement: a
+/// shorter monitor beside a taller one leaves dead space in the box, and
+/// mapping through the box lands the cursor at the wrong height. The
+/// monitor's edge and the box's edge are the same line; only the extent
+/// differs, and the monitor's is the correct one.
+///
+/// Generic over an iterator of rectangles so a caller holding richer
+/// monitor records need not copy them into a scratch vector to ask.
 ///
 /// **Ties are inherited, not invented.** Two monitors ending on the same
 /// column — a stacked pair — tie on the key, and `max_by_key` keeps the
 /// *last* such element while `min_by_key` keeps the *first*. That asymmetry
 /// is ADR 0009's original behaviour and is preserved deliberately rather
-/// than tidied, so this refactor changes no crossing that works today; it
-/// is pinned by `both_edge_monitor_selectors_break_a_tie_the_same_way`.
+/// than tidied, so this generalization changes no crossing that works
+/// today; it is pinned by
+/// `every_edge_monitor_selection_agrees_on_the_same_screen`.
 ///
 /// The key saturates: a hostile or nonsense rectangle must not overflow
 /// (NFR-1).
-pub(crate) fn edge_monitor_index<I>(side: LinkSide, monitors: I) -> Option<usize>
+pub(crate) fn outer_monitor_index<I>(edge: Edge, monitors: I) -> Option<usize>
 where
     I: IntoIterator<Item = MonitorRect>,
 {
     let indexed = monitors.into_iter().enumerate();
-    match side {
-        // Matched on the *side*, not on `linked_edge()`: the side model has
-        // exactly two members and neither links vertically, so there is no
-        // third case to answer for (see [`LinkSide`]).
-        LinkSide::Left => indexed
+    match edge {
+        Edge::Left => indexed.min_by_key(|(_, m)| m.left).map(|(index, _)| index),
+        Edge::Right => indexed
             .max_by_key(|(_, m)| m.left.saturating_add(last_index(m.width)))
             .map(|(index, _)| index),
-        LinkSide::Right => indexed.min_by_key(|(_, m)| m.left).map(|(index, _)| index),
+        Edge::Top => indexed.min_by_key(|(_, m)| m.top).map(|(index, _)| index),
+        Edge::Bottom => indexed
+            .max_by_key(|(_, m)| m.top.saturating_add(last_index(m.height)))
+            .map(|(index, _)| index),
     }
+}
+
+/// Which monitor sits on `side`'s linked edge — the outermost one in the
+/// linked direction (the rightmost for a left member, the leftmost for a
+/// right member).
+///
+/// A thin naming of [`outer_monitor_index`] in the side model's vocabulary;
+/// the side model has exactly two members and neither links vertically, so
+/// [`LinkSide::linked_edge`] can only ever produce `Left` or `Right`.
+pub(crate) fn edge_monitor_index<I>(side: LinkSide, monitors: I) -> Option<usize>
+where
+    I: IntoIterator<Item = MonitorRect>,
+{
+    outer_monitor_index(side.linked_edge(), monitors)
 }
 
 /// The two-machine left–right topology (ADR 0009): one linked edge pair,
 /// this machine being the left or the right member.
+///
+/// **Test-only since ADR 0018.** Nothing in the running worker holds one:
+/// detection measures against a [`crate::crossing::CrossingMap`] and
+/// placement resolves an `EntryPoint` through it. It survives as the
+/// **equivalence oracle** the span model is run against
+/// (`edge_driver`'s `the_span_detector_reproduces_the_side_model_across_a_cursor_script`
+/// and `crossing`'s placement comparisons).
+///
+/// # What kind of oracle this is, precisely
+///
+/// An independent **composition**, not an independent implementation. The
+/// pixel arithmetic underneath — [`Edge::inset_of`],
+/// [`Edge::offset_along`], [`Edge::entry_point`], [`EdgeFraction`] — is
+/// shared with the span model deliberately, because two implementations of
+/// "which column does the cursor ride" that drifted a pixel apart would
+/// drift at exactly the seam where a wrong answer hands control away. A
+/// bug *inside* those primitives is therefore invisible to this oracle:
+/// both sides would be wrong together. That is a trade taken knowingly,
+/// and the primitives carry their own tests.
+///
+/// What it pins independently is everything **above** the primitives —
+/// which is where ADR 0018 changed the model, and so where a regression
+/// would come from:
+///
+/// - **which screen** a crossing attaches to, and which one an arrival is
+///   placed against (the edge-monitor selection, ties included);
+/// - **which edge** of that screen is the crossing edge, and which edge an
+///   arrival lands on;
+/// - **when** a touch counts — the threshold, the re-arm margin, and the
+///   direction the margin is measured in — and **what fraction** results.
+///
+/// The side model answers those with one flag and a bounding box; the span
+/// model answers them by deriving spans from a drawn arrangement. That two
+/// such different compositions agree pixel-for-pixel across a nasty cursor
+/// script is the claim worth keeping. Deleting this type would not remove
+/// production code; it would remove the only statement of that claim.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Topology {
+pub(crate) struct Topology {
     side: LinkSide,
 }
 
+#[cfg(test)]
 impl Topology {
     /// A topology for a machine on `side` of the pair.
     #[must_use]
-    pub fn new(side: LinkSide) -> Self {
+    pub(crate) fn new(side: LinkSide) -> Self {
         Self { side }
-    }
-
-    /// Which member of the pair this machine is.
-    #[must_use]
-    pub fn side(self) -> LinkSide {
-        self.side
     }
 
     /// The edge that links to the peer.
     #[must_use]
-    pub fn linked_edge(self) -> Edge {
+    pub(crate) fn linked_edge(self) -> Edge {
         self.side.linked_edge()
     }
 
@@ -408,7 +484,11 @@ impl Topology {
     /// monitor's height, so the peer places its cursor through its own
     /// geometry.
     #[must_use]
-    pub fn leaving(self, cursor: CursorPoint, monitors: &[MonitorRect]) -> Option<EdgeFraction> {
+    pub(crate) fn leaving(
+        self,
+        cursor: CursorPoint,
+        monitors: &[MonitorRect],
+    ) -> Option<EdgeFraction> {
         let monitor = self.edge_monitor(monitors)?;
         let edge = self.linked_edge();
         // Touching means reaching the extreme column — or, defensively,
@@ -438,7 +518,12 @@ impl Topology {
     /// monitors (never reported by a real display) is never "clear", so the
     /// degenerate case can only ever suppress a crossing, not invent one.
     #[must_use]
-    pub fn clear_of_edge(self, cursor: CursorPoint, monitors: &[MonitorRect], margin: u32) -> bool {
+    pub(crate) fn clear_of_edge(
+        self,
+        cursor: CursorPoint,
+        monitors: &[MonitorRect],
+        margin: u32,
+    ) -> bool {
         let Some(monitor) = self.edge_monitor(monitors) else {
             return false;
         };
@@ -451,7 +536,7 @@ impl Topology {
     /// fraction of the monitor's height. The inverse direction of
     /// [`leaving`](Self::leaving), and the same edge in reverse.
     #[must_use]
-    pub fn entering(self, fraction: EdgeFraction, monitors: &[MonitorRect]) -> CursorPoint {
+    pub(crate) fn entering(self, fraction: EdgeFraction, monitors: &[MonitorRect]) -> CursorPoint {
         let Some(monitor) = self.edge_monitor(monitors) else {
             return CursorPoint { x: 0, y: 0 };
         };

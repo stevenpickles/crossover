@@ -20,7 +20,7 @@
 //!
 //! # What ADR 0018 changed here, and what it deliberately did not
 //!
-//! The detector used to measure against [`crate::topology::Topology`]'s one
+//! The detector used to measure against the side model's one
 //! linked edge; it now measures against a [`CrossingMap`], which is every
 //! crossing the drawn arrangement gives this machine. Three consequences,
 //! all of them narrow:
@@ -56,7 +56,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
 use crossover_platform::{DisplayError, DisplayInfo, MonitorInfo};
-use crossover_topology::DeviceId;
+use crossover_topology::{DeviceId, Layout};
 
 use crate::crossing::{CrossTarget, CrossingMap, SpanId, from_link_side};
 use crate::topology::{CursorPoint, EdgeFraction, LinkSide, MonitorRect};
@@ -132,15 +132,25 @@ pub enum CrossingKind {
     Return,
 }
 
-/// Where a crossing goes: the destination in the **receiver's** terms, and
-/// how far along that destination's facing edge (ADR 0018).
+/// Where a crossing goes: the destination in the **receiver's** terms, how
+/// far along that destination's facing edge, and the revision of the
+/// arrangement that said so (ADR 0018).
 ///
-/// This is deliberately everything a wire `EntryPoint` needs except the
-/// layout revision, which belongs to the arrangement rather than to the
-/// crossing: the monitor the cursor arrives on, which of its edges, and the
-/// fraction along it. A consumer builds the message from this without
-/// re-deriving anything, and without holding the [`CrossingMap`] the
-/// crossing was detected against.
+/// This is deliberately **everything a wire `EntryPoint` needs**: the
+/// monitor the cursor arrives on, which of its edges, the fraction along
+/// it, and the layout revision. A consumer builds the message from this
+/// without re-deriving anything, and without holding the [`CrossingMap`]
+/// the crossing was detected against — which is the whole point, because
+/// that map may already have been replaced by the time the message is
+/// built.
+///
+/// **No mirroring happens downstream.** [`CrossTarget::edge`] is already
+/// the receiver's arrival edge — the derivation computed it as
+/// [`crate::topology::Edge::opposite`] of the local edge the span sits on —
+/// so `control`'s `wire_entry_point` copies it through. A second
+/// `opposite()` anywhere on the way out would mirror it back onto the
+/// sender's own edge and place the peer's cursor on the wrong side of its
+/// screen.
 ///
 /// The destination is **carried by value** rather than named by
 /// [`SpanId`], and that is the whole point of the type. A span id is only
@@ -158,6 +168,19 @@ pub struct DetectedCrossing {
     pub target: CrossTarget,
     /// How far along the target's facing edge the cursor arrives, `[0, 1]`.
     pub position: EdgeFraction,
+    /// The revision of the arrangement this crossing was derived from
+    /// ([`CrossingMap::revision`]) — `0` for an implicit one, which is
+    /// also what an unaddressed `EntryPoint` carries.
+    ///
+    /// Stamped here, at detection, rather than read from the live
+    /// arrangement when the message is built: a crossing queues on a
+    /// channel while a display change or (later) a peer's `LayoutSync`
+    /// rebuilds the map underneath it, and an entry point must state the
+    /// revision the *sender actually used*, not whichever one it happens
+    /// to hold a moment later. Getting that wrong would make the receiver
+    /// honour an entry point derived from an arrangement neither machine
+    /// still has.
+    pub layout_revision: u64,
 }
 
 /// A detected edge crossing: which way it goes, where it lands, and the
@@ -353,7 +376,11 @@ impl EdgeDetector {
         // would leave it, so every span it hugs is left disarmed and only
         // real perpendicular travel brings any of them back.
         self.disarm_spans_near(cursor);
-        Some(DetectedCrossing { target, position })
+        Some(DetectedCrossing {
+            target,
+            position,
+            layout_revision: self.map.revision(),
+        })
     }
 
     /// Is this span's flag set? A span id the map does not hold is never
@@ -398,9 +425,20 @@ impl EdgeDetector {
 /// A map is a pure function of the arrangement and the live monitors, and
 /// the detector only ever sees the latter. Handing the driver a function
 /// rather than an arrangement is what lets the *same* driver serve an
-/// implicit side-model layout ([`implicit_crossing_source`]) and, when the
-/// control wiring grows one, an explicit drawn layout that can itself
-/// change mid-run — without the driver knowing which it has.
+/// implicit side-model layout ([`implicit_crossing_source`]) and an
+/// explicit drawn one ([`explicit_crossing_source`]) without knowing which
+/// it has.
+///
+/// **One source per run, shared by both consumers.** The detector holds it
+/// to re-derive on a display change; `control_driver`'s `SeamlessInputs`
+/// holds a clone to derive at cursor-placement time, off its own fresh
+/// read. That is one *definition* of the derivation with two call sites at
+/// different cadences, rather than a derived map published from one to the
+/// other — which would be a second, independently-aged copy of a pure
+/// function's result. It is also the shape the layout-sync branch needs:
+/// what changes when a peer's arrangement is adopted is the layout, so a
+/// source closure reading it from a `watch` reaches both consumers with no
+/// further wiring.
 ///
 /// # Why the fidelity is declared rather than assumed
 ///
@@ -518,6 +556,73 @@ pub fn implicit_crossing_source(side: LinkSide, local: DeviceId) -> CrossingSour
                 CrossingMap::inert(local, live)
             }
         }
+    })
+}
+
+/// A **drawn** arrangement as a crossing source: the layout the user drew,
+/// matched to live screens by device string (ADR 0018).
+///
+/// The counterpart to [`implicit_crossing_source`], and the reason the
+/// driver takes a source rather than an arrangement: the same detector,
+/// the same control wiring and the same placement path serve both, and
+/// only this constructor knows which it has.
+///
+/// It reads identity ([`CrossingSource::identified`]), because that is the
+/// whole mechanism — a drawn rectangle finds its screen by the platform's
+/// device string, and a screen re-enumerated under a different one changes
+/// which seams exist without moving a pixel.
+///
+/// # Degrading, and the contract that survives it
+///
+/// [`crate::crossing::derive`] is total: it never refuses. What it can
+/// produce is a map with **no spans** — every screen the layout placed for
+/// this machine is unplugged, renamed, or reported ambiguously — which is
+/// the same state [`CrossingMap::inert`] describes, reached by geometry
+/// rather than by error. That map's contract says a machine currently
+/// *being controlled* must not be left without a reclaim path. What is
+/// lost when it goes inert is reclaiming **by crossing a specific seam**;
+/// what remains are four routes that never ran through spans, and it is
+/// worth being exact about each rather than claiming the first one always
+/// works:
+///
+/// - **Local input on the controlled machine** —
+///   `ControlEvent::LocalInputReclaim`, which gives the grant up on any
+///   genuine local input (ADR 0009). This is the one a user reaches for by
+///   instinct, and it is *usually* enough, but not unconditionally: the
+///   detection re-baselines the system input tick after every injection
+///   the peer makes, so while the controller is actively driving, a local
+///   event can be re-baselined past before a poll sees it. It resolves the
+///   moment the controller pauses — see `local_input_reclaim_due`, which
+///   states the same caveat — and it is unavailable altogether on a
+///   platform with no input-tick query.
+/// - **`r` at the controller's console**, which hands control back.
+/// - **Both Control keys at the controller** — the escape gesture, and the
+///   way out when its keyboard is captured and its console unreachable
+///   (ADR 0008).
+/// - **Disconnect**, which releases everything on both sides (FR-4.4).
+///
+/// The starvation window above is why [`CrossingMap::inert`] carries a
+/// NOTE naming the stronger fix — keeping the previous map's spans alive
+/// for the `Returning` direction — as the thing to reach for if a soak
+/// ever shows this mattering in practice.
+///
+/// The degradation is logged rather than silent, because "seamless quietly
+/// stopped working" is the report that cannot be diagnosed afterwards
+/// (NFR-3).
+#[must_use]
+pub fn explicit_crossing_source(layout: Layout, local: DeviceId) -> CrossingSource {
+    CrossingSource::identified(move |live| {
+        let map = crate::crossing::derive(&layout, local, live);
+        if map.is_inert() {
+            tracing::warn!(
+                revision = layout.revision(),
+                monitors = live.len(),
+                "edge: none of this machine's live screens matches the drawn arrangement; \
+                 crossing by cursor is off until one does (local input, the console, and the \
+                 escape gesture still end a grant)"
+            );
+        }
+        map
     })
 }
 
@@ -877,6 +982,11 @@ mod tests {
         EdgeDetector::new(side_map(side, rects))
     }
 
+    /// The revision every drawn test arrangement is built at — a value
+    /// that is neither `0` (which would be indistinguishable from an
+    /// implicit map's) nor `1` (which a stray increment could produce).
+    const DRAWN_REVISION: u64 = 7;
+
     /// A drawn arrangement of `(device, id, x, y, width, height)`
     /// rectangles, for the multi-span shapes the side model cannot express.
     /// This is the *explicit* path, which does match by identity.
@@ -898,7 +1008,7 @@ mod tests {
             })
             .collect();
         let pair = DevicePair::new(LOCAL, PEER).unwrap();
-        let layout = Layout::new(1, LOCAL, monitors, &pair).unwrap();
+        let layout = Layout::new(DRAWN_REVISION, LOCAL, monitors, &pair).unwrap();
         Arc::new(derive(&layout, LOCAL, live))
     }
 
@@ -935,24 +1045,33 @@ mod tests {
         assert!(d.observe(at(1919, 305), &hd).is_some());
     }
 
-    /// What a detected crossing carries: the destination in the receiver's
-    /// terms, so the wiring can build an `EntryPoint` without going back to
-    /// the map. An implicit arrangement names neither a peer device nor a
-    /// peer monitor — that is ADR 0018's *unaddressed* entry point, and an
-    /// honest absence rather than a fabricated id.
+    /// What a detected crossing carries: everything a wire `EntryPoint`
+    /// needs — the destination in the receiver's terms, the position, and
+    /// the revision it was derived under — so the wiring builds the
+    /// message without going back to the map (ADR 0018).
+    ///
+    /// An implicit arrangement names neither a peer device nor a peer
+    /// monitor and carries revision 0: ADR 0018's *unaddressed* entry
+    /// point, an honest absence rather than a fabricated id, and the same
+    /// `0` `EntryPoint::unaddressed` puts on the wire.
     #[test]
     fn a_detected_crossing_names_its_destination() {
         let hd = bare(&HD_MON);
         let mut d = detector(LinkSide::Left, &HD_MON);
         assert!(d.observe(at(960, 540), &hd).is_none());
-        let DetectedCrossing { target, position } =
-            d.observe(at(1919, 540), &hd).expect("crossing");
+        let DetectedCrossing {
+            target,
+            position,
+            layout_revision,
+        } = d.observe(at(1919, 540), &hd).expect("crossing");
         assert_eq!(target.device, None, "the side model names no peer machine");
         assert_eq!(target.monitor, None, "the side model names no peer screen");
         assert_eq!(target.edge, Edge::Left, "the peer's facing edge");
         assert!((position.value() - 0.5).abs() < 0.01);
+        assert_eq!(layout_revision, 0, "an implicit arrangement is revision 0");
 
-        // A drawn arrangement names both, and they travel with the crossing.
+        // A drawn arrangement names both, and they travel with the crossing
+        // — along with the revision `drawn_map` built the layout at.
         let screens = [live("A", 0, 0, 1000, 1000)];
         let map = drawn_map(
             &[
@@ -971,6 +1090,7 @@ mod tests {
         );
         assert_eq!(crossing.target.edge, Edge::Left);
         assert!((crossing.position.value() - 0.0).abs() < 1e-9);
+        assert_eq!(crossing.layout_revision, DRAWN_REVISION);
     }
 
     #[test]

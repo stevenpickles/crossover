@@ -21,6 +21,8 @@ pub mod net;
 pub mod outbound;
 pub mod pairing;
 pub mod supervision;
+#[cfg(test)]
+mod testing;
 pub mod topology;
 
 pub use clipboard::{
@@ -40,7 +42,7 @@ pub use crossing::{
 };
 pub use edge_driver::{
     CrossingKind, CrossingSource, DetectedCrossing, EdgeCrossing, EdgeDetectDriver, EdgeDetector,
-    EdgeMode, EdgeModeUpdate, edge_detect, implicit_crossing_source,
+    EdgeMode, EdgeModeUpdate, edge_detect, explicit_crossing_source, implicit_crossing_source,
 };
 pub use file_blob::{FALLBACK_ARCHIVE_NAME, wire_file_name};
 pub use input::{
@@ -62,7 +64,7 @@ pub use supervision::{
     DisconnectReason, KeepaliveConfig, ReconnectPolicy, SessionEvent, SupervisorConfig,
     SupervisorHandle, run_session, supervise_outbound,
 };
-pub use topology::{CursorPoint, Edge, EdgeFraction, LinkSide, Screen, Topology};
+pub use topology::{CursorPoint, Edge, EdgeFraction, LinkSide, Screen};
 
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str = "state machines, clipboard and input engines, topology, \

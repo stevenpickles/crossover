@@ -984,49 +984,7 @@ mod tests {
 
     // --- disconnect diagnostics: the local link ---
 
-    /// A subscriber writing into a buffer, so a test can read the line a
-    /// maintainer would read.
-    #[derive(Clone, Default)]
-    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Run `body` with everything it logs captured, and return the text.
-    fn captured(body: impl FnOnce()) -> String {
-        let sink = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        tracing::subscriber::with_default(subscriber, body);
-        let bytes = sink
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        String::from_utf8(bytes).expect("log output was not UTF-8")
-    }
+    use crate::testing::captured;
 
     /// The error the incident produced, verbatim: what Windows says when the
     /// *local* NIC drops its link mid-session, on both machines at once.
