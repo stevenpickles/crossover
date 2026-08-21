@@ -417,10 +417,11 @@ impl Layout {
     /// Validate `monitors` as an arrangement of `pair`, drawn by `origin`
     /// at `revision`.
     ///
-    /// Checks run cheapest-and-most-bounding first: the counts, then each
-    /// monitor's own rectangle and membership, then the set-wide rules
-    /// (per-machine counts, id uniqueness, both machines present), and the
-    /// O(n²) overlap sweep last, over a set already bounded at
+    /// Checks run cheapest-and-most-bounding first: [`check_structure`] —
+    /// the counts, each monitor's own rectangle, per-machine counts, and id
+    /// uniqueness — then the two checks that need to know *this session's*
+    /// pair specifically (device/origin membership, both machines present),
+    /// then the O(n²) overlap sweep last, over a set already bounded at
     /// [`MAX_LAYOUT_MONITORS`].
     ///
     /// # Errors
@@ -433,49 +434,20 @@ impl Layout {
         monitors: Vec<PlacedMonitor>,
         pair: &DevicePair,
     ) -> Result<Self, LayoutError> {
-        // Counts first: everything below walks the set, and this is what
-        // says how far that walk can go.
-        if monitors.is_empty() {
-            return Err(LayoutError::NoMonitors);
-        }
-        if monitors.len() > MAX_LAYOUT_MONITORS {
-            return Err(LayoutError::TooManyMonitors {
-                count: monitors.len(),
-            });
-        }
+        check_structure(&monitors)?;
+
         if !pair.contains(origin) {
             return Err(LayoutError::UnexpectedOrigin { device: origin });
         }
-
         for monitor in &monitors {
             if !pair.contains(monitor.device) {
                 return Err(LayoutError::UnexpectedDevice {
                     device: monitor.device,
                 });
             }
-            check_rect(monitor)?;
         }
-
         for device in *pair.devices() {
-            let mut ids: Vec<&MonitorId> = Vec::new();
-            for monitor in monitors.iter().filter(|m| m.device == device) {
-                if ids.len() == MAX_MONITORS_PER_MACHINE {
-                    // Report the true count, not the cap: a diagnostic
-                    // that says "16 of 16" tells the user nothing about
-                    // how far over the desk actually is.
-                    return Err(LayoutError::TooManyMonitorsForMachine {
-                        device,
-                        count: monitors.iter().filter(|m| m.device == device).count(),
-                    });
-                }
-                if ids.contains(&&monitor.id) {
-                    return Err(LayoutError::DuplicateMonitorId {
-                        monitor: monitor.key(),
-                    });
-                }
-                ids.push(&monitor.id);
-            }
-            if ids.is_empty() {
+            if monitors.iter().all(|m| m.device != device) {
                 return Err(LayoutError::MissingMachine { device });
             }
         }
@@ -655,6 +627,81 @@ fn check_rect(monitor: &PlacedMonitor) -> Result<(), LayoutError> {
         })
 }
 
+/// The structural rules a set of placed monitors must satisfy **on their
+/// own**, without knowing which two devices a session's pair names (ADR
+/// 0018): the count is `1..=`[`MAX_LAYOUT_MONITORS`], every rectangle
+/// satisfies [`LayoutRect::check_bounds`], no device contributes more than
+/// [`MAX_MONITORS_PER_MACHINE`] monitors, and no device repeats a monitor
+/// id.
+///
+/// This is the one home for that logic, checked in bound order (cheapest
+/// and most-bounding first) and shared by two callers that would otherwise
+/// each carry their own copy: [`Layout::new`]/[`Layout::from_raw`] here,
+/// and `crossover-protocol`'s wire-level validation of `MonitorTopology`
+/// and `LayoutSync` (docs/PROTOCOL.md §6.2), which maps each [`LayoutError`]
+/// onto its own error type.
+///
+/// Deliberately **not** checked here, because both need the caller's own
+/// context to mean anything: session-pair membership (`UnexpectedDevice`,
+/// `UnexpectedOrigin`) — this function does not know which devices *should*
+/// appear, only how many may share the list — "both machines present"
+/// (`MissingMachine`), which needs the pair's two identities to ask the
+/// question of; and overlap, which is a property of the whole arrangement
+/// compared against itself, not of one monitor's own structure.
+///
+/// # Errors
+///
+/// [`LayoutError`], one variant per rule, naming the monitor or the
+/// machine at fault.
+pub fn check_structure(monitors: &[PlacedMonitor]) -> Result<(), LayoutError> {
+    // Counts first: everything below walks the set, and this is what says
+    // how far that walk can go.
+    if monitors.is_empty() {
+        return Err(LayoutError::NoMonitors);
+    }
+    if monitors.len() > MAX_LAYOUT_MONITORS {
+        return Err(LayoutError::TooManyMonitors {
+            count: monitors.len(),
+        });
+    }
+
+    for monitor in monitors {
+        check_rect(monitor)?;
+    }
+
+    // Per-device count and id uniqueness, grouped over whichever devices
+    // are actually present — not assumed to be any particular pair, since
+    // this function does not know one.
+    let mut devices: Vec<DeviceId> = Vec::new();
+    for monitor in monitors {
+        if !devices.contains(&monitor.device) {
+            devices.push(monitor.device);
+        }
+    }
+    for device in devices {
+        let mut ids: Vec<&MonitorId> = Vec::new();
+        for monitor in monitors.iter().filter(|m| m.device == device) {
+            if ids.len() == MAX_MONITORS_PER_MACHINE {
+                // Report the true count, not the cap: a diagnostic that
+                // says "16 of 16" tells the user nothing about how far
+                // over the desk actually is.
+                return Err(LayoutError::TooManyMonitorsForMachine {
+                    device,
+                    count: monitors.iter().filter(|m| m.device == device).count(),
+                });
+            }
+            if ids.contains(&&monitor.id) {
+                return Err(LayoutError::DuplicateMonitorId {
+                    monitor: monitor.key(),
+                });
+            }
+            ids.push(&monitor.id);
+        }
+    }
+
+    Ok(())
+}
+
 /// A compile-time restatement of the bounds the overflow argument rests
 /// on, so a later edit to one constant cannot quietly invalidate it.
 const _: () = {
@@ -672,6 +719,7 @@ pub(crate) mod tests {
     use super::{
         DevicePair, Layout, LayoutError, LayoutRect, MAX_LAYOUT_COORDINATE, MAX_LAYOUT_MONITORS,
         MAX_MONITOR_EXTENT, MAX_MONITORS_PER_MACHINE, MonitorKey, PlacedMonitor, RawPlacedMonitor,
+        check_structure,
     };
     use crate::device::DeviceId;
     use crate::monitor::{MAX_MONITOR_ID_BYTES, MonitorId, MonitorIdError};
@@ -722,6 +770,49 @@ pub(crate) mod tests {
             device,
             id: MonitorId::new(id).unwrap(),
         }
+    }
+
+    /// [`check_structure`] needs no [`DevicePair`] at all: it is the same
+    /// structural rules `Layout::new` runs, usable directly by a caller
+    /// (`crossover-protocol`'s wire validation) that has not yet resolved
+    /// which two devices a session's pair actually is.
+    #[test]
+    fn check_structure_needs_no_pair() {
+        // A three-device list is fine structurally — "which devices"
+        // is not this function's question — but a per-device rule (the
+        // cap, a duplicate id) still fires without knowing the pair.
+        check_structure(&[
+            monitor(LOCAL, "A", 0, 0, 100, 100),
+            monitor(PEER, "B", 200, 0, 100, 100),
+            monitor(STRANGER, "C", 400, 0, 100, 100),
+        ])
+        .unwrap();
+
+        assert_eq!(check_structure(&[]).unwrap_err(), LayoutError::NoMonitors);
+        assert_eq!(
+            check_structure(&[
+                monitor(LOCAL, "A", 0, 0, 100, 100),
+                monitor(LOCAL, "A", 200, 0, 100, 100),
+            ])
+            .unwrap_err(),
+            LayoutError::DuplicateMonitorId {
+                monitor: key(LOCAL, "A")
+            }
+        );
+        assert_eq!(
+            check_structure(&[monitor(LOCAL, "A", 0, 0, 0, 100)]).unwrap_err(),
+            LayoutError::ZeroExtent {
+                monitor: key(LOCAL, "A")
+            }
+        );
+        // It does not check overlap, session-pair membership, or "both
+        // machines present" — those are `Layout::new`'s, once it has a
+        // `DevicePair` to check them against.
+        check_structure(&[
+            monitor(LOCAL, "A", 0, 0, 100, 100),
+            monitor(LOCAL, "B", 50, 50, 100, 100),
+        ])
+        .unwrap();
     }
 
     #[test]

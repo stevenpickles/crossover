@@ -30,6 +30,7 @@ use crossover_platform::{ServiceError, ServiceStatus};
 use crossover_protocol::DEFAULT_PORT;
 use crossover_protocol::hello::{FeatureFlags, MessageType};
 use crossover_protocol::input::{InputBatch, WireInputEvent};
+use crossover_protocol::layout::{LayoutSync, MonitorTopology};
 use crossover_security::pairing::{PairedPeer, PairingCode, PairingIdentity};
 use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TrustStore, TrustedPeer,
@@ -841,17 +842,24 @@ enum InboundRoute {
     Sync,
     /// Input and control-transfer traffic: the control driver's.
     Control,
-    /// Neither driver claims it. Only a message type this build does not
-    /// know reaches here (the session layer answers or rejects everything
-    /// else before it becomes an app frame), and both drivers ignore it —
-    /// but *ignoring* is their decision to make, not this function's, so
-    /// the unknown keeps its historical delivery to both rather than being
-    /// dropped by a classifier that predates it.
+    /// Neither driver claims it. Reached by a message type this build does
+    /// not know (the session layer answers or rejects everything else
+    /// before it becomes an app frame) and by a known type with no driver
+    /// yet — `MonitorTopology`/`LayoutSync` (ADR 0018), which have no
+    /// engine to route to until the topology work lands. Both drivers
+    /// ignore what lands here, but *ignoring* is their decision to make,
+    /// not this function's, so it keeps historical delivery to both rather
+    /// than being dropped by a classifier that predates its owner.
     Both,
 }
 
 /// Route one inbound frame by message type. Total by construction: every
 /// arm of [`MessageType`], and the unknown, lands somewhere.
+///
+/// This is a driver partition, not docs/PROTOCOL.md §4's class —
+/// `MessageType::class` reports that fact directly; here CONTROL-class
+/// types split across `Control` (control-transfer) and `Both` (topology,
+/// no driver yet) by which driver, if any, actually wants them.
 fn inbound_route(message_type: u16) -> InboundRoute {
     match MessageType::from_wire(message_type) {
         Some(
@@ -873,12 +881,19 @@ fn inbound_route(message_type: u16) -> InboundRoute {
         // answers Ping, accepts Pong, and fails the session on Hello or a
         // pairing message. Listed so adding a message type is a compile
         // error here rather than a silent misroute.
+        // Display topology (ADR 0018) is listed alongside the session-layer
+        // types below rather than folded into `None`, so the topology
+        // engine's arrival is the thing that moves this arm rather than a
+        // silent fallthrough: a known CONTROL-class type with no driver
+        // yet.
         Some(
             MessageType::Hello
             | MessageType::Ping
             | MessageType::Pong
             | MessageType::PairingStart
-            | MessageType::PairingConfirm,
+            | MessageType::PairingConfirm
+            | MessageType::MonitorTopology
+            | MessageType::LayoutSync,
         )
         | None => InboundRoute::Both,
     }
@@ -995,6 +1010,42 @@ impl SessionFanout {
         {
             metrics.record_input_received(total, keys);
         }
+
+        // Transitional (feature/146; the topology hub that actually
+        // consumes these lands on a later branch). `inbound_route` sends
+        // both types to `InboundRoute::Both`, where neither driver looks
+        // at them — so without this, nothing on the dispatch path ever
+        // decodes a `MonitorTopology`/`LayoutSync` frame, and
+        // docs/PROTOCOL.md §6.2/§7's "malformed is fatal" would not hold:
+        // a garbage payload would keep the session healthy. Decode and
+        // validate here instead, fail closed on `Err` exactly as any other
+        // malformed frame (§7), and discard the value either way — a real
+        // engine replaces this block once it exists.
+        if frame.message_type == MessageType::MonitorTopology.wire() {
+            match MonitorTopology::decode_payload(&frame.payload) {
+                Ok(_) => tracing::debug!(
+                    session = %session,
+                    "MonitorTopology decoded and discarded: no topology engine yet"
+                ),
+                Err(error) => {
+                    terminate_on_malformed_topology_frame(&self.registry, session, &error);
+                }
+            }
+            return;
+        }
+        if frame.message_type == MessageType::LayoutSync.wire() {
+            match LayoutSync::decode_payload(&frame.payload) {
+                Ok(_) => tracing::debug!(
+                    session = %session,
+                    "LayoutSync decoded and discarded: no topology engine yet"
+                ),
+                Err(error) => {
+                    terminate_on_malformed_topology_frame(&self.registry, session, &error);
+                }
+            }
+            return;
+        }
+
         match inbound_route(frame.message_type) {
             InboundRoute::Sync => {
                 let _ = self.sync.send(SyncEvent::Frame(frame)).await;
@@ -1563,6 +1614,40 @@ fn terminate_on_revocation(route: &SessionRoute) {
             }
         }
         FrameSink::Outbound(handle) => handle.shutdown(),
+    }
+}
+
+/// Terminate the session that sent an unparseable `MonitorTopology` or
+/// `LayoutSync` frame — docs/PROTOCOL.md §7's fail-closed treatment of a
+/// malformed message, applied by [`SessionFanout::frame`]'s transitional
+/// decode (feature/146) since no topology engine exists yet to emit its
+/// own [`SessionCommand::TerminateSession`] the way the clipboard and
+/// control drivers do for their own payload violations. Reuses
+/// [`terminate_on_revocation`]'s kill mechanism rather than a second one,
+/// and logs the standard violation diagnostic (session id, reason) either
+/// way — with a route to kill, or without one because the session has
+/// already ended.
+fn terminate_on_malformed_topology_frame(
+    registry: &SessionRegistry,
+    session: Uuid,
+    error: &crossover_protocol::ProtocolError,
+) {
+    match registry_lock(registry).get(&session) {
+        Some(route) => {
+            tracing::error!(
+                session = %session,
+                error = %error,
+                "terminating session: malformed display-topology frame (docs/PROTOCOL.md §7)"
+            );
+            terminate_on_revocation(route);
+        }
+        None => {
+            tracing::warn!(
+                session = %session,
+                error = %error,
+                "malformed display-topology frame with no live session route"
+            );
+        }
     }
 }
 
@@ -2740,6 +2825,150 @@ mod tests {
             control_rx.try_recv(),
             Ok(InputControlEvent::Frame { frame, .. }) if frame.message_type == 0x7777
         ));
+    }
+
+    /// A well-formed `MonitorTopology`/`LayoutSync` frame is decoded (so
+    /// the transitional path in `SessionFanout::frame` genuinely runs the
+    /// real decoder) and then discarded: neither driver claims it, since
+    /// no topology engine exists yet (feature/146).
+    #[tokio::test]
+    async fn well_formed_topology_frames_are_decoded_and_discarded() {
+        use crossover_protocol::layout::{LayoutSync, MonitorTopology};
+        use crossover_topology::{DeviceId, LayoutRect, MonitorId, PlacedMonitor};
+
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        let fanout = routing_fanout(sync_tx, control_tx);
+        let session = Uuid::from_bytes([0x5D; 16]);
+
+        let topology = MonitorTopology {
+            monitors: vec![crossover_protocol::layout::MonitorReport {
+                id: MonitorId::new("A").unwrap(),
+                rect: LayoutRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+                scale_percent: 100,
+            }],
+        };
+        fanout
+            .frame(
+                session,
+                raw(
+                    MessageType::MonitorTopology,
+                    topology.encode_payload().unwrap(),
+                ),
+            )
+            .await;
+
+        let sync = LayoutSync {
+            revision: 1,
+            origin: DeviceId::from_bytes([0x11; 16]),
+            monitors: vec![
+                PlacedMonitor {
+                    device: DeviceId::from_bytes([0x11; 16]),
+                    id: MonitorId::new("A").unwrap(),
+                    rect: LayoutRect {
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 100,
+                    },
+                },
+                PlacedMonitor {
+                    device: DeviceId::from_bytes([0x22; 16]),
+                    id: MonitorId::new("B").unwrap(),
+                    rect: LayoutRect {
+                        x: 100,
+                        y: 0,
+                        width: 100,
+                        height: 100,
+                    },
+                },
+            ],
+        };
+        fanout
+            .frame(
+                session,
+                raw(MessageType::LayoutSync, sync.encode_payload().unwrap()),
+            )
+            .await;
+
+        assert!(
+            sync_rx.try_recv().is_err(),
+            "a well-formed topology frame reached the sync driver"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "a well-formed topology frame reached the control driver"
+        );
+    }
+
+    /// A malformed `MonitorTopology`/`LayoutSync` frame terminates the
+    /// session — docs/PROTOCOL.md §7's fail-closed treatment — rather than
+    /// being silently accepted because no engine decodes it yet
+    /// (feature/146). The kill switch firing is the observable proxy for
+    /// "the session died": that is the same mechanism a real
+    /// `SessionCommand::TerminateSession` uses.
+    #[tokio::test]
+    async fn malformed_topology_frames_terminate_the_session() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::time::Instant;
+
+        use super::{FrameSink, SessionFanout, SessionRoute};
+
+        for message_type in [MessageType::MonitorTopology, MessageType::LayoutSync] {
+            let identity = DeviceIdentity::generate("malformed-topology-peer").unwrap();
+            let certified = CertifiedIdentity::from_identity(&identity).unwrap();
+            let session = Uuid::from_bytes([0x5E; 16]);
+            let (sink, _outbound) = outbound_channel();
+            let (kill_tx, mut killed) = watch::channel(false);
+            let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::from([(
+                session,
+                SessionRoute {
+                    sink: FrameSink::Inbound(sink),
+                    kill: Some(kill_tx),
+                    peer_fingerprint: certified.fingerprint(),
+                    features: crossover_protocol::hello::FeatureFlags::NONE,
+                    established_at: Instant::now(),
+                },
+            )])));
+
+            let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(4);
+            let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+            let fanout = SessionFanout {
+                sync: sync_tx,
+                control: control_tx,
+                metrics: None,
+                storage: Arc::new(crossover_platform::fakes::InMemorySecureStorage::new()),
+                registry,
+                spool_open: false,
+            };
+
+            // Not a valid encoding of either message under any postcard
+            // interpretation this build produces: `0xFF` repeated is not a
+            // valid leading varint for the element-count prefix every
+            // `Vec` field here starts with.
+            fanout
+                .frame(session, raw(message_type, vec![0xFF; 8]))
+                .await;
+
+            assert!(
+                *killed.borrow_and_update(),
+                "{message_type:?}: a malformed frame did not fire the kill switch"
+            );
+            assert!(
+                sync_rx.try_recv().is_err(),
+                "{message_type:?}: a malformed frame reached the sync driver"
+            );
+            assert!(
+                control_rx.try_recv().is_err(),
+                "{message_type:?}: a malformed frame reached the control driver"
+            );
+        }
     }
 
     #[test]

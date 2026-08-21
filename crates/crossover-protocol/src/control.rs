@@ -18,16 +18,12 @@ use crate::ProtocolError;
 use crate::decode_strict;
 
 /// Bound on [`EntryPoint::monitor`] (ADR 0018, docs/PROTOCOL.md §6.1/§8):
-/// printable ASCII, twice Windows' `CCHDEVICENAME`. This is the same
-/// constant `MonitorTopology`/`LayoutSync` will share once a later branch
-/// introduces the `crossover-topology` crate (ADR 0018); this crate does
-/// not yet depend on it, so the bound lives here for the one field that
-/// needs it today. Once this crate depends on `crossover-topology`,
-/// replace this definition with a re-export of that crate's constant (or,
-/// if both must exist independently for some reason, a
-/// `const _: () = assert!(...)` pinning them equal) rather than trusting
-/// two hand-kept numbers to agree.
-pub const MAX_MONITOR_ID_BYTES: usize = 64;
+/// printable ASCII, twice Windows' `CCHDEVICENAME`. Re-exported from
+/// `crossover-topology`, which now carries the one definition
+/// `MonitorTopology` and `LayoutSync` ([`crate::layout`]) also share — the
+/// directive this comment used to leave for a later branch: no hand-kept
+/// numeric twin.
+pub use crossover_topology::MAX_MONITOR_ID_BYTES;
 
 /// A monitor edge ([`EntryPoint::edge`], ADR 0018, docs/PROTOCOL.md §6.1).
 ///
@@ -109,30 +105,27 @@ impl EntryPoint {
     /// discipline every wire message in this crate follows: a bound we
     /// would reject from a peer must be impossible to send.
     ///
+    /// The one rule this checks that [`crossover_topology::validate_monitor_id`]
+    /// does not is the "unaddressed" carve-out: the empty string is a valid
+    /// [`EntryPoint::monitor`] (see the type docs), even though an empty
+    /// monitor id is never a valid [`crossover_topology::MonitorId`].
+    /// Everything else — the byte bound, the printable-ASCII rule — is that
+    /// one function's, not reimplemented here, so the rule a real monitor
+    /// id must satisfy has exactly one definition.
+    ///
     /// # Errors
     ///
-    /// [`ProtocolError::Malformed`] for a monitor id over
-    /// [`MAX_MONITOR_ID_BYTES`] bytes or containing a non-printable-ASCII
-    /// byte. The empty string passes both checks vacuously — see the type
-    /// docs for what that means.
+    /// [`ProtocolError::Malformed`] from [`crossover_topology::validate_monitor_id`]
+    /// for a non-empty, invalid monitor id.
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.monitor.len() > MAX_MONITOR_ID_BYTES {
-            return Err(ProtocolError::Malformed {
-                reason: format!(
-                    "entry point monitor id is {} bytes, over the \
-                     {MAX_MONITOR_ID_BYTES}-byte maximum",
-                    self.monitor.len()
-                ),
-            });
+        if self.monitor.is_empty() {
+            return Ok(());
         }
-        if let Some(byte) = self.monitor.bytes().find(|b| !(0x20..=0x7E).contains(b)) {
-            return Err(ProtocolError::Malformed {
-                reason: format!(
-                    "entry point monitor id contains non-printable-ASCII byte 0x{byte:02X}"
-                ),
-            });
-        }
-        Ok(())
+        crossover_topology::validate_monitor_id(&self.monitor).map_err(|error| {
+            ProtocolError::Malformed {
+                reason: format!("entry point {error}"),
+            }
+        })
     }
 }
 

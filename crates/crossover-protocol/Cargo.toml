@@ -11,6 +11,14 @@ repository.workspace = true
 # independently testable without sockets (docs/ARCHITECTURE.md §3). Pure
 # helper crates such as thiserror are acceptable.
 [dependencies]
+# The layout model (ADR 0018): `DeviceId`, `MonitorId`, `LayoutRect`,
+# `PlacedMonitor` and their bounds ride the wire directly, so
+# `MonitorTopology` and `LayoutSync` reuse one definition of "a monitor" and
+# "a device" instead of a wire copy that can drift from the model. Default
+# features only: the `config` feature's `toml_edit`/`serde_json` stay out of
+# this graph, which is what keeps this crate dependency-light and
+# socket-free (docs/ARCHITECTURE.md §3.1).
+crossover-topology = { workspace = true }
 # Wire payload encoding per ADR 0001; serde stays an implementation detail
 # of this crate and does not leak across crate boundaries.
 postcard = { workspace = true }

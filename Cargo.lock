@@ -618,6 +618,7 @@ dependencies = [
  "crossover-platform-windows",
  "crossover-protocol",
  "crossover-security",
+ "crossover-topology",
  "serde",
  "tokio",
  "toml",
@@ -678,6 +679,7 @@ dependencies = [
 name = "crossover-protocol"
 version = "0.2.0"
 dependencies = [
+ "crossover-topology",
  "postcard",
  "proptest",
  "serde",

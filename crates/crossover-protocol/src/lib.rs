@@ -11,6 +11,7 @@ pub mod file_name;
 pub mod framing;
 pub mod hello;
 pub mod input;
+pub mod layout;
 pub mod pairing;
 pub mod version;
 
@@ -25,10 +26,30 @@ pub use control::{
 };
 pub use file_name::{FileNameError, validate_file_name};
 pub use framing::{FrameDecoder, RawFrame, encode_frame};
-pub use hello::{FeatureFlags, Hello, MessageType, OsFamily};
+pub use hello::{FeatureFlags, Hello, MessageClass, MessageType, OsFamily};
 pub use input::{InputBatch, ReleaseAllInput, WireButton, WireInputEvent};
+pub use layout::{
+    LayoutSync, MAX_LAYOUT_MONITORS, MAX_MONITORS_PER_MACHINE, MAX_SCALE_PERCENT,
+    MIN_SCALE_PERCENT, MonitorReport, MonitorTopology,
+};
 pub use pairing::{PairingConfirm, PairingStart};
 pub use version::{PROTOCOL_VERSION, VersionRange, negotiate};
+
+/// Encode a value as a postcard payload (ADR 0001), wrapping the one way
+/// this can fail as [`ProtocolError::Encode`] rather than a panic.
+///
+/// Promoted here from `clipboard.rs`'s private copy so `layout.rs`'s two
+/// `encode_payload` bodies can share it too, rather than carrying a third
+/// copy of the same two-line wrapper. `hello.rs`, `control.rs`,
+/// `pairing.rs`, and `input.rs` still each have their own inline
+/// `postcard::to_stdvec(self).map_err(...)` — left alone here as a
+/// pre-existing pattern, not something this change set out to touch; a
+/// later sweep can point them at this one too.
+pub(crate) fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
+    postcard::to_stdvec(value).map_err(|e| ProtocolError::Encode {
+        reason: e.to_string(),
+    })
+}
 
 /// Decode a full postcard payload, rejecting trailing bytes — the strict
 /// contract every message decoder shares (docs/PROTOCOL.md §2: payload

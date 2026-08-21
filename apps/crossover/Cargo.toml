@@ -35,6 +35,12 @@ uuid = { workspace = true }
 # The in-memory secure storage the trust-policy tests read a trust store
 # out of, without touching the machine's real one.
 crossover-platform = { workspace = true, features = ["fakes"] }
+# To build a well-formed `MonitorReport`/`PlacedMonitor` for the
+# transitional decode-and-discard tests in `commands.rs` (feature/146):
+# `crossover-protocol`'s wire types carry these model types by reference,
+# so constructing one needs this crate's own constructors. Dev-only — the
+# shipped binary never links it directly.
+crossover-topology = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 # Windows-only: compile the app icon into crossover.exe (build.rs). A build

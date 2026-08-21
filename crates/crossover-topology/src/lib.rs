@@ -50,6 +50,7 @@
 //! bounds make overflow impossible rather than improbable, and malformed
 //! input produces a typed refusal — never a panic (NFR-1).
 
+pub mod bounded;
 pub mod device;
 pub mod layout;
 pub mod monitor;
@@ -62,11 +63,12 @@ pub mod config;
 #[cfg(any(test, feature = "config"))]
 pub mod state;
 
+pub use bounded::bounded_seq;
 pub use device::{DEVICE_ID_BYTES, DeviceId, DeviceIdParseError};
 pub use layout::{
     DevicePair, Layout, LayoutError, LayoutRect, MAX_LAYOUT_COORDINATE, MAX_LAYOUT_MONITORS,
     MAX_MONITOR_EXTENT, MAX_MONITORS_PER_MACHINE, MAX_SCALE_PERCENT, MIN_SCALE_PERCENT, MonitorKey,
-    PlacedMonitor, RawPlacedMonitor,
+    PlacedMonitor, RawPlacedMonitor, check_structure,
 };
 pub use monitor::{MAX_MONITOR_ID_BYTES, MonitorId, MonitorIdError, validate_monitor_id};
 
