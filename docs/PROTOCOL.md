@@ -546,12 +546,27 @@ Invariants, all of them checked before anything is adopted:
   dimension, an out-of-range coordinate, a non-ASCII or overlong id — the
   session terminates, fail closed.
 - **Well-formed but semantically impossible is rejected, never adopted**: a
-  layout naming a device that is not this session's pair, a monitor neither
-  peer has reported, or rectangles that overlap. It is logged and charged
-  as a protocol violation on §7's graduated rule. The distinction is
-  deliberate — the first case is a broken decoder or a hostile frame, the
-  second is a peer disagreeing with reality, which must never steer local
-  behaviour but must not cost a healthy session its first frame either.
+  layout naming a device that is not this session's pair, or rectangles
+  that overlap. It is logged and charged as a protocol violation on §7's
+  graduated rule. The distinction is deliberate — the first case is a
+  broken decoder or a hostile frame, the second is a peer disagreeing with
+  reality, which must never steer local behaviour but must not cost a
+  healthy session its first frame either.
+- **A monitor neither peer has reported is _not_ in that list** (amended
+  2026-08-21, feature/152). An earlier draft included it; implementation
+  showed the rule would be over-strict rather than protective. An
+  arrangement legitimately names screens that are not attached *right
+  now* — that is exactly what lets a drawing survive an undock, a reboot
+  with a monitor powered off, or a dock the user only sometimes sits at —
+  so refusing one would make the layout forget the desk every time a
+  laptop left it. Containment does not need the rule: a layout naming an
+  id nothing reports **derives inert** (no spans — see adjacency below),
+  so it cannot invent a crossing, only fail to produce one. What the
+  receiver owes here is *observability*, not refusal. Adopting an
+  arrangement that matches none of this machine's attached screens is
+  warned about at the moment of adoption, naming the drawn ids and the
+  attached ones, so an inert desk is diagnosed then rather than discovered
+  later at a seam that does nothing.
 - **Adjacency is exact.** A crossing span exists only where an edge
   coordinate matches identically and the perpendicular extents overlap; a
   gap of one unit is not an edge. Spans are half-open intervals, so a
