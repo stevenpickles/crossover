@@ -23,9 +23,16 @@ pub fn crossover_home() -> Option<PathBuf> {
 }
 
 /// `~/.crossover/config.toml`.
+///
+/// The name comes from [`crossover_topology::CONFIG_FILE_NAME`] rather than
+/// a literal here, because the layout editor writes this same file to hand
+/// an edit back to the worker (ADR 0018) and cannot depend on this crate —
+/// ADR 0019 fixes its dependency graph at the GUI stack and
+/// `crossover-topology`. That crate is the one thing both binaries *do*
+/// share, so it owns the name and neither of us can drift from it.
 #[must_use]
 pub fn config_path() -> Option<PathBuf> {
-    crossover_home().map(|home| home.join("config.toml"))
+    crossover_home().map(|home| crossover_topology::config_path_in(&home))
 }
 
 /// `~/.crossover/logs` — the directory for rotating log files.

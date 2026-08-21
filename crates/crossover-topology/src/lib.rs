@@ -78,8 +78,9 @@ pub use monitor::{MAX_MONITOR_ID_BYTES, MonitorId, MonitorIdError, validate_moni
 pub use atomic_write::{AtomicWriteError, temp_path, write_atomic};
 #[cfg(any(test, feature = "config"))]
 pub use config::{
-    CONFIG_SCHEMA_MIN_SUPPORTED, CONFIG_SCHEMA_VERSION, LayoutMonitorRow, LayoutSection,
-    PersistError, config_schema_supported, persist_layout,
+    CONFIG_FILE_NAME, CONFIG_SCHEMA_MIN_SUPPORTED, CONFIG_SCHEMA_VERSION, LayoutMonitorRow,
+    LayoutSection, PersistError, config_path_in, config_schema_supported, persist_layout,
+    read_layout_revision,
 };
 #[cfg(any(test, feature = "config"))]
 pub use state::{
