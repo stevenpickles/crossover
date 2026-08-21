@@ -1,6 +1,6 @@
-//! Core logic for Crossover: the topology model, control-transfer state
-//! machine, clipboard and input engines, and connection lifecycle
-//! supervision.
+//! Core logic for Crossover: the topology and crossing models, the
+//! control-transfer state machine, clipboard and input engines, and
+//! connection lifecycle supervision.
 //!
 //! Contains no direct OS API calls and compiles on all platforms; platform
 //! effects flow through the traits in `crossover-platform`
@@ -11,6 +11,7 @@ pub mod clipboard_driver;
 pub mod command;
 pub mod control;
 pub mod control_driver;
+pub mod crossing;
 pub mod edge_driver;
 pub mod file_blob;
 pub mod input;
@@ -33,6 +34,10 @@ pub use control::{
     OutboundControl,
 };
 pub use control_driver::{InputControlDriver, InputControlEvent, SeamlessInputs, input_control};
+pub use crossing::{
+    CrossSpan, CrossTarget, CrossingMap, Departure, ImplicitLayout, ImplicitLayoutError,
+    LayoutSpan, MappedMonitor, SpanId, derive as derive_crossings, from_link_side,
+};
 pub use edge_driver::{
     CrossingKind, EdgeCrossing, EdgeDetectDriver, EdgeDetector, EdgeMode, EdgeModeUpdate,
     edge_detect,
