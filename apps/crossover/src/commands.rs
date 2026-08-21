@@ -464,6 +464,39 @@ fn service_failure(error: &ServiceError, context: &str) -> anyhow::Error {
     }
 }
 
+/// `crossover layout` — open the display layout editor (ADR 0019).
+///
+/// The editor is its own binary and its own process: it is started, not
+/// hosted. This command exists because the editor ships beside `crossover.exe`
+/// rather than on `PATH`, and because a user who knows one Crossover command
+/// should not have to learn where its files live.
+pub fn layout() -> anyhow::Result<()> {
+    let editor = crate::storage::sibling_binary("crossover-layout")?;
+    if !editor.is_file() {
+        anyhow::bail!(
+            "the layout editor was not found at {}; reinstall Crossover so \
+             crossover-layout{} sits next to crossover{}",
+            editor.display(),
+            std::env::consts::EXE_SUFFIX,
+            std::env::consts::EXE_SUFFIX,
+        );
+    }
+
+    // Started and let go: the editor outlives this command, and the console
+    // that ran it is free immediately. Its streams go to null rather than to
+    // ours so nothing it writes interleaves with a console session that has
+    // moved on (`crossover run`'s notices, for instance).
+    std::process::Command::new(&editor)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("starting the layout editor at {}", editor.display()))?;
+
+    println!("Opened the Crossover layout editor.");
+    Ok(())
+}
+
 /// `crossover run [--listen [--bind <addr>]] [--connect <addr>]`
 ///
 /// Foreground session maintenance: accept trusted peers, keep an

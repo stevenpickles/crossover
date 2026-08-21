@@ -47,6 +47,14 @@ struct Cli {
     command: Command,
 }
 
+// Two of these verbs are also spelled out in another binary: the layout
+// editor's empty state tells the user to run `crossover run` or `crossover
+// service install` (apps/crossover-layout/src/app.rs, which carries the
+// matching note). Renaming either here without changing that text leaves the
+// editor naming a command that no longer exists. Sharing the strings would
+// mean a crate between the two binaries for four words, which ADR 0019's
+// dependency rule makes a poor trade — so the coupling is deliberately held
+// by these two comments and the editor's test.
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run Crossover in the foreground (clipboard sync arrives in Phase 2).
@@ -74,6 +82,9 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Open the display layout editor: arrange both machines' monitors and
+    /// save the arrangement (ADR 0018, ADR 0019).
+    Layout,
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
@@ -340,6 +351,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             ServiceAction::Uninstall => commands::service_uninstall(),
             ServiceAction::Status => commands::service_status(),
         },
+        Command::Layout => commands::layout(),
     }
 }
 
@@ -468,6 +480,17 @@ mod tests {
         }
         // `service` with no subcommand is a usage error, not a default action.
         assert!(Cli::try_parse_from(["crossover", "service"]).is_err());
+    }
+
+    #[test]
+    fn layout_is_a_bare_verb_that_takes_no_arguments() {
+        let cli = Cli::try_parse_from(["crossover", "layout"]).unwrap();
+        assert!(matches!(cli.command, Command::Layout));
+        // The editor takes its input from the state file and the config, not
+        // from this command line (ADR 0018) — so anything here is a mistake
+        // worth reporting rather than an argument to forward.
+        assert!(Cli::try_parse_from(["crossover", "layout", "--edit"]).is_err());
+        assert!(Cli::try_parse_from(["crossover", "layout", "topology.json"]).is_err());
     }
 
     #[test]

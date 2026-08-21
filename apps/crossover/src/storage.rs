@@ -306,8 +306,9 @@ pub fn open_input() -> anyhow::Result<(
 /// Open the platform's auto-start [`ServiceManager`] (ADR 0011).
 ///
 /// On Windows, the manager registers `crossover-svc.exe` — resolved as a
-/// sibling of the running `crossover.exe`, since the two binaries ship
-/// together. On other platforms it returns the `Unsupported` manager, so
+/// sibling of the running `crossover.exe`, since every binary of an install
+/// (the CLI, the daemon, and the layout editor) is deployed into one
+/// directory. On other platforms it returns the `Unsupported` manager, so
 /// `crossover service` reports a clear "not on this platform yet" rather than
 /// being absent.
 ///
@@ -317,15 +318,32 @@ pub fn open_input() -> anyhow::Result<(
 /// be determined (needed to locate the sibling daemon binary).
 #[cfg(windows)]
 pub fn open_service_manager() -> anyhow::Result<Box<dyn crossover_platform::ServiceManager>> {
+    Ok(Box::new(
+        crossover_platform_windows::WindowsServiceManager::new(sibling_binary("crossover-svc")?),
+    ))
+}
+
+/// Where a binary that ships with this one lives: beside the running
+/// executable, with the platform's executable suffix.
+///
+/// An install deploys every Crossover binary into one directory (ADR 0011 for
+/// the service, ADR 0019 for the editor), so "next to me" is the only lookup
+/// that stays right for a Program Files install, a portable archive, and a
+/// `cargo build` target directory alike — and it never consults `PATH`, where
+/// a different copy could answer.
+///
+/// # Errors
+///
+/// If the running executable's path or its parent directory cannot be
+/// determined. The file's existence is the caller's to check, so each can say
+/// what is missing.
+pub fn sibling_binary(name: &str) -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context;
-    let exe = std::env::current_exe().context("locating the running executable")?;
-    let dir = exe
+    let executable = std::env::current_exe().context("locating the running executable")?;
+    let directory = executable
         .parent()
         .context("the running executable has no parent directory")?;
-    let service_binary = dir.join("crossover-svc.exe");
-    Ok(Box::new(
-        crossover_platform_windows::WindowsServiceManager::new(service_binary),
-    ))
+    Ok(directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
 }
 
 /// Open the platform's auto-start [`ServiceManager`] (ADR 0011).

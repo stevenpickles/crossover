@@ -722,8 +722,10 @@ builds on rather than repeats.
 [ADR 0018](adr/0018-drawn-display-topology.md) (Accepted) — the drawn layout
 in one shared coordinate space, edges derived from exact adjacency,
 protocol v4, config schema v2, the worker↔editor state file, and the new
-`crossover-topology` crate. The UI toolkit decision deliverable 5 calls for
-follows as **ADR 0019**. ADR 0018 supersedes ADR
+`crossover-topology` crate. The UI toolkit decision deliverable 5 calls for is
+[ADR 0019](adr/0019-layout-editor-toolkit.md) (Accepted): egui through eframe,
+in its own on-demand user-session binary, `apps/crossover-layout`, which the
+service never touches. ADR 0018 supersedes ADR
 0009's *topology* only; the crossing mechanism (fractional position, the
 negotiated engine as the trigger's target, the re-arm hysteresis, the cursor
 mask) is retained and restated there.

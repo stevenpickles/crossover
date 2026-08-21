@@ -8,7 +8,7 @@
       1. the CI gate  - cargo fmt --check, clippy (warnings denied),
                         cargo test --workspace, cargo deny (if installed)
       2. the build     - cargo build --release --locked --workspace
-      3. verification  - both executables are x64 PE files carrying the same
+      3. verification  - every executable is an x64 PE file carrying the same
                         embedded build version and Git commit as the source
                         they were built from
       4. the artifacts - a portable .zip (+ .sha256), the Chocolatey .nupkg,
@@ -58,7 +58,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repoRoot 'dist' }
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 $releaseDirectory = Join-Path $repoRoot 'target\release'
-$binaries = @('crossover.exe', 'crossover-svc.exe')
+$binaries = @('crossover.exe', 'crossover-svc.exe', 'crossover-layout.exe')
 $startedAt = Get-Date
 
 function Write-Step([string]$Message) {
@@ -169,7 +169,7 @@ if ($SkipChecks) {
     # The Windows clipboard tests open the real clipboard, and a running
     # worker holds it — they fail with "Access is denied" for a reason that
     # has nothing to do with the code. Say so before the failure, not after.
-    $running = @(Get-Process 'crossover', 'crossover-svc' -ErrorAction SilentlyContinue)
+    $running = @(Get-Process 'crossover', 'crossover-svc', 'crossover-layout' -ErrorAction SilentlyContinue)
     if ($running.Count -gt 0) {
         Write-Warning ("Crossover is running (PID {0}). The Windows clipboard tests need an uncontended clipboard; stop the service first (Stop-Service Crossover) or pass -SkipChecks." -f ($running.Id -join ', '))
     }
@@ -215,7 +215,7 @@ $reportJson = Get-NativeOutput (Join-Path $releaseDirectory 'crossover.exe') @('
 $report = ($reportJson -join "`n") | ConvertFrom-Json
 $buildVersion = [string]$report.version
 
-# Both executables ship together and are upgraded together; a mismatch means
+# The executables ship together and are upgraded together; a mismatch means
 # one of them is stale, which is exactly the bug that is impossible to see
 # once they are installed side by side.
 foreach ($binary in $binaries) {
@@ -259,11 +259,17 @@ Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath "$archive.sha256" -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stagingDirectory | Out-Null
 
-# install.ps1 expects the executables beside it (packaging\README.md), which
-# is exactly the layout of this archive.
+# install.ps1 expects every file it deploys beside it (packaging\README.md),
+# which is exactly the layout of this archive.
 $staged = @(
     @{ Source = Join-Path $releaseDirectory 'crossover.exe'; Name = 'crossover.exe' },
     @{ Source = Join-Path $releaseDirectory 'crossover-svc.exe'; Name = 'crossover-svc.exe' },
+    @{ Source = Join-Path $releaseDirectory 'crossover-layout.exe'; Name = 'crossover-layout.exe' },
+    # The notice that third-party material embedded in the binaries requires to
+    # travel with them (today: the editor's Go fonts, ADR 0019). Copied verbatim
+    # from its one committed source, which the Chocolatey package copies too, so
+    # both artifacts carry the same text.
+    @{ Source = Join-Path $repoRoot 'packaging\THIRD-PARTY-NOTICES.txt'; Name = 'THIRD-PARTY-NOTICES.txt' },
     @{ Source = Join-Path $repoRoot 'packaging\windows\install.ps1'; Name = 'install.ps1' },
     @{ Source = Join-Path $repoRoot 'packaging\windows\uninstall.ps1'; Name = 'uninstall.ps1' },
     @{ Source = Join-Path $repoRoot 'packaging\README.md'; Name = 'INSTALL.md' },
