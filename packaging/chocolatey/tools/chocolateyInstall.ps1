@@ -9,8 +9,15 @@ $installDir = Join-Path $env:ProgramFiles 'Crossover'
 $serviceName = 'Crossover'
 
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-foreach ($binary in @('crossover.exe', 'crossover-svc.exe')) {
-    Copy-Item -Path (Join-Path $toolsDir $binary) -Destination $installDir -Force
+# The same list install.ps1 deploys: the three executables, and the notice the
+# material embedded in them requires to sit beside them (ADR 0019). pack.ps1
+# stages all four into tools\.
+foreach ($file in @(
+        'crossover.exe',
+        'crossover-svc.exe',
+        'crossover-layout.exe',
+        'THIRD-PARTY-NOTICES.txt')) {
+    Copy-Item -Path (Join-Path $toolsDir $file) -Destination $installDir -Force
 }
 
 # The service runs crossover-svc.exe as LocalSystem, so it must live in this
@@ -23,4 +30,4 @@ Start-Service -Name $serviceName
 # Chocolatey shims the exes in tools\ onto PATH for CLI access. The service uses
 # this Program Files copy (registered by `service install`); the shims are for
 # running `crossover` by hand.
-Write-Host "Crossover installed to $installDir; the service is running. Set a role in ~\.crossover\config.toml (see ``crossover config``) so the worker has something to do."
+Write-Host "Crossover installed to $installDir; the service is running. Set a role in ~\.crossover\config.toml (see ``crossover config``) so the worker has something to do, and arrange the monitors with ``crossover layout``."

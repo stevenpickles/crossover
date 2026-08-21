@@ -20,9 +20,12 @@
     <summary>Secure keyboard, mouse, and clipboard sharing between trusted computers.</summary>
     <description>
 Crossover shares one keyboard, mouse, and clipboard across two trusted
-computers over a pinned mutual-TLS link. Installing deploys crossover.exe and
-crossover-svc.exe to Program Files and registers a background service that
-launches the worker into your logon session and keeps it running (ADR 0011).
+computers over a pinned mutual-TLS link. Installing deploys crossover.exe,
+crossover-svc.exe and crossover-layout.exe to Program Files and registers a
+background service that launches the worker into your logon session and keeps
+it running (ADR 0011). `crossover layout` opens the editor, where both
+machines' monitors are arranged into the layout they physically sit in
+(ADR 0018, ADR 0019).
 
 The binaries are embedded in this package (suited to a local or private feed).
 For the public community repository, switch tools\chocolateyInstall.ps1 to
