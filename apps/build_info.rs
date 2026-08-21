@@ -73,9 +73,39 @@ impl Value {
     }
 }
 
+/// Answer `--version` / `-V` (add `--json` for a machine-readable object) and
+/// report whether that is all this invocation wanted.
+///
+/// Shared by the two windowless binaries — the service daemon and the layout
+/// editor — rather than written out in each. Deliberately not clap: two flags
+/// do not justify an argument parser in binaries whose dependency graphs are
+/// themselves architectural decisions (ADR 0011, ADR 0019). `crossover.exe`
+/// does not use it: its clap definition owns `--version` and appends the
+/// protocol range.
+///
+/// One implementation rather than two matters beyond tidiness —
+/// `scripts/build.ps1` checks that every shipped binary reports the same
+/// build, and two copies of this parser could drift into disagreeing about
+/// what counts as asking.
+pub fn reported_version() -> bool {
+    let mut asked = false;
+    let mut json = false;
+    for argument in std::env::args().skip(1) {
+        match argument.as_str() {
+            "--version" | "-V" => asked = true,
+            "--json" => json = true,
+            _ => {}
+        }
+    }
+    if asked {
+        print!("{}", report(&[], json));
+    }
+    asked
+}
+
 /// Render the full report. `extra` is appended verbatim, letting a binary add
 /// facts this module cannot know (the CLI adds the protocol range; the
-/// service has none to add).
+/// service and the editor have none to add).
 pub fn report(extra: &[(&'static str, Value)], json: bool) -> String {
     let mut fields = fields();
     fields.extend(extra.iter().cloned());
