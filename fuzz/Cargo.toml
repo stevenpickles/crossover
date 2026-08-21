@@ -87,5 +87,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "monitor_topology"
+path = "fuzz_targets/monitor_topology.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layout_sync"
+path = "fuzz_targets/layout_sync.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
