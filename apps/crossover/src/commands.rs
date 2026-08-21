@@ -5,6 +5,7 @@
 //! diagnostics go to structured logs (docs/ARCHITECTURE.md §9, §10).
 
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,6 +36,7 @@ use crossover_security::pairing::{PairedPeer, PairingCode, PairingIdentity};
 use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TrustStore, TrustedPeer,
 };
+use crossover_topology::{DeviceId, Layout, LayoutState};
 
 use crate::config::LayoutSource;
 use crate::console::{self, ConsoleCommand};
@@ -42,6 +44,7 @@ use crate::storage::{
     open_clipboard_provider, open_cursor_mask, open_display, open_file_blob_builder, open_input,
     open_secure_storage, open_service_manager, open_spool, open_virtual_files,
 };
+use crate::topology_state::{TopologyStateWriter, initial_state, watch_own_display};
 
 /// One ceremony's allowance, listener and connector alike. Generous
 /// enough to read a code off one screen and type it on another; bounded
@@ -58,6 +61,15 @@ const EDGE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 /// tolerates a bounded few-second latency; this reuses the listener's
 /// per-accept load path.
 const REVOCATION_POLL: Duration = Duration::from_secs(2);
+
+/// How often `apply_config_changes` checks `config.toml`'s modification
+/// time for a re-read (ADR 0018), and — on the same tick, whether or not
+/// the file changed — refreshes the topology state file's heartbeat.
+/// Derived from [`crossover_topology::HEARTBEAT_INTERVAL_MS`] rather than a
+/// literal 2 s, so the two cannot drift apart: the heartbeat's staleness
+/// math ([`crossover_topology::HEARTBEAT_STALE_AFTER_MS`]) assumes the
+/// worker refreshes it at exactly this cadence.
+const CONFIG_POLL: Duration = Duration::from_millis(crossover_topology::HEARTBEAT_INTERVAL_MS);
 
 /// `crossover pair --listen [--bind <addr>]`
 pub async fn pair_listen(device_name: &str, bind: Option<String>) -> anyhow::Result<()> {
@@ -633,12 +645,91 @@ fn setup_clipboard_sync(
     Ok((events, commands, file_paste_ready))
 }
 
+/// What `apply_config_changes` needs to know about `config.toml` as of the
+/// moment this run started watching it (ADR 0018): its path, and the
+/// `(mtime, len)` signature captured at the initial load — bundled into
+/// one value (rather than two parameters) so its one call site in `run`
+/// stays a short line, which is what keeps that already-long function
+/// under clippy's line cap.
+///
+/// The signature is captured *before* `run` does anything else — identity,
+/// trust store, clipboard and input-control setup, an outbound connection
+/// attempt — not lazily inside `apply_config_changes` once its task first
+/// polls, which could be well after that. Seeding the baseline from this
+/// early reading is what lets an edit landing in that window reach the
+/// topology state file on the task's very first re-read tick instead of
+/// requiring a second edit to be noticed.
+struct ConfigWatch {
+    path: Option<PathBuf>,
+    initial_signature: Option<(SystemTime, u64)>,
+}
+
+/// Bring up the worker's half of the worker→editor state file (ADR 0018):
+/// create `~/.crossover/state` on demand, write the startup snapshot, spawn
+/// the coalesced writer and the ~1 s own-display poll, and hand back what
+/// `apply_config_changes` re-reads from and the writer `run`'s shutdown
+/// gives a final write.
+///
+/// `state_writer` is `None` when no home directory was resolvable (logged
+/// here as the one place that decides it) — every other topology-state
+/// task tolerates that by simply having nothing to do.
+fn setup_topology_state(
+    identity: &DeviceIdentity,
+    layout_source: Option<&LayoutSource>,
+    initial_config_signature: Option<(SystemTime, u64)>,
+) -> anyhow::Result<(ConfigWatch, Option<Arc<TopologyStateWriter>>)> {
+    // A second, independent `DisplayInfo` handle from the one
+    // `setup_input_control` opened: both are thin, stateless Win32 query
+    // wrappers, and this one is polled on its own ~1 s cadence,
+    // deliberately separate from the 8 ms edge-detection poll.
+    let topology_display = open_display()?;
+    let config_path = crate::paths::config_path();
+    let topology_state_path = crate::paths::topology_state_path();
+    if let Some(dir) = crate::paths::state_dir() {
+        // Created on demand, the same shape `logging.rs` creates `log_dir`
+        // in the first time it opens a log file.
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                error = %error,
+                path = %dir.display(),
+                "could not create the topology state directory"
+            );
+        }
+    } else {
+        tracing::warn!(
+            "no home directory resolvable; the topology state file (ADR 0018, the layout \
+             editor's input) will not be written this run"
+        );
+    }
+    let state_writer = topology_state_path.map(|path| {
+        let initial = initial_state(
+            DeviceId::from_bytes(*identity.device_id().as_bytes()),
+            identity.device_name().to_owned(),
+            &*topology_display,
+            layout_source,
+        );
+        Arc::new(TopologyStateWriter::start(path, initial))
+    });
+    if let Some(writer) = &state_writer {
+        tokio::spawn(watch_own_display(
+            Arc::clone(&topology_display),
+            Arc::clone(writer),
+        ));
+    }
+    let config_watch = ConfigWatch {
+        path: config_path,
+        initial_signature: initial_config_signature,
+    };
+    Ok((config_watch, state_writer))
+}
+
 pub async fn run(
     device_name: &str,
     listen_bind: Option<String>,
     connect: Option<String>,
     layout_source: Option<LayoutSource>,
     no_cursor_mask: bool,
+    initial_config_signature: Option<(SystemTime, u64)>,
 ) -> anyhow::Result<()> {
     let storage: Arc<dyn SecureStorage> = Arc::from(open_secure_storage()?);
     let (identity, generated) = DeviceIdentity::load_or_generate(&*storage, device_name)
@@ -678,6 +769,11 @@ pub async fn run(
     // and (in seamless mode) the edge detector.
     let (control_events, control_commands) =
         setup_input_control(layout_source.as_ref(), &metrics, no_cursor_mask)?;
+
+    // Topology state: what the layout editor needs to draw (ADR 0018) — own
+    // facts only on this branch; see `topology_state`'s module docs.
+    let (config_watch, state_writer) =
+        setup_topology_state(&identity, layout_source.as_ref(), initial_config_signature)?;
 
     // Every live session, keyed by id, so the mux can route control and
     // input frames to the exact session the engine named and broadcast
@@ -762,13 +858,33 @@ pub async fn run(
         // Act on trust-store edits made while this run is up: revocation
         // (ADR 0010) and the file-receive grant (ADR 0015).
         () = apply_trust_changes(&storage, &registry, &policy_events, file_paste_ready) => {}
+        // Re-read config.toml for a changed [layout] and drive the state
+        // file's heartbeat (ADR 0018); `None` is the hub branch's seam.
+        () = apply_config_changes(config_watch, state_writer.clone(), None) => {}
     }
-    if let Some(handle) = &handle {
+    finish_run(handle.as_ref(), state_writer.as_ref(), &registry, &metrics).await;
+    Ok(())
+}
+
+/// End-of-run teardown: signal the outbound supervisor to stop, write the
+/// topology state file's final heartbeat (ADR 0018 — the file is never
+/// deleted, so the editor keeps showing last-known geometry while the
+/// worker is down), account for sessions still live at shutdown, and print
+/// the execution metrics summary.
+async fn finish_run(
+    handle: Option<&Arc<crossover_core::supervision::SupervisorHandle>>,
+    state_writer: Option<&Arc<TopologyStateWriter>>,
+    registry: &SessionRegistry,
+    metrics: &Metrics,
+) {
+    if let Some(handle) = handle {
         handle.shutdown();
     }
-    close_live_sessions(&registry, &metrics);
-    print_execution_metrics(&metrics);
-    Ok(())
+    if let Some(writer) = state_writer {
+        writer.write_final().await;
+    }
+    close_live_sessions(registry, metrics);
+    print_execution_metrics(metrics);
 }
 
 /// Account for sessions that were still up when the run ended.
@@ -1794,6 +1910,129 @@ async fn apply_trust_changes(
             if let Some(route) = registry_lock(registry).remove(&id) {
                 tracing::warn!(session = %id, "peer revoked; terminating active session");
                 terminate_on_revocation(&route);
+            }
+        }
+    }
+}
+
+/// Is `signature`'s modification time recent enough that a poll interval's
+/// worth of mtime-granularity coarseness could hide a second edit behind
+/// it?
+///
+/// Some filesystems — network shares in particular — report a
+/// modification time coarser than [`CONFIG_POLL`]: two saves landing
+/// inside one such tick can carry the exact same `(mtime, len)` signature
+/// [`crate::config::config_signature_at`] reads, which would otherwise
+/// look unchanged forever. Forcing a re-read whenever the observed mtime
+/// is still within one poll interval of *now* — every tick, for as long as
+/// that holds — costs at most one redundant reload per recent edit, which
+/// is cheap next to silently missing one.
+fn config_recently_modified(signature: Option<(SystemTime, u64)>, now: SystemTime) -> bool {
+    let Some((modified, _)) = signature else {
+        return false;
+    };
+    now.duration_since(modified)
+        .is_ok_and(|age| age < CONFIG_POLL)
+}
+
+/// Re-read `config.toml` on a ~2 s modification-time poll and keep the
+/// topology state file in step (ADR 0018) — the mtime-gated shape beside
+/// [`apply_trust_changes`]'s unconditional reload, because a re-validation
+/// here is worth skipping when nothing changed and a revocation check is
+/// not.
+///
+/// `config.initial_signature` seeds the baseline this poll compares
+/// against — see [`ConfigWatch`] for why it is captured early rather than
+/// read fresh when this task starts.
+///
+/// Two guards, both load-bearing, mirroring `config`'s own module docs for
+/// the same failure at startup: a file that fails to parse, or whose
+/// `[layout]` fails structural validation, **keeps the last good state**
+/// and only warns *once* per failure streak — an editor caught mid-save (a
+/// half-written temp file, a not-yet-corrected typo) must never make the
+/// worker discard what it already knows, and must not spam the log on
+/// every subsequent tick while the file stays broken. A re-read whose
+/// layout is **content-equal** to what the state file already holds is a
+/// no-op — no write, no log line — which is what will keep this worker's
+/// own future adoption-writes (the hub branch) from echoing into a
+/// worker↔peer sync loop.
+///
+/// Every *changed*, valid, explicit layout updates the state file and is
+/// also offered to `layout_changed` — the seam the hub branch (the
+/// `LayoutSync` broadcast and the resolver) connects a sender to. This
+/// branch never constructs one, so `run` always calls this with `None`.
+///
+/// `writer` is `None` when no home directory was resolvable at startup
+/// (`run`'s own warning covers that case): this task then has nothing to
+/// keep in sync and simply never completes, the same as every other
+/// never-ending branch of `run`'s foreground select.
+///
+/// Never returns — runs as a branch of the foreground select, mirroring
+/// [`apply_trust_changes`].
+async fn apply_config_changes(
+    config: ConfigWatch,
+    writer: Option<Arc<TopologyStateWriter>>,
+    layout_changed: Option<mpsc::Sender<Layout>>,
+) {
+    let Some(writer) = writer else {
+        loop {
+            std::future::pending::<()>().await;
+        }
+    };
+    let config_path = config.path;
+
+    let mut ticker = tokio::time::interval(CONFIG_POLL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_signature = config.initial_signature;
+    // Warn once per failure streak, not once per tick: `warned` resets the
+    // moment a read succeeds again.
+    let mut warned = false;
+    loop {
+        ticker.tick().await;
+        writer.heartbeat();
+
+        let now = SystemTime::now();
+        let signature = crate::config::config_signature_at(config_path.as_deref());
+        if signature == last_signature && !config_recently_modified(signature, now) {
+            continue;
+        }
+        last_signature = signature;
+
+        match crate::config::load_run_config_at(config_path.as_deref()) {
+            Ok(loaded) => match loaded.layout {
+                Ok(layout) => {
+                    warned = false;
+                    let reported = layout.as_ref().map(LayoutState::from_layout);
+                    if writer.set_layout(reported) {
+                        tracing::info!(
+                            revision = ?layout.as_ref().map(Layout::revision),
+                            "topology state: config re-read picked up a changed layout"
+                        );
+                        if let (Some(sender), Some(layout)) = (layout_changed.as_ref(), layout) {
+                            let _ = sender.send(layout).await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    if !warned {
+                        tracing::warn!(
+                            error = %error,
+                            "topology state: config re-read has an invalid [layout]; keeping \
+                             the last good one"
+                        );
+                        warned = true;
+                    }
+                }
+            },
+            Err(error) => {
+                if !warned {
+                    tracing::warn!(
+                        error = %error,
+                        "topology state: config re-read failed; keeping the last good \
+                         configuration"
+                    );
+                    warned = true;
+                }
             }
         }
     }

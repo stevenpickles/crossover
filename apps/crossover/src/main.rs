@@ -13,6 +13,7 @@ mod console;
 mod logging;
 mod paths;
 mod storage;
+mod topology_state;
 
 // Shared with `crossover-svc` so both binaries of one install report the same
 // identity (apps/build_identity.rs explains why it is an include, not a crate).
@@ -271,6 +272,18 @@ fn protocol_fields() -> [(&'static str, build_info::Value); 2] {
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Run(args) => {
+            // Captured *before* the read below, not lazily inside
+            // `commands::apply_config_changes` once its task first polls —
+            // which can be well after this point, since identity, trust
+            // store, clipboard and input-control setup, and an outbound
+            // connection attempt all run between here and the foreground
+            // select starting. Seeding that task's baseline from this
+            // early reading is what lets an edit landing in that window
+            // reach the topology state file on the very first re-read
+            // tick rather than needing a second edit to be noticed
+            // (ADR 0018).
+            let initial_config_signature =
+                config::config_signature_at(paths::config_path().as_deref());
             // Merge CLI flags over the startup config file: a flag present on
             // the command line wins; otherwise the file supplies the value
             // (Phase 6). `--name` is global, so it rides in from `cli`.
@@ -328,6 +341,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 effective.connect,
                 effective.layout_source,
                 effective.no_cursor_mask,
+                initial_config_signature,
             )
             .await;
             // Seamless masking may have blanked the system cursor; restore it

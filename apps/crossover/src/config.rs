@@ -75,6 +75,8 @@
 //! Nothing secret goes here — identity and trust stay in the DPAPI-encrypted
 //! store.
 
+use std::path::Path;
+
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
@@ -513,13 +515,29 @@ impl LoadedConfig {
 /// semantically invalid is **not** one of these: see
 /// [`LoadedConfig::layout`] and the module docs.
 pub fn load_run_config() -> anyhow::Result<LoadedConfig> {
-    let Some(path) = config_path() else {
+    load_run_config_at(config_path().as_deref())
+}
+
+/// [`load_run_config`], parameterized by the file's path rather than
+/// resolving it from the environment.
+///
+/// This is the shape that makes the function testable against a sandboxed
+/// file instead of the real `~/.crossover/config.toml` —
+/// `commands::apply_config_changes`'s re-read (ADR 0018) calls this
+/// directly with the path it was started with, and its tests do the same
+/// with a temporary one.
+///
+/// # Errors
+///
+/// Same as [`load_run_config`].
+pub fn load_run_config_at(path: Option<&Path>) -> anyhow::Result<LoadedConfig> {
+    let Some(path) = path else {
         return Ok(LoadedConfig {
             config: RunConfig::default(),
             layout: Ok(None),
         });
     };
-    let config: RunConfig = match std::fs::read_to_string(&path) {
+    let config: RunConfig = match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text)
             .with_context(|| format!("parsing config file {}", path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => RunConfig::default(),
@@ -535,6 +553,32 @@ pub fn load_run_config() -> anyhow::Result<LoadedConfig> {
         .with_context(|| format!("in config file {}", path.display()))?;
     let layout = config.validated_layout();
     Ok(LoadedConfig { config, layout })
+}
+
+/// The config file's modification time and length, if it both exists and
+/// has metadata this platform can report — for
+/// `commands::apply_config_changes`'s re-read poll (ADR 0018), parameterized
+/// by path the same way [`load_run_config_at`] is (`commands::run` calls
+/// this with [`config_path`]'s result, captured once at the initial load so
+/// the very first poll tick can already tell an edit landed while the run
+/// was starting up; tests use a sandboxed path).
+///
+/// The length rides along with the modification time rather than the time
+/// alone: some filesystems (network shares in particular) report mtime at a
+/// coarser granularity than the poll interval, so two edits inside one
+/// tick's worth of time can carry the same timestamp. A length change
+/// still tells them apart; `apply_config_changes`'s own "is this reading
+/// recent" fallback covers the residual case of two same-length edits
+/// landing in the same coarse tick.
+///
+/// `None` covers both "no config file" and "could not read its metadata":
+/// either way there is nothing to compare the next reading against, so the
+/// first `Some` after a run of `None`s always counts as a change and
+/// triggers a re-read, which is the safe direction to be wrong in.
+#[must_use]
+pub fn config_signature_at(path: Option<&Path>) -> Option<(std::time::SystemTime, u64)> {
+    let metadata = std::fs::metadata(path?).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 #[cfg(test)]
