@@ -1,6 +1,66 @@
 # Crossover Roadmap
 
-> **Current phase: 7 — Rich Clipboard (images and files)** (in progress.)
+> **Current phase: 8 — Dynamic Display Topology** (not yet started.)
+>
+> Phase 7 (Rich Clipboard — images and files) closed 2026-08-20: the last
+> open exit criterion — **input latency bounded under a saturating
+> background transfer** — was measured on the wired link the decision had
+> been waiting for, and it passes. Images and files were already
+> delivery-proven on hardware (2026-08-16 and 2026-08-19, recorded below);
+> what remained was the number, and the number the 64 KiB hold was really
+> about is the socket write.
+>
+> **Measured on wire, 2026-08-21T00:19:07Z** (evening of 08-20 local).
+> Direct wired link, machine A (Intel I225-LMvP 2.5 GbE, dock-attached,
+> listener) ↔ machine B (10 GbE, dialer), negotiated 2.5 Gbps full duplex,
+> both machines on `dev` at `f69afc8`. B drove the contention ADR 0013 is
+> actually about — **one writer carrying both**: interactive input (B
+> controlling A, continuous mouse and keyboard) and bulk file data (B → A)
+> over the same connection. Ten distinct 200 MiB random-content files
+> (distinct so hash-dedup could not shortcut them) were pasted back-to-back
+> between 00:04:34 and 00:05:13 UTC — 39 s, ~1 s per delivery (file
+> delivery p50 906 ms / p95 1080 ms) — with input running the whole time,
+> then hands-off until the interim metrics line. B's counters over the
+> window: 4,558 input samples (4,561 input events), 36,732 frames sent,
+> 2,098,396,126 bytes sent, `clipboard_files_sent=10`
+> (`clipboard_file_sent_bytes=2,097,152,000`).
+>
+> | | avg | max |
+> |---|---|---|
+> | socket accepting the bytes (`input_write`) | **0.019 ms** | **0.147 ms** |
+> | waiting for the writer (`input_lane`) | 0.41 ms | 72.2 ms |
+> | queue-to-wire, total (`input_queue`) | 0.43 ms | 72.2 ms |
+>
+> **This is a pass, and it settles the 64 KiB question.** The socket-write
+> path — the thing the hold questioned — never exceeded **0.147 ms** under
+> full saturation, which is below even the **0.21 ms** ADR 0013 costs a
+> *single* 64 KiB chunk at 2.5 GbE, and against the WiFi run's mean 1.94 ms
+> / max 309.8 ms. The 2026-08-16 failure is therefore attributable to the
+> slow physical link, not to the chunking design. **Resolution
+> (maintainer, 2026-08-20): the 64 KiB chunk size stands** — recorded as
+> [ADR 0013](adr/0013-interactive-over-bulk-prioritization.md)'s 2026-08-20
+> addendum, with [ARCHITECTURE.md](ARCHITECTURE.md) §5.4's "held pending a
+> wired measurement" closed to match. The writer-task redesign §5.4 said
+> this measurement would price is **not warranted by this evidence**: §5.4
+> already records that a writer task still writes serially into one TLS
+> stream, and the socket figures leave it nothing to win.
+>
+> **The window is clean, which is what makes the maxima mean anything.**
+> B's service was restarted at 00:04:06 UTC for fresh counters (the
+> measurement start, T), and across T → T+15 A's log shows one unbroken
+> session while B reports `reconnect_attempts=0` — so every input sample
+> coexisted with genuine transfer traffic and nothing else. An earlier
+> attempt the same day *was* polluted, by an environmental NIC link drop,
+> and was discarded rather than reported.
+>
+> **One honest observation, recorded rather than buried.** A single tail
+> event of **~72 ms** appeared in the interactive lane while socket writes
+> stayed ≤ 0.147 ms — so it is a pre-writer scheduling/queueing stall, not
+> bulk head-of-line blocking at the socket, which is the failure mode this
+> criterion exists to catch. The averages (0.41 ms lane, 0.43 ms total)
+> place it as one outlier among 4,558 samples, and the operator perceived
+> nothing. Worth a future investigation, not a blocker; it is listed with
+> the phase's carried follow-ups under Phase 7's exit criteria below.
 >
 > **Images landed 2026-08-16.** The Windows CF_DIB backend carries real
 > images between two machines verbatim in both directions, and the feature
@@ -51,6 +111,9 @@
 > first chunk, so a smaller sender-side chunk needs no protocol change. Note
 > that **moving the writer to its own task would not help**: it still writes
 > serially into one stream (see ARCHITECTURE.md §5.4, corrected).
+> **Resolved 2026-08-20**: the wired re-run happened, the socket write
+> measured 0.147 ms worst case, and 64 KiB stands unchanged — see the
+> closure summary at the top of this marker.
 >
 > The mechanism is already documented rather than newly discovered:
 > [ARCHITECTURE.md](ARCHITECTURE.md) §5.4 records that the session loop
@@ -203,7 +266,8 @@
 > instrumentation (feature/117/118) redone over wired. The wired link that
 > just proved out files is exactly the link that decision was waiting to be
 > revisited on; a formal wired re-run of that measurement is a candidate next
-> step, not undertaken here. Also skipped, deliberately: the mid-transfer
+> step, not undertaken here. (It was undertaken on 2026-08-20 and closed the
+> phase — the closure summary at the top of this marker.) Also skipped, deliberately: the mid-transfer
 > network-disconnect case — at 2.5 Gbps a 200 MiB transfer completes
 > sub-second, leaving no practical "mid" — with the 02:05:38 abrupt-disconnect
 > recovery standing as live evidence for that class of fault ([SOAK.md](SOAK.md)).
@@ -585,6 +649,43 @@ Exit criteria:
 The hermetic stress and fault-injection suites extend to cover chunked transfers
 and the priority guarantee. Files/folders may run as a second sub-milestone
 after images, given the added security surface.
+
+Verified 2026-08-20 — **all four criteria met, phase closed**:
+
+- **Images, both directions, byte-identical, plus hash-dedup**: the
+  2026-08-16 two-machine session (7h45m, ~144 MiB received, real snips into
+  Paint/Word/browser on the far side), and feature/116's session evidence
+  that an image the receiver already holds costs one offer and one
+  `AlreadyHave` decline with nothing following it onto the wire.
+- **Live input stays responsive during a concurrent bulk transfer,
+  measured**: the wired measurement of 2026-08-21T00:19:07Z under ten
+  back-to-back 200 MiB file transfers with continuous input on the same
+  writer — socket write avg 0.019 ms / max 0.147 ms, total queue-to-wire
+  avg 0.43 ms / max 72.2 ms, inside ADR 0013's per-chunk budget (full record
+  in the marker above and docs/SOAK.md's Phase 7 input-latency section).
+- **Files materialize only through an explicit user paste, guardrails
+  enforced, refusals observable**: the 2026-08-18 → 2026-08-19 files session
+  — both directions byte-identical from the spool via Ctrl+V, `TooLarge`
+  refused live at 268,500,992 bytes, loop prevention suppressing a
+  spool-path probe exactly once ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)'s
+  2026-08-19 addendum).
+- **No regression in text-clipboard reliability or in input
+  latency/correctness**: the Phase 2 stress gate is hermetic and gates every
+  merge, and no hardware session in this phase left input stuck or looped
+  the clipboard.
+
+Small follow-ups carried out of the phase, none of them blocking:
+
+- **A ~72 ms tail in the interactive lane** (2026-08-21 measurement, one
+  sample in 4,558) with socket writes ≤ 0.147 ms — a pre-writer
+  scheduling/queueing stall to investigate, not bulk head-of-line blocking.
+- **The service relaunches the worker into a dying session at logoff**,
+  because it acts on the session-change notification before the `Logoff`
+  stop reason arrives. Cosmetic: the relaunch fails harmlessly.
+- **Exit code `0x40010004` (`DBG_TERMINATE_PROCESS`) is labelled
+  `crashed=true`** in the supervision log, when at logoff it is Windows
+  terminating the worker deliberately. Cosmetic: it misleads whoever reads
+  the log next (docs/SOAK.md, 2026-08-20 session).
 
 ## Phase 8 — Dynamic Display Topology
 

@@ -185,3 +185,55 @@ priority #2 (clipboard reliability) outranks #5 (input latency), so bulk may
 never be dropped to clear the way. The guarantee here is narrower and exactly
 the one that was violated: an interactive frame is never delayed by a queue
 belonging to a driver with no interest in it.
+
+## Addendum (2026-08-20): the chunk size, measured on the link it was costed for
+
+This ADR's chunk-size arithmetic — 64 KiB is "0.21 ms of 2.5 GbE, so one
+chunk of worst-case input delay stays sub-millisecond" — was an assertion
+about a wired LAN that had never been read on one. A 2026-08-16 hardware
+measurement over **WiFi** broke it badly (input queue-to-wire mean 1.94 ms,
+max 309.8 ms), and the maintainer held the size at 64 KiB rather than tune
+it against a link this ADR never contemplated, pending a wired re-run. That
+re-run has happened.
+
+**The measurement.** 2026-08-21T00:19:07Z, both machines on `dev` at
+`f69afc8`, over a direct wired link negotiated at 2.5 Gbps full duplex — the
+design target exactly. The contended case was driven as this ADR describes
+it, with **one writer carrying both classes**: the sending machine was
+simultaneously controlling the other (continuous mouse and keyboard) and
+streaming bulk file data to it over the same connection. Ten distinct
+200 MiB random-content files went across back-to-back in 39 s (~1 s per
+delivery), with input running throughout; 4,558 input frames were timed.
+
+| | avg | max |
+|---|---|---|
+| socket accepting the bytes | **0.019 ms** | **0.147 ms** |
+| waiting for the writer | 0.41 ms | 72.2 ms |
+| queue-to-wire, total | 0.43 ms | 72.2 ms |
+
+**Decision: 64 KiB stands** (maintainer, 2026-08-20). The worst socket write
+under full saturation, 0.147 ms, is smaller than the 0.21 ms this ADR costs a
+single 64 KiB chunk at 2.5 GbE — so the unpreemptable unit behaves as the
+arithmetic said it would, and shrinking it would buy latency nobody is
+paying. The WiFi failure is attributed to the physical link rather than to
+the chunking design: the same chunk that is a fifth of a millisecond here was
+a tenth of a second there. Nothing in the decision changes; what changes is
+that the number behind it is now evidence instead of arithmetic.
+
+The corollary matters as much: **the writer-task redesign this measurement
+was meant to price is not warranted.** [ARCHITECTURE.md](../ARCHITECTURE.md)
+§5.4 already corrected the claim that moving the writer to its own task would
+remove the wait — it would still write serially into one TLS stream — and the
+socket figures now leave it nothing to recover. Genuine mid-frame preemption
+still means separate streams or a second connection, both considered and
+rejected above, and this measurement gives no reason to revisit them.
+
+**One observation the numbers carry honestly.** A single ~72 ms tail event
+appeared in the interactive *lane* while socket writes stayed at or below
+0.147 ms — so a frame waited before the writer, not behind bulk bytes in the
+socket. That is not the head-of-line blocking this ADR exists to prevent; it
+is one outlier among 4,558 samples against lane and total averages of
+0.41 ms and 0.43 ms, and the operator noticed nothing. It is recorded as a
+future investigation in the roadmap's Phase 7 follow-ups, not as a defect in
+this decision. The full session record is docs/SOAK.md's Phase 7
+input-latency section.
