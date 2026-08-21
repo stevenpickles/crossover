@@ -84,16 +84,27 @@ pub fn config_path_in(crossover_home: &Path) -> PathBuf {
 /// is the app's business. What this constant fixes is what a **write**
 /// produces, and a write is always an upgrade to 2.
 ///
-/// # Wired into the reader (feature/151)
+/// # Both sides are wired, and there are two writers
 ///
 /// `apps/crossover/src/config.rs` accepts this constant's range — 1
 /// through [`CONFIG_SCHEMA_VERSION`] — reads `[layout]` into
 /// [`LayoutSection`], and treats a v1 file or a lingering `side` as an
-/// implicit layout, exactly as the coupling this doc used to describe as
-/// outstanding required. What is **not** yet wired is the write side: no
-/// caller in the app calls [`persist_layout`] yet — that lands with the
-/// editor (feature/152) — so a v1 file stays v1 until then, and this
-/// constant only ever describes what a future write would upgrade it to.
+/// implicit layout. Two things write it, both through [`persist_layout`],
+/// so both stamp this constant and retire `side`:
+///
+/// - **the editor's save** (`apps/crossover-layout/src/save.rs`) — the
+///   user's own edit, at this desk; and
+/// - **the worker's layout-sync engine**
+///   (`apps/crossover/src/topology_sync.rs`) — adopting an arrangement
+///   drawn at the *other* desk. ADR 0018 is deliberate that adoption
+///   counts as a write: on a two-machine pair the peer's edit is the
+///   user's edit, made at the other desk.
+///
+/// Either upgrades a v1 file in place the first time it runs, with the
+/// user's comments and unrelated sections untouched. They do not race for
+/// a revision: a save numbers past everything *both* files have seen
+/// ([`read_layout_revision`] plus the state file's, in
+/// `save::next_revision`), and every write here is atomic.
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 /// Oldest config schema this build still reads (ADR 0018): a bare

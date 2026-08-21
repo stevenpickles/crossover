@@ -15,6 +15,7 @@ pub mod crossing;
 pub mod edge_driver;
 pub mod file_blob;
 pub mod input;
+pub mod layout_sync;
 pub mod link;
 pub mod metrics;
 pub mod net;
@@ -41,8 +42,9 @@ pub use crossing::{
     LayoutSpan, MappedMonitor, SpanId, derive as derive_crossings, from_link_side,
 };
 pub use edge_driver::{
-    CrossingKind, CrossingSource, DetectedCrossing, EdgeCrossing, EdgeDetectDriver, EdgeDetector,
-    EdgeMode, EdgeModeUpdate, edge_detect, explicit_crossing_source, implicit_crossing_source,
+    CrossingKind, CrossingSource, DerivedCrossings, DetectedCrossing, EdgeCrossing,
+    EdgeDetectDriver, EdgeDetector, EdgeMode, EdgeModeUpdate, LiveLayout, edge_detect,
+    explicit_crossing_source, implicit_crossing_source, live_crossing_source,
 };
 pub use file_blob::{FALLBACK_ARCHIVE_NAME, wire_file_name};
 pub use input::{

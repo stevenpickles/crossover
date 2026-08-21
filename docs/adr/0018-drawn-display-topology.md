@@ -531,6 +531,15 @@ This ADR is the crate-creation record `adr/README.md` requires.
   mismatch produces a cursor at the desktop edge and a diagnostic, not a
   failed or divided grant. That asymmetry is deliberate and is the reason the
   entry point may be treated as advisory.
+- **(Added 2026-08-21, feature/152.) A run holding no drawn arrangement
+  needs one restart before an adopted one drives its cursor.** Adoption on
+  such a run persists and reports but cannot publish — there is no live
+  crossing source to replace (see the amendment below). So the very first
+  sync onto a fresh machine converges the *arrangement* immediately and the
+  *behaviour* at the next start. It is the honest cost of not rebuilding
+  the detector and the placement path mid-session, it applies once per
+  machine rather than per edit, and it is logged at the moment it applies
+  so nobody has to deduce it from a cursor that will not cross.
 - **The platform display trait grows an identity.** `MonitorRect` today is
   bare geometry; matching live monitors to a layout needs a stable id per
   monitor, which on Windows is `GetMonitorInfoW`'s `szDevice`. A stable
@@ -550,6 +559,52 @@ This ADR is the crate-creation record `adr/README.md` requires.
   ADR 0012) — the same shape as T21's local-process concern, contained the
   same way everything from this file always was: validated on load, before
   use.
+
+**Amendment (2026-08-21):** the adoption order above says the winning
+layout is "published to the live topology `watch`", and implementation
+found one case the sentence does not cover: a run that holds **no drawn
+arrangement** — an implicit `--left`/`--right` run, or seamless off — has
+no live crossing source for a publication to replace. Its detector is
+derived from the side model, or does not exist at all, and switching a
+*running* worker between the two arrangement models would mean rebuilding
+the detector and the control driver's placement path mid-session, which
+this decision never asked for and which buys nothing a restart does not.
+
+So on such a run, adoption **persists and reports, and the publication is
+a no-op that logs itself**: the arrangement is written to the config (which
+is precisely the schema 1 → 2 upgrade the persistence section describes),
+the state file records it, and the next start crosses by it. The run in
+progress keeps crossing the way it was configured to. The two properties
+this decision actually rests on are unaffected — the layout is never lost,
+and the change is never silent — and the honest cost is one restart before
+a first-ever adopted arrangement drives the cursor. A run that already has
+a drawn arrangement publishes immediately, as specified, which is the case
+the sentence was written for.
+
+**That such a run adopts and persists at all is deliberate, and is the
+primary first-use flow rather than an edge case.** A fresh machine — a v1
+config, a `--right` baked into a service registration, or nothing
+configured — holds no arrangement, so the first time anyone draws one it is
+drawn at the *other* desk. Declining to adopt there would leave the pair
+unable to converge until the user visited both machines with the editor,
+which is precisely the hand-copied-file failure "Alternatives Considered"
+rejects. The persistence section already settles the authority question in
+its own words: on a two-machine pair the peer's edit **is** the user's
+edit, drawn at the other desk, so persisting it here happens on their
+behalf rather than behind their back — the same reasoning that makes
+adoption count as the first write for the schema upgrade.
+
+**Amendment (2026-08-21), the rejection list:** "a monitor neither peer has
+reported" is removed from the well-formed-but-impossible cases above.
+Implementation showed it over-strict rather than protective: an arrangement
+legitimately names screens that are not attached right now, which is what
+lets a drawing survive an undock or a reboot with a monitor powered off,
+and such a layout **derives inert** — no spans — so it cannot invent a
+crossing, only fail to produce one. What the receiver owes is
+observability, and it now gives it: adopting an arrangement matching none
+of this machine's attached screens warns at that moment, naming the drawn
+ids and the attached ones. [PROTOCOL.md](../PROTOCOL.md) §6.2 and
+[SECURITY.md](../SECURITY.md) T23 carry the same amendment.
 
 **Amendment (2026-08-20):** the `config` feature also carries `serde_json`,
 for the state-file schema this ADR places in the same crate — versioned

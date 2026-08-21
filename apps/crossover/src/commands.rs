@@ -21,10 +21,10 @@ use crossover_core::supervision::{
 };
 use crossover_core::{
     ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, CrossingMap, EdgeCrossing,
-    EdgeDetectDriver, FileReceive, FileSend, FrameTarget, InputControlEvent, LocalNode, Metrics,
-    OutboundSender, SeamlessInputs, SessionCommand, SessionListener, SessionOptions, SyncEvent,
-    clipboard_sync, edge_detect, explicit_crossing_source, implicit_crossing_source, input_control,
-    outbound_channel,
+    EdgeDetectDriver, FileReceive, FileSend, FrameTarget, InputControlEvent, LiveLayout, LocalNode,
+    Metrics, OutboundSender, SeamlessInputs, SessionCommand, SessionListener, SessionOptions,
+    SyncEvent, clipboard_sync, edge_detect, implicit_crossing_source, input_control,
+    live_crossing_source, outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
@@ -32,12 +32,11 @@ use crossover_platform::{ServiceError, ServiceStatus};
 use crossover_protocol::DEFAULT_PORT;
 use crossover_protocol::hello::{FeatureFlags, MessageType};
 use crossover_protocol::input::{InputBatch, WireInputEvent};
-use crossover_protocol::layout::{LayoutSync, MonitorTopology};
 use crossover_security::pairing::{PairedPeer, PairingCode, PairingIdentity};
 use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TrustStore, TrustedPeer,
 };
-use crossover_topology::{DeviceId, Layout, LayoutState};
+use crossover_topology::{DeviceId, Layout};
 
 use crate::config::LayoutSource;
 use crate::console::{self, ConsoleCommand};
@@ -46,6 +45,7 @@ use crate::storage::{
     open_secure_storage, open_service_manager, open_spool, open_virtual_files,
 };
 use crate::topology_state::{TopologyStateWriter, initial_state, watch_own_display};
+use crate::topology_sync::{TopologyEvent, TopologyHandle, TopologyInputs, TopologySync};
 
 /// One ceremony's allowance, listener and connector alike. Generous
 /// enough to read a code off one screen and type it on another; bounded
@@ -343,8 +343,12 @@ listen = "0.0.0.0:27677"            # or accept inbound peers (presence = listen
 # writes [layout] below and retires this section.
 side = "right"                      # "left" | "right"
 
-# [layout] is written by `crossover layout`, not hand-edited — this is the
-# shape it writes, for reference:
+# [layout] is written for you, not hand-edited: by `crossover layout`, and
+# by `crossover run` itself when it adopts an arrangement drawn on the
+# other machine (ADR 0018 — the peer's edit is your edit, made at the other
+# desk). Either write upgrades this file to schema 2 and removes `side`,
+# leaving your comments and every other section exactly as they are. This
+# is the shape it writes, for reference:
 # revision = 1
 # origin = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8"
 #
@@ -570,7 +574,7 @@ fn setup_input_control(
     identity: &DeviceIdentity,
     metrics: &Arc<Metrics>,
     no_cursor_mask: bool,
-) -> anyhow::Result<(mpsc::Sender<InputControlEvent>, CommandReceiver)> {
+) -> anyhow::Result<InputControl> {
     let local = DeviceId::from_bytes(*identity.device_id().as_bytes());
     let (capture, injector) = open_input()?;
     // Diagnostic switch: run without masking to isolate cursor behavior
@@ -595,9 +599,13 @@ fn setup_input_control(
     // ADR 0018), so a soak report shows what each side actually ran with.
     log_display_and_edge(&*display, layout_source, seamless.as_ref().map(|s| &*s.map));
 
-    let (inputs, edge_wiring) = match seamless {
-        Some(seamless) => (Some(seamless.inputs), Some(seamless.wiring)),
-        None => (None, None),
+    let (inputs, edge_wiring, layout_publisher) = match seamless {
+        Some(seamless) => (
+            Some(seamless.inputs),
+            Some(seamless.wiring),
+            seamless.publisher,
+        ),
+        None => (None, None, None),
     };
     let (control_driver, control_events, control_commands, control_notices) = input_control(
         capture,
@@ -615,7 +623,20 @@ fn setup_input_control(
     }
     tokio::spawn(print_control_notices(control_notices, Arc::clone(metrics)));
 
-    Ok((control_events, control_commands))
+    Ok(InputControl {
+        events: control_events,
+        commands: control_commands,
+        layout_publisher,
+    })
+}
+
+/// What [`setup_input_control`] hands back to the composition root: the
+/// control driver's two ends, plus the seam an adopted arrangement is
+/// published through (ADR 0018).
+struct InputControl {
+    events: mpsc::Sender<InputControlEvent>,
+    commands: CommandReceiver,
+    layout_publisher: Option<watch::Sender<LiveLayout>>,
 }
 
 /// Start clipboard synchronization: the provider, the spool a received
@@ -688,14 +709,14 @@ struct ConfigWatch {
 fn setup_topology_state(
     identity: &DeviceIdentity,
     layout_source: Option<&LayoutSource>,
+    config_path: Option<PathBuf>,
     initial_config_signature: Option<(SystemTime, u64)>,
-) -> anyhow::Result<(ConfigWatch, Option<Arc<TopologyStateWriter>>)> {
+) -> anyhow::Result<TopologyPlumbing> {
     // A second, independent `DisplayInfo` handle from the one
     // `setup_input_control` opened: both are thin, stateless Win32 query
     // wrappers, and this one is polled on its own ~1 s cadence,
     // deliberately separate from the 8 ms edge-detection poll.
     let topology_display = open_display()?;
-    let config_path = crate::paths::config_path();
     let topology_state_path = crate::paths::topology_state_path();
     if let Some(dir) = crate::paths::state_dir() {
         // Created on demand, the same shape `logging.rs` creates `log_dir`
@@ -722,27 +743,182 @@ fn setup_topology_state(
         );
         Arc::new(TopologyStateWriter::start(path, initial))
     });
-    if let Some(writer) = &state_writer {
-        tokio::spawn(watch_own_display(
-            Arc::clone(&topology_display),
-            Arc::clone(writer),
-        ));
-    }
+    // The own-display poll is spawned by `run`, not here: it now also
+    // pings the layout-sync hub on a change (ADR 0018's "re-send
+    // `MonitorTopology` whenever the local display configuration
+    // changes"), and the hub cannot exist until this function has produced
+    // the writer it reports through.
     let config_watch = ConfigWatch {
         path: config_path,
         initial_signature: initial_config_signature,
     };
-    Ok((config_watch, state_writer))
+    Ok(TopologyPlumbing {
+        config_watch,
+        state_writer,
+        display: topology_display,
+    })
 }
 
-pub async fn run(
-    device_name: &str,
-    listen_bind: Option<String>,
-    connect: Option<String>,
-    layout_source: Option<LayoutSource>,
-    no_cursor_mask: bool,
+/// Bring up layout sync (ADR 0018): the hub that states this machine's
+/// monitors and arrangement, receives the peer's, and resolves the two.
+/// Spawns the hub and — once the hub's queue exists to ping — the ~1 s
+/// own-display poll that keeps both the state file and the peer current.
+///
+/// Returns the sender every producer talks to it on, its command lane for
+/// the mux, and the handle shutdown flushes it through.
+///
+/// `publisher` is the seam that makes an adopted arrangement live: it is
+/// `Some` only for a run whose crossings come from a *drawn* layout, since
+/// there is nothing for a publication to replace otherwise (ADR 0018's
+/// 2026-08-21 amendment).
+///
+/// `state_writer` is `None` only when no home directory resolved, which
+/// `setup_topology_state` has already warned about. Two things follow, both
+/// harmless and neither silent: nothing reports to the editor, and the
+/// own-display poll — the thing that would re-state `MonitorTopology` on a
+/// display change — is not spawned, so on that run the peer learns of a
+/// display change at the next session instead. A machine with no home
+/// directory has no config file either, so there was nothing to persist to
+/// on it in the first place.
+fn setup_layout_sync(
+    identity: &DeviceIdentity,
+    display: &Arc<dyn DisplayInfo>,
+    layout_source: Option<&LayoutSource>,
+    publisher: Option<watch::Sender<LiveLayout>>,
+    metrics: &Arc<Metrics>,
+    state_writer: Option<&Arc<TopologyStateWriter>>,
+    config_path: Option<PathBuf>,
+) -> (mpsc::Sender<TopologyEvent>, CommandReceiver, TopologyHandle) {
+    let (commands_tx, commands) = command_lanes();
+    let (hub, events, shutdown) = TopologySync::start(TopologyInputs {
+        local: DeviceId::from_bytes(*identity.device_id().as_bytes()),
+        display: Arc::clone(display),
+        commands: commands_tx,
+        metrics: Arc::clone(metrics),
+        state: state_writer.map(Arc::clone),
+        // An implicit arrangement is never synced (ADR 0018), so such a run
+        // starts holding nothing and a peer's drawn layout wins outright —
+        // which is exactly the schema-1 upgrade path.
+        layout: match layout_source {
+            Some(LayoutSource::Explicit(layout)) => Some(layout.clone()),
+            Some(LayoutSource::Implicit(_)) | None => None,
+        },
+        publisher,
+        config_path,
+    });
+    let task = tokio::spawn(hub.run());
+    if let Some(writer) = state_writer {
+        tokio::spawn(watch_own_display(
+            Arc::clone(display),
+            Arc::clone(writer),
+            events.clone(),
+        ));
+    }
+    (events, commands, TopologyHandle::new(shutdown, task))
+}
+
+/// Everything the display-topology half of a run needs, brought up
+/// together (ADR 0018).
+pub struct Topology {
+    config_watch: ConfigWatch,
+    state_writer: Option<Arc<TopologyStateWriter>>,
+    events: mpsc::Sender<TopologyEvent>,
+    commands: CommandReceiver,
+    handle: TopologyHandle,
+}
+
+/// Bring up the state file, the config poll's baseline, and the layout-sync
+/// hub as one unit.
+///
+/// They are one unit because they share three things and would otherwise
+/// have to be handed them separately, in the right order, by the caller:
+/// the **config path** (resolved exactly once here, so the poll that
+/// watches the file and the hub that writes it cannot end up looking at
+/// different ones), the **display handle** the state file and
+/// `MonitorTopology` both read this desk through, and the **state writer**
+/// the hub reports into — which cannot exist before this function and which
+/// the hub cannot be built without.
+fn setup_topology(
+    identity: &DeviceIdentity,
+    layout_source: Option<&LayoutSource>,
+    layout_publisher: Option<watch::Sender<LiveLayout>>,
+    metrics: &Arc<Metrics>,
     initial_config_signature: Option<(SystemTime, u64)>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Topology> {
+    let config_path = crate::paths::config_path();
+    let TopologyPlumbing {
+        config_watch,
+        state_writer,
+        display,
+    } = setup_topology_state(
+        identity,
+        layout_source,
+        config_path.clone(),
+        initial_config_signature,
+    )?;
+    let (events, commands, handle) = setup_layout_sync(
+        identity,
+        &display,
+        layout_source,
+        layout_publisher,
+        metrics,
+        state_writer.as_ref(),
+        config_path,
+    );
+    Ok(Topology {
+        config_watch,
+        state_writer,
+        events,
+        commands,
+        handle,
+    })
+}
+
+/// What [`setup_topology_state`] hands [`setup_topology`].
+struct TopologyPlumbing {
+    config_watch: ConfigWatch,
+    state_writer: Option<Arc<TopologyStateWriter>>,
+    /// The display handle both the own-display poll and the layout-sync
+    /// hub read this machine's monitors through — one handle, so the desk
+    /// the editor is shown and the desk the peer is told about are read the
+    /// same way.
+    display: Arc<dyn DisplayInfo>,
+}
+
+/// Open the inbound role's listener, if this run has one, announcing the
+/// address it actually bound to — which is not always the one asked for
+/// (`0.0.0.0:0`, say). A failure to bind is fatal: a run told to listen
+/// that silently does not is a run whose peer can never reach it.
+async fn bind_listener(bind: Option<&str>) -> anyhow::Result<Option<SessionListener>> {
+    let Some(bind) = bind else {
+        return Ok(None);
+    };
+    let listener = SessionListener::bind(bind)
+        .await
+        .with_context(|| format!("binding listener on {bind}"))?;
+    println!("Listening for trusted peers on {}.", listener.local_addr()?);
+    Ok(Some(listener))
+}
+
+/// Who this run is and who it will talk to: the secure storage everything
+/// reads through, this machine's identity and its TLS-presentable
+/// credential, and the trust store as of startup.
+struct RunIdentity {
+    storage: Arc<dyn SecureStorage>,
+    identity: DeviceIdentity,
+    certified: CertifiedIdentity,
+    store: TrustStore,
+}
+
+/// Load (or generate) this machine's identity, certify it, and read the
+/// trust store — announcing all three, since "which identity, how many
+/// peers, what fingerprint" is the first thing anyone diagnosing a run
+/// needs and the last thing they should have to go looking for.
+///
+/// Refuses a run with no trusted peers: there is nothing for it to do, and
+/// failing here with the pairing command named is far better than a
+/// listener that accepts nobody.
+fn open_run_identity(device_name: &str) -> anyhow::Result<RunIdentity> {
     let storage: Arc<dyn SecureStorage> = Arc::from(open_secure_storage()?);
     let (identity, generated) = DeviceIdentity::load_or_generate(&*storage, device_name)
         .context("loading device identity")?;
@@ -766,6 +942,28 @@ pub async fn run(
         store.peers().len(),
         identity.spki_fingerprint()?
     );
+    Ok(RunIdentity {
+        storage,
+        identity,
+        certified,
+        store,
+    })
+}
+
+pub async fn run(
+    device_name: &str,
+    listen_bind: Option<String>,
+    connect: Option<String>,
+    layout_source: Option<LayoutSource>,
+    no_cursor_mask: bool,
+    initial_config_signature: Option<(SystemTime, u64)>,
+) -> anyhow::Result<()> {
+    let RunIdentity {
+        storage,
+        identity,
+        certified,
+        store,
+    } = open_run_identity(device_name)?;
 
     // One metrics registry for the whole run, shared by every layer that
     // knows something worth counting and dumped on the way out (FR-7.3,
@@ -779,13 +977,28 @@ pub async fn run(
 
     // Input control: capture/inject, the transfer engine, cursor masking,
     // and (in seamless mode) the edge detector.
-    let (control_events, control_commands) =
-        setup_input_control(layout_source.as_ref(), &identity, &metrics, no_cursor_mask)?;
+    let InputControl {
+        events: control_events,
+        commands: control_commands,
+        layout_publisher,
+    } = setup_input_control(layout_source.as_ref(), &identity, &metrics, no_cursor_mask)?;
 
-    // Topology state: what the layout editor needs to draw (ADR 0018) — own
-    // facts only on this branch; see `topology_state`'s module docs.
-    let (config_watch, state_writer) =
-        setup_topology_state(&identity, layout_source.as_ref(), initial_config_signature)?;
+    // Display topology (ADR 0018): what the editor needs to draw, the
+    // config poll that picks its edits up, and the engine that agrees one
+    // arrangement with the peer.
+    let Topology {
+        config_watch,
+        state_writer,
+        events: topology_events,
+        commands: topology_commands,
+        handle: topology_handle,
+    } = setup_topology(
+        &identity,
+        layout_source.as_ref(),
+        layout_publisher,
+        &metrics,
+        initial_config_signature,
+    )?;
 
     // Every live session, keyed by id, so the mux can route control and
     // input frames to the exact session the engine named and broadcast
@@ -793,20 +1006,19 @@ pub async fn run(
     let registry: SessionRegistry =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    // Session lifecycle and frames fan out to both drivers.
+    // Session lifecycle and frames fan out to every driver; every driver's
+    // commands merge back into the two priority lanes (ADR 0013).
     let policy_events = sync_events.clone();
     let fanout = SessionFanout {
         sync: sync_events,
         control: control_events.clone(),
+        topology: topology_events.clone(),
         metrics: Some(Arc::clone(&metrics)),
         storage: Arc::clone(&storage),
         registry: Arc::clone(&registry),
         spool_open: file_paste_ready,
     };
-
-    // Both drivers emit the same SessionCommands; merge them into the two
-    // priority lanes the mux drains independently (ADR 0013).
-    let commands = merge_command_lanes(sync_commands, control_commands);
+    let commands = merge_command_lanes([sync_commands, control_commands, topology_commands]);
 
     // How a disconnect finds out whether the local wire went down (the
     // `local_link` field on session-end and connect-failure records).
@@ -825,16 +1037,7 @@ pub async fn run(
     spawn_command_mux(Arc::clone(&registry), commands, Some(Arc::clone(&metrics)));
 
     // Inbound role: accept loop, one session at a time (two-machine scope).
-    let listener = match &listen_bind {
-        Some(bind) => {
-            let listener = SessionListener::bind(bind.as_str())
-                .await
-                .with_context(|| format!("binding listener on {bind}"))?;
-            println!("Listening for trusted peers on {}.", listener.local_addr()?);
-            Some(listener)
-        }
-        None => None,
-    };
+    let listener = bind_listener(listen_bind.as_deref()).await?;
 
     println!();
     println!("{}", console::HELP);
@@ -871,27 +1074,50 @@ pub async fn run(
         // (ADR 0010) and the file-receive grant (ADR 0015).
         () = apply_trust_changes(&storage, &registry, &policy_events, file_paste_ready) => {}
         // Re-read config.toml for a changed [layout] and drive the state
-        // file's heartbeat (ADR 0018); `None` is the hub branch's seam.
-        () = apply_config_changes(config_watch, state_writer.clone(), None) => {}
+        // file's heartbeat (ADR 0018). A changed, valid, explicit layout
+        // is offered to the layout-sync hub, which decides whether it is
+        // newer than what this run holds and states it to the peer.
+        () = apply_config_changes(
+            config_watch,
+            state_writer.clone(),
+            Some(topology_events),
+        ) => {}
     }
-    finish_run(handle.as_ref(), state_writer.as_ref(), &registry, &metrics).await;
+    finish_run(
+        handle.as_ref(),
+        state_writer.as_ref(),
+        topology_handle,
+        &registry,
+        &metrics,
+    )
+    .await;
     Ok(())
 }
 
-/// End-of-run teardown: signal the outbound supervisor to stop, write the
-/// topology state file's final heartbeat (ADR 0018 — the file is never
-/// deleted, so the editor keeps showing last-known geometry while the
-/// worker is down), account for sessions still live at shutdown, and print
-/// the execution metrics summary.
+/// End-of-run teardown: signal the outbound supervisor to stop, land the
+/// two files this run owns, account for sessions still live at shutdown,
+/// and print the execution metrics summary.
+///
+/// Both file writes are here, side by side, because they are the same
+/// obligation in two places (ADR 0018): the **config** gets whatever
+/// arrangement the layout-sync hub adopted but has not yet written — a
+/// clean quit inside a coalescing window must not lose it — and the
+/// **state file** gets a final heartbeat, since it is never deleted and the
+/// editor keeps showing last-known geometry while the worker is down.
 async fn finish_run(
     handle: Option<&Arc<crossover_core::supervision::SupervisorHandle>>,
     state_writer: Option<&Arc<TopologyStateWriter>>,
+    topology: TopologyHandle,
     registry: &SessionRegistry,
     metrics: &Metrics,
 ) {
     if let Some(handle) = handle {
         handle.shutdown();
     }
+    // The hub first: it can still change what the state file should report
+    // (its adoption writes the config and then reports), so flushing it
+    // before the final snapshot is what keeps the two agreeing.
+    topology.shutdown().await;
     if let Some(writer) = state_writer {
         writer.write_final().await;
     }
@@ -1009,14 +1235,15 @@ enum InboundRoute {
     Sync,
     /// Input and control-transfer traffic: the control driver's.
     Control,
-    /// Neither driver claims it. Reached by a message type this build does
-    /// not know (the session layer answers or rejects everything else
-    /// before it becomes an app frame) and by a known type with no driver
-    /// yet — `MonitorTopology`/`LayoutSync` (ADR 0018), which have no
-    /// engine to route to until the topology work lands. Both drivers
-    /// ignore what lands here, but *ignoring* is their decision to make,
-    /// not this function's, so it keeps historical delivery to both rather
-    /// than being dropped by a classifier that predates its owner.
+    /// Display topology: the layout-sync hub's, and nobody else's
+    /// (ADR 0018, [`crate::topology_sync`]).
+    Topology,
+    /// Neither driver claims it. Reached only by a message type this build
+    /// does not know — the session layer answers or rejects everything
+    /// else before it becomes an app frame. Both drivers ignore what lands
+    /// here, but *ignoring* is their decision to make, not this function's,
+    /// so it keeps historical delivery to both rather than being dropped by
+    /// a classifier that predates its owner.
     Both,
 }
 
@@ -1025,8 +1252,8 @@ enum InboundRoute {
 ///
 /// This is a driver partition, not docs/PROTOCOL.md §4's class —
 /// `MessageType::class` reports that fact directly; here CONTROL-class
-/// types split across `Control` (control-transfer) and `Both` (topology,
-/// no driver yet) by which driver, if any, actually wants them.
+/// types split across `Control` (control-transfer) and `Topology` (the
+/// drawn arrangement) by which driver actually wants them.
 fn inbound_route(message_type: u16) -> InboundRoute {
     match MessageType::from_wire(message_type) {
         Some(
@@ -1044,23 +1271,21 @@ fn inbound_route(message_type: u16) -> InboundRoute {
             | MessageType::ControlResponse
             | MessageType::ControlRelease,
         ) => InboundRoute::Control,
+        // Display topology (ADR 0018): the layout-sync hub decodes both,
+        // so neither driver ever sees them. Routing them to one owner is
+        // also what keeps a `LayoutSync` — which can cost a config write —
+        // off the clipboard driver's bulk queue.
+        Some(MessageType::MonitorTopology | MessageType::LayoutSync) => InboundRoute::Topology,
         // Session-layer traffic never becomes an app frame: `dispatch_frame`
         // answers Ping, accepts Pong, and fails the session on Hello or a
         // pairing message. Listed so adding a message type is a compile
         // error here rather than a silent misroute.
-        // Display topology (ADR 0018) is listed alongside the session-layer
-        // types below rather than folded into `None`, so the topology
-        // engine's arrival is the thing that moves this arm rather than a
-        // silent fallthrough: a known CONTROL-class type with no driver
-        // yet.
         Some(
             MessageType::Hello
             | MessageType::Ping
             | MessageType::Pong
             | MessageType::PairingStart
-            | MessageType::PairingConfirm
-            | MessageType::MonitorTopology
-            | MessageType::LayoutSync,
+            | MessageType::PairingConfirm,
         )
         | None => InboundRoute::Both,
     }
@@ -1075,6 +1300,11 @@ fn inbound_route(message_type: u16) -> InboundRoute {
 struct SessionFanout {
     sync: mpsc::Sender<SyncEvent>,
     control: mpsc::Sender<InputControlEvent>,
+    /// Where display-topology frames and the session lifecycle go
+    /// (ADR 0018): a queue of its own, so a `LayoutSync` — which can cost
+    /// a config write — never rides the clipboard driver's bulk path and
+    /// never waits on it.
+    topology: mpsc::Sender<TopologyEvent>,
     metrics: Option<Arc<Metrics>>,
     /// Where the `file_receive` grant is read from when a session comes up
     /// or goes away (ADR 0015). The store on disk, not a cached copy: it
@@ -1116,12 +1346,30 @@ impl SessionFanout {
         let _ = control_sent;
     }
 
-    async fn established(&self, session: Uuid) {
+    /// A session came up.
+    ///
+    /// Takes the whole [`SessionInfo`] rather than the id alone because the
+    /// layout-sync hub needs the peer's identity to know which pair a
+    /// layout may describe (ADR 0018) — and because that is the one moment
+    /// it is in hand.
+    async fn established(&self, info: &crossover_core::SessionInfo) {
+        let session = info.session_id;
         self.fan_out(
             SyncEvent::SessionEstablished,
             InputControlEvent::SessionEstablished { session },
         )
         .await;
+        // Post-Hello, the same moment the file policies are published: the
+        // peer now knows what this machine has attached and, if there is
+        // one, the arrangement it is crossing by.
+        let _ = self
+            .topology
+            .send(TopologyEvent::SessionEstablished {
+                session,
+                peer_device: info.peer_device_id,
+                peer_name: info.peer_device_name.clone(),
+            })
+            .await;
         // Immediately, not on the next poll: a file copied in the first
         // seconds of a session would otherwise be refused for a permission
         // the user has actually granted.
@@ -1134,6 +1382,10 @@ impl SessionFanout {
             InputControlEvent::SessionLost { session },
         )
         .await;
+        let _ = self
+            .topology
+            .send(TopologyEvent::SessionLost { session })
+            .await;
         self.publish_file_policy().await;
     }
 
@@ -1178,41 +1430,6 @@ impl SessionFanout {
             metrics.record_input_received(total, keys);
         }
 
-        // Transitional (feature/146; the topology hub that actually
-        // consumes these lands on a later branch). `inbound_route` sends
-        // both types to `InboundRoute::Both`, where neither driver looks
-        // at them — so without this, nothing on the dispatch path ever
-        // decodes a `MonitorTopology`/`LayoutSync` frame, and
-        // docs/PROTOCOL.md §6.2/§7's "malformed is fatal" would not hold:
-        // a garbage payload would keep the session healthy. Decode and
-        // validate here instead, fail closed on `Err` exactly as any other
-        // malformed frame (§7), and discard the value either way — a real
-        // engine replaces this block once it exists.
-        if frame.message_type == MessageType::MonitorTopology.wire() {
-            match MonitorTopology::decode_payload(&frame.payload) {
-                Ok(_) => tracing::debug!(
-                    session = %session,
-                    "MonitorTopology decoded and discarded: no topology engine yet"
-                ),
-                Err(error) => {
-                    terminate_on_malformed_topology_frame(&self.registry, session, &error);
-                }
-            }
-            return;
-        }
-        if frame.message_type == MessageType::LayoutSync.wire() {
-            match LayoutSync::decode_payload(&frame.payload) {
-                Ok(_) => tracing::debug!(
-                    session = %session,
-                    "LayoutSync decoded and discarded: no topology engine yet"
-                ),
-                Err(error) => {
-                    terminate_on_malformed_topology_frame(&self.registry, session, &error);
-                }
-            }
-            return;
-        }
-
         match inbound_route(frame.message_type) {
             InboundRoute::Sync => {
                 let _ = self.sync.send(SyncEvent::Frame(frame)).await;
@@ -1221,6 +1438,12 @@ impl SessionFanout {
                 let _ = self
                     .control
                     .send(InputControlEvent::Frame { session, frame })
+                    .await;
+            }
+            InboundRoute::Topology => {
+                let _ = self
+                    .topology
+                    .send(TopologyEvent::Frame { session, frame })
                     .await;
             }
             InboundRoute::Both => {
@@ -1261,20 +1484,20 @@ struct ClassifiedCommands {
     background: BudgetedReceiver<SessionCommand>,
 }
 
-/// Fold both drivers' already-classified command lanes into one merged pair.
+/// Fold every driver's already-classified command lanes into one merged pair.
 ///
 /// **One forwarder task per source lane, never per source.** A task that read
 /// a driver's two lanes together would serialize them: parked handing a bulk
 /// command downstream, it could not pick up that driver's next High command —
 /// so a fail-closed `TerminateSession` emitted during a stalled transfer
-/// would sit behind the very bulk that stalled it. Four single-class tasks
-/// have nothing to serialize; each waits only on its own class.
+/// would sit behind the very bulk that stalled it. Two single-class tasks per
+/// source have nothing to serialize; each waits only on its own class.
 ///
 /// Classification is a pure function of the message type, so re-running it on
 /// the merged sender maps each lane onto the matching lane, never across.
-fn merge_command_lanes(a: CommandReceiver, b: CommandReceiver) -> ClassifiedCommands {
+fn merge_command_lanes(sources: impl IntoIterator<Item = CommandReceiver>) -> ClassifiedCommands {
     let (merged_tx, merged_rx) = command_lanes();
-    for source in [a, b] {
+    for source in sources {
         let (mut source_high, mut source_background) = source.into_lanes();
 
         let high_tx = merged_tx.clone();
@@ -1362,6 +1585,13 @@ struct Seamless {
     /// map the detector begins with, not a second derivation of it.
     map: Arc<CrossingMap>,
     wiring: EdgeWiring,
+    /// Where an adopted arrangement is published so this run's crossings
+    /// change without a restart (ADR 0018's persist-**publish**-report).
+    /// `Some` only for a drawn arrangement: an implicit (side-model) run
+    /// has no drawn layout for a publication to replace, so adoption there
+    /// persists and reports but takes effect at the next start — see
+    /// `topology_sync::TopologySync::take`.
+    publisher: Option<watch::Sender<LiveLayout>>,
 }
 
 fn build_seamless(
@@ -1369,6 +1599,7 @@ fn build_seamless(
     local: DeviceId,
     display: &Arc<dyn DisplayInfo>,
 ) -> Option<Seamless> {
+    let mut publisher = None;
     let source = match layout_source? {
         LayoutSource::Implicit(side) => implicit_crossing_source(*side, local),
         LayoutSource::Explicit(layout) => {
@@ -1386,7 +1617,17 @@ fn build_seamless(
                 );
                 return None;
             }
-            explicit_crossing_source(layout.clone(), local)
+            // A drawn arrangement can be replaced while the run is live —
+            // the peer draws one at the other desk and this machine adopts
+            // it — so the source reads the layout from a `watch` rather
+            // than capturing it, and the hub owns the sending half
+            // (ADR 0018).
+            let (sender, layouts) = watch::channel(LiveLayout {
+                publication: 0,
+                layout: layout.clone(),
+            });
+            publisher = Some(sender);
+            live_crossing_source(layouts, local)
         }
     };
     // One derivation at startup, through the same source the detector
@@ -1407,10 +1648,11 @@ fn build_seamless(
             return None;
         }
     };
-    let map = Arc::new(source.derive(&live));
+    let initial = source.derive_current(&live);
+    let map = Arc::clone(&initial.map);
     let (edge_driver, edge_mode, crossings_rx) = edge_detect(
         Arc::clone(display),
-        Arc::clone(&map),
+        initial,
         source.clone(),
         EDGE_POLL_INTERVAL,
     );
@@ -1422,6 +1664,7 @@ fn build_seamless(
         },
         map,
         wiring: (edge_driver, crossings_rx),
+        publisher,
     })
 }
 
@@ -1938,40 +2181,6 @@ fn terminate_on_revocation(route: &SessionRoute) {
     }
 }
 
-/// Terminate the session that sent an unparseable `MonitorTopology` or
-/// `LayoutSync` frame — docs/PROTOCOL.md §7's fail-closed treatment of a
-/// malformed message, applied by [`SessionFanout::frame`]'s transitional
-/// decode (feature/146) since no topology engine exists yet to emit its
-/// own [`SessionCommand::TerminateSession`] the way the clipboard and
-/// control drivers do for their own payload violations. Reuses
-/// [`terminate_on_revocation`]'s kill mechanism rather than a second one,
-/// and logs the standard violation diagnostic (session id, reason) either
-/// way — with a route to kill, or without one because the session has
-/// already ended.
-fn terminate_on_malformed_topology_frame(
-    registry: &SessionRegistry,
-    session: Uuid,
-    error: &crossover_protocol::ProtocolError,
-) {
-    match registry_lock(registry).get(&session) {
-        Some(route) => {
-            tracing::error!(
-                session = %session,
-                error = %error,
-                "terminating session: malformed display-topology frame (docs/PROTOCOL.md §7)"
-            );
-            terminate_on_revocation(route);
-        }
-        None => {
-            tracing::warn!(
-                session = %session,
-                error = %error,
-                "malformed display-topology frame with no live session route"
-            );
-        }
-    }
-}
-
 /// Act on trust-store changes made while the process runs. Two jobs, one
 /// re-read, because they are the same question asked of the same file.
 ///
@@ -2056,36 +2265,49 @@ fn config_recently_modified(signature: Option<(SystemTime, u64)>, now: SystemTim
         .is_ok_and(|age| age < CONFIG_POLL)
 }
 
-/// Re-read `config.toml` on a ~2 s modification-time poll and keep the
-/// topology state file in step (ADR 0018) — the mtime-gated shape beside
-/// [`apply_trust_changes`]'s unconditional reload, because a re-validation
-/// here is worth skipping when nothing changed and a revocation check is
-/// not.
+/// Re-read `config.toml` on a ~2 s modification-time poll (ADR 0018) — the
+/// mtime-gated shape beside [`apply_trust_changes`]'s unconditional reload,
+/// because a re-validation here is worth skipping when nothing changed and
+/// a revocation check is not.
 ///
 /// `config.initial_signature` seeds the baseline this poll compares
 /// against — see [`ConfigWatch`] for why it is captured early rather than
 /// read fresh when this task starts.
 ///
-/// Two guards, both load-bearing, mirroring `config`'s own module docs for
-/// the same failure at startup: a file that fails to parse, or whose
-/// `[layout]` fails structural validation, **keeps the last good state**
-/// and only warns *once* per failure streak — an editor caught mid-save (a
-/// half-written temp file, a not-yet-corrected typo) must never make the
-/// worker discard what it already knows, and must not spam the log on
-/// every subsequent tick while the file stays broken. A re-read whose
-/// layout is **content-equal** to what the state file already holds is a
-/// no-op — no write, no log line — which is what will keep this worker's
-/// own future adoption-writes (the hub branch) from echoing into a
-/// worker↔peer sync loop.
+/// # What this does *not* do: write the layout
 ///
-/// Every *changed*, valid, explicit layout updates the state file and is
-/// also offered to `layout_changed` — the seam the hub branch (the
-/// `LayoutSync` broadcast and the resolver) connects a sender to. This
-/// branch never constructs one, so `run` always calls this with `None`.
+/// It offers what it reads to the layout-sync hub and stops there. The hub
+/// owns the state file's `layout` field, and it must, because the config
+/// file is allowed to lag: a rate-bounded adoption publishes immediately
+/// and writes seconds later (ADR 0018), so during that window this poll can
+/// read a revision *older* than the run is crossing by. Reporting that
+/// would put an arrangement the worker is not using in front of the editor,
+/// and the editor numbers its next save one past everything both files have
+/// seen — so a rolled-back report would let a save claim a revision this
+/// machine had already adopted. The hub resolves instead, and reports only
+/// what it actually holds.
+///
+/// # Two guards, both load-bearing
+///
+/// Mirroring `config`'s own module docs for the same failure at startup: a
+/// file that fails to parse, or whose `[layout]` fails structural
+/// validation, **keeps the last good state** and only warns *once* per
+/// failure streak — an editor caught mid-save (a half-written temp file, a
+/// not-yet-corrected typo) must never make the worker discard what it
+/// already knows, and must not spam the log on every subsequent tick while
+/// the file stays broken.
+///
+/// And `last_offered` gates the hand-off: only a layout that differs from
+/// the one last offered is offered again. The mtime poll already re-reads
+/// on every touch of the file, and `config_recently_modified` re-reads on
+/// *every tick* while the file is fresh, so without this a single save
+/// would be offered several times over. The hub would answer
+/// `Identical` each time and do nothing, but a queue nobody needed to fill
+/// is still a queue filled.
 ///
 /// `writer` is `None` when no home directory was resolvable at startup
-/// (`run`'s own warning covers that case): this task then has nothing to
-/// keep in sync and simply never completes, the same as every other
+/// (`run`'s own warning covers that case): this task then has no heartbeat
+/// to keep and simply never completes, the same as every other
 /// never-ending branch of `run`'s foreground select.
 ///
 /// Never returns — runs as a branch of the foreground select, mirroring
@@ -2093,7 +2315,7 @@ fn config_recently_modified(signature: Option<(SystemTime, u64)>, now: SystemTim
 async fn apply_config_changes(
     config: ConfigWatch,
     writer: Option<Arc<TopologyStateWriter>>,
-    layout_changed: Option<mpsc::Sender<Layout>>,
+    layout_changed: Option<mpsc::Sender<TopologyEvent>>,
 ) {
     let Some(writer) = writer else {
         loop {
@@ -2108,6 +2330,8 @@ async fn apply_config_changes(
     // Warn once per failure streak, not once per tick: `warned` resets the
     // moment a read succeeds again.
     let mut warned = false;
+    // What was last handed to the hub, so one save is offered once.
+    let mut last_offered: Option<Layout> = None;
     loop {
         ticker.tick().await;
         writer.heartbeat();
@@ -2123,23 +2347,37 @@ async fn apply_config_changes(
             Ok(loaded) => match loaded.layout {
                 Ok(layout) => {
                     warned = false;
-                    let reported = layout.as_ref().map(LayoutState::from_layout);
-                    if writer.set_layout(reported) {
+                    if last_offered == layout {
+                        continue;
+                    }
+                    last_offered.clone_from(&layout);
+                    let Some(layout) = layout else {
+                        // The file no longer names an arrangement. Nothing
+                        // is offered: "stop crossing" is not something the
+                        // resolver can express, and a run mid-session must
+                        // not lose its crossings to a file edit it cannot
+                        // resolve. It takes effect at the next start.
                         tracing::info!(
-                            revision = ?layout.as_ref().map(Layout::revision),
-                            "topology state: config re-read picked up a changed layout"
+                            "topology: the config file no longer names an arrangement; this                              run keeps the one it is using until it restarts"
                         );
-                        if let (Some(sender), Some(layout)) = (layout_changed.as_ref(), layout) {
-                            let _ = sender.send(layout).await;
-                        }
+                        continue;
+                    };
+                    tracing::info!(
+                        revision = layout.revision(),
+                        origin = %layout.origin(),
+                        "topology: config re-read picked up a changed layout"
+                    );
+                    if let Some(sender) = layout_changed.as_ref() {
+                        let _ = sender
+                            .send(TopologyEvent::LocalLayoutEdited(Box::new(layout)))
+                            .await;
                     }
                 }
                 Err(error) => {
                     if !warned {
                         tracing::warn!(
                             error = %error,
-                            "topology state: config re-read has an invalid [layout]; keeping \
-                             the last good one"
+                            "topology: config re-read has an invalid [layout]; keeping the                              last good one"
                         );
                         warned = true;
                     }
@@ -2149,8 +2387,7 @@ async fn apply_config_changes(
                 if !warned {
                     tracing::warn!(
                         error = %error,
-                        "topology state: config re-read failed; keeping the last good \
-                         configuration"
+                        "topology: config re-read failed; keeping the last good configuration"
                     );
                     warned = true;
                 }
@@ -2344,7 +2581,7 @@ async fn listener_loop(
                         established_at,
                     },
                 );
-                fanout.established(session_id).await;
+                fanout.established(&info).await;
 
                 let frame_sink = fanout.clone();
                 let drain = tokio::spawn(async move {
@@ -2429,7 +2666,7 @@ async fn outbound_event_loop(
                         },
                     );
                 }
-                fanout.established(info.session_id).await;
+                fanout.established(&info).await;
             }
             SessionEvent::Disconnected {
                 session_id,
@@ -2553,7 +2790,7 @@ mod tests {
     use crossover_protocol::hello::MessageType;
     use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore, TrustedPeer};
 
-    use super::{SessionRegistry, age, registry_lock, revoked_session_ids};
+    use super::{SessionRegistry, TopologyEvent, age, registry_lock, revoked_session_ids};
 
     /// A `--left` run must not start depending on what the platform can
     /// *name*. The side model picks its crossing edge by position and
@@ -2879,7 +3116,7 @@ mod tests {
         let (control, control_rx) = command_lanes();
         spawn_command_mux(
             Arc::clone(&registry),
-            merge_command_lanes(clipboard_rx, control_rx),
+            merge_command_lanes([clipboard_rx, control_rx]),
             None,
         );
 
@@ -3174,6 +3411,9 @@ mod tests {
         let fanout = SessionFanout {
             sync: sync_tx,
             control: control_tx,
+            // Nothing in this test is about display topology; the hub's
+            // queue exists so the fanout is whole, and is never read.
+            topology: tokio::sync::mpsc::channel(4).0,
             metrics: None,
             // No peer is trusted in this rig, so the file-receive policy
             // it publishes is the closed one — which is all this test
@@ -3273,6 +3513,9 @@ mod tests {
         let fanout = SessionFanout {
             sync: sync_tx,
             control: control_tx,
+            // Nothing in this test is about display topology; the hub's
+            // queue exists so the fanout is whole, and is never read.
+            topology: tokio::sync::mpsc::channel(4).0,
             metrics: None,
             // No peer is trusted in this rig, so the file-receive policy
             // it publishes is the closed one — which is all this test
@@ -3317,10 +3560,12 @@ mod tests {
     fn routing_fanout(
         sync: tokio::sync::mpsc::Sender<crossover_core::SyncEvent>,
         control: tokio::sync::mpsc::Sender<crossover_core::InputControlEvent>,
+        topology: tokio::sync::mpsc::Sender<super::TopologyEvent>,
     ) -> super::SessionFanout {
         super::SessionFanout {
             sync,
             control,
+            topology,
             metrics: None,
             storage: Arc::new(crossover_platform::fakes::InMemorySecureStorage::new()),
             registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -3356,7 +3601,8 @@ mod tests {
 
         let (sync_tx, _sync_rx) = tokio::sync::mpsc::channel(4);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(16);
-        let fanout = routing_fanout(sync_tx, control_tx);
+        let (topology_tx, _topology_rx) = tokio::sync::mpsc::channel(4);
+        let fanout = routing_fanout(sync_tx, control_tx, topology_tx);
         let session = Uuid::from_bytes([0x5A; 16]);
 
         // Back the clipboard driver's queue right up and park a bulk frame
@@ -3418,7 +3664,8 @@ mod tests {
 
         let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(32);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(32);
-        let fanout = routing_fanout(sync_tx, control_tx);
+        let (topology_tx, mut topology_rx) = tokio::sync::mpsc::channel(32);
+        let fanout = routing_fanout(sync_tx, control_tx, topology_tx);
         let session = Uuid::from_bytes([0x5B; 16]);
 
         let bulk = [
@@ -3455,6 +3702,10 @@ mod tests {
             assert_eq!(frame.message_type, expected.wire());
         }
         assert!(control_rx.try_recv().is_err(), "bulk traffic leaked");
+        assert!(
+            topology_rx.try_recv().is_err(),
+            "driver traffic reached the topology hub"
+        );
     }
 
     /// A message type this build does not know keeps its old behavior — both
@@ -3466,7 +3717,8 @@ mod tests {
 
         let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(4);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
-        let fanout = routing_fanout(sync_tx, control_tx);
+        let (topology_tx, _topology_rx) = tokio::sync::mpsc::channel(4);
+        let fanout = routing_fanout(sync_tx, control_tx, topology_tx);
 
         fanout
             .frame(
@@ -3489,148 +3741,201 @@ mod tests {
         ));
     }
 
-    /// A well-formed `MonitorTopology`/`LayoutSync` frame is decoded (so
-    /// the transitional path in `SessionFanout::frame` genuinely runs the
-    /// real decoder) and then discarded: neither driver claims it, since
-    /// no topology engine exists yet (feature/146).
+    /// Display topology has exactly one owner (ADR 0018): both message
+    /// types reach the layout-sync hub and **neither** driver, malformed
+    /// or not.
+    ///
+    /// Decoding moved with the routing. This used to decode here and throw
+    /// the value away, because there was no engine to hand it to; there is
+    /// one now, and it owns the decode — which is what lets a malformed
+    /// frame terminate the session through the ordinary
+    /// `SessionCommand::TerminateSession` path every other driver uses for
+    /// its own payload violations, instead of reaching into the registry
+    /// from the fanout. The hub's own tests
+    /// (`crate::topology_sync`) cover both outcomes.
     #[tokio::test]
-    async fn well_formed_topology_frames_are_decoded_and_discarded() {
-        use crossover_protocol::layout::{LayoutSync, MonitorTopology};
+    async fn topology_frames_reach_the_layout_sync_hub_and_no_driver() {
+        use crossover_protocol::layout::{LayoutSync, MonitorReport, MonitorTopology};
         use crossover_topology::{DeviceId, LayoutRect, MonitorId, PlacedMonitor};
 
         let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(4);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
-        let fanout = routing_fanout(sync_tx, control_tx);
+        let (topology_tx, mut topology_rx) = tokio::sync::mpsc::channel(8);
+        let fanout = routing_fanout(sync_tx, control_tx, topology_tx);
         let session = Uuid::from_bytes([0x5D; 16]);
 
+        let rect = LayoutRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
         let topology = MonitorTopology {
-            monitors: vec![crossover_protocol::layout::MonitorReport {
+            monitors: vec![MonitorReport {
                 id: MonitorId::new("A").unwrap(),
-                rect: LayoutRect {
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                },
+                rect,
                 scale_percent: 100,
             }],
         };
-        fanout
-            .frame(
-                session,
-                raw(
-                    MessageType::MonitorTopology,
-                    topology.encode_payload().unwrap(),
-                ),
-            )
-            .await;
-
-        let sync = LayoutSync {
+        let layout = LayoutSync {
             revision: 1,
             origin: DeviceId::from_bytes([0x11; 16]),
             monitors: vec![
                 PlacedMonitor {
                     device: DeviceId::from_bytes([0x11; 16]),
                     id: MonitorId::new("A").unwrap(),
-                    rect: LayoutRect {
-                        x: 0,
-                        y: 0,
-                        width: 100,
-                        height: 100,
-                    },
+                    rect,
                 },
                 PlacedMonitor {
                     device: DeviceId::from_bytes([0x22; 16]),
                     id: MonitorId::new("B").unwrap(),
-                    rect: LayoutRect {
-                        x: 100,
-                        y: 0,
-                        width: 100,
-                        height: 100,
-                    },
+                    rect: LayoutRect { x: 100, ..rect },
                 },
             ],
         };
-        fanout
-            .frame(
-                session,
-                raw(MessageType::LayoutSync, sync.encode_payload().unwrap()),
-            )
-            .await;
 
+        // Well-formed, and deliberately malformed: both are the hub's, so
+        // the routing decision cannot depend on the payload.
+        let deliveries = [
+            (
+                MessageType::MonitorTopology,
+                topology.encode_payload().unwrap(),
+            ),
+            (MessageType::LayoutSync, layout.encode_payload().unwrap()),
+            (MessageType::MonitorTopology, vec![0xFF; 8]),
+            (MessageType::LayoutSync, vec![0xFF; 8]),
+        ];
+        for (message_type, payload) in &deliveries {
+            fanout
+                .frame(session, raw(*message_type, payload.clone()))
+                .await;
+        }
+
+        for (message_type, payload) in &deliveries {
+            let Some(TopologyEvent::Frame { session: id, frame }) = topology_rx.try_recv().ok()
+            else {
+                panic!("{message_type:?} did not reach the topology hub in order");
+            };
+            assert_eq!(id, session);
+            assert_eq!(frame.message_type, message_type.wire());
+            assert_eq!(&frame.payload, payload);
+        }
         assert!(
             sync_rx.try_recv().is_err(),
-            "a well-formed topology frame reached the sync driver"
+            "a topology frame reached the sync driver"
         );
         assert!(
             control_rx.try_recv().is_err(),
-            "a well-formed topology frame reached the control driver"
+            "a topology frame reached the control driver"
         );
     }
 
-    /// A malformed `MonitorTopology`/`LayoutSync` frame terminates the
-    /// session — docs/PROTOCOL.md §7's fail-closed treatment — rather than
-    /// being silently accepted because no engine decodes it yet
-    /// (feature/146). The kill switch firing is the observable proxy for
-    /// "the session died": that is the same mechanism a real
-    /// `SessionCommand::TerminateSession` uses.
-    #[tokio::test]
-    async fn malformed_topology_frames_terminate_the_session() {
-        use std::collections::HashMap;
-        use std::sync::Mutex;
-        use std::time::Instant;
+    /// The config poll, end to end (ADR 0018): a save lands in the file,
+    /// the poll notices, and the layout goes **to the hub** — while the
+    /// state file's own `layout` field is left strictly alone, because the
+    /// hub owns it (see `apply_config_changes`'s docs for why that
+    /// ownership is load-bearing rather than tidy).
+    ///
+    /// A paused clock for the 2 s poll, against a real file: the timing is
+    /// what is being tested, the filesystem is not being simulated.
+    #[tokio::test(start_paused = true)]
+    async fn the_config_poll_offers_a_changed_layout_to_the_hub_and_writes_no_layout_itself() {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
-        use super::{FrameSink, SessionFanout, SessionRoute};
+        use crossover_platform::Screen;
+        use crossover_platform::fakes::FakeDisplay;
+        use crossover_topology::DeviceId;
 
-        for message_type in [MessageType::MonitorTopology, MessageType::LayoutSync] {
-            let identity = DeviceIdentity::generate("malformed-topology-peer").unwrap();
-            let certified = CertifiedIdentity::from_identity(&identity).unwrap();
-            let session = Uuid::from_bytes([0x5E; 16]);
-            let (sink, _outbound) = outbound_channel();
-            let (kill_tx, mut killed) = watch::channel(false);
-            let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::from([(
-                session,
-                SessionRoute {
-                    sink: FrameSink::Inbound(sink),
-                    kill: Some(kill_tx),
-                    peer_fingerprint: certified.fingerprint(),
-                    features: crossover_protocol::hello::FeatureFlags::NONE,
-                    established_at: Instant::now(),
-                },
-            )])));
+        use super::{ConfigWatch, apply_config_changes};
+        use crate::topology_state::{TopologyStateWriter, initial_state};
+        use crate::topology_sync::TopologyEvent;
 
-            let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(4);
-            let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
-            let fanout = SessionFanout {
-                sync: sync_tx,
-                control: control_tx,
-                metrics: None,
-                storage: Arc::new(crossover_platform::fakes::InMemorySecureStorage::new()),
-                registry,
-                spool_open: false,
-            };
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        const LOCAL: &str = "11111111-1111-1111-1111-111111111111";
+        const PEER: &str = "22222222-2222-2222-2222-222222222222";
 
-            // Not a valid encoding of either message under any postcard
-            // interpretation this build produces: `0xFF` repeated is not a
-            // valid leading varint for the element-count prefix every
-            // `Vec` field here starts with.
-            fanout
-                .frame(session, raw(message_type, vec![0xFF; 8]))
-                .await;
+        let dir: PathBuf = std::env::temp_dir().join(format!(
+            "crossover-config-poll-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("sandbox");
+        let config = dir.join("config.toml");
+        let display = FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        });
+        let writer = Arc::new(TopologyStateWriter::start(
+            dir.join("topology.json"),
+            initial_state(
+                DeviceId::from_bytes([0x11; 16]),
+                "a".to_owned(),
+                &display,
+                None,
+            ),
+        ));
+        let (topology_tx, mut topology_rx) = tokio::sync::mpsc::channel(8);
 
-            assert!(
-                *killed.borrow_and_update(),
-                "{message_type:?}: a malformed frame did not fire the kill switch"
-            );
-            assert!(
-                sync_rx.try_recv().is_err(),
-                "{message_type:?}: a malformed frame reached the sync driver"
-            );
-            assert!(
-                control_rx.try_recv().is_err(),
-                "{message_type:?}: a malformed frame reached the control driver"
-            );
+        let poll = tokio::spawn(apply_config_changes(
+            ConfigWatch {
+                path: Some(config.clone()),
+                initial_signature: None,
+            },
+            Some(Arc::clone(&writer)),
+            Some(topology_tx),
+        ));
+
+        // The editor saves an arrangement.
+        std::fs::write(
+            &config,
+            format!(
+                "schema_version = 2\n\n[layout]\nrevision = 4\norigin = \"{LOCAL}\"\n\n\
+                 [[layout.monitor]]\ndevice = \"{LOCAL}\"\nid = \"A\"\nx = 0\ny = 0\n\
+                 width = 100\nheight = 100\n\n\
+                 [[layout.monitor]]\ndevice = \"{PEER}\"\nid = \"B\"\nx = 100\ny = 0\n\
+                 width = 100\nheight = 100\n"
+            ),
+        )
+        .unwrap();
+
+        // Two ticks' worth: one to notice, and slack for the mtime read.
+        tokio::time::advance(super::CONFIG_POLL * 3).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
         }
+
+        let offered = topology_rx
+            .try_recv()
+            .expect("the changed layout never reached the hub");
+        let TopologyEvent::LocalLayoutEdited(layout) = offered else {
+            panic!("the poll offered something other than a layout: {offered:?}");
+        };
+        assert_eq!(layout.revision(), 4);
+
+        // One save, one offer: the poll re-reads on every tick while the
+        // file is fresh, and `last_offered` is what keeps that from
+        // becoming a queue of duplicates.
+        tokio::time::advance(super::CONFIG_POLL * 3).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            topology_rx.try_recv().is_err(),
+            "one save was offered to the hub more than once"
+        );
+
+        // And the state file's layout is untouched: reporting it is the
+        // hub's job, and the hub in this test never ran.
+        assert!(
+            writer.snapshot().layout.is_none(),
+            "the config poll wrote the layout into the state file"
+        );
+        // The heartbeat is still this task's, though.
+        assert!(writer.snapshot().written_at > 0);
+
+        poll.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

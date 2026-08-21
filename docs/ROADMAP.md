@@ -21,11 +21,22 @@
 > and the rigid-group drag, exact snapping, validation diagnostics and the
 > save that writes `[layout]` back to `config.toml` (feature/156).
 >
-> **Not yet done:** deliverable 3's cross-machine half — one layout that
-> both machines agree on, travelling over the session and resolving
-> disagreement by newest-revision-wins — and the exit criteria, which are
-> hardware work on two desks (docs/SOAK.md, and docs/TESTING.md §3.2's E-7
-> for the loop this phase exists to close).
+> Deliverable 3's cross-machine half is the most recent to land
+> (feature/152): `MonitorTopology` and `LayoutSync` in both directions, the
+> `(revision, origin)` resolver with its SHA-256 tiebreak, adoption written
+> straight into `config.toml` under a rate bound, and publication to the
+> live crossing source — so an arrangement drawn at one desk reaches the
+> other, survives a restart, and takes effect without one. Two machines
+> that disagree converge on the newer arrangement, and the one that loses
+> says so.
+>
+> **Not yet done:** the exit criteria, which are hardware work on two desks
+> (docs/SOAK.md, and docs/TESTING.md §3.2's E-7 for the loop this phase
+> exists to close). One behaviour is worth knowing before that soak: a run
+> holding *no drawn arrangement* — a `--left`/`--right` run, or seamless
+> off — adopts and persists a layout the peer sends, but begins crossing by
+> it at the next start rather than mid-session (ADR 0018's 2026-08-21
+> amendment says why).
 >
 > Phase 7 (Rich Clipboard — images and files) closed 2026-08-20: the last
 > open exit criterion — **input latency bounded under a saturating
