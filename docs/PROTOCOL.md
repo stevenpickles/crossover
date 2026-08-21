@@ -466,12 +466,34 @@ Rules, all fail-closed:
   control.** An `EntryPoint` naming a monitor id this machine does not
   have, or a `layout_revision` that is not the one this machine holds, is
   **not** an error: the receiver places the cursor on its desktop-bounds
-  edge matching `EntryPoint.edge`, fraction taken against those bounds —
-  the pre-v4 placement, retained solely as this degraded mode — logs a
-  diagnostic naming the mismatch, and the grant or release proceeds.
-  Placement is a nicety; control correctness never depends on it
+  edge matching `EntryPoint.edge` — precisely, on the **outermost monitor
+  in that direction**, at `fraction` along *that monitor's* edge, which is
+  the pre-v4 placement retained unchanged solely as this degraded mode —
+  logs a diagnostic naming the mismatch, and the grant or release
+  proceeds. Placement is a nicety; control correctness never depends on it
   (ADR 0018). A revision mismatch is expected during an edit's propagation
   window; crossings in that window degrade this way, briefly.
+
+  The monitor's edge and the desktop bounding box's are the same line, so
+  "the desktop-bounds edge" names the right place; the fraction is taken
+  against that **monitor**, not against the box, and the distinction is
+  load-bearing rather than pedantic. A shorter monitor beside a taller one
+  leaves dead space in the box, and mapping through the box lands the
+  cursor at the wrong height — ADR 0009's 2026-08-09 refinement, which
+  every implicit (`--left`/`--right`) crossing depends on, since those
+  travel unaddressed and so take this path on every transfer.
+
+  This clause **tightens** ADR 0018's own phrasing rather than departing
+  from it. That ADR describes the degraded mode as "the fraction taken
+  against those bounds" while also calling it "exactly the pre-0018
+  placement" — and the pre-0018 placement is the outermost monitor's edge,
+  by ADR 0009's refinement, which ADR 0018's Context section restates
+  approvingly ("the crossing fraction maps against the outermost monitor
+  in the linked direction"). The two readings of "those bounds" differ
+  only where a shorter monitor is the outer one; the ADR's own Context
+  settles which was meant, and this paragraph is that reading written out
+  so no implementer has to reconstruct it. ADRs being immutable, the
+  precise statement lives here.
 - Disconnect in any state releases everything: the controlled side executes
   `ReleaseAllInput` locally (FR-4.4), the controller stops capture, and
   both sides are local until a new negotiation.
