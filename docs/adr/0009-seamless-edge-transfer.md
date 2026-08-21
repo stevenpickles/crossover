@@ -1,7 +1,17 @@
 # 0009. Seamless control transfer: cross a screen edge, control follows
 
-Status: Accepted
+Status: Accepted — topology superseded by [0018](0018-drawn-display-topology.md) (2026-08-20)
 Date: 2026-08-09
+
+What 0018 replaces is the topology only: the "one linked edge pair,
+left–right" side model, the 2026-08-09 refinement's "edge monitor =
+outermost in the linked direction", and desktop-bounds-decides-the-edge —
+all superseded by a drawn layout in one shared coordinate space. The
+crossing *mechanism* below is retained: the edge as a trigger on the
+negotiated engine, local symmetric detection on the real cursor, the
+crossing position as a fraction, reclaim to neutral, the Schmitt-trigger
+re-arm (now per-span), the generation-stamped mode, and the cursor mask all
+stand as written and are restated in 0018.
 
 ## Context
 

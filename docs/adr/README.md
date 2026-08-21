@@ -58,7 +58,7 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0006](0006-clipboard-transmission-triggers.md) | Clipboard transmission is trigger-driven, not change-driven | Accepted |
 | [0007](0007-windows-input-capture.md) | Windows input: hooks to suppress, Raw Input for motion, SendInput to inject | Accepted |
 | [0008](0008-keyboard-key-representation.md) | Keyboard key representation: physical key by USB HID usage, text carried, inject by scan code | Accepted |
-| [0009](0009-seamless-edge-transfer.md) | Seamless control transfer: edge crossing triggers the negotiated engine, position as a fraction | Accepted |
+| [0009](0009-seamless-edge-transfer.md) | Seamless control transfer: edge crossing triggers the negotiated engine, position as a fraction | Accepted; topology superseded by [0018](0018-drawn-display-topology.md) (mechanism retained) |
 | [0010](0010-active-session-revocation.md) | Revocation terminates active sessions via a trust-store poll, not just new connections | Accepted |
 | [0011](0011-background-service-launcher.md) | Background operation: a minimal LocalSystem service launches the worker into the user session, behind a `ServiceManager` boundary | Accepted (amended by 0012) |
 | [0012](0012-elevated-worker-integrity.md) | Worker runs at high integrity, launched with the user's elevated linked token, so it can drive elevated windows | Accepted |
@@ -67,10 +67,15 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0015](0015-spooled-virtual-file-paste.md) | Files/folders transfer: eager transfer to a bounded internal spool, pasted as a virtual file list, sender-zipped archives, per-peer permission (Phase 7) | Accepted |
 | [0017](0017-protocol-version-3.md) | Protocol v3: the file descriptor changes every offer's layout, so the version and its floor both move; no back-compatibility with v2 | Accepted |
 | [0016](0016-image-interchange-format.md) | Image interchange: the receiver names the format, the sender produces it; PNG is the baseline and receivers never decode (cross-platform) | Proposed |
+| [0018](0018-drawn-display-topology.md) | Display topology is a drawn layout in one shared coordinate space; edges derived from adjacency, protocol v4, a `crossover-topology` crate (Phase 8) | Accepted (supersedes 0009's topology) |
 
 ## Known decisions awaiting an ADR
 
-None outstanding. The files/folders **filesystem-write surface** sketched in
+**The layout editor's UI toolkit** (Phase 8, deliverable 5). The editor is
+the project's first GUI, and the toolkit is a core-library selection — the
+first trigger above. To be recorded as **ADR 0019**.
+
+Resolved previously: the files/folders **filesystem-write surface** sketched in
 0014 is now designed in [0015](0015-spooled-virtual-file-paste.md) (Accepted) —
 eager verified transfer into a bounded internal spool, disposed of by pasting a
 virtual file list, superseding the drop-folder model 0014 sketched and 0015's
