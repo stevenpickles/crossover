@@ -5,8 +5,8 @@ Notable changes to Crossover. The format follows
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — with
 the pre-1.0 caveat that the wire protocol and on-disk formats may still
 change between minor versions. Protocol compatibility is negotiated per
-session and versioned separately (`PROTOCOL_VERSION`, currently 2); a
-release note says so whenever that number moves.
+session and versioned separately (`PROTOCOL_VERSION` in
+`crossover-protocol`); a release note says so whenever that number moves.
 
 Builds that are not tagged releases identify themselves as such —
 `0.1.0-dev.7.gabc1234` — and say where they came from. Run
@@ -16,6 +16,16 @@ Builds that are not tagged releases identify themselves as such —
 
 ### Changed
 
+- **Wire protocol moves to version 4, and does not accept version 3**
+  ([ADR 0018](docs/adr/0018-drawn-display-topology.md)). Crossing control
+  now carries an `EntryPoint` — destination monitor, edge, fraction, and
+  layout revision — where it used to carry a bare fraction, a structural
+  change to messages that already travel between every pair of peers,
+  which no feature bit can hide, so **this build cannot connect to a v3
+  peer and a v3 peer cannot connect to this build**. Both machines must be
+  upgraded together. The failure is a clean refusal at the handshake
+  naming both version ranges, not a session that dies later; `crossover
+  version` reports the range a build speaks.
 - **Wire protocol moves to version 3, and does not accept version 2**
   ([ADR 0017](docs/adr/0017-protocol-version-3.md)). A file descriptor on the
   clipboard offer adds a byte to *every* offer, which no feature bit can

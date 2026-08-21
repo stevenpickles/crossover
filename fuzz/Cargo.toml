@@ -80,5 +80,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "control"
+path = "fuzz_targets/control.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

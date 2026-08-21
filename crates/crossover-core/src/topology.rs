@@ -80,6 +80,28 @@ impl Edge {
     fn touched_by(self, x: i32, monitor: MonitorRect) -> bool {
         self.inset_of(x, monitor) <= 0
     }
+
+    /// The edge on the *other* side of the pair: a cursor leaving this
+    /// machine's `Right` edge arrives on the peer's `Left`, and vice
+    /// versa. This is what turns a sender's own crossing edge into the
+    /// wire `EntryPoint.edge`, which docs/PROTOCOL.md §6.1 specifies in
+    /// the **receiver's** terms.
+    #[must_use]
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+
+    /// The wire encoding of this edge.
+    #[must_use]
+    pub fn to_wire(self) -> crossover_protocol::control::Edge {
+        match self {
+            Self::Left => crossover_protocol::control::Edge::Left,
+            Self::Right => crossover_protocol::control::Edge::Right,
+        }
+    }
 }
 
 // The display geometry vocabulary — the monitor layout and a cursor
@@ -284,6 +306,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{CursorPoint, Edge, EdgeFraction, LinkSide, MonitorRect, Topology};
+    use crossover_protocol::control::Edge as WireEdge;
 
     /// A single monitor `width`×`height` at the desktop origin.
     fn one(width: u32, height: u32) -> Vec<MonitorRect> {
@@ -304,6 +327,20 @@ mod tests {
     fn each_side_links_on_the_edge_facing_the_peer() {
         assert_eq!(LinkSide::Left.linked_edge(), Edge::Right);
         assert_eq!(LinkSide::Right.linked_edge(), Edge::Left);
+    }
+
+    /// `opposite` is its own inverse, and `to_wire` maps onto the
+    /// like-named protocol variant — pinned directly, since
+    /// `wire_entry_point`'s tests rely on both holding (docs/PROTOCOL.md
+    /// §6.1: `EntryPoint.edge` is the receiver's arrival edge).
+    #[test]
+    fn opposite_and_to_wire_are_pinned() {
+        assert_eq!(Edge::Left.opposite(), Edge::Right);
+        assert_eq!(Edge::Right.opposite(), Edge::Left);
+        assert_eq!(Edge::Left.opposite().opposite(), Edge::Left);
+
+        assert_eq!(Edge::Left.to_wire(), WireEdge::Left);
+        assert_eq!(Edge::Right.to_wire(), WireEdge::Right);
     }
 
     #[test]

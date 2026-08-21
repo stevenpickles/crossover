@@ -19,7 +19,10 @@ pub use clipboard::{
     ClipboardApplied, ClipboardChunk, ClipboardData, ClipboardDecline, ClipboardMeta,
     ClipboardOffer, ContentType, DeclineReason, FileDescriptor, ImageFormat, StreamOutcome,
 };
-pub use control::{ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason};
+pub use control::{
+    ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, Edge, EntryPoint,
+    MAX_MONITOR_ID_BYTES,
+};
 pub use file_name::{FileNameError, validate_file_name};
 pub use framing::{FrameDecoder, RawFrame, encode_frame};
 pub use hello::{FeatureFlags, Hello, MessageType, OsFamily};
