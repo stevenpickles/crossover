@@ -85,12 +85,13 @@ The first useful implementation supports exactly:
 - seamless screen-edge control transfer
 - structured logging and command-line operation (foreground/debug execution)
 
-No GUI is required initially.
+No GUI is required initially (the one exception arrives in Phase 8 — the
+topology editor; see the §3.3 note).
 
 ### 3.2 Long-term scope
 
-Eventually: macOS and Linux; more than two peers; multiple monitors per peer
-with arbitrary topology; background/tray operation; peer discovery; rich
+Eventually: macOS and Linux; more than two peers, including arbitrary
+display topology across them; background/tray operation; peer discovery; rich
 clipboard types (HTML, images, file lists); drag-and-drop; auto-update;
 secure WAN operation; diagnostics UI.
 
@@ -105,6 +106,16 @@ secure WAN operation; diagnostics UI.
 > because the capability is negotiated and a peer without the bit is sent
 > nothing new.
 
+> **Re-scoped (2026-08-20):** **multiple monitors per peer with arbitrary
+> topology** left this list for the two-peer case, which is why the entry
+> above now scopes it to "more than two peers". Phase 8 places both machines'
+> monitors in one drawn coordinate space and derives crossing edges from
+> adjacency, so a seam between two monitors of the same machine, an
+> over/under arrangement, and a three-monitor corner are all expressible
+> ([ADR 0018](adr/0018-drawn-display-topology.md)). The same capability
+> across *more* than two peers stays long-term: the layout model admits it,
+> and this phase does not build it.
+
 Long-term capabilities must not complicate the initial implementation except
 where required to preserve a clean architecture (chiefly: the protocol and
 platform abstractions must not hard-code two-peer, one-display, Windows-only
@@ -116,6 +127,16 @@ Graphical configuration, tray application, service installation, peer
 discovery, >2 computers, macOS/Linux implementations, non-text clipboard,
 drag-and-drop, screen streaming or remote video/audio, NAT traversal, cloud
 services, user accounts, centralized authentication, mobile platforms.
+
+> **No longer a non-goal (2026-08-20):** graphical configuration, in one
+> specific form. Phase 8 ships a **topology editor** — the project's first
+> GUI — because an arrangement the user draws is the deliverable, and a
+> drawn arrangement has no command-line form worth having. It is a separate
+> user-session surface rather than a mode of the headless, service-launched
+> worker ([ADR 0011](adr/0011-background-service-launcher.md),
+> [ADR 0018](adr/0018-drawn-display-topology.md); the UI toolkit decision
+> follows as ADR 0019). Graphical configuration of everything *else* remains
+> out of initial scope and stays in Phase 10.
 
 ## 4. Functional requirements
 
