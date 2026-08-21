@@ -649,7 +649,12 @@ dependencies = [
 name = "crossover-layout"
 version = "0.2.0"
 dependencies = [
+ "crossover-topology",
  "eframe",
+ "proptest",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
  "winresource",
 ]
 

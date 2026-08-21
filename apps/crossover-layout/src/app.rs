@@ -2,12 +2,24 @@
 //!
 //! Split from `main.rs` so the entry point stays about *starting a process*
 //! (version reporting, exit codes) and this module about *being an editor*.
-//! Today it holds one screen — the empty state below — and the canvas, the
-//! state-file reader, and the config writer grow into it from here.
+//! [`LayoutEditor`] owns one [`SessionTracker`] (`session.rs`) and ticks its
+//! ~1 s re-read of the worker's state file (`state_file.rs`); every screen
+//! it can be in is painted by `render.rs`, and the transform between the
+//! layout model (`model.rs`) and the screen is `viewport.rs`'s.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
+
+use crate::render;
+use crate::session::{SessionEvent, SessionTracker};
+use crate::state_file;
+
+/// How often the app re-reads the state file. ADR 0018/0019 call for
+/// "~1 s"; this is the exact figure everything else (the poll deadline,
+/// the test below) is defined against.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The editor's text, embedded rather than borrowed from the machine: the two
 /// Go fonts (Bigelow & Holmes, BSD-3-Clause — `assets/fonts/`). egui bundles
@@ -29,8 +41,8 @@ pub fn run(title: &str) -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
-            // Roomy enough to draw two desks' worth of monitors side by side
-            // once the canvas lands, and freely resizable below that.
+            // Roomy enough to draw two desks' worth of monitors side by side,
+            // and freely resizable below that.
             .with_inner_size([960.0, 640.0])
             .with_min_inner_size([480.0, 320.0]),
         // Explicit rather than inferred: the wgpu backend is compiled out
@@ -44,7 +56,7 @@ pub fn run(title: &str) -> Result<(), eframe::Error> {
         options,
         Box::new(|creation| {
             install_fonts(&creation.egui_ctx);
-            Ok(Box::new(LayoutEditor))
+            Ok(Box::new(LayoutEditor::new()))
         }),
     )
 }
@@ -52,7 +64,13 @@ pub fn run(title: &str) -> Result<(), eframe::Error> {
 /// Give egui the only fonts it has. With `default_fonts` off there is no
 /// fallback stack behind these: an empty `FontDefinitions` renders nothing at
 /// all, so this runs before the first frame.
-fn install_fonts(context: &egui::Context) {
+///
+/// `pub(crate)` rather than private: `test_support.rs`'s shared headless
+/// harness installs these same, real fonts rather than keeping a second
+/// `include_bytes!` copy of its own (a font set that failed to load renders
+/// *nothing*, which would make every text assertion in the crate vacuously
+/// true against a stand-in).
+pub(crate) fn install_fonts(context: &egui::Context) {
     let mut fonts = egui::FontDefinitions::empty();
     fonts.font_data.insert(
         "go-regular".to_owned(),
@@ -75,127 +93,112 @@ fn install_fonts(context: &egui::Context) {
     context.set_fonts(fonts);
 }
 
-/// Everything the editor knows. Nothing, for now: this branch establishes the
-/// crate, the window, and the packaging; reading the worker's state file is
-/// the canvas branch's first job (ADR 0018's worker→editor contract).
-struct LayoutEditor;
+/// Everything the editor knows: its current screen (with the grace-period
+/// bookkeeping `SessionTracker` adds), and when it last read the state file
+/// to get there.
+struct LayoutEditor {
+    session: SessionTracker,
+    last_poll: Instant,
+}
 
-impl eframe::App for LayoutEditor {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // The `Ui` eframe hands over has no margin or background of its own; a
-        // central panel is what gives the window the theme's surface to draw
-        // on, and it is the container the canvas will fill.
-        egui::CentralPanel::default().show(ui, |ui| {
-            draw_worker_absent(ui);
-        });
+impl LayoutEditor {
+    /// A fresh editor, having already done its first read — so the very
+    /// first frame shows real facts (or the real absence of them) rather
+    /// than a `Loading` flash nobody would see anyway, since eframe does
+    /// not call `logic` before the first `ui`.
+    fn new() -> Self {
+        let mut editor = Self {
+            session: SessionTracker::new(),
+            last_poll: Instant::now(),
+        };
+        editor.poll();
+        editor
+    }
+
+    /// Re-read the state file, advance the session, and log exactly the
+    /// transitions `SessionTracker` reports — never once per poll (NFR-3):
+    /// a state file stuck unreadable would otherwise print the same line
+    /// once a second forever.
+    fn poll(&mut self) {
+        let status = state_file::read_state_file();
+        match self.session.on_read(status) {
+            SessionEvent::Unchanged => {}
+            SessionEvent::Unreadable(reason) => {
+                tracing::warn!(reason = %reason, "the worker's state file could not be used");
+            }
+            SessionEvent::Demoted(reason) => {
+                tracing::warn!(
+                    reason = %reason,
+                    "no drawn arrangement survived the read-failure grace period; showing the empty state"
+                );
+            }
+            SessionEvent::Recovered => {
+                tracing::info!("the worker's state file is readable again");
+            }
+        }
     }
 }
 
-/// The empty state: what the editor shows when it has no live facts to draw.
-///
-/// ADR 0018 makes this a first-class screen rather than a blank canvas. The
-/// state file carries a heartbeat precisely so the editor can say *the worker
-/// is not running* instead of presenting stale monitors as current — and until
-/// the reader lands, this is the only thing the editor honestly knows.
-fn draw_worker_absent(ui: &mut egui::Ui) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() / 3.0);
-        ui.heading("No displays to arrange yet");
-        ui.add_space(8.0);
-        ui.label("The Crossover worker is not running, so it has reported no displays.");
-        ui.add_space(4.0);
-        // These two command names are `crossover.exe`'s, spelled out in a
-        // different binary: renaming `run` or `service install` in the clap
-        // definition (apps/crossover/src/main.rs, which carries the matching
-        // note) leaves this window telling the user to type something that no
-        // longer exists. Sharing constants would mean a crate between the two
-        // for four words, which ADR 0019's dependency rule makes a poor trade
-        // — so the coupling is held by these comments and by the test below,
-        // which greps for both strings.
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            ui.label("Start it with ");
-            ui.label(egui::RichText::new("crossover run").monospace());
-            ui.label(", or install the background service with ");
-            ui.label(egui::RichText::new("crossover service install").monospace());
-            ui.label(", and this window fills in.");
+impl eframe::App for LayoutEditor {
+    /// Runs before painting, every frame eframe decides to paint one.
+    /// `request_repaint_after` is computed against the *original* poll
+    /// deadline rather than reset to a fresh `POLL_INTERVAL` on every call,
+    /// so a frame painted early for some other reason (an input event, a
+    /// resize) cannot keep pushing the next poll further out — sparse
+    /// input stretching the effective cadence toward 2x is exactly the
+    /// failure a fixed deadline avoids. No background thread: the ~1 s
+    /// cadence ADR 0018/0019 call for is entirely this timer.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let elapsed = self.last_poll.elapsed();
+        if elapsed >= POLL_INTERVAL {
+            self.last_poll = Instant::now();
+            self.poll();
+            ctx.request_repaint_after(POLL_INTERVAL);
+        } else {
+            ctx.request_repaint_after(POLL_INTERVAL.saturating_sub(elapsed));
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Shown first so it claims its strip of the window before the
+        // central panel takes the rest — window resize is handled entirely
+        // by `render.rs`'s `Viewport::fit`, recomputed from whatever area
+        // is left every frame, so there is nothing else to react to here.
+        egui::Panel::bottom("status_bar").show(ui, |ui| {
+            render::draw_status_bar(ui, self.session.session());
         });
-    });
+        egui::CentralPanel::default().show(ui, |ui| {
+            render::draw_central(ui, self.session.session());
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{draw_worker_absent, install_fonts};
-    use eframe::egui;
+    use super::POLL_INTERVAL;
+    use crate::session::EditorSession;
+    use crate::test_support::painted_text;
 
-    /// Drive one headless pass of the real drawing code and read back what it
-    /// painted.
-    ///
-    /// egui needs no window to lay out and rasterize a frame, which is what
-    /// makes the editor's screens testable on all three CI OSes — none of
-    /// which has a display server (docs/TESTING.md §2).
-    fn painted_text() -> String {
-        let context = egui::Context::default();
-        install_fonts(&context);
-        let mut output = context.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(960.0, 640.0),
-                )),
-                ..egui::RawInput::default()
-            },
-            |ui| {
-                egui::CentralPanel::default().show(ui, draw_worker_absent);
-            },
-        );
-        // There is no renderer here to upload the font atlas to, and epaint
-        // treats an unapplied texture delta as a defect rather than letting it
-        // drop quietly — so a headless pass has to say it meant it.
-        output.textures_delta.clear();
-
-        let mut painted = String::new();
-        for clipped in output.shapes {
-            collect_text(&clipped.shape, &mut painted);
-        }
-        painted
-    }
-
-    /// A frame is a tree of shapes, and text sits at its leaves.
-    fn collect_text(shape: &egui::epaint::Shape, into: &mut String) {
-        match shape {
-            egui::epaint::Shape::Text(text) => {
-                into.push_str(text.galley.text());
-                into.push('\n');
-            }
-            egui::epaint::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    collect_text(shape, into);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// The empty state is the only thing this binary says today, and it says
-    /// it with fonts it embeds itself — with `default_fonts` off (ADR 0019),
-    /// a font set that failed to load renders *nothing* rather than failing
-    /// loudly, so painting no text is the failure this asserts against.
+    /// The empty state is still the first thing an editor with no worker
+    /// says, reached through `EditorSession` and `render.rs` — this is the
+    /// integration point the fuller per-screen coverage lives in
+    /// `render.rs`'s own tests.
     #[test]
-    fn the_empty_state_paints_what_it_promises() {
-        let painted = painted_text();
+    fn the_empty_state_paints_through_the_app_layer_with_its_own_fonts() {
+        let painted = painted_text(&EditorSession::NoWorker { reason: None });
         assert!(
             painted.contains("The Crossover worker is not running"),
             "the empty state painted: {painted}"
         );
-        // The command names are the actionable half, and they are the only
-        // text here that goes through the *monospace* family — so one
-        // assertion covers both embedded faces, and an empty family for
-        // either one fails this test rather than passing silently.
         assert!(painted.contains("crossover run"), "painted: {painted}");
         assert!(
             painted.contains("crossover service install"),
             "painted: {painted}"
         );
+    }
+
+    #[test]
+    fn the_poll_interval_is_about_one_second() {
+        assert_eq!(POLL_INTERVAL, std::time::Duration::from_secs(1));
     }
 }
