@@ -19,6 +19,11 @@ crossover-platform = { workspace = true }
 crossover-platform-windows = { workspace = true }
 crossover-protocol = { workspace = true }
 crossover-security = { workspace = true }
+# `config` for the `[layout]` section reader (ADR 0018, config schema v2):
+# the shared model, its validation, and the `LayoutSection` shape this
+# binary deserializes `[layout]` into. The writer half (`persist_layout`)
+# is not called from here yet — that lands with the editor (feature/152).
+crossover-topology = { workspace = true, features = ["config"] }
 serde = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }

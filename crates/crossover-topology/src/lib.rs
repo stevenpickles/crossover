@@ -74,7 +74,8 @@ pub use monitor::{MAX_MONITOR_ID_BYTES, MonitorId, MonitorIdError, validate_moni
 
 #[cfg(any(test, feature = "config"))]
 pub use config::{
-    CONFIG_SCHEMA_VERSION, LayoutMonitorRow, LayoutSection, PersistError, persist_layout,
+    CONFIG_SCHEMA_MIN_SUPPORTED, CONFIG_SCHEMA_VERSION, LayoutMonitorRow, LayoutSection,
+    PersistError, config_schema_supported, persist_layout,
 };
 #[cfg(any(test, feature = "config"))]
 pub use state::{
