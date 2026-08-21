@@ -59,24 +59,37 @@ use crate::layout::{DevicePair, Layout, LayoutError, LayoutRect, RawPlacedMonito
 /// is the app's business. What this constant fixes is what a **write**
 /// produces, and a write is always an upgrade to 2.
 ///
-/// # Not yet wired, and deliberately so
+/// # Wired into the reader (feature/151)
 ///
-/// `apps/crossover/src/config.rs` has its own `SCHEMA_VERSION`, still at
-/// **1**, and its loader rejects any other value outright. So a file this
-/// writer has touched is a file that binary refuses to start from. That is
-/// safe only because nothing calls [`persist_layout`] yet, and it is the
-/// coupling to resolve before anything does:
-///
-/// **The app's loader must adopt this constant and this crate's
-/// [`LayoutSection`] — accepting 1 and 2, reading `[layout]`, and treating
-/// a v1 file or a lingering `side` as the implicit layout ADR 0018
-/// describes — before the first caller wires `persist_layout` in.** Doing
-/// it in the other order would ship a writer that bricks the reader.
-///
-/// That work is the config-schema branch's; this constant exists now so
-/// the writer and the reader converge on one definition rather than two
-/// literals.
+/// `apps/crossover/src/config.rs` accepts this constant's range — 1
+/// through [`CONFIG_SCHEMA_VERSION`] — reads `[layout]` into
+/// [`LayoutSection`], and treats a v1 file or a lingering `side` as an
+/// implicit layout, exactly as the coupling this doc used to describe as
+/// outstanding required. What is **not** yet wired is the write side: no
+/// caller in the app calls [`persist_layout`] yet — that lands with the
+/// editor (feature/152) — so a v1 file stays v1 until then, and this
+/// constant only ever describes what a future write would upgrade it to.
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+
+/// Oldest config schema this build still reads (ADR 0018): a bare
+/// `[seamless] side` file, with no `[layout]` section at all.
+///
+/// Named beside [`CONFIG_SCHEMA_VERSION`] rather than left as a literal at
+/// each reader, because "which versions does this build understand" is one
+/// fact, and the writer and every reader (today: `apps/crossover`;
+/// tomorrow: the editor's own re-read) should compute it from the same two
+/// constants — see [`config_schema_supported`].
+pub const CONFIG_SCHEMA_MIN_SUPPORTED: u32 = 1;
+
+/// Whether `version` is a config schema this build can read — the range
+/// [`CONFIG_SCHEMA_MIN_SUPPORTED`] through [`CONFIG_SCHEMA_VERSION`],
+/// inclusive. A reader's `schema_version` check should delegate to this
+/// rather than re-deriving the bound, so the writer and every reader agree
+/// on one definition instead of drifting literals.
+#[must_use]
+pub const fn config_schema_supported(version: u32) -> bool {
+    version >= CONFIG_SCHEMA_MIN_SUPPORTED && version <= CONFIG_SCHEMA_VERSION
+}
 
 /// The `[layout]` section as it sits in the file: still untrusted, and
 /// with monitor ids still bare strings.
@@ -142,6 +155,61 @@ impl LayoutSection {
                 })
                 .collect(),
         }
+    }
+
+    /// The two-device pair this section's own bytes imply: the origin, and
+    /// the first other device its monitors mention.
+    ///
+    /// For a reader that does not yet know the *real* pair to validate
+    /// against — a config loader, before this machine's identity is even
+    /// loaded and before a session (and therefore a peer) exists; the
+    /// editor's own re-read of what it just wrote — asking for the real
+    /// pair is not an option. This is the fallback: derive the pair the
+    /// file's *own* bytes name, so shape rules that do not need the real
+    /// pair — the counts, the bounds, duplicate ids, overlap, "exactly two
+    /// machines" — still run. What this does **not** prove is whether
+    /// these two devices are actually *this session's* ends; that check
+    /// belongs where the real pair is known (`crossover-core`, at session
+    /// establishment) and is deliberately not attempted here.
+    ///
+    /// # Errors
+    ///
+    /// [`LayoutError::NoMonitors`] for an empty section — checked before
+    /// any pair is derived, so an empty list is reported as itself rather
+    /// than manufacturing a degenerate pair out of nothing. Otherwise
+    /// [`LayoutError::DegeneratePair`] when every monitor belongs to the
+    /// origin: not "no other device happened to be found", but the actual
+    /// shape of a single-device file — there is no second machine to pair
+    /// it with.
+    pub fn implied_pair(&self) -> Result<DevicePair, LayoutError> {
+        if self.monitors.is_empty() {
+            return Err(LayoutError::NoMonitors);
+        }
+        let other = self
+            .monitors
+            .iter()
+            .map(|row| row.device)
+            .find(|&device| device != self.origin);
+        match other {
+            Some(other) => DevicePair::new(self.origin, other),
+            None => Err(LayoutError::DegeneratePair {
+                device: self.origin,
+            }),
+        }
+    }
+
+    /// Validate this section against the pair its own bytes imply
+    /// ([`Self::implied_pair`]), for a caller that does not yet know the
+    /// real session pair. See that method's docs for exactly what is, and
+    /// is not, checked this way.
+    ///
+    /// # Errors
+    ///
+    /// [`LayoutError`], from either [`Self::implied_pair`] or
+    /// [`Self::validate`].
+    pub fn validate_standalone(&self) -> Result<Layout, LayoutError> {
+        let pair = self.implied_pair()?;
+        self.validate(&pair)
     }
 
     /// Validate this section as an arrangement of `pair`.
@@ -376,7 +444,10 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
 
-    use super::{CONFIG_SCHEMA_VERSION, LayoutSection, PersistError, persist_layout, temp_path};
+    use super::{
+        CONFIG_SCHEMA_MIN_SUPPORTED, CONFIG_SCHEMA_VERSION, LayoutMonitorRow, LayoutSection,
+        PersistError, config_schema_supported, persist_layout, temp_path,
+    };
     use crate::device::DeviceId;
     use crate::layout::tests::{LOCAL, PEER, monitor, pair, side_by_side, valid_layout};
     use crate::layout::{Layout, LayoutError, MAX_LAYOUT_MONITORS};
@@ -429,6 +500,71 @@ mod tests {
         assert_eq!(section.origin, LOCAL);
         assert_eq!(section.monitors.len(), 2);
         assert_eq!(section.validate(&pair()).unwrap(), layout);
+    }
+
+    #[test]
+    fn config_schema_supported_is_the_closed_range_one_through_current() {
+        assert!(!config_schema_supported(0));
+        assert!(config_schema_supported(CONFIG_SCHEMA_MIN_SUPPORTED));
+        assert!(config_schema_supported(CONFIG_SCHEMA_VERSION));
+        assert!(!config_schema_supported(CONFIG_SCHEMA_VERSION + 1));
+        assert_eq!(CONFIG_SCHEMA_MIN_SUPPORTED, 1);
+    }
+
+    #[test]
+    fn implied_pair_is_the_origin_and_the_first_other_device_the_monitors_name() {
+        let section = LayoutSection::from_layout(&valid_layout());
+        let implied = section.implied_pair().unwrap();
+        assert!(implied.contains(LOCAL) && implied.contains(PEER));
+        assert_eq!(section.validate_standalone().unwrap(), valid_layout());
+    }
+
+    /// An empty section reports `NoMonitors`, not a fabricated
+    /// `DegeneratePair` — the count is checked before any pair is derived.
+    #[test]
+    fn implied_pair_reports_no_monitors_before_attempting_a_pair() {
+        let empty = LayoutSection {
+            revision: 1,
+            origin: LOCAL,
+            monitors: Vec::new(),
+        };
+        assert_eq!(empty.implied_pair().unwrap_err(), LayoutError::NoMonitors);
+        assert_eq!(
+            empty.validate_standalone().unwrap_err(),
+            LayoutError::NoMonitors
+        );
+    }
+
+    /// Every monitor belonging to the origin is a real degenerate pair —
+    /// not an artifact of the derivation.
+    #[test]
+    fn implied_pair_reports_a_single_device_file_as_degenerate() {
+        let section = LayoutSection {
+            revision: 1,
+            origin: LOCAL,
+            monitors: vec![
+                LayoutMonitorRow {
+                    device: LOCAL,
+                    id: "A".to_owned(),
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                },
+                LayoutMonitorRow {
+                    device: LOCAL,
+                    id: "B".to_owned(),
+                    x: 20,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                },
+            ],
+        };
+        assert_eq!(
+            section.implied_pair().unwrap_err(),
+            LayoutError::DegeneratePair { device: LOCAL }
+        );
     }
 
     /// The config file, as far as this crate's half of it goes — the
