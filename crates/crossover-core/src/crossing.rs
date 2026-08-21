@@ -7,11 +7,16 @@
 //! that edge a peer monitor abuts, and where a cursor crossing each interval
 //! arrives on the far side.
 //!
-//! Nothing here does I/O, and nothing here is consumed by the running
-//! detector yet — [`crate::topology::Topology`]'s side model still drives
-//! [`crate::edge_driver`]. [`from_link_side`] is the bridge: it expresses
-//! today's side model *as* a layout, so the detector can be swapped onto
-//! this model without a behaviour change.
+//! Nothing here does I/O. This *is* what the running detector measures
+//! against: [`crate::edge_driver`] holds a [`CrossingMap`] and one armed
+//! flag per [`SpanId`]. A `--left`/`--right` run reaches it through
+//! [`from_link_side`], which expresses the side model *as* a layout — one
+//! span on one edge, going somewhere unaddressed — so the swap onto this
+//! model cost the side model no behaviour at all. What has **not** moved
+//! yet is the far end: the control wiring still places an arriving cursor
+//! through [`crate::topology::Topology`] rather than through
+//! [`CrossingMap::arrive`], and still sends a bare fraction rather than an
+//! `EntryPoint`.
 //!
 //! # Two coordinate spaces, and the fraction between them
 //!
@@ -84,11 +89,10 @@
 
 use crossover_platform::{CursorPoint, MonitorInfo, MonitorRect};
 use crossover_topology::{
-    DeviceId, DevicePair, Layout, LayoutError, LayoutRect, MonitorId, MonitorIdError,
-    RawPlacedMonitor,
+    DeviceId, DevicePair, Layout, LayoutError, LayoutRect, MonitorId, RawPlacedMonitor,
 };
 
-use crate::topology::{Edge, EdgeFraction, LinkSide, edge_monitor_index};
+use crate::topology::{Edge, EdgeFraction, LinkSide, edge_monitor_index, last_index};
 
 /// A half-open interval `[start, end)` along one axis of the shared layout
 /// space, in layout units (ADR 0018).
@@ -155,9 +159,18 @@ impl LayoutSpan {
 /// and which of that monitor's edges it arrives at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossTarget {
-    /// The machine the cursor arrives on — always the peer, since a span
-    /// exists only for a local-to-peer pair.
-    pub device: DeviceId,
+    /// The machine the cursor arrives on — the peer, since a span exists
+    /// only for a local-to-peer pair — or `None` when the arrangement
+    /// names no peer at all.
+    ///
+    /// `None` is what an **implicit** (side-model) arrangement produces,
+    /// and it is an absence rather than a synthesized id on purpose:
+    /// `--left` says which end of a pair this machine is and nothing
+    /// whatever about the other end, so there is no peer identity to
+    /// report. A fabricated one would be indistinguishable, downstream,
+    /// from a device a drawn layout actually named — and the first consumer
+    /// to treat it as truth would be routing by a fiction.
+    pub device: Option<DeviceId>,
     /// The monitor it arrives on, or `None` when the arrangement cannot
     /// name one.
     ///
@@ -352,6 +365,57 @@ impl CrossingMap {
         self.local
     }
 
+    /// A map of these live monitors with **no crossings at all**: the
+    /// geometry intact, seamless transfer off.
+    ///
+    /// ADR 0018's degradation is "log and cross nowhere", never a guess and
+    /// never a panic, and a caller that has a detector already running
+    /// needs something to hand it: an inert map stops every crossing while
+    /// leaving the rectangles the detector measures against exactly as the
+    /// platform reported them. Identity is still resolved, on the same
+    /// rules [`derive`] applies, so an arriving entry point can still be
+    /// placed against a named screen even where nothing can leave.
+    ///
+    /// # The contract a caller must honour before using this
+    ///
+    /// **A machine that is currently *being controlled* must never be left
+    /// inert.** The crossing spans do double duty (ADR 0009): while the
+    /// peer drives this machine, reaching one is how the user *reclaims*
+    /// control. A map with no spans therefore removes the reclaim path, and
+    /// a machine that goes inert mid-grant is a machine whose user cannot
+    /// get their cursor back by moving it — the release-blocking shape of
+    /// defect this project treats a stuck key as.
+    ///
+    /// So a caller that may substitute this map while a grant is live owes
+    /// one of two things: keep the previous map's spans alive for the
+    /// `Returning` direction, or force a release (`ReleaseAllInput` and
+    /// back to `LOCAL`) as it substitutes. The implicit side-model source
+    /// sidesteps the question by construction — it derives from geometry
+    /// alone, so no plug event can make it refuse — and the explicit
+    /// layout source that the control wiring will grow must answer it
+    /// explicitly.
+    ///
+    /// The remaining reachable route here is geometry no layout model can
+    /// express at all (a monitor past `MAX_MONITOR_EXTENT`, or no monitors
+    /// whatsoever), which no display reports.
+    #[must_use]
+    pub fn inert(local: DeviceId, live: &[MonitorInfo]) -> Self {
+        let identities = usable_identities(live);
+        Self {
+            local,
+            monitors: live
+                .iter()
+                .zip(identities)
+                .map(|(info, id)| MappedMonitor {
+                    id,
+                    live: info.rect,
+                    drawn: None,
+                })
+                .collect(),
+            spans: Vec::new(),
+        }
+    }
+
     /// Every live monitor, in the order the platform reported them.
     #[must_use]
     pub fn monitors(&self) -> &[MappedMonitor] {
@@ -476,15 +540,34 @@ impl CrossingMap {
     /// than a wobble at the seam?
     ///
     /// The release half of the per-span Schmitt trigger (ADR 0018, ADR
-    /// 0009's addendum before it). Judged on **perpendicular distance from
-    /// the edge alone**, deliberately: sliding laterally along a hugged
-    /// edge from one span into its neighbour clears nothing, so it cannot
-    /// arm the neighbour and cannot re-create the oscillation the margin
-    /// exists to prevent.
+    /// 0009's addendum before it).
     ///
-    /// Distance is measured **unsigned**, with one exception: a cursor
-    /// clamped past the outer boundary of the desktop is never clear. Those
-    /// two halves are the exact dual of [`CrossingMap::touching`]'s.
+    /// A cursor is **not** clear only when it is close to the span's edge
+    /// in *both* directions — within `margin` perpendicular of it, **and**
+    /// within the span's monitor's own extent along it, likewise widened by
+    /// `margin`. Two different mistakes are ruled out by the two halves:
+    ///
+    /// - **Perpendicular alone would let a distant monitor suppress
+    ///   arming.** Two of this machine's screens stacked, a seam on the
+    ///   upper one's right edge: a cursor on the *lower* screen, near its
+    ///   own right edge, sits within a few pixels of the upper screen's
+    ///   seam column while being hundreds of rows away from the seam. It
+    ///   would hold that span disarmed for as long as the user worked
+    ///   there, and the seam would then not fire on arrival.
+    /// - **Narrowing the lateral test to the span's own interval, rather
+    ///   than its monitor's edge, would undo ADR 0018's lateral rule.** On
+    ///   an edge shared by two spans, a cursor hugging one span's share is
+    ///   laterally outside the other's — so the neighbour would arm, and
+    ///   sliding into it would fire, which is exactly what "sliding
+    ///   laterally along a hugged edge does not fire the neighbour" (and
+    ///   the addendum's oscillation) forbids. The monitor's edge is the
+    ///   unit the cursor actually hugs, so it is the unit the margin is
+    ///   measured in.
+    ///
+    /// Perpendicular distance is measured **unsigned**, with one exception:
+    /// a cursor clamped past the outer boundary of the desktop is never
+    /// clear. Those two halves are the exact dual of
+    /// [`CrossingMap::touching`]'s.
     ///
     /// A cursor that is past a seam because it is on the screen *across*
     /// that seam has genuinely travelled away, and must be able to re-arm,
@@ -505,6 +588,9 @@ impl CrossingMap {
             return false;
         };
         let margin = i32::try_from(margin).unwrap_or(i32::MAX);
+        if Self::laterally_beyond(span, monitor, cursor, margin) {
+            return true;
+        }
         let inset = span.edge.inset_of(monitor.live, cursor);
         if inset > 0 {
             return inset > margin;
@@ -513,6 +599,24 @@ impl CrossingMap {
             return false;
         }
         inset.saturating_neg() > margin
+    }
+
+    /// Is the cursor past either end of `span`'s edge — along the edge, not
+    /// across it — by more than `margin`?
+    ///
+    /// The lateral half of [`CrossingMap::clear_of`]; see its note for why
+    /// the bound is the monitor's whole edge rather than the span's share
+    /// of it. Saturating throughout, so a nonsense rectangle or coordinate
+    /// is an answer rather than an overflow (NFR-1).
+    fn laterally_beyond(
+        span: &CrossSpan,
+        monitor: &MappedMonitor,
+        cursor: CursorPoint,
+        margin: i32,
+    ) -> bool {
+        let (offset, extent) = span.edge.offset_along(monitor.live, cursor);
+        let last = last_index(extent);
+        offset < margin.saturating_neg() || offset > last.saturating_add(margin)
     }
 
     /// Every span the cursor is **not** clear of — the exact complement of
@@ -653,18 +757,32 @@ impl CrossingMap {
 /// change, never per poll.
 #[must_use]
 pub fn derive(layout: &Layout, local: DeviceId, live: &[MonitorInfo]) -> CrossingMap {
-    derive_with(layout, local, live, None)
+    derive_with(layout, local, live, Addressing::Drawn)
+}
+
+/// Whether the identities in a [`Layout`] describe real screens on real
+/// machines, or are scaffolding an [`ImplicitLayout`] erected to express
+/// the side model in the same shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Addressing {
+    /// The user drew this: every device and monitor id names something.
+    Drawn,
+    /// The side model, expressed as a layout. Its ids exist only so
+    /// [`derive_with`] can match rectangle to rectangle; **none of them
+    /// leaves this module**, because every target comes out unaddressed
+    /// (`device` and `monitor` both `None`) and every mapped monitor comes
+    /// out unnamed. The side model never learned a single identity, and the
+    /// map it produces says exactly that.
+    Implicit,
 }
 
 /// [`derive`], plus the one thing a [`Layout`] cannot say about itself:
-/// which peer monitor id is a fiction, and therefore names an
-/// **unaddressed** destination rather than a real screen. See
-/// [`ImplicitLayout`].
+/// whether its identities are real. See [`Addressing`].
 fn derive_with(
     layout: &Layout,
     local: DeviceId,
     live: &[MonitorInfo],
-    fiction: Option<&MonitorId>,
+    addressing: Addressing,
 ) -> CrossingMap {
     let identities = usable_identities(live);
     let mut monitors: Vec<MappedMonitor> = Vec::with_capacity(live.len());
@@ -693,10 +811,17 @@ fn derive_with(
                         monitor: index,
                         edge,
                         span: overlap,
-                        target: CrossTarget {
-                            device: peer.device,
-                            monitor: (fiction != Some(&peer.id)).then(|| peer.id.clone()),
-                            edge: facing,
+                        target: match addressing {
+                            Addressing::Drawn => CrossTarget {
+                                device: Some(peer.device),
+                                monitor: Some(peer.id.clone()),
+                                edge: facing,
+                            },
+                            Addressing::Implicit => CrossTarget {
+                                device: None,
+                                monitor: None,
+                                edge: facing,
+                            },
                         },
                         target_edge: theirs,
                     });
@@ -705,7 +830,10 @@ fn derive_with(
         }
 
         monitors.push(MappedMonitor {
-            id,
+            id: match addressing {
+                Addressing::Drawn => id,
+                Addressing::Implicit => None,
+            },
             live: info.rect,
             drawn,
         });
@@ -763,45 +891,56 @@ fn usable_identities(live: &[MonitorInfo]) -> Vec<Option<MonitorId>> {
 
 /// The monitor id given to the peer rectangle [`from_link_side`] invents.
 ///
-/// Private, and it never leaves this module: [`derive_with`] turns a target
-/// naming it into [`CrossTarget::monitor`] `None`, so no fabricated device
-/// string reaches the wire, a log line, or a caller. It exists only because
-/// [`Layout`] requires every placed rectangle to carry an id, and the
-/// implicit arrangement's peer rectangle is a rectangle.
+/// Private, and it never leaves this module: the arrangement is derived
+/// under [`Addressing::Implicit`], which reports every target unaddressed,
+/// so no fabricated device string reaches the wire, a log line, or a
+/// caller. It exists only because [`Layout`] requires every placed
+/// rectangle to carry an id, and the implicit arrangement's peer rectangle
+/// is a rectangle.
 const IMPLICIT_PEER_MONITOR_ID: &str = "<implicit-peer>";
 
+/// The id given to the local rectangle at position `index` in the live
+/// enumeration, for the same reason and with the same guarantee.
+///
+/// **Positional, and that is safe here precisely because it is
+/// throw-away.** ADR 0018 rejected positional identity for *drawn* layouts
+/// because an index outlives a re-enumeration and would silently rename a
+/// screen; this id is minted and consumed inside one derivation, from one
+/// live list, and never persisted, synced, or compared against anything
+/// from another enumeration. It exists so [`derive_with`] can match
+/// rectangle to rectangle without the platform having named anything —
+/// which is what makes the implicit path work on **geometry alone**.
+fn implicit_monitor_id(index: usize) -> String {
+    format!("<implicit-{index}>")
+}
+
+/// The device the peer rectangle is attributed to.
+///
+/// Same guarantee as [`IMPLICIT_PEER_MONITOR_ID`], for the same reason
+/// ([`Layout`] places every rectangle on *some* device): the derivation
+/// reports [`CrossTarget::device`] as `None`, so this never escapes.
+/// Derived from `local` rather than fixed so it is distinct from it
+/// whatever `local` is — [`DevicePair`] requires two distinct devices, and
+/// a fixed constant could in principle collide with a real device id and
+/// turn a perfectly ordinary configuration into a refusal.
+fn implicit_peer_device(local: DeviceId) -> DeviceId {
+    let mut bytes = local.to_bytes();
+    bytes[0] ^= 0xFF;
+    DeviceId::from_bytes(bytes)
+}
+
 /// Why a side-model configuration could not be expressed as a layout.
+///
+/// Both variants are about **geometry**, and deliberately so: the implicit
+/// path reads no monitor identity at all, so nothing the platform does or
+/// does not know about a screen's name can refuse it. See
+/// [`from_link_side`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ImplicitLayoutError {
     /// The platform reported no monitors. Never true of a real display.
     #[error("there are no monitors to derive an arrangement from")]
     NoMonitors,
-    /// The monitor on the linked edge has no device string, so no drawn
-    /// rectangle can address it. The honest cost of the side model needing
-    /// no identity while the layout model does — seamless transfer is off
-    /// rather than silently attached to the wrong screen.
-    #[error("the monitor on the linked edge has no platform identity")]
-    UnnamedEdgeMonitor,
-    /// The monitor on the linked edge reported a device string that is not
-    /// a usable id.
-    #[error("the monitor on the linked edge has an unusable identity")]
-    InvalidEdgeMonitorId {
-        /// Which rule the device string broke.
-        #[source]
-        source: MonitorIdError,
-    },
-    /// Another live monitor reports the same device string as the one on
-    /// the linked edge, so the two selectors would disagree about which
-    /// physical screen the seam belongs to: this one chooses by geometry
-    /// (the outermost monitor), and [`derive`] matches by id. Refused
-    /// rather than resolved, because resolving it means guessing which
-    /// screen hands control away.
-    #[error("more than one monitor reports the identity {id}, so the linked edge is ambiguous")]
-    AmbiguousEdgeMonitor {
-        /// The repeated identity.
-        id: MonitorId,
-    },
     /// The live geometry does not fit the layout model's bounds — a monitor
     /// past `MAX_MONITOR_EXTENT`, or a desktop past `MAX_LAYOUT_COORDINATE`.
     /// Unreachable on real hardware, and a refusal rather than a truncation
@@ -817,22 +956,20 @@ pub enum ImplicitLayoutError {
 /// The side model expressed as a layout (ADR 0018's *implicit layout*:
 /// revision 0, never synced, never written back).
 ///
-/// Carries the arrangement together with the one fact the arrangement
-/// cannot state about itself: its peer rectangle is a **fiction**, so a
-/// crossing onto it is unaddressed. Deriving through
-/// [`ImplicitLayout::crossings`] rather than through the free [`derive`] is
-/// what turns that fact into [`CrossTarget::monitor`] `None` instead of a
-/// device string no peer has.
+/// Its identities are scaffolding — see [`Addressing::Implicit`] — so
+/// deriving through [`ImplicitLayout::crossings`] rather than through the
+/// free [`derive`] is what turns every destination into an honest `None`
+/// instead of a device string and a monitor string no peer has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImplicitLayout {
     layout: Layout,
-    peer: MonitorId,
 }
 
 impl ImplicitLayout {
     /// The arrangement itself, for a caller that has to publish or inspect
     /// it. Note that it is *implicit*: ADR 0018 forbids syncing it to the
-    /// peer or writing it back to the config file.
+    /// peer or writing it back to the config file, and its ids are the
+    /// throw-away ones above rather than anything a peer could match.
     #[must_use]
     pub fn layout(&self) -> &Layout {
         &self.layout
@@ -844,16 +981,48 @@ impl ImplicitLayout {
         self.layout
     }
 
-    /// The crossing map this arrangement gives `local`, with the fictional
-    /// peer rectangle reported as an unaddressed destination.
+    /// The crossing map this arrangement gives `local`, from the same bare
+    /// rectangles it was derived from.
+    ///
+    /// Every destination comes out unaddressed and every mapped monitor
+    /// unnamed, because that is the whole truth the side model holds.
     #[must_use]
-    pub fn crossings(&self, local: DeviceId, live: &[MonitorInfo]) -> CrossingMap {
-        derive_with(&self.layout, local, live, Some(&self.peer))
+    pub fn crossings(&self, local: DeviceId, live: &[MonitorRect]) -> CrossingMap {
+        derive_with(&self.layout, local, &scaffold(live), Addressing::Implicit)
     }
+}
+
+/// The live rectangles, labelled with the throw-away positional ids the
+/// implicit arrangement places them under. One function, called by both
+/// [`from_link_side`] and [`ImplicitLayout::crossings`], so the label a
+/// rectangle is drawn under and the label it is matched by cannot drift.
+fn scaffold(live: &[MonitorRect]) -> Vec<MonitorInfo> {
+    live.iter()
+        .enumerate()
+        .map(|(index, rect)| MonitorInfo {
+            id: Some(implicit_monitor_id(index)),
+            rect: *rect,
+        })
+        .collect()
 }
 
 /// Express today's side model as a layout, so the same derivation drives
 /// both.
+///
+/// # Geometry in, geometry only
+///
+/// This takes bare [`MonitorRect`]s, and that is the point rather than a
+/// convenience. The side model never knew a monitor's name and never
+/// needed one: it names one edge of one screen chosen by *position*, and
+/// the destination it produces is unaddressed, so identity has nothing to
+/// contribute at either end. Requiring one would import every way a
+/// platform can fail to name a screen — a USB display adapter the OS
+/// declines to name, two panels reporting one device string, an
+/// enumeration caught mid-hotplug — into a path that worked without
+/// identity for the whole of Phase 5, and each of those would turn
+/// seamless transfer off for a configuration that has nothing wrong with
+/// it. The ids the [`Layout`] carries are minted here, positionally, and
+/// consumed by the derivation ([`implicit_monitor_id`]).
 ///
 /// # What it draws, and why that shape
 ///
@@ -865,8 +1034,7 @@ impl ImplicitLayout {
 /// the mirror's opposite edge: precisely the side model's one linked edge
 /// pair.
 ///
-/// Three choices in that sentence are worth stating rather than
-/// discovering:
+/// Two choices in that sentence are worth stating rather than discovering:
 ///
 /// - **The edge monitor, not the desktop bounding box.** The bounding box
 ///   is what the side model uses to decide *whether* a seam is a crossing
@@ -884,48 +1052,31 @@ impl ImplicitLayout {
 ///   ([`ImplicitLayout`]), so the receiver falls back to desktop-bounds
 ///   placement: the pre-0018 behaviour, which is what the side model had
 ///   all along.
-/// - **Two selectors, one answer.** This picks the local rectangle by
-///   geometry while [`derive`] later matches it by id, so the two agree
-///   only while that id is unique — hence the ambiguity refusal below.
 ///
 /// # Errors
 ///
-/// [`ImplicitLayoutError`] when the linked-edge monitor cannot be named
-/// unambiguously, or when the live geometry is outside what a layout can
-/// hold.
+/// [`ImplicitLayoutError`] when there are no monitors at all, or when the
+/// live geometry is outside what a layout can hold. Neither is reachable
+/// from a real display, which is the improvement over an identity-matched
+/// implicit path: a `--left` run that worked before this branch works
+/// after it, on any hardware.
 pub fn from_link_side(
     side: LinkSide,
     local: DeviceId,
-    peer: DeviceId,
-    live: &[MonitorInfo],
+    live: &[MonitorRect],
 ) -> Result<ImplicitLayout, ImplicitLayoutError> {
+    let peer = implicit_peer_device(local);
     let pair = DevicePair::new(local, peer)
         .map_err(|source| ImplicitLayoutError::Unrepresentable { source })?;
-    let edge_monitor = edge_monitor(side, live).ok_or(ImplicitLayoutError::NoMonitors)?;
-    let text = edge_monitor
-        .id
-        .as_deref()
-        .ok_or(ImplicitLayoutError::UnnamedEdgeMonitor)?;
-    let id = MonitorId::new(text)
-        .map_err(|source| ImplicitLayoutError::InvalidEdgeMonitorId { source })?;
-    // The geometric choice above and `derive`'s later match by id must land
-    // on the same physical screen, and they do only while the id is this
-    // machine's alone.
-    // `usable_identities` blanks an id it saw twice, so the chosen id
-    // surviving that pass *is* the statement that it is unique.
-    let unambiguous = usable_identities(live)
-        .into_iter()
-        .flatten()
-        .any(|usable| usable == id);
-    if !unambiguous {
-        return Err(ImplicitLayoutError::AmbiguousEdgeMonitor { id });
-    }
+    let index =
+        edge_monitor_index(side, live.iter().copied()).ok_or(ImplicitLayoutError::NoMonitors)?;
+    let edge_monitor = live[index];
 
     let mine = LayoutRect {
-        x: edge_monitor.rect.left,
-        y: edge_monitor.rect.top,
-        width: edge_monitor.rect.width,
-        height: edge_monitor.rect.height,
+        x: edge_monitor.left,
+        y: edge_monitor.top,
+        width: edge_monitor.width,
+        height: edge_monitor.height,
     };
     // Mirrored across the linked edge: the same size, one width away in the
     // linked direction. Matched on the side rather than on its edge, for
@@ -948,7 +1099,7 @@ pub fn from_link_side(
         vec![
             RawPlacedMonitor {
                 device: local,
-                id: id.as_str().to_owned(),
+                id: implicit_monitor_id(index),
                 rect: mine,
             },
             RawPlacedMonitor {
@@ -961,17 +1112,7 @@ pub fn from_link_side(
     )
     .map_err(|source| ImplicitLayoutError::Unrepresentable { source })?;
 
-    let peer = MonitorId::new(IMPLICIT_PEER_MONITOR_ID)
-        .map_err(|source| ImplicitLayoutError::InvalidEdgeMonitorId { source })?;
-    Ok(ImplicitLayout { layout, peer })
-}
-
-/// The monitor on `side`'s linked edge, through the crate's one selector —
-/// so the rectangle this attaches a seam to is the same one the side model
-/// measures crossings against. Pinned by
-/// `both_edge_monitor_selectors_break_a_tie_the_same_way`.
-fn edge_monitor(side: LinkSide, live: &[MonitorInfo]) -> Option<&MonitorInfo> {
-    edge_monitor_index(side, live.iter().map(|info| info.rect)).map(|index| &live[index])
+    Ok(ImplicitLayout { layout })
 }
 
 /// The coordinate of `edge` on a drawn rectangle: the line the edge sits
@@ -1160,7 +1301,7 @@ mod tests {
                 end: 1000
             }
         );
-        assert_eq!(span.target().device, PEER);
+        assert_eq!(span.target().device, Some(PEER));
         assert_eq!(span.target().edge, Edge::Right);
     }
 
@@ -1530,33 +1671,39 @@ mod tests {
     }
 
     /// The two selectors must land on the same physical screen: this one
-    /// chooses the edge monitor by geometry, `derive` later matches it by
-    /// id. A duplicated id is the one case where they could disagree, so it
-    /// is refused rather than resolved.
+    /// chooses the edge monitor by geometry, and the derivation matches it
+    /// by the throw-away id minted for it — so the two agree by
+    /// construction, and what the *platform* calls a screen never enters.
+    ///
+    /// That is what makes the implicit path immune to every identity
+    /// failure a real display can produce: no name, an unusable name, or
+    /// one name on two screens are all just rectangles here.
     #[test]
-    fn from_link_side_refuses_an_ambiguous_edge_monitor() {
+    fn the_implicit_path_ignores_platform_identity_entirely() {
+        // Two screens the platform names identically — which for a *drawn*
+        // arrangement makes both unaddressable — still produce exactly the
+        // side model's one span, on the outer edge.
         let screens = [
             live("DUP", 0, 0, 1000, 1000),
             live("DUP", 1000, 0, 1000, 1000),
         ];
+        let rects: Vec<MonitorRect> = screens.iter().map(|m| m.rect).collect();
         for side in [LinkSide::Left, LinkSide::Right] {
-            assert_eq!(
-                from_link_side(side, LOCAL, PEER, &screens),
-                Err(ImplicitLayoutError::AmbiguousEdgeMonitor { id: id("DUP") }),
-                "{side:?} accepted an ambiguous edge monitor"
-            );
+            let implicit = from_link_side(side, LOCAL, &rects).unwrap();
+            let map = implicit.crossings(LOCAL, &rects);
+            assert_eq!(map.span_count(), 1, "{side:?}");
+            assert_eq!(map.spans()[0].edge(), side.linked_edge(), "{side:?}");
         }
 
-        // A collision that is not the edge monitor costs nothing: those
-        // screens were never going to carry the seam.
-        let screens = [
-            live("DUP", 0, 0, 100, 100),
-            live("DUP", 100, 0, 100, 100),
-            live("EDGE", 200, 0, 100, 100),
-        ];
-        let implicit = from_link_side(LinkSide::Left, LOCAL, PEER, &screens).unwrap();
-        assert!(implicit.layout().find(LOCAL, &id("EDGE")).is_some());
-        assert_eq!(implicit.crossings(LOCAL, &screens).span_count(), 1);
+        // Identity is not merely tolerated, it is *absent from the input*:
+        // the same rectangles named, unnamed, or unusably named give the
+        // identical map, and none of the names survives into it.
+        let unnamed_map = from_link_side(LinkSide::Left, LOCAL, &rects)
+            .unwrap()
+            .crossings(LOCAL, &rects);
+        assert!(unnamed_map.monitors().iter().all(|m| m.id().is_none()));
+        assert_eq!(unnamed_map.spans()[0].target().device, None);
+        assert_eq!(unnamed_map.spans()[0].target().monitor, None);
     }
 
     /// Both selectors break a tie the same way — the property that keeps a
@@ -1572,8 +1719,8 @@ mod tests {
         let rects: Vec<MonitorRect> = screens.iter().map(|m| m.rect).collect();
 
         for side in [LinkSide::Left, LinkSide::Right] {
-            let implicit = from_link_side(side, LOCAL, PEER, &screens).unwrap();
-            let map = implicit.crossings(LOCAL, &screens);
+            let implicit = from_link_side(side, LOCAL, &rects).unwrap();
+            let map = implicit.crossings(LOCAL, &rects);
             let chosen = map.monitors()[map.spans()[0].monitor()].live();
             // The side model's own choice, observed where it places an
             // arriving cursor: fraction 0.0 is the chosen screen's corner.
@@ -1746,6 +1893,42 @@ mod tests {
         assert_eq!(map.spans_near(at(900, 500), 24).count(), 0);
     }
 
+    /// The shape a machine falls back to when its arrangement cannot be
+    /// derived at all: every rectangle the platform reported, every
+    /// identity it could resolve, and nowhere to cross. Geometry and
+    /// placement survive; only leaving stops.
+    #[test]
+    fn an_inert_map_keeps_the_geometry_and_removes_every_crossing() {
+        let screens = [
+            live("A", 0, 0, 1000, 1000),
+            unnamed(1000, 0, 1000, 1000),
+            live("DUP", 2000, 0, 10, 10),
+            live("DUP", 2010, 0, 10, 10),
+        ];
+        let map = CrossingMap::inert(LOCAL, &screens);
+        assert_eq!(map.local(), LOCAL);
+        assert!(map.is_inert());
+        assert_eq!(map.span_count(), 0);
+        assert_eq!(map.monitors().len(), screens.len());
+        for (mapped, original) in map.monitors().iter().zip(&screens) {
+            assert_eq!(mapped.live(), original.rect);
+            assert!(mapped.drawn().is_none());
+        }
+        // Identity follows `derive`'s rules: named once is addressable,
+        // unnamed and duplicated are not.
+        assert_eq!(map.monitors()[0].id(), Some(&id("A")));
+        assert!(map.monitors()[1].id().is_none());
+        assert!(map.monitors()[2].id().is_none());
+        assert!(map.monitors()[3].id().is_none());
+        // Nothing leaves, but an arriving entry point still places.
+        assert!(map.leave(at(999, 500)).is_none());
+        assert!(map.crossings_at(at(999, 500)).next().is_none());
+        assert_eq!(
+            map.enter(&id("A"), Edge::Right, EdgeFraction::new(0.0)),
+            Some(at(999, 0))
+        );
+    }
+
     /// A span id from another map is never "clear", so a stale id can only
     /// suppress a crossing, never invent one.
     #[test]
@@ -1783,14 +1966,15 @@ mod tests {
             ] {
                 let rects: Vec<MonitorRect> = screens.iter().map(|m| m.rect).collect();
                 let topology = Topology::new(side);
-                let arrangement = from_link_side(side, LOCAL, PEER, &screens).unwrap();
-                let map = arrangement.crossings(LOCAL, &screens);
+                let arrangement = from_link_side(side, LOCAL, &rects).unwrap();
+                let map = arrangement.crossings(LOCAL, &rects);
 
                 // One span, on the outer edge, covering the whole of it,
                 // and going somewhere this machine cannot name — the side
                 // model never knew anything about the peer's screens.
                 assert_eq!(map.span_count(), 1);
                 assert_eq!(map.spans()[0].edge(), side.linked_edge());
+                assert_eq!(map.spans()[0].target().device, None);
                 assert_eq!(map.spans()[0].target().monitor, None);
                 assert_eq!(map.spans()[0].target().edge, side.linked_edge().opposite());
                 assert_eq!(
@@ -1812,13 +1996,19 @@ mod tests {
                     }
                 }
 
-                // Entering: the same pixel, for every fraction.
-                let edge_monitor = map.spans()[0].monitor();
-                let edge_id = map.monitors()[edge_monitor].id().unwrap().clone();
+                // Entering: the same pixel, for every fraction. The
+                // implicit map names no screen — that is the point — so
+                // this goes through the rectangle the span sits on, which
+                // is the same rectangle the side model measures against.
+                let edge_monitor = map.monitors()[map.spans()[0].monitor()].live();
+                assert!(
+                    map.monitors().iter().all(|m| m.id().is_none()),
+                    "an implicit map reported an identity"
+                );
                 for raw in [0.0, 0.001, 0.25, 0.5, 0.75, 0.999, 1.0] {
                     let fraction = EdgeFraction::new(raw);
                     assert_eq!(
-                        map.enter(&edge_id, side.linked_edge(), fraction).unwrap(),
+                        side.linked_edge().entry_point(edge_monitor, fraction),
                         topology.entering(fraction, &rects),
                         "{side:?} placed differently at {raw}"
                     );
@@ -1839,18 +2029,35 @@ mod tests {
     }
 
     /// The implicit layout is exactly two rectangles — the edge monitor and
-    /// its mirror — at revision 0, with the synthetic peer named something
-    /// no platform reports.
+    /// its mirror — at revision 0, both under throw-away ids no platform
+    /// reports and no peer could match.
     #[test]
     fn the_implicit_layout_is_one_real_rectangle_and_one_fiction() {
-        let screens = [live("A", 0, 0, 1920, 1080), live("B", 1920, 0, 2560, 1440)];
-        let implicit = from_link_side(LinkSide::Left, LOCAL, PEER, &screens).unwrap();
+        let screens = [
+            MonitorRect {
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+            MonitorRect {
+                left: 1920,
+                top: 0,
+                width: 2560,
+                height: 1440,
+            },
+        ];
+        let implicit = from_link_side(LinkSide::Left, LOCAL, &screens).unwrap();
         let arrangement = implicit.layout();
         assert_eq!(arrangement.revision(), 0);
         assert_eq!(arrangement.origin(), LOCAL);
         assert_eq!(arrangement.monitors().len(), 2);
 
-        let mine = arrangement.find(LOCAL, &id("B")).unwrap();
+        // The edge monitor is index 1 — the rightmost — and is placed under
+        // that position's scaffolding id.
+        let mine = arrangement
+            .find(LOCAL, &id(&super::implicit_monitor_id(1)))
+            .unwrap();
         assert_eq!(
             mine.rect,
             LayoutRect {
@@ -1860,8 +2067,10 @@ mod tests {
                 height: 1440
             }
         );
+        let peer_device = super::implicit_peer_device(LOCAL);
+        assert_ne!(peer_device, LOCAL, "the scaffolding peer must be distinct");
         let theirs = arrangement
-            .find(PEER, &id(IMPLICIT_PEER_MONITOR_ID))
+            .find(peer_device, &id(IMPLICIT_PEER_MONITOR_ID))
             .unwrap();
         assert_eq!(
             theirs.rect,
@@ -1875,10 +2084,10 @@ mod tests {
 
         // A right member mirrors the other way, off the left of its own
         // leftmost screen.
-        let implicit = from_link_side(LinkSide::Right, LOCAL, PEER, &screens).unwrap();
+        let implicit = from_link_side(LinkSide::Right, LOCAL, &screens).unwrap();
         let theirs = implicit
             .layout()
-            .find(PEER, &id(IMPLICIT_PEER_MONITOR_ID))
+            .find(peer_device, &id(IMPLICIT_PEER_MONITOR_ID))
             .unwrap();
         assert_eq!(
             theirs.rect,
@@ -1889,53 +2098,55 @@ mod tests {
                 height: 1080
             }
         );
+
+        // None of that scaffolding reaches the map: no identity in, none out.
+        let map = implicit.crossings(LOCAL, &screens);
+        assert!(map.monitors().iter().all(|m| m.id().is_none()));
+        assert_eq!(map.spans()[0].target().device, None);
+        assert_eq!(map.spans()[0].target().monitor, None);
     }
 
-    /// The side model needed no monitor identity; the layout model does.
-    /// Where the platform cannot supply one, that is a refusal naming the
-    /// reason, not a layout attached to a guess.
+    /// The implicit path refuses only on **geometry**, never on identity —
+    /// and both refusals are things no display reports. That is the whole
+    /// improvement: a `--left` run that worked before ADR 0018 works after
+    /// it, on any hardware, whatever the OS calls the screens.
     #[test]
-    fn an_unnameable_edge_monitor_is_a_refusal_rather_than_a_guess() {
+    fn the_implicit_path_refuses_only_geometry_no_display_reports() {
         assert_eq!(
-            from_link_side(LinkSide::Left, LOCAL, PEER, &[]),
+            from_link_side(LinkSide::Left, LOCAL, &[]),
             Err(ImplicitLayoutError::NoMonitors)
         );
-        assert_eq!(
-            from_link_side(LinkSide::Left, LOCAL, PEER, &[unnamed(0, 0, 1920, 1080)]),
-            Err(ImplicitLayoutError::UnnamedEdgeMonitor)
-        );
+        // Geometry no layout can hold is refused, rather than truncated.
         assert!(matches!(
             from_link_side(
                 LinkSide::Left,
                 LOCAL,
-                PEER,
-                &[MonitorInfo {
-                    id: Some(String::new()),
-                    rect: MonitorRect {
-                        left: 0,
-                        top: 0,
-                        width: 1920,
-                        height: 1080
-                    }
+                &[MonitorRect {
+                    left: 0,
+                    top: 0,
+                    width: u32::MAX,
+                    height: 1080
                 }]
             ),
-            Err(ImplicitLayoutError::InvalidEdgeMonitorId { .. })
-        ));
-        // Geometry no layout can hold is refused too, rather than truncated.
-        assert!(matches!(
-            from_link_side(
-                LinkSide::Left,
-                LOCAL,
-                PEER,
-                &[live("A", 0, 0, u32::MAX, 1080)]
-            ),
             Err(ImplicitLayoutError::Unrepresentable { .. })
         ));
-        // A pair of one machine is not an arrangement of anything.
-        assert!(matches!(
-            from_link_side(LinkSide::Left, LOCAL, LOCAL, &[live("A", 0, 0, 1920, 1080)]),
-            Err(ImplicitLayoutError::Unrepresentable { .. })
-        ));
+        // Anything a real display reports is accepted, whatever its name.
+        for width in [1u32, 1920, 65_535] {
+            assert!(
+                from_link_side(
+                    LinkSide::Left,
+                    LOCAL,
+                    &[MonitorRect {
+                        left: -4000,
+                        top: -4000,
+                        width,
+                        height: 1080
+                    }]
+                )
+                .is_ok(),
+                "a {width}-wide screen was refused"
+            );
+        }
     }
 
     /// The whole point of a round trip: on a drawn seam, a cursor that
