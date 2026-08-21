@@ -20,14 +20,28 @@ use crate::ProtocolError;
 /// byte as trailing data and fail the payload, which by
 /// docs/PROTOCOL.md §7 is fatal to the session. The bump turns that into
 /// a clean, diagnosable refusal at `Hello` instead.
-pub const PROTOCOL_VERSION: u16 = 3;
+///
+/// v4 (Phase 8, [ADR 0018](../../../docs/adr/0018-drawn-display-topology.md)):
+/// `ControlRequest.entry` and `ControlRelease.entry` change shape, from
+/// `Option<u16>` to `Option<EntryPoint>` (docs/PROTOCOL.md §6.1) — a
+/// structural change to messages that already travel between every pair
+/// of peers, exactly the v2→v3 case above and ADR 0017's rule applied
+/// unchanged: no feature bit can hide a layout change to a message that
+/// is not gated by one, so it is a version bump rather than a bit. A v3
+/// peer would read `EntryPoint`'s extra fields as trailing data (or
+/// misread `Option<u16>`'s single byte as `EntryPoint`'s multi-field
+/// encoding) and fail the payload — fatal per docs/PROTOCOL.md §7 — so
+/// the bump turns that into a clean, diagnosable refusal at `Hello`
+/// instead.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The lowest protocol version this build accepts. Each bump has been an
 /// incompatible layout change (v1's control messages cannot be decoded by
-/// v2; v2's offers cannot be decoded by v3), and peers are deployed in
-/// lockstep, so the floor tracks the ceiling rather than carrying
-/// compatibility code for a version nobody runs.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 3;
+/// v2; v2's offers cannot be decoded by v3; v3's `entry` cannot be decoded
+/// by v4), and peers are deployed in lockstep, so the floor tracks the
+/// ceiling rather than carrying compatibility code for a version nobody
+/// runs.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 4;
 
 /// An inclusive range of supported protocol versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

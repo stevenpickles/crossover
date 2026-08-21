@@ -416,6 +416,15 @@ EntryPoint
     layout_revision  // the layout revision the sender derived this from
 ```
 
+An empty `monitor` is a valid value, not a malformed one: it reads as
+"unaddressed" under the same degraded-placement rule below, and is what a
+sender still on the pre-layout side model sends deliberately, having no
+destination id yet to give. Such a sender derives `edge` as the *opposite*
+of the edge it is crossing on its own screen, since `edge` is specified in
+the receiver's terms above and a two-machine pair's edges mirror each
+other — so the field reads correctly under the degraded rule even before
+either side knows the other's real geometry.
+
 `fraction` is ADR 0009's normalized position, unchanged and still
 resolution- and DPI-independent; the edge's **start** is the smaller
 coordinate on the perpendicular axis — top for a Left/Right edge, left for
