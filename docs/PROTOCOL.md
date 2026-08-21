@@ -78,8 +78,8 @@ Hello
 - The session runs at the highest mutually supported version; if the ranges
   don't intersect, the session terminates with a diagnostic. No silent
   downgrade below either side's minimum.
-- Capabilities beyond the base protocol (optional clipboard types, multiple
-  displays, …) are negotiated via `supported_features`, never assumed.
+- Capabilities beyond the base protocol (optional clipboard types, …) are
+  negotiated via `supported_features`, never assumed.
 - Behavior for unknown fields and unknown messages at each version is part
   of the version's definition. Breaking changes require an ADR,
   compatibility tests, and documentation updates.
@@ -163,13 +163,26 @@ offer of every type, negotiated or not. No bit can hide it from a peer
 that predates it, so files are the v2 → **v3** bump, while images needed
 none.
 
+The same rule decides the v3 → **v4** bump
+([ADR 0018](adr/0018-drawn-display-topology.md), Phase 8): the drawn
+topology grows `ControlRequest.entry` and `ControlRelease.entry` from
+`Option<u16>` to `Option<EntryPoint>` (§6.1), a layout change to control
+messages that already travel between every pair of peers. Both ends of the
+range move to 4, as they did for v2 and v3 — pre-1.0 the floor tracks the
+ceiling, because there are no deployed peers to be compatible with
+([ADR 0017](adr/0017-protocol-version-3.md)). The two new topology messages
+(§6.2) deliberately carry **no feature bit**: the `entry` change already
+refuses every v3 peer at `Hello`, so the only peers that can receive them
+are peers that understand them, and a bit both sides always set would be a
+gate that never closes.
+
 ## 4. Message classes
 
 Four logical classes, initially multiplexed over the single TLS connection:
 
 | Class | Contents | Delivery requirement |
 |-------|----------|----------------------|
-| CONTROL | Hello, control-transfer negotiation, keepalive, ReleaseAllInput, session management | Ordered *within the class*, lossless |
+| CONTROL | Hello, control-transfer negotiation, display topology (§6.2), keepalive, ReleaseAllInput, session management | Ordered *within the class*, lossless |
 | INPUT | Key transitions, pointer motion/buttons/scroll | Keys: ordered within the class, lossless. Pointer motion: coalescable (§6) |
 | CLIPBOARD | Clipboard transaction messages | Ordered within the class, lossless, acknowledged |
 | TELEMETRY | Latency probes, statistics | Best effort |
@@ -387,12 +400,32 @@ Unicode `text` for mismatched layouts (ADR 0008).
 
 Ownership is explicit, negotiated state (FR-5.1) — request → acknowledge →
 switch (FR-5.3). Phase 3 triggers requests explicitly (CLI command); Phase 5
-also triggers them from edge crossings, which carry a normalized `entry`
-position so the destination places the cursor where the pointer crossed
-(ADR 0009). The `entry` is `Option<u16>` — `0` top, `u16::MAX` bottom, a
-fraction of the edge that is resolution- and DPI-independent; `None` for
-an explicit (console) transfer, which places no cursor. Carrying it grew
-the request and release layouts, which is the v1 → **v2** protocol bump.
+also triggers them from edge crossings, which carry an `entry` position so
+the destination places the cursor where the pointer crossed (ADR 0009).
+Carrying it grew the request and release layouts, which was the v1 → **v2**
+protocol bump; changing its shape in Phase 8 is the v3 → **v4** bump.
+
+The `entry` is `Option<EntryPoint>` (ADR 0018). `None` is an explicit
+(console) transfer, which places no cursor. Otherwise:
+
+```
+EntryPoint
+    monitor          // destination monitor id, ≤ MAX_MONITOR_ID_BYTES
+    edge             // Left | Right | Top | Bottom, of that monitor
+    fraction         // u16 along that edge: 0 at its start, u16::MAX at its end
+    layout_revision  // the layout revision the sender derived this from
+```
+
+`fraction` is ADR 0009's normalized position, unchanged and still
+resolution- and DPI-independent; the edge's **start** is the smaller
+coordinate on the perpendicular axis — top for a Left/Right edge, left for
+a Top/Bottom edge. What v4 adds around the fraction is *which* edge it is
+a fraction of. A bare fraction was sufficient only while a machine had
+exactly one crossing edge — with per-monitor seams there is no unique "the
+edge", so the entry point is stated in the **receiver's** terms: the
+monitor the cursor arrives on, which of its edges, and how far along it.
+Stating it that way is what lets the receiver recognize an entry it cannot
+honour instead of placing a cursor somewhere plausible and wrong.
 
 ```
 A -> B   ControlRequest   { request_id, entry }        // A asks to control B
@@ -420,9 +453,88 @@ Rules, all fail-closed:
   local user's escape hatch) and is also the reverse-edge return; when it
   carries an `entry`, the ex-controller places its cursor there on the way
   back (ADR 0009). The ex-controller stops capturing on receipt.
+- **An entry point the receiver cannot honour costs placement, not
+  control.** An `EntryPoint` naming a monitor id this machine does not
+  have, or a `layout_revision` that is not the one this machine holds, is
+  **not** an error: the receiver places the cursor on its desktop-bounds
+  edge matching `EntryPoint.edge`, fraction taken against those bounds —
+  the pre-v4 placement, retained solely as this degraded mode — logs a
+  diagnostic naming the mismatch, and the grant or release proceeds.
+  Placement is a nicety; control correctness never depends on it
+  (ADR 0018). A revision mismatch is expected during an edit's propagation
+  window; crossings in that window degrade this way, briefly.
 - Disconnect in any state releases everything: the controlled side executes
   `ReleaseAllInput` locally (FR-4.4), the controller stops capture, and
   both sides are local until a new negotiation.
+
+### 6.2 Display topology (CONTROL class)
+
+Seamless crossing follows from a **drawn layout**: both machines' monitors
+placed in one shared, unit-agnostic coordinate space, with crossing edges
+derived from exact adjacency between a local rectangle and a *peer*
+rectangle ([ADR 0018](adr/0018-drawn-display-topology.md), Phase 8). Two
+messages carry it, both added at v4 and both base protocol — no feature bit
+(§3.1).
+
+```
+MonitorTopology   { monitors: [ { id, x, y, width, height,         // type 17
+                                  scale_percent } ] }
+LayoutSync        { revision, origin,                              // type 18
+                    monitors: [ { device, id, x, y, width, height } ] }
+```
+
+- **`MonitorTopology` states a fact about the sender**: its own live
+  monitors, in its own local coordinates. `scale_percent`
+  (`MIN_SCALE_PERCENT`–`MAX_SCALE_PERCENT`, 100 = unscaled) is a seeding
+  input for the editor's to-scale drawing **only**; it never enters
+  crossing mapping, which is proportional through the drawn geometry
+  (ADR 0018). The message is sent after `Hello` and again whenever the
+  local display configuration changes, and it is what lets either
+  machine's editor draw the peer's screens and lets layout validation tell
+  a real monitor id from a fiction. It is not an arrangement and never
+  changes crossing behaviour on its own.
+- **`LayoutSync` states the arrangement**, which describes *both* machines:
+  a `u64` revision, `origin` (the editing device's identity), and the
+  placed monitors. It is sent after `Hello` when the sender holds an
+  explicit layout, and on every edit. A layout that exists only
+  implicitly — the compatibility layout a v1 config or a `--left` /
+  `--right` flag produces — is never sent.
+
+Invariants, all of them checked before anything is adopted:
+
+- **Every bound is a named constant (§8), validated on encode as well as
+  decode**, so a local defect cannot put on the wire a layout the peer
+  would be right to refuse.
+- **Bounds**: at most `MAX_MONITORS_PER_MACHINE` monitors from one machine
+  and `MAX_LAYOUT_MONITORS` in a layout; a monitor id of at most
+  `MAX_MONITOR_ID_BYTES` printable-ASCII bytes, unique within a machine;
+  `1 ≤ width, height ≤ MAX_MONITOR_EXTENT`; `|x|, |y| ≤
+  MAX_LAYOUT_COORDINATE`. Every derivation runs in `i64`, where those
+  bounds make overflow impossible rather than merely unlikely.
+- **Malformed is fatal** (§7): a count past its cap, a zero or oversized
+  dimension, an out-of-range coordinate, a non-ASCII or overlong id — the
+  session terminates, fail closed.
+- **Well-formed but semantically impossible is rejected, never adopted**: a
+  layout naming a device that is not this session's pair, a monitor neither
+  peer has reported, or rectangles that overlap. It is logged and charged
+  as a protocol violation on §7's graduated rule. The distinction is
+  deliberate — the first case is a broken decoder or a hostile frame, the
+  second is a peer disagreeing with reality, which must never steer local
+  behaviour but must not cost a healthy session its first frame either.
+- **Adjacency is exact.** A crossing span exists only where an edge
+  coordinate matches identically and the perpendicular extents overlap; a
+  gap of one unit is not an edge. Spans are half-open intervals, so a
+  corner where three monitors meet resolves deterministically. Same-machine
+  abutment produces no span by construction, so a machine's internal seams
+  stay inert unless the peer is drawn across them.
+- **Newest revision wins**, ordered by `(revision, origin)`
+  lexicographically — `origin` comparing as its 16 raw bytes — with an
+  equal key and differing content resolved by the lower SHA-256 hash of
+  the postcard encoding of the monitor list sorted by `(device, id)`, and
+  logged. Revisions are assigned as `seen_max.saturating_add(1)`, so a
+  peer asserting `u64::MAX` cannot wrap the counter. Adoption is
+  observable at both ends: the winner logs the adoption, the loser logs
+  the supersession with both revisions and both origins (NFR-3).
 
 ## 7. Error handling
 
@@ -450,6 +562,12 @@ Rules, all fail-closed:
 | Max file name | 255 bytes, `MAX_FILE_NAME_BYTES` (NTFS's per-component limit) and 259 UTF-16 units, `MAX_FILE_NAME_UTF16_UNITS` (`FILEDESCRIPTORW.cFileName` is `WCHAR[260]`). Both checked, so raising either cannot silently overrun a fixed-size Win32 buffer |
 | Chunk payload maximum | 64 KiB, `MAX_CHUNK_BYTES` (ADR 0014) — a *maximum*, not a fixed size; see below |
 | Chunk count maximum | 4096, `MAX_CHUNK_COUNT` = `MAX_CLIPBOARD_FILE_BYTES` ÷ `MAX_CHUNK_BYTES` — the largest chunked type over the largest chunk. Derived, and compile-time asserted against every chunked type's ceiling. Raising it does not raise what a transfer may cost: a plan must reconcile exactly with the offered length, which is bounded per type |
+| Max monitors per machine | 16, `MAX_MONITORS_PER_MACHINE` (ADR 0018) — bounds `MonitorTopology` and one machine's share of a layout |
+| Max monitors in a layout | 32, `MAX_LAYOUT_MONITORS` (ADR 0018) — a layout describes exactly two machines |
+| Max monitor id | 64 bytes, `MAX_MONITOR_ID_BYTES` (ADR 0018), printable ASCII — the platform's device string (`szDevice` on Windows), which survives a restart where an enumeration index does not |
+| Max monitor extent | 65 535, `MAX_MONITOR_EXTENT` (ADR 0018); minimum 1 — a zero-sized monitor has no edge to cross |
+| Max layout coordinate | 2^24, `MAX_LAYOUT_COORDINATE` (ADR 0018) — with the extent cap this keeps every derivation under 2^42 in `i64`, so overflow is impossible rather than improbable |
+| Monitor scale bounds | 25–500 percent, `MIN_SCALE_PERCENT` / `MAX_SCALE_PERCENT` (ADR 0018) — seeds the editor's to-scale drawing only; never enters crossing mapping |
 | Keepalive interval / timeout | 5 s / 15 s defaults in `crossover-core::supervision` |
 
 **Chunk size is the sender's to choose.** `MAX_CHUNK_BYTES` bounds a chunk;
