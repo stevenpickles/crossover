@@ -561,16 +561,16 @@ impl TopologySync {
             );
             return;
         }
-        // Captions the display would not repeat this instant, filled in
-        // from what the state writer last saw. Geometry is always this
-        // query's own; only the labels come from memory, and only where
-        // this query had none — see `TopologyStateWriter::set_monitors`
-        // for why a caption is remembered rather than re-read. Without
-        // this the state file and the wire would describe the same desk
-        // differently whenever a label sweep failed to coincide with a
-        // real display change.
+        // Captions and panel sizes the display would not repeat this
+        // instant, filled in from what the state writer last saw. Geometry
+        // is always this query's own; only the descriptive fields come from
+        // memory, and only where this query had none — see
+        // `TopologyStateWriter::set_monitors` for why a description is
+        // remembered rather than re-read. Without this the state file and
+        // the wire would describe the same desk differently whenever a
+        // description sweep failed to coincide with a real display change.
         if let Some(writer) = &self.state {
-            writer.fill_remembered_labels(&mut monitors);
+            writer.fill_remembered(&mut monitors);
         }
         let message = MonitorTopology {
             monitors: monitors.iter().map(report_of).collect(),

@@ -994,8 +994,8 @@ mod tests {
             let verdict = validate_physical_size(width, height);
             prop_assert_eq!(verdict, validate_physical_size(width, height));
             if verdict.is_ok() {
-                prop_assert!(width >= 1 && width <= MAX_PHYSICAL_SIZE_MM);
-                prop_assert!(height >= 1 && height <= MAX_PHYSICAL_SIZE_MM);
+                prop_assert!((1..=MAX_PHYSICAL_SIZE_MM).contains(&width));
+                prop_assert!((1..=MAX_PHYSICAL_SIZE_MM).contains(&height));
                 let accepted = PhysicalSizeMm::new(width, height).unwrap();
                 prop_assert_eq!(accepted.width_mm(), width);
                 prop_assert_eq!(accepted.height_mm(), height);

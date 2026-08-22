@@ -49,14 +49,14 @@
 //!   list; a startup enumeration that is already over the cap has no last
 //!   good to fall back to, so it reports an empty list rather than a
 //!   truncated, falsely-complete one — both cases logged loudly.
-//! - **A label sweep that fails while the geometry beside it does not** is
-//!   the same policy one level finer, per monitor id rather than per
-//!   list: the last caption that id carried is kept, so a caption that
-//!   flaps changes nothing and therefore reports nothing. Without it the
-//!   flap would read as a changed monitor list and put a
-//!   `MonitorTopology` on the wire once a second — see
-//!   [`TopologyStateWriter::set_monitors`], which states the accepted cost
-//!   too.
+//! - **A description sweep that fails while the geometry beside it does
+//!   not** is the same policy two levels finer — per monitor id, and per
+//!   field within that: the last caption and the last panel size that id
+//!   carried are kept, so a description that flaps changes nothing and
+//!   therefore reports nothing. Without it the flap would read as a
+//!   changed monitor list and put a `MonitorTopology` on the wire once a
+//!   second — see [`TopologyStateWriter::set_monitors`], which states the
+//!   accepted cost too.
 //! - **A config re-read that fails to parse or fails `[layout]`
 //!   validation** offers nothing to the hub, so the run keeps the layout
 //!   it already holds and this file keeps reporting it (see
@@ -120,10 +120,36 @@ pub struct TopologyStateWriter {
     /// by [`Self::write_final`] before it does its own write. `None` once
     /// that has happened.
     writer_task: Mutex<Option<JoinHandle<()>>>,
-    /// The last label each monitor was seen to carry, keyed by its id —
-    /// see [`Self::set_monitors`] for why a caption is *remembered* rather
-    /// than re-read every second.
-    remembered_labels: Mutex<BTreeMap<MonitorId, MonitorLabel>>,
+    /// The last description each monitor was seen to carry, keyed by its
+    /// id — see [`Self::set_monitors`] for why these are *remembered*
+    /// rather than re-read every second.
+    ///
+    /// One map of a small struct rather than one map per field: the two
+    /// values are learned by the same sweep, forgotten by the same rule,
+    /// and keyed the same way, so splitting them would buy two lookups, two
+    /// prunes, and the standing risk of the two drifting out of step about
+    /// which ids they still hold.
+    remembered: Mutex<BTreeMap<MonitorId, RememberedDescription>>,
+}
+
+/// What the last successful sweep said *about* a monitor, as opposed to
+/// where it is.
+///
+/// Both fields are `Option` because a sweep can succeed at one and not the
+/// other — a panel Windows names but whose EDID will not read, or an EDID
+/// with measurements and no product string — so "remembered" is per field,
+/// not per monitor.
+#[derive(Clone, Default)]
+struct RememberedDescription {
+    label: Option<MonitorLabel>,
+    physical_size: Option<PhysicalSizeMm>,
+}
+
+impl RememberedDescription {
+    /// Nothing left to remember: the id can be dropped from the map.
+    fn is_empty(&self) -> bool {
+        self.label.is_none() && self.physical_size.is_none()
+    }
 }
 
 impl TopologyStateWriter {
@@ -133,19 +159,23 @@ impl TopologyStateWriter {
     #[must_use]
     pub fn start(path: PathBuf, initial: TopologyState) -> Self {
         write_state_file_logged(&path, &initial);
-        // Seed the label memory from the startup snapshot, so the very
-        // first poll after start has something to fall back on rather than
-        // having to re-learn what `initial_state` already read.
+        // Seed the memory from the startup snapshot, so the very first poll
+        // after start has something to fall back on rather than having to
+        // re-learn what `initial_state` already read.
         let remembered = initial
             .local
             .monitors
             .iter()
-            .filter_map(|monitor| {
-                monitor
-                    .label
-                    .clone()
-                    .map(|label| (monitor.id.clone(), label))
+            .map(|monitor| {
+                (
+                    monitor.id.clone(),
+                    RememberedDescription {
+                        label: monitor.label.clone(),
+                        physical_size: monitor.physical_size,
+                    },
+                )
             })
+            .filter(|(_, description)| !description.is_empty())
             .collect();
         let (state, updates) = watch::channel(initial);
         let writer_task = tokio::spawn(run_writer(path.clone(), updates));
@@ -153,7 +183,7 @@ impl TopologyStateWriter {
             path,
             state,
             writer_task: Mutex::new(Some(writer_task)),
-            remembered_labels: Mutex::new(remembered),
+            remembered: Mutex::new(remembered),
         }
     }
 
@@ -166,16 +196,18 @@ impl TopologyStateWriter {
     /// Replace this machine's reported monitors, if `monitors` differs from
     /// what is already held. Returns whether anything changed.
     ///
-    /// # Labels are remembered, not re-read
+    /// # Descriptions are remembered, not re-read
     ///
-    /// `monitors` now carries a per-monitor caption, and a caption is far
-    /// less reliably readable than the geometry beside it: on Windows it
-    /// costs a whole `QueryDisplayConfig` sweep, and an RDP transition, a
-    /// session lock, a GPU reset, or one target that will not answer turns
-    /// every `Some` into `None` with the rectangles completely unchanged.
+    /// `monitors` carries two per-monitor descriptive facts — a caption and
+    /// a panel size — and both are far less reliably readable than the
+    /// geometry beside them: on Windows they cost a whole
+    /// `QueryDisplayConfig` sweep and, for the size, an EDID read off the
+    /// registry per monitor on top of it. An RDP transition, a session
+    /// lock, a GPU reset, or one target that will not answer turns every
+    /// `Some` into `None` with the rectangles completely unchanged.
     ///
     /// Left alone, that would defeat this method's own change gate. The
-    /// gate compares whole [`LiveMonitor`]s, so a label flap reads as a
+    /// gate compares whole [`LiveMonitor`]s, so such a flap reads as a
     /// changed monitor list: a state-file write, an `info!` line, a
     /// `LocalDisplayChanged` ping, and a `MonitorTopology` frame to the
     /// peer — then all of it again, in reverse, on the next tick. At the
@@ -184,23 +216,26 @@ impl TopologyStateWriter {
     /// nothing new must not put a `MonitorTopology` on the wire once a
     /// second.*
     ///
-    /// So the label follows this module's standing policy — **a failure to
+    /// So both follow this module's standing policy — **a failure to
     /// learn something new is not a reason to erase what is known** — one
-    /// level finer than the rest of it. Per monitor id: a `Some` is
-    /// learned, a `None` is filled in from the last `Some` that id
-    /// carried, and an id absent from `monitors` is forgotten (which
+    /// level finer than the rest of it. Per monitor id and per field: a
+    /// `Some` is learned, a `None` is filled in from the last `Some` that
+    /// id carried, and an id absent from `monitors` is forgotten (which
     /// bounds the memory at the enumeration's own size). Only a genuinely
     /// *different* `Some` moves it. The gate above then compares
     /// post-retention lists and needs no special case of its own.
     ///
     /// **The accepted cost, stated:** a monitor that genuinely stops
-    /// advertising a name — an EDID the driver stops reporting — keeps its
-    /// last caption until it leaves the enumeration or the worker
-    /// restarts. That is the right way round. A label is display-only, so
-    /// a stale caption costs a word that is no longer strictly true, while
-    /// a flapping one costs a frame per second to the peer.
+    /// advertising a name, or whose panel genuinely re-measures, keeps what
+    /// it last reported until it leaves the enumeration or the worker
+    /// restarts. That is the right way round for both. Each is display-only,
+    /// so a stale one costs a caption that is no longer strictly true or a
+    /// rectangle drawn at last week's proportions, while a flapping one
+    /// costs a frame per second to the peer. And a panel does not resize:
+    /// unlike a caption, a *changed* size is nearly always a re-read of the
+    /// same screen going wrong rather than news.
     pub fn set_monitors(&self, mut monitors: Vec<LiveMonitor>) -> bool {
-        self.remember_labels(&mut monitors);
+        self.remember_descriptions(&mut monitors);
         self.state.send_if_modified(|state| {
             if state.local.monitors == monitors {
                 return false;
@@ -211,26 +246,36 @@ impl TopologyStateWriter {
         })
     }
 
-    /// Learn every label `monitors` carries, fill in every one it does not
-    /// from what that id carried last, and forget ids that have left the
-    /// enumeration. See [`Self::set_monitors`] for the reasoning.
-    fn remember_labels(&self, monitors: &mut [LiveMonitor]) {
-        let mut known = lock(&self.remembered_labels);
+    /// Learn every description `monitors` carries, fill in every field it
+    /// does not from what that id carried last, and forget ids that have
+    /// left the enumeration. See [`Self::set_monitors`] for the reasoning.
+    fn remember_descriptions(&self, monitors: &mut [LiveMonitor]) {
+        let mut known = lock(&self.remembered);
         for monitor in monitors.iter_mut() {
+            // Learning and filling are the same pass, per field: whichever
+            // of the two the sweep managed this tick is remembered, and
+            // whichever it did not is restored.
+            let held = known.entry(monitor.id.clone()).or_default();
             match &monitor.label {
-                Some(label) => {
-                    known.insert(monitor.id.clone(), label.clone());
-                }
-                None => monitor.label = known.get(&monitor.id).cloned(),
+                Some(label) => held.label = Some(label.clone()),
+                None => monitor.label.clone_from(&held.label),
+            }
+            match monitor.physical_size {
+                Some(size) => held.physical_size = Some(size),
+                None => monitor.physical_size = held.physical_size,
             }
         }
         // Bounded by the enumeration: an id nothing reports any more is an
-        // id whose caption can never be wanted again.
-        known.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
+        // id whose description can never be wanted again. An entry the loop
+        // above created for a monitor it learned nothing about goes too,
+        // rather than lingering empty.
+        known.retain(|id, description| {
+            !description.is_empty() && monitors.iter().any(|monitor| &monitor.id == id)
+        });
     }
 
-    /// Fill in labels `monitors` does not carry from what this writer last
-    /// saw, without learning or forgetting anything.
+    /// Fill in the description fields `monitors` does not carry from what
+    /// this writer last saw, without learning or forgetting anything.
     ///
     /// The read-only half of [`Self::set_monitors`]'s retention, for the
     /// one other producer that reports this machine's monitors:
@@ -238,13 +283,21 @@ impl TopologyStateWriter {
     /// itself rather than reading this snapshot (it has its own
     /// per-machine cap rule to apply, and it must work on a run with no
     /// state file at all). Without this the peer's editor would lose every
-    /// caption for one report whenever a label sweep failed to coincide
-    /// with a genuine display change — the state file and the wire
-    /// disagreeing about the same desk.
-    pub fn fill_remembered_labels(&self, monitors: &mut [LiveMonitor]) {
-        let known = lock(&self.remembered_labels);
-        for monitor in monitors.iter_mut().filter(|m| m.label.is_none()) {
-            monitor.label = known.get(&monitor.id).cloned();
+    /// caption and every proportion for one report whenever a description
+    /// sweep failed to coincide with a genuine display change — the state
+    /// file and the wire disagreeing about the same desk.
+    pub fn fill_remembered(&self, monitors: &mut [LiveMonitor]) {
+        let known = lock(&self.remembered);
+        for monitor in monitors.iter_mut() {
+            let Some(held) = known.get(&monitor.id) else {
+                continue;
+            };
+            if monitor.label.is_none() {
+                monitor.label = held.label.clone();
+            }
+            if monitor.physical_size.is_none() {
+                monitor.physical_size = held.physical_size;
+            }
         }
     }
 
@@ -1120,22 +1173,181 @@ mod tests {
         drop(writer);
     }
 
+    /// The same wire loop, for the size rather than the caption.
+    ///
+    /// An EDID read is *more* failure-prone than the product-name sweep it
+    /// rides along with — it walks `SetupAPI` to a registry key per monitor —
+    /// so a size that flaps while the geometry beside it does not is the
+    /// likelier of the two flaps, not the theoretical one. Without
+    /// retention it costs exactly what a flapping caption would: a
+    /// `MonitorTopology` a second, forever.
+    #[tokio::test]
+    async fn a_physical_size_that_flaps_writes_nothing_and_tells_nobody() {
+        use crossover_platform::{MonitorDescription, PhysicalSizeMm as PlatformSize};
+
+        let sandbox = Sandbox::new("size-flap");
+        let path = sandbox.path("topology.json");
+        let display = display(1920, 1080);
+        let panel = PlatformSize {
+            width_mm: 597,
+            height_mm: 336,
+        };
+        let described = |size: Option<PlatformSize>| MonitorDescription {
+            info: monitor_at(0, 0),
+            label: Some("DELL U2720Q".to_owned()),
+            physical_size: size,
+        };
+        let measured = crossover_topology::PhysicalSizeMm::new(597, 336).unwrap();
+
+        display.set_monitor_descriptions(vec![described(Some(panel))]);
+        let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
+        let writer = TopologyStateWriter::start(path, state);
+        assert_eq!(
+            writer.snapshot().local.monitors[0].physical_size,
+            Some(measured)
+        );
+
+        // The EDID read fails: same rectangles, same caption, no size.
+        // Nothing changed about this desk, so nothing may be reported.
+        display.set_monitor_descriptions(vec![described(None)]);
+        let flapped = live_monitors(&display).unwrap();
+        assert_eq!(
+            flapped[0].physical_size, None,
+            "the fixture did not model a flap"
+        );
+        assert!(
+            !writer.set_monitors(flapped),
+            "an EDID read failing reported a display change"
+        );
+        assert_eq!(
+            writer.snapshot().local.monitors[0].physical_size,
+            Some(measured),
+            "the last known measurement was erased by a failed read"
+        );
+
+        // And it recovers without reporting a change either.
+        display.set_monitor_descriptions(vec![described(Some(panel))]);
+        assert!(!writer.set_monitors(live_monitors(&display).unwrap()));
+
+        drop(writer);
+    }
+
+    /// The other half: a size that genuinely *changes* still propagates,
+    /// exactly once. Retention must not become "panels never re-measure" —
+    /// a monitor swapped for a different model behind the same device
+    /// string is the case that has to still work.
+    #[tokio::test]
+    async fn a_genuine_physical_size_change_propagates_exactly_once() {
+        use crossover_platform::{MonitorDescription, PhysicalSizeMm as PlatformSize};
+
+        let sandbox = Sandbox::new("size-change");
+        let path = sandbox.path("topology.json");
+        let display = display(1920, 1080);
+        let described = |width_mm: u16, height_mm: u16| MonitorDescription {
+            info: monitor_at(0, 0),
+            label: None,
+            physical_size: Some(PlatformSize {
+                width_mm,
+                height_mm,
+            }),
+        };
+
+        display.set_monitor_descriptions(vec![described(597, 336)]);
+        let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
+        let writer = TopologyStateWriter::start(path, state);
+
+        display.set_monitor_descriptions(vec![described(286, 179)]);
+        let resized = live_monitors(&display).unwrap();
+        assert!(
+            writer.set_monitors(resized.clone()),
+            "a real measurement change was swallowed"
+        );
+        assert_eq!(
+            writer.snapshot().local.monitors[0].physical_size,
+            Some(crossover_topology::PhysicalSizeMm::new(286, 179).unwrap())
+        );
+        assert!(
+            !writer.set_monitors(resized),
+            "the same measurement reported a second change"
+        );
+
+        drop(writer);
+    }
+
+    /// The two fields are remembered independently, which is the case a
+    /// single shared flag would get wrong: a sweep that names a monitor
+    /// but cannot read its EDID must not have its measurement erased, and
+    /// the reverse must hold too.
+    #[tokio::test]
+    async fn a_caption_and_a_size_are_remembered_independently() {
+        use crossover_platform::{MonitorDescription, PhysicalSizeMm as PlatformSize};
+
+        let sandbox = Sandbox::new("independent");
+        let path = sandbox.path("topology.json");
+        let display = display(1920, 1080);
+        let panel = PlatformSize {
+            width_mm: 597,
+            height_mm: 336,
+        };
+        let described = |label: Option<&str>, size: Option<PlatformSize>| MonitorDescription {
+            info: monitor_at(0, 0),
+            label: label.map(str::to_owned),
+            physical_size: size,
+        };
+
+        display.set_monitor_descriptions(vec![described(Some("DELL U2720Q"), Some(panel))]);
+        let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
+        let writer = TopologyStateWriter::start(path, state);
+
+        // Half the sweep fails, each way round in turn. Neither reports a
+        // change, and neither field loses what the other one kept.
+        for half in [
+            described(Some("DELL U2720Q"), None),
+            described(None, Some(panel)),
+            described(None, None),
+        ] {
+            display.set_monitor_descriptions(vec![half]);
+            assert!(
+                !writer.set_monitors(live_monitors(&display).unwrap()),
+                "half a description sweep reported a display change"
+            );
+            let monitor = writer.snapshot().local.monitors.remove(0);
+            assert_eq!(
+                monitor
+                    .label
+                    .as_ref()
+                    .map(crossover_topology::MonitorLabel::as_str),
+                Some("DELL U2720Q")
+            );
+            assert_eq!(
+                monitor.physical_size,
+                Some(crossover_topology::PhysicalSizeMm::new(597, 336).unwrap())
+            );
+        }
+
+        drop(writer);
+    }
+
     /// A monitor that leaves the enumeration takes its remembered caption
-    /// with it, so the memory is bounded by the desk rather than by how
-    /// many screens have ever been plugged in — and a *different* monitor
-    /// that later takes the same id inherits nothing.
+    /// and its remembered measurement with it, so the memory is bounded by
+    /// the desk rather than by how many screens have ever been plugged in —
+    /// and a *different* monitor that later takes the same id inherits
+    /// nothing.
     #[tokio::test]
     async fn a_departed_monitor_is_forgotten_rather_than_remembered_forever() {
         use crossover_platform::MonitorDescription;
 
-        let sandbox = Sandbox::new("label-forget");
+        let sandbox = Sandbox::new("description-forget");
         let path = sandbox.path("topology.json");
         let display = display(1920, 1080);
 
         display.set_monitor_descriptions(vec![MonitorDescription {
             info: monitor_at(0, 0),
             label: Some("DELL U2720Q".to_owned()),
-            physical_size: None,
+            physical_size: Some(crossover_platform::PhysicalSizeMm {
+                width_mm: 597,
+                height_mm: 336,
+            }),
         }]);
         let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
         let writer = TopologyStateWriter::start(path, state);
@@ -1148,38 +1360,46 @@ mod tests {
         }]);
         assert!(writer.set_monitors(live_monitors(&display).unwrap()));
 
-        // Now the original id comes back, still unnamed by the platform.
-        // It must not inherit the caption the *previous* enumeration knew:
-        // the memory was pruned when the id left.
+        // Now the original id comes back, still undescribed by the
+        // platform. It must inherit neither the caption nor the
+        // measurement the *previous* enumeration knew: the memory was
+        // pruned when the id left.
         display.set_monitor_descriptions(vec![MonitorDescription {
             info: monitor_at(0, 0),
             label: None,
             physical_size: None,
         }]);
         assert!(writer.set_monitors(live_monitors(&display).unwrap()));
+        let monitor = writer.snapshot().local.monitors.remove(0);
         assert_eq!(
-            writer.snapshot().local.monitors[0].label,
-            None,
+            monitor.label, None,
             "a caption outlived the enumeration that produced it"
+        );
+        assert_eq!(
+            monitor.physical_size, None,
+            "a measurement outlived the enumeration that produced it"
         );
 
         drop(writer);
     }
 
-    /// A failed label sweep must not reach the peer either: the read-only
-    /// half of the retention, which `topology_sync` applies to the
-    /// `MonitorTopology` it builds from its own display query.
+    /// A failed description sweep must not reach the peer either: the
+    /// read-only half of the retention, which `topology_sync` applies to
+    /// the `MonitorTopology` it builds from its own display query.
     #[tokio::test]
-    async fn the_remembered_caption_is_available_to_the_wire_producer() {
+    async fn the_remembered_description_is_available_to_the_wire_producer() {
         use crossover_platform::MonitorDescription;
 
-        let sandbox = Sandbox::new("label-wire");
+        let sandbox = Sandbox::new("description-wire");
         let path = sandbox.path("topology.json");
         let display = display(1920, 1080);
         display.set_monitor_descriptions(vec![MonitorDescription {
             info: monitor_at(0, 0),
             label: Some("DELL U2720Q".to_owned()),
-            physical_size: None,
+            physical_size: Some(crossover_platform::PhysicalSizeMm {
+                width_mm: 597,
+                height_mm: 336,
+            }),
         }]);
         let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
         let writer = TopologyStateWriter::start(path, state);
@@ -1191,7 +1411,8 @@ mod tests {
         }]);
         let mut fresh = live_monitors(&display).unwrap();
         assert_eq!(fresh[0].label, None);
-        writer.fill_remembered_labels(&mut fresh);
+        assert_eq!(fresh[0].physical_size, None);
+        writer.fill_remembered(&mut fresh);
         assert_eq!(
             fresh[0]
                 .label
@@ -1200,9 +1421,14 @@ mod tests {
             Some("DELL U2720Q"),
             "the wire would have described this desk without its captions"
         );
+        assert_eq!(
+            fresh[0].physical_size,
+            Some(crossover_topology::PhysicalSizeMm::new(597, 336).unwrap()),
+            "the wire would have described this desk without its proportions"
+        );
 
         // Read-only: filling did not teach the writer anything new, and a
-        // monitor it has never heard of stays unlabelled.
+        // monitor it has never heard of stays undescribed.
         let mut stranger = vec![crossover_topology::LiveMonitor {
             id: crossover_topology::MonitorId::new("NEVER-SEEN").unwrap(),
             rect: crossover_topology::LayoutRect {
@@ -1215,8 +1441,9 @@ mod tests {
             label: None,
             physical_size: None,
         }];
-        writer.fill_remembered_labels(&mut stranger);
+        writer.fill_remembered(&mut stranger);
         assert_eq!(stranger[0].label, None);
+        assert_eq!(stranger[0].physical_size, None);
 
         drop(writer);
     }
@@ -1405,25 +1632,28 @@ mod tests {
         assert!(stray_files(&sandbox.0).is_empty());
     }
 
-    /// The flap, end to end through the real poll: a label sweep failing
-    /// and recovering across several ticks must not wake the hub even
-    /// once, because waking the hub is what puts a `MonitorTopology` on
-    /// the wire. The writer's own gate is unit-tested above; this is the
+    /// The flap, end to end through the real poll: a description sweep
+    /// failing and recovering across several ticks must not wake the hub
+    /// even once, because waking the hub is what puts a `MonitorTopology`
+    /// on the wire. The writer's own gate is unit-tested above; this is the
     /// path that would have leaked a frame per second.
     #[tokio::test]
-    async fn a_flapping_label_never_wakes_the_layout_sync_hub() {
+    async fn a_flapping_description_never_wakes_the_layout_sync_hub() {
         use crossover_platform::MonitorDescription;
 
         let sandbox = Sandbox::new("flap-quiet");
         let path = sandbox.path("topology.json");
         let display = Arc::new(display(1920, 1080));
-        let described = |label: Option<&str>| MonitorDescription {
+        let described = |described: bool| MonitorDescription {
             info: monitor_at(0, 0),
-            label: label.map(str::to_owned),
-            physical_size: None,
+            label: described.then(|| "DELL U2720Q".to_owned()),
+            physical_size: described.then_some(crossover_platform::PhysicalSizeMm {
+                width_mm: 597,
+                height_mm: 336,
+            }),
         };
 
-        display.set_monitor_descriptions(vec![described(Some("DELL U2720Q"))]);
+        display.set_monitor_descriptions(vec![described(true)]);
         let state = initial_state(LOCAL, "workstation".to_owned(), &*display, None);
         let writer = Arc::new(TopologyStateWriter::start(path, state));
 
@@ -1438,23 +1668,29 @@ mod tests {
         // Several poll intervals of the sweep failing, recovering, and
         // failing again — the shape an RDP session or a locking screen
         // actually produces.
-        for labelled in [false, true, false] {
-            display.set_monitor_descriptions(vec![described(labelled.then_some("DELL U2720Q"))]);
+        for sweeping in [false, true, false] {
+            display.set_monitor_descriptions(vec![described(sweeping)]);
             tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
         }
 
         poll.abort();
         assert!(
             topology_rx.try_recv().is_err(),
-            "a flapping caption woke the hub, which puts a MonitorTopology on the wire"
+            "a flapping description woke the hub, which puts a MonitorTopology on the wire"
         );
+        let monitor = writer.snapshot().local.monitors.remove(0);
         assert_eq!(
-            writer.snapshot().local.monitors[0]
+            monitor
                 .label
                 .as_ref()
                 .map(crossover_topology::MonitorLabel::as_str),
             Some("DELL U2720Q"),
             "the caption did not survive the flap"
+        );
+        assert_eq!(
+            monitor.physical_size,
+            Some(crossover_topology::PhysicalSizeMm::new(597, 336).unwrap()),
+            "the measurement did not survive the flap"
         );
     }
 
