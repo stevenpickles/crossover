@@ -48,8 +48,10 @@ Builds that are not tagged releases identify themselves as such —
   screen and a panel on the right names it, shows its resolution, and gives
   its drawn width and height in millimetres to edit. Type the real size of
   a screen your machine measured wrongly — or could not measure at all —
-  and the rectangle is redrawn at it, with the screens beside it shuffling
-  along so the seams on that machine stay closed. Editing one dimension
+  and the rectangle is redrawn at it, with the screens beside it in that row
+  shuffling along so the seams stay closed — screens elsewhere on the
+  machine, such as one plugged in since the arrangement was saved, stay
+  exactly where they are. Editing one dimension
   fills the other in the screen's current proportions unless you untick the
   lock. A size no panel could be (under 50 mm or over 3000 mm on a side) is
   refused with a note rather than quietly rounded into range, and **Use

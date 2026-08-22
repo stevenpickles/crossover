@@ -859,15 +859,41 @@ smallest of them:
   marks a rectangle the *editor* inferred; once the user has said how big
   the screen is, there is nothing left to hedge about. The flag is re-set
   only by a fresh seed of a scene the statement is no longer part of.
-- **A size change re-packs its machine through the seeder's own abutment.**
-  Intra-machine geometry is the OS's fact and a machine drags rigidly, so
-  the one gesture that can open an intra-machine seam is a width that
-  changes. The re-pack reuses the seeding packing (each x derived from the
-  width actually drawn, monitors keeping their drawn order, the group
-  keeping its own leftmost edge and each rectangle its own `y`) rather than
-  restating it, because the model's abutment tolerance is zero and a seam a
-  unit out is not a seam at all. Its invariants — exact abutment,
-  non-overlap, determinism, idempotence, totality — are property-tested.
+- **A size change closes the seam it opened, in one row and by
+  translation.** Intra-machine geometry is the OS's fact and a machine drags
+  rigidly, so the one gesture that can open an intra-machine seam is a width
+  that changes. The repair slides the rectangles that were *following the
+  corrected one in its own row* — those whose vertical interval overlaps the
+  union of its old and new bands and whose left edge is at or beyond where
+  its right edge used to be — by the width delta, and touches nothing else.
+
+  Re-packing the **whole machine** into one abutting row was implemented
+  first and is wrong, because a group is not always one row: the
+  supplement that draws a live monitor the saved arrangement does not name
+  (the display plugged in after the layout was saved) sits on a *second*
+  row below the placed ones, and a saved arrangement may stack screens
+  deliberately. A whole-group re-pack moves rectangles the user never
+  touched, flattens the second row into the first, and opens a real gap in
+  the placed row's seam — saved that way, and unrecoverable inside the
+  editor, since groups drag rigidly and another correction re-packs
+  identically. A translation has none of that: it preserves every abutment
+  in the row exactly (the model's tolerance is zero), leaves every other
+  rectangle bit-identical, and is its own inverse. What it deliberately
+  does not repair is a collision with the *other* machine's group or with
+  the row below, both of which are blocking diagnostics with a recovery —
+  drag the groups apart, or state a smaller size. The invariants are
+  property-tested over multi-row machines: other rows bit-identical, the
+  corrected row still abutting, no new overlap, determinism, idempotence,
+  reversibility, totality.
+- **"Changed" is asked in millimetres, not in layout units.** The fields
+  hold whole millimetres and a rectangle is quarter-millimetres, so an
+  extent that is not a multiple of four — every extent the DIP fallback
+  seeds — does not survive a round trip through them. Asked in units, Apply
+  on *untouched* fields would nudge the geometry, dirty the scene, shift the
+  row and pin the transplant hold on a size nobody stated. One conversion
+  back (`mm_for_units`) therefore serves the pre-fill, the override's no-op
+  test, and the reset's — which is also what makes "use detected size"
+  enabled exactly when pressing it would do something.
 - **Preservation.** A stated size is user work, so the once-a-second
   transplant holds it exactly as it holds a dragged position, and holds it
   *harder*: unconditionally, including over an authoritative rectangle
