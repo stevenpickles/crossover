@@ -166,21 +166,17 @@ impl MachineScale {
     /// How big `monitor` is drawn under this rule.
     #[must_use]
     pub fn size_of(self, monitor: &LiveMonitor) -> SeededSize {
-        let pixels = (monitor.rect.width, monitor.rect.height);
         let dips = dip_pair(monitor);
-        match (believable(monitor), self.units_per_dip) {
+        match (measured_mm(monitor), self.units_per_dip) {
             // Measured: the panel's own millimetres, in the orientation the
             // OS is presenting it. Integer arithmetic throughout — a
             // believable size is at most 3000 mm, so the product is at most
             // 12 000 and nothing here can overflow or round.
-            (Some(size), _) => {
-                let (width_mm, height_mm) = oriented(size, pixels);
-                SeededSize {
-                    width: bound(width_mm * UNITS_PER_MM),
-                    height: bound(height_mm * UNITS_PER_MM),
-                    estimated: false,
-                }
-            }
+            (Some((width_mm, height_mm)), _) => SeededSize {
+                width: units_for_mm(width_mm),
+                height: units_for_mm(height_mm),
+                estimated: false,
+            },
             // Unmeasured, on a machine (or a pair) that measured something:
             // DIPs carried onto the measured monitors' scale, so the
             // rectangle is at least the right size relative to its
@@ -204,6 +200,33 @@ impl MachineScale {
     }
 }
 
+/// The panel's own measurement, in the millimetre axes the drawing uses —
+/// [`believable`] filtered and [`oriented`] to the pixel rectangle — or
+/// `None` where there is no size worth drawing from.
+///
+/// The one place a live monitor's millimetres are turned into a *drawn*
+/// pair, so the seeding arm above, the median below, and the editor's
+/// "use detected size" reset (`crate::model`) all mean the same thing by
+/// "the size this panel reports". A reset that re-derived the orientation
+/// for itself would put a portrait screen back landscape.
+#[must_use]
+pub fn measured_mm(monitor: &LiveMonitor) -> Option<(u32, u32)> {
+    believable(monitor).map(|size| oriented(size, (monitor.rect.width, monitor.rect.height)))
+}
+
+/// The drawn extent, in layout units, for a size in millimetres — the
+/// measured arm's own arithmetic, named so the manual override
+/// ([`crate::model::Model::set_size_mm`]) is literally that arm applied to
+/// a number the user typed rather than a second conversion beside it.
+///
+/// Bounded like every other extent this module produces. The bound is
+/// unreachable from a plausible size (3000 mm seeds 12 000 units) and is
+/// kept so the function is total for any `u32`.
+#[must_use]
+pub fn units_for_mm(millimetres: u32) -> u32 {
+    bound(millimetres.saturating_mul(UNITS_PER_MM))
+}
+
 /// The panel size to *draw from*, which is not simply the one the monitor
 /// reported: a size outside the shared plausible range
 /// (`crossover_topology::is_plausible_physical_size`) is treated exactly as
@@ -216,11 +239,13 @@ impl MachineScale {
 /// 1 mm does not draw one wrong rectangle — it seeds a four-unit sliver on
 /// a real crossing seam, too small to grab, while every other rectangle
 /// keeps its own scale; and one claiming 10 m seeds 40 000 units and dwarfs
-/// the scene. Neither is repairable in the editor until the manual override
-/// lands (feature/161), and both are reachable from a peer this machine
-/// merely trusts to be *itself*, not to be correct. Falling back to the
-/// estimate the module already computes costs the improvement for that one
-/// screen and nothing else.
+/// the scene. Both are reachable from a peer this machine merely trusts to
+/// be *itself*, not to be correct, and neither is a rectangle a user could
+/// comfortably take hold of to repair by hand. Falling back to the estimate
+/// the module already computes costs the improvement for that one screen
+/// and nothing else — and the manual override
+/// ([`crate::model::Model::set_size_mm`]) then corrects it from a
+/// believable starting rectangle rather than from a sliver.
 ///
 /// The range is `crossover-topology`'s rather than this module's precisely
 /// so that it is the same range the Windows EDID reader applies to local
@@ -253,8 +278,7 @@ pub fn median_mm_per_dip(monitors: &[LiveMonitor]) -> Option<f64> {
             // through: an implausible measurement must not steer the
             // rectangles of the screens that *did* measure believably,
             // which is precisely what letting it into this median would do.
-            let size = believable(monitor)?;
-            let (width_mm, height_mm) = oriented(size, (monitor.rect.width, monitor.rect.height));
+            let (width_mm, height_mm) = measured_mm(monitor)?;
             let (width_dip, height_dip) = dip_pair(monitor);
             // Both denominators are at least 1 (`dip_size` floors there), so
             // the sum cannot be zero and this cannot divide by zero.
@@ -350,7 +374,9 @@ fn to_extent(value: f64) -> u32 {
 mod tests {
     use proptest::prelude::*;
 
-    use super::{MachineScale, UNITS_PER_MM, dip_size, median_mm_per_dip};
+    use super::{
+        MachineScale, UNITS_PER_MM, dip_size, measured_mm, median_mm_per_dip, units_for_mm,
+    };
     use crossover_topology::{
         LayoutRect, LiveMonitor, MAX_MONITOR_EXTENT, MAX_PHYSICAL_SIZE_MM, MonitorId,
         PhysicalSizeMm,
@@ -382,6 +408,40 @@ mod tests {
             physical_size: Some(PhysicalSizeMm::new(width_mm, height_mm).unwrap()),
             ..monitor(width, height, scale_percent)
         }
+    }
+
+    /// What the editor's reset-to-detected offers is exactly what the
+    /// measured arm drew: the same believability filter and the same
+    /// orientation match, so the two cannot disagree about a panel.
+    #[test]
+    fn the_detected_size_a_reset_offers_is_the_one_the_seed_drew() {
+        let landscape = measured(2560, 1440, 100, 597, 336);
+        assert_eq!(measured_mm(&landscape), Some((597, 336)));
+        // Rotated: the panel measured itself in its own orientation, and
+        // the pair a reset re-draws from follows the pixels.
+        let portrait = measured(1440, 2560, 100, 597, 336);
+        assert_eq!(measured_mm(&portrait), Some((336, 597)));
+        // Unbelievable and absent are the same answer — there is nothing
+        // to reset *to* in either case.
+        assert_eq!(measured_mm(&measured(1920, 1080, 100, 1, 1)), None);
+        assert_eq!(measured_mm(&monitor(1920, 1080, 100)), None);
+
+        let drawn = MachineScale::of(std::slice::from_ref(&landscape), None).size_of(&landscape);
+        assert_eq!(
+            (drawn.width, drawn.height),
+            (units_for_mm(597), units_for_mm(336))
+        );
+    }
+
+    #[test]
+    fn millimetres_convert_to_units_and_stay_a_legal_extent() {
+        assert_eq!(units_for_mm(597), 597 * UNITS_PER_MM);
+        assert_eq!(units_for_mm(0), 1, "no rectangle is ever zero wide");
+        assert_eq!(
+            units_for_mm(u32::MAX),
+            MAX_MONITOR_EXTENT,
+            "total, and bounded"
+        );
     }
 
     #[test]

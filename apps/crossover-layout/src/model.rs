@@ -167,6 +167,31 @@ pub struct DrawnMonitor {
     /// platform knows about the panel today. That is an invariant of every
     /// path that builds or updates a group, [`transplant_group`] included.
     pub size_estimated: bool,
+    /// The panel's own believable measurement in millimetres, matched to
+    /// the orientation the OS is presenting it in
+    /// ([`crate::seeding::measured_mm`]) — `None` when the machine reported
+    /// no size, reported one no panel could have, or does not report this
+    /// monitor as live at all.
+    ///
+    /// A *fact*, re-read from the document on every poll rather than
+    /// transplanted: it is what the machine says the panel measures, which
+    /// is never the user's to edit. What it is for is the reset — "use
+    /// detected size" ([`Model::reset_to_detected_size`]) has somewhere to
+    /// go back **to** exactly when this is `Some` and the drawn rectangle
+    /// has been moved away from it.
+    pub detected_size_mm: Option<(u32, u32)>,
+    /// `true` when this rectangle's **size** is one the user stated in the
+    /// inspector — typed in millimetres, or reset to the detected
+    /// measurement (ADR 0018, addendum 2026-08-22, feature/161).
+    ///
+    /// Editor-only and never saved: what a save writes is the rectangle,
+    /// and a saved rectangle is authoritative on the way back in, which is
+    /// the whole reason an override needs no persistence of its own. This
+    /// flag exists for the *unsaved* window, where it is what
+    /// [`transplant_group`] holds an extent by — a stated size is user work
+    /// exactly as a dragged position is, and the once-a-second poll must no
+    /// more resize it than move it.
+    pub size_edited: bool,
 }
 
 /// One machine's monitors, drawn.
@@ -178,6 +203,27 @@ pub struct MachineGroup {
 }
 
 impl MachineGroup {
+    /// This machine's monitors in the shape [`crate::caption`] reads.
+    ///
+    /// Here rather than in either caller because both of them need it and
+    /// both must get the *same* answer: the canvas paints a caption inside
+    /// each rectangle, and the inspector names the rectangle it is talking
+    /// about. Two adapters would be two chances for the panel to call a
+    /// screen something the picture does not.
+    #[must_use]
+    pub fn caption_inputs(&self) -> Vec<crate::caption::CaptionInput<'_>> {
+        self.monitors
+            .iter()
+            .map(|monitor| crate::caption::CaptionInput {
+                id: &monitor.id,
+                label: monitor.label.as_ref(),
+                ordinal: monitor.ordinal,
+                native_size: monitor.native_size,
+                size_estimated: monitor.size_estimated,
+            })
+            .collect()
+    }
+
     /// The union of every monitor's rectangle, or `None` for an empty group
     /// (never produced by [`Model::from_state`], but not assumed away).
     #[must_use]
@@ -326,6 +372,14 @@ pub struct Model {
     /// saved. The Save button's first condition, and what an attempt to
     /// close the window asks about.
     dirty: bool,
+    /// The monitor the pointer last took hold of, if it is still drawn —
+    /// what the inspector talks about (`crate::inspector`).
+    ///
+    /// Not unsaved work: a selection is a place to look, and losing one
+    /// costs a click. It is carried across a poll all the same
+    /// ([`Model::adopt_selection_from`]), because an inspector that emptied
+    /// itself once a second would be unusable for the one job it has.
+    selected: Option<MonitorKey>,
     /// The drag in progress, if any.
     drag: Option<Drag>,
     /// What the shared validation makes of the scene as it stands,
@@ -521,6 +575,7 @@ impl Model {
             rejected_layout,
             seen_revision,
             dirty: false,
+            selected: None,
             drag: None,
             diagnostics: Diagnostics::default(),
         };
@@ -731,6 +786,153 @@ impl Model {
         hit
     }
 
+    /// The monitor the inspector is talking about, if any.
+    #[must_use]
+    pub const fn selected(&self) -> Option<&MonitorKey> {
+        self.selected.as_ref()
+    }
+
+    /// One drawn monitor and the machine it belongs to, by key — how the
+    /// inspector reads the scene without a second copy of the lookup.
+    #[must_use]
+    pub fn find(&self, target: &MonitorKey) -> Option<(&MachineGroup, &DrawnMonitor)> {
+        let group = self.groups().find(|group| group.device == target.device)?;
+        let monitor = group.monitors.iter().find(|drawn| drawn.id == target.id)?;
+        Some((group, monitor))
+    }
+
+    /// Select the monitor drawn at `point` (layout space), or clear the
+    /// selection when the pointer landed on empty canvas.
+    ///
+    /// Clearing on a miss rather than keeping the last selection: a click
+    /// on the background is the ordinary way to mean "never mind", and an
+    /// inspector still describing a rectangle the user has stopped pointing
+    /// at is worse than an empty one.
+    pub fn select_at(&mut self, point: (f64, f64)) {
+        self.selected = self.monitor_at(point);
+    }
+
+    /// Select `target` outright, or clear the selection with `None`.
+    /// Ignores a key no group holds, for [`Model::begin_drag`]'s reason.
+    pub fn select(&mut self, target: Option<&MonitorKey>) {
+        self.selected = target.filter(|key| self.find(key).is_some()).cloned();
+    }
+
+    /// Keep `previous`'s selection, if the monitor it names is still drawn.
+    ///
+    /// Deliberately separate from [`Model::transplant_from`] and called
+    /// unconditionally by the poll (`crate::session`): a transplant only
+    /// happens when there is *unsaved work*, and a selection on a clean
+    /// scene is neither unsaved nor work — but it still has to survive the
+    /// once-a-second rebuild, or the inspector would blink empty while the
+    /// user was reading it.
+    pub fn adopt_selection_from(&mut self, previous: &Self) {
+        self.select(previous.selected.as_ref());
+    }
+
+    /// Draw `target` at `width_mm` × `height_mm` **millimetres** — the
+    /// manual size override (ADR 0018, addendum 2026-08-22).
+    ///
+    /// The drawn rectangle *is* the size (ADR 0018: crossings map
+    /// proportionally along drawn edges), so correcting a screen the
+    /// platform measured wrongly — or could not measure at all — is
+    /// resizing its rectangle and nothing more. There is no new persistence
+    /// here and no schema change anywhere: the arrangement a save writes
+    /// already carries every rectangle's extent, and reads it back as
+    /// authoritative.
+    ///
+    /// The millimetres are **clamped** into the shared plausible range
+    /// (`crossover_topology::MIN_PLAUSIBLE_PHYSICAL_MM`..=`MAX_…`) so this
+    /// is total for any input. That clamp is a floor under the operation,
+    /// not the gate the user meets: `crate::inspector` *rejects* an
+    /// out-of-range entry with a message rather than silently drawing
+    /// something other than what was typed, which is the only honest answer
+    /// to a number that cannot be a panel.
+    ///
+    /// Returns whether anything changed. Re-stating the size a measured
+    /// rectangle already has changes nothing and does not dirty the scene;
+    /// stating the size of an *estimated* one does, because it replaces a
+    /// guess with the user's own statement and clears the badge that said
+    /// so.
+    pub fn set_size_mm(&mut self, target: &MonitorKey, width_mm: u32, height_mm: u32) -> bool {
+        let plausible = |millimetres: u32| {
+            millimetres.clamp(
+                u32::from(crossover_topology::MIN_PLAUSIBLE_PHYSICAL_MM),
+                u32::from(crossover_topology::MAX_PLAUSIBLE_PHYSICAL_MM),
+            )
+        };
+        self.resize(
+            target,
+            (
+                seeding::units_for_mm(plausible(width_mm)),
+                seeding::units_for_mm(plausible(height_mm)),
+            ),
+        )
+    }
+
+    /// Draw `target` at the size its own machine says the panel measures —
+    /// the "use detected size" reset, which undoes an override (or a seed
+    /// the user has decided against) without them having to remember what
+    /// the platform originally said.
+    ///
+    /// Does nothing, and reports `false`, when there is no believable
+    /// detected size to go back to ([`DrawnMonitor::detected_size_mm`]) or
+    /// when the rectangle is already drawn at it — which is exactly the
+    /// condition the inspector disables the control on, so the two agree by
+    /// construction rather than by two copies of a rule.
+    pub fn reset_to_detected_size(&mut self, target: &MonitorKey) -> bool {
+        let Some((_, monitor)) = self.find(target) else {
+            return false;
+        };
+        let Some((width_mm, height_mm)) = monitor.detected_size_mm else {
+            return false;
+        };
+        self.resize(
+            target,
+            (
+                seeding::units_for_mm(width_mm),
+                seeding::units_for_mm(height_mm),
+            ),
+        )
+    }
+
+    /// The one place a monitor's drawn extent changes: set it, clear the
+    /// badge, mark the size as the user's, re-pack its machine so the seam
+    /// beside it does not open, and re-validate.
+    ///
+    /// Re-packing is the seeder's own left-to-right abutment
+    /// ([`repack_group`]), not a second rule: a machine's monitors touch
+    /// because each x is derived from the width actually drawn, so a width
+    /// that changes has to be followed by the same derivation or the model
+    /// — whose abutment tolerance is zero (ADR 0018) — sees a gap where the
+    /// user sees a seam.
+    fn resize(&mut self, target: &MonitorKey, size: (u32, u32)) -> bool {
+        let Some(group) = self.group_mut(target.device) else {
+            return false;
+        };
+        let Some(monitor) = group
+            .monitors
+            .iter_mut()
+            .find(|drawn| drawn.id == target.id)
+        else {
+            return false;
+        };
+        if (monitor.rect.width, monitor.rect.height) == size && !monitor.size_estimated {
+            return false;
+        }
+        monitor.rect.width = size.0;
+        monitor.rect.height = size.1;
+        // The user has said how big this screen is, so it is no longer one
+        // of the rectangles the canvas hedges about (ADR 0018's badge marks
+        // a *guess*, and this is a statement).
+        monitor.size_estimated = false;
+        monitor.size_edited = true;
+        repack_group(group);
+        self.dirty = true;
+        self.diagnostics = self.compute_diagnostics();
+        true
+    }
+
     /// Take hold of `target`'s **machine** — every monitor of it — with
     /// the pointer at `grab`, drawn through `viewport`.
     ///
@@ -758,6 +960,11 @@ impl Model {
             .filter(|other| other.device != target.device)
             .flat_map(|other| other.monitors.iter().map(|drawn| drawn.rect))
             .collect();
+        // Taking hold of a rectangle is also pointing at it: the inspector
+        // follows the same gesture the drag does, so a user who moved a
+        // machine to look at one screen does not then have to click it
+        // again to correct its size.
+        self.selected = Some(target.clone());
         self.drag = Some(Drag {
             device: target.device,
             grab,
@@ -903,7 +1110,17 @@ impl Model {
 ///
 /// A monitor the previous scene also drew always takes that scene's
 /// **position**. Whether it also keeps that scene's **extent** is one
-/// question with two halves, and both halves have to hold:
+/// question, and the first answer to it outranks the rest: **a size the
+/// user stated in the inspector is kept, full stop**
+/// ([`DrawnMonitor::size_edited`]). That is the same rule as the position's
+/// — an override exists nowhere but this window until it is saved — and it
+/// is unconditional because neither of the two conditions below is evidence
+/// against it: an authoritative rectangle's saved size is exactly what an
+/// override is correcting, and a resolution or DPI change is news about the
+/// pixels rather than about the panel's millimetres.
+///
+/// For every other rectangle the question has two halves, and both halves
+/// have to hold:
 ///
 /// - **Is the fresh rectangle a seed?** Only a seed's extent is this
 ///   module's to hold on to. A rectangle a validated arrangement placed is
@@ -945,6 +1162,19 @@ fn transplant_group(fresh: &mut MachineGroup, previous: &MachineGroup) {
     };
     for monitor in &mut fresh.monitors {
         match previous.monitors.iter().find(|was| was.id == monitor.id) {
+            Some(was) if was.size_edited => {
+                // A size the user *stated* is user work, held exactly as a
+                // dragged position is — including over an authoritative
+                // rectangle, whose saved size is precisely what the user is
+                // in the middle of correcting, and including across a
+                // resolution or DPI change, which are news about the pixels
+                // and say nothing about how many millimetres wide the panel
+                // is. The badge travels with it: a stated size is not a
+                // guess, whatever a fresh seed would have made of it.
+                monitor.rect = was.rect;
+                monitor.size_estimated = false;
+                monitor.size_edited = true;
+            }
             Some(was) if !monitor.authoritative && describes_the_same_screen(was, monitor) => {
                 // A seed, for a screen that has not changed: the rectangle
                 // the user is arranging stands whole, and the badge travels
@@ -1172,32 +1402,112 @@ fn seed_monitors(
     let mut ordered: Vec<&LiveMonitor> = monitors.iter().collect();
     ordered.sort_by_key(|m| (m.rect.x, m.rect.y));
 
-    let mut x = start_x;
-    let mut drawn = Vec::with_capacity(ordered.len());
-    for (index, monitor) in ordered.into_iter().enumerate() {
-        let size = scale.size_of(monitor);
-        drawn.push(DrawnMonitor {
+    let sizes: Vec<seeding::SeededSize> = ordered
+        .iter()
+        .map(|monitor| scale.size_of(monitor))
+        .collect();
+    let lefts = abutting_lefts(start_x, sizes.iter().map(|size| size.width));
+
+    ordered
+        .into_iter()
+        .zip(sizes)
+        .enumerate()
+        .map(|(index, (monitor, seeded))| DrawnMonitor {
             id: monitor.id.clone(),
             label: monitor.label.clone(),
             ordinal: starting_ordinal + index + 1,
             rect: LayoutRect {
-                x: clamp_coordinate(x),
+                x: lefts[index],
                 y,
-                width: size.width,
-                height: size.height,
+                width: seeded.width,
+                height: seeded.height,
             },
             native_size: Some((monitor.rect.width, monitor.rect.height)),
             native_scale_percent: Some(monitor.scale_percent),
             authoritative: false,
-            size_estimated: size.estimated,
-        });
-        // Abutment is a property of this line: the next rectangle starts at
-        // exactly the width the last one was drawn at, whatever decided
-        // that width. A seam the user can see is a seam the layout model
-        // sees too, since its abutment test has zero tolerance (ADR 0018).
-        x += i64::from(size.width);
+            size_estimated: seeded.estimated,
+            detected_size_mm: seeding::measured_mm(monitor),
+            size_edited: false,
+        })
+        .collect()
+}
+
+/// The left edges of a row of rectangles of the given `widths`, laid out
+/// **abutting** from `start_x` in the order given: each one begins exactly
+/// where the last one ended.
+///
+/// Abutment is a property of this one line of arithmetic — `x +=
+/// width` — and it is shared rather than repeated because two callers now
+/// depend on it meaning the same thing: [`seed_monitors`], which packs a
+/// machine the first time it is drawn, and [`repack_group`], which packs it
+/// again after the user has corrected one rectangle's size. A seam the user
+/// can see must be a seam the layout model sees too, and the model's
+/// abutment test has zero tolerance (ADR 0018), so a re-pack that was a
+/// unit out would silently stop a crossing working.
+///
+/// Total: `clamp_coordinate` holds an adversarially wide row inside the
+/// layout coordinate space, at the cost of the abutment it would not have
+/// been able to express anyway (such an arrangement is refused by
+/// `Layout::new` and cannot be saved).
+fn abutting_lefts(start_x: i64, widths: impl Iterator<Item = u32>) -> Vec<i32> {
+    let mut x = start_x;
+    widths
+        .map(|width| {
+            let left = clamp_coordinate(x);
+            x += i64::from(width);
+            left
+        })
+        .collect()
+}
+
+/// Re-pack `group` so its monitors abut left to right again, in the order
+/// they are currently drawn in, from wherever the group currently starts.
+///
+/// Called after a size correction, and only then: a *drag* moves the whole
+/// group rigidly and cannot open a seam, while a width that changes leaves
+/// every rectangle to its right where it was — a gap on one side or an
+/// overlap on the other, neither of which the user asked for.
+///
+/// Three deliberate choices about what is preserved:
+///
+/// - **The order is the drawn one**, taken from the current left edges
+///   rather than from the group's vector order (which is live-geometry
+///   order for a seed and id order for a saved arrangement). What the user
+///   is looking at is the arrangement; re-packing must not permute it.
+/// - **The anchor is the group's own leftmost edge**, so a machine the user
+///   has already dragged into place does not jump back to where it was
+///   seeded.
+/// - **Every rectangle keeps its own `y`.** The packing axis is horizontal;
+///   a vertical offset in a saved arrangement is the user's and is none of
+///   this function's business.
+fn repack_group(group: &mut MachineGroup) {
+    let Some(start_x) = group
+        .monitors
+        .iter()
+        .map(|monitor| monitor.rect.left())
+        .min()
+    else {
+        return;
+    };
+    // Ordered by where each rectangle is drawn now, with the id as a final
+    // tie-break so two rectangles at the same point (which is not a legal
+    // arrangement, but is a reachable one) pack deterministically.
+    let mut order: Vec<usize> = (0..group.monitors.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (first, second) = (&group.monitors[a], &group.monitors[b]);
+        (first.rect.x, first.rect.y, first.id.as_str()).cmp(&(
+            second.rect.x,
+            second.rect.y,
+            second.id.as_str(),
+        ))
+    });
+    let lefts = abutting_lefts(
+        start_x,
+        order.iter().map(|&index| group.monitors[index].rect.width),
+    );
+    for (slot, &index) in order.iter().enumerate() {
+        group.monitors[index].rect.x = lefts[slot];
     }
-    drawn
 }
 
 /// The bounding box of some already-drawn monitors, in `i64` — the
@@ -1262,6 +1572,11 @@ fn authoritative_group(
                 // nothing about it is estimated — not even when the panel
                 // behind it declines to measure itself today.
                 size_estimated: false,
+                // But what the panel says about itself is still worth
+                // carrying: it is what "use detected size" goes back to
+                // when a saved rectangle is the one that is wrong.
+                detected_size_mm: live.and_then(seeding::measured_mm),
+                size_edited: false,
             }
         })
         .collect();
@@ -1322,9 +1637,9 @@ mod tests {
         LOCAL_DEVICE as LOCAL, PEER_DEVICE as PEER, drag_by, monitor_key as key, unit_viewport,
     };
     use crossover_topology::{
-        DeviceId, DevicePair, Layout, LayoutRect, LayoutState, LiveMonitor, MachineState,
-        MonitorId, MonitorLabel, PeerState, PhysicalSizeMm, PlacedMonitor, TOPOLOGY_STATE_VERSION,
-        TopologyState,
+        DeviceId, DevicePair, Layout, LayoutRect, LayoutState, LiveMonitor, MAX_MONITOR_EXTENT,
+        MachineState, MonitorId, MonitorKey, MonitorLabel, PeerState, PhysicalSizeMm,
+        PlacedMonitor, TOPOLOGY_STATE_VERSION, TopologyState,
     };
 
     fn live(id: &str, x: i32, width: u32, height: u32, scale_percent: u16) -> LiveMonitor {
@@ -2273,7 +2588,339 @@ mod tests {
         assert_eq!(model.seen_revision, 12);
     }
 
+    /// A machine of two screens, one measured and one not, with a peer —
+    /// the fixture the override tests correct something on.
+    fn measured(id: &str, x: i32, width_mm: u16, height_mm: u16) -> LiveMonitor {
+        LiveMonitor {
+            physical_size: Some(PhysicalSizeMm::new(width_mm, height_mm).unwrap()),
+            ..live(id, x, 1920, 1080, 100)
+        }
+    }
+
+    fn two_screen_desk() -> Model {
+        Model::from_state(&state(
+            vec![
+                measured(r"\\.\DISPLAY1", 0, 597, 336),
+                live(r"\\.\DISPLAY2", 1920, 1920, 1080, 100),
+            ],
+            vec![measured(r"\\.\DISPLAY1", 0, 286, 179)],
+            None,
+        ))
+    }
+
+    /// The override, at the level the drawing cares about: the rectangle is
+    /// the size the user stated, the machine still abuts itself, and the
+    /// scene is dirty exactly as a drag leaves it.
+    #[test]
+    fn stating_a_size_redraws_the_rectangle_and_keeps_the_machine_abutting() {
+        let mut model = two_screen_desk();
+        let anchor = model.local.monitors[0].rect.left();
+
+        assert!(model.set_size_mm(&key(LOCAL, r"\\.\DISPLAY1"), 500, 300));
+
+        let drawn = &model.local.monitors;
+        assert_eq!(drawn[0].rect.width, 500 * UNITS_PER_MM);
+        assert_eq!(drawn[0].rect.height, 300 * UNITS_PER_MM);
+        assert_eq!(
+            drawn[0].rect.left(),
+            anchor,
+            "the machine stays where the user put it"
+        );
+        assert_eq!(
+            drawn[0].rect.right(),
+            drawn[1].rect.left(),
+            "and the seam beside it stays exactly closed: {drawn:?}"
+        );
+        assert!(model.is_dirty(), "an override is an edit like any other");
+        assert!(model.can_save(), "and it is savable");
+    }
+
+    /// A size no panel could be is held off at the model layer too, so the
+    /// operation is total whatever calls it — the *user* meets a refusal
+    /// with a reason instead (`inspector.rs`), which is the honest answer to
+    /// a number that cannot be a screen.
+    #[test]
+    fn a_stated_size_is_held_inside_the_plausible_range() {
+        let mut model = two_screen_desk();
+        assert!(model.set_size_mm(&key(LOCAL, r"\\.\DISPLAY1"), 0, 99_999));
+        let rect = model.local.monitors[0].rect;
+        assert_eq!(
+            rect.width,
+            u32::from(crossover_topology::MIN_PLAUSIBLE_PHYSICAL_MM) * UNITS_PER_MM
+        );
+        assert_eq!(
+            rect.height,
+            u32::from(crossover_topology::MAX_PLAUSIBLE_PHYSICAL_MM) * UNITS_PER_MM
+        );
+    }
+
+    /// Requirement of the badge: a rectangle whose size the user stated is
+    /// no longer a guess, so the `(size estimated)` cue goes — and it comes
+    /// back if the statement itself goes, because a fresh seed of the same
+    /// document is a scene with no override in it at all.
+    #[test]
+    fn stating_a_size_clears_the_estimated_badge_and_a_fresh_seed_restores_it() {
+        let mut model = two_screen_desk();
+        assert!(
+            model.local.monitors[1].size_estimated,
+            "the fixture's second screen could not measure itself"
+        );
+
+        model.set_size_mm(&key(LOCAL, r"\\.\DISPLAY2"), 400, 250);
+        assert!(!model.local.monitors[1].size_estimated);
+        assert!(model.local.monitors[1].size_edited);
+
+        // The same document, drawn again with nothing carried over: the
+        // seed's own verdict stands, badge included.
+        assert!(two_screen_desk().local.monitors[1].size_estimated);
+    }
+
+    /// "Use detected size" puts a rectangle back on its machine's own
+    /// measurement — and offers nothing where there is no measurement to go
+    /// back to, which is exactly the `(size estimated)` case.
+    #[test]
+    fn a_reset_returns_a_rectangle_to_the_measurement_its_machine_reported() {
+        let mut model = two_screen_desk();
+        model.set_size_mm(&key(LOCAL, r"\\.\DISPLAY1"), 500, 300);
+        assert!(model.reset_to_detected_size(&key(LOCAL, r"\\.\DISPLAY1")));
+        assert_eq!(model.local.monitors[0].rect.width, 597 * UNITS_PER_MM);
+        assert_eq!(model.local.monitors[0].rect.height, 336 * UNITS_PER_MM);
+        assert!(
+            !model.reset_to_detected_size(&key(LOCAL, r"\\.\DISPLAY1")),
+            "already there"
+        );
+
+        // Nothing measured this one, so there is nothing to reset it to.
+        assert_eq!(model.local.monitors[1].detected_size_mm, None);
+        assert!(!model.reset_to_detected_size(&key(LOCAL, r"\\.\DISPLAY2")));
+    }
+
+    /// A rotated screen resets to the panel's millimetres **in the
+    /// orientation it is being presented in** — the seeder's rule, shared
+    /// rather than re-derived, or a portrait screen would reset to a
+    /// landscape rectangle.
+    #[test]
+    fn a_reset_follows_the_pixels_the_way_the_seed_does() {
+        let portrait = LiveMonitor {
+            physical_size: Some(PhysicalSizeMm::new(597, 336).unwrap()),
+            ..live(r"\\.\DISPLAY1", 0, 1440, 2560, 100)
+        };
+        let mut model = Model::from_state(&state(
+            vec![portrait],
+            vec![measured(r"\\.\DISPLAY1", 0, 286, 179)],
+            None,
+        ));
+        model.set_size_mm(&key(LOCAL, r"\\.\DISPLAY1"), 500, 500);
+        model.reset_to_detected_size(&key(LOCAL, r"\\.\DISPLAY1"));
+        let rect = model.local.monitors[0].rect;
+        assert_eq!(
+            (rect.width, rect.height),
+            (336 * UNITS_PER_MM, 597 * UNITS_PER_MM)
+        );
+    }
+
+    /// **The preservation rule**: an override is work that exists nowhere
+    /// but this window until it is saved, so the once-a-second poll must no
+    /// more resize it than it would move a dragged machine back.
+    #[test]
+    fn an_override_survives_the_poll_that_lands_mid_edit() {
+        let document = state(
+            vec![
+                measured(r"\\.\DISPLAY1", 0, 597, 336),
+                live(r"\\.\DISPLAY2", 1920, 1920, 1080, 100),
+            ],
+            vec![measured(r"\\.\DISPLAY1", 0, 286, 179)],
+            None,
+        );
+        let mut edited = Model::from_state(&document);
+        edited.set_size_mm(&key(LOCAL, r"\\.\DISPLAY2"), 400, 250);
+        let stated = edited.local.monitors[1].rect;
+
+        // The next read of the state file, unchanged — and, in the second
+        // half, one in which the worker has finally read that panel's EDID.
+        for later in [document.clone(), {
+            let mut later = document.clone();
+            later.local.monitors[1].physical_size = Some(PhysicalSizeMm::new(600, 340).unwrap());
+            later
+        }] {
+            let mut fresh = Model::from_state(&later);
+            fresh.transplant_from(&edited);
+            assert_eq!(
+                fresh.local.monitors[1].rect, stated,
+                "the size the user stated is theirs, not the seed's"
+            );
+            assert!(!fresh.local.monitors[1].size_estimated);
+            assert!(fresh.local.monitors[1].size_edited, "and it stays held");
+            assert!(fresh.is_dirty());
+        }
+    }
+
+    /// The same hold over an **authoritative** rectangle, which is the case
+    /// the position-only transplant would otherwise undo once a second: the
+    /// saved size is precisely what an override is correcting, so it cannot
+    /// be allowed to win over the correction.
+    #[test]
+    fn an_override_of_a_saved_rectangle_is_not_undone_by_the_next_read() {
+        let document = state(
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            Some(side_by_side_layout()),
+        );
+        let mut edited = Model::from_state(&document);
+        assert!(edited.local.monitors[0].authoritative);
+        edited.set_size_mm(&key(LOCAL, r"\\.\DISPLAY1"), 597, 336);
+        let stated = edited.local.monitors[0].rect;
+        assert_ne!(stated.width, 1920, "the fixture must actually differ");
+
+        let mut fresh = Model::from_state(&document);
+        fresh.transplant_from(&edited);
+        assert_eq!(fresh.local.monitors[0].rect, stated);
+    }
+
+    /// After a save the override needs no protection at all: what was
+    /// written is a rectangle, and a rectangle read back from a saved
+    /// arrangement is authoritative and never re-seeded. That is the whole
+    /// reason an override needs no persistence of its own.
+    #[test]
+    fn an_override_survives_a_save_and_a_restart_as_an_ordinary_rectangle() {
+        let mut model = two_screen_desk();
+        model.set_size_mm(&key(LOCAL, r"\\.\DISPLAY2"), 400, 250);
+        let stated = model.local.monitors[1].rect;
+
+        // Exactly what `save.rs` writes, read back the way the worker
+        // republishes it — a fresh editor, with nothing carried over.
+        let layout = model.to_layout(9).expect("the arrangement is valid");
+        let reopened = Model::from_state(&state(
+            vec![
+                measured(r"\\.\DISPLAY1", 0, 597, 336),
+                live(r"\\.\DISPLAY2", 1920, 1920, 1080, 100),
+            ],
+            vec![measured(r"\\.\DISPLAY1", 0, 286, 179)],
+            Some(LayoutState::from_layout(&layout)),
+        ));
+
+        let drawn = reopened
+            .local
+            .monitors
+            .iter()
+            .find(|monitor| monitor.id.as_str() == r"\\.\DISPLAY2")
+            .expect("the overridden screen is placed");
+        assert!(drawn.authoritative);
+        assert_eq!(drawn.rect, stated, "the stated size came back");
+        assert!(!drawn.size_estimated, "and it is nobody's guess now");
+        assert!(!reopened.is_dirty());
+    }
+
+    /// A click selects, a click on nothing clears, and a selection whose
+    /// monitor has left the scene is not carried onto one that no longer
+    /// draws it.
+    #[test]
+    fn a_selection_points_at_a_drawn_monitor_or_at_nothing() {
+        let mut model = two_screen_desk();
+        model.select_at((10.0, 10.0));
+        assert_eq!(model.selected(), Some(&key(LOCAL, r"\\.\DISPLAY1")));
+
+        model.select_at((-5_000.0, -5_000.0));
+        assert_eq!(model.selected(), None, "empty canvas means never mind");
+
+        // Taking hold of a machine also points at the screen grabbed.
+        model.begin_drag(&key(LOCAL, r"\\.\DISPLAY2"), (0.0, 0.0), unit_viewport());
+        model.end_drag();
+        assert_eq!(model.selected(), Some(&key(LOCAL, r"\\.\DISPLAY2")));
+
+        // The screen is unplugged: a scene that does not draw it cannot
+        // point at it.
+        let mut fresh = Model::from_state(&state(
+            vec![measured(r"\\.\DISPLAY1", 0, 597, 336)],
+            vec![measured(r"\\.\DISPLAY1", 0, 286, 179)],
+            None,
+        ));
+        fresh.adopt_selection_from(&model);
+        assert_eq!(fresh.selected(), None);
+    }
+
     proptest! {
+        /// The re-pack's invariants, over any desk and any size a user
+        /// could state: a machine's rectangles still abut **exactly** (the
+        /// model's tolerance is zero), none of them overlap, the group has
+        /// not walked away from where it was, and the operation is total.
+        #[test]
+        fn a_stated_size_repacks_the_machine_without_opening_or_overlapping_a_seam(
+            local in any_machine("L"),
+            peer in any_machine("P"),
+            index in 0usize..6,
+            width_mm in 50u32..=3_000,
+            height_mm in 50u32..=3_000,
+        ) {
+            let document = state(local, peer, None);
+            let mut model = Model::from_state(&document);
+            let Some(target) = model
+                .local
+                .monitors
+                .get(index % model.local.monitors.len())
+                .map(|monitor| MonitorKey { device: LOCAL, id: monitor.id.clone() })
+            else {
+                return Ok(());
+            };
+            let anchor = model
+                .local
+                .monitors
+                .iter()
+                .map(|monitor| monitor.rect.left())
+                .min();
+
+            model.set_size_mm(&target, width_mm, height_mm);
+
+            let drawn: Vec<LayoutRect> =
+                model.local.monitors.iter().map(|monitor| monitor.rect).collect();
+            prop_assert_eq!(
+                drawn.iter().map(|rect| rect.left()).min(),
+                anchor,
+                "the machine moved: {:?}",
+                drawn
+            );
+            for pair in drawn.windows(2) {
+                prop_assert_eq!(
+                    pair[0].right(),
+                    pair[1].left(),
+                    "a seam opened: {:?}",
+                    drawn
+                );
+            }
+            for (position, first) in drawn.iter().enumerate() {
+                prop_assert!((1..=MAX_MONITOR_EXTENT).contains(&first.width));
+                prop_assert!((1..=MAX_MONITOR_EXTENT).contains(&first.height));
+                for second in &drawn[position + 1..] {
+                    prop_assert!(!first.overlaps(*second), "{first:?} overlaps {second:?}");
+                }
+            }
+        }
+
+        /// Determinism: the same statement about the same scene draws the
+        /// same thing, and stating it twice changes nothing the second
+        /// time — a re-pack that drifted would walk a machine across the
+        /// canvas one correction at a time.
+        #[test]
+        fn stating_a_size_is_deterministic_and_idempotent(
+            local in any_machine("L"),
+            width_mm in 50u32..=3_000,
+            height_mm in 50u32..=3_000,
+        ) {
+            let document = state(local, vec![live(r"\\.\P0", 0, 1920, 1080, 100)], None);
+            let target = MonitorKey {
+                device: LOCAL,
+                id: Model::from_state(&document).local.monitors[0].id.clone(),
+            };
+
+            let mut once = Model::from_state(&document);
+            once.set_size_mm(&target, width_mm, height_mm);
+            let mut twice = Model::from_state(&document);
+            twice.set_size_mm(&target, width_mm, height_mm);
+            twice.set_size_mm(&target, width_mm, height_mm);
+
+            prop_assert_eq!(&once.local.monitors, &twice.local.monitors);
+        }
+
         /// Rigidity under any drag at all: whatever the pointer does, the
         /// dragged machine's rectangles keep exactly the relative
         /// positions and sizes the OS gave them.

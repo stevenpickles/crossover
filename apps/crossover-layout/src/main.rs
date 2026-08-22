@@ -38,6 +38,7 @@
 
 mod app;
 mod caption;
+mod inspector;
 mod logging;
 mod model;
 mod paths;

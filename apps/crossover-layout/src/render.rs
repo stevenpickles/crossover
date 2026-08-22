@@ -23,10 +23,12 @@
 
 use eframe::egui::{self, Color32};
 
+use crate::inspector::{Inspector, MonitorFacts, Request};
 use crate::model::{Diagnostics, MachineGroup, Model, Severity};
 use crate::session::{EditorSession, Freshness};
 use crate::snap::{Axis, Guide};
 use crate::viewport::Viewport;
+use crossover_topology::MonitorKey;
 
 /// Screen-space margin around the drawn arrangement, so a monitor's stroke
 /// and its label are never flush against the window edge.
@@ -55,6 +57,16 @@ const UNPLACED_STROKE_ALPHA: f32 = 0.55;
 /// the ordinary outline, so an offender is obvious without reading the
 /// status bar.
 const OFFENDER_STROKE_WIDTH: f32 = 2.5;
+
+/// How far outside a selected monitor's rectangle its selection ring is
+/// drawn — outside rather than on the stroke, so selecting a screen never
+/// changes the size or the colour of the shape whose *size* the inspector
+/// is about to talk about.
+const SELECTION_RING_GAP: f32 = 2.5;
+
+/// The size inspector's starting width, in points. Wide enough for the two
+/// millimetre fields side by side under a caption, and resizable.
+const INSPECTOR_WIDTH: f32 = 232.0;
 
 /// Everything the frame draws that is not the scene or the session: the
 /// last save's outcome, and whether the close-confirmation is up.
@@ -104,17 +116,28 @@ pub enum CloseChoice {
 pub fn draw_frame(
     ui: &mut egui::Ui,
     session: &mut EditorSession,
+    inspector: &mut Inspector,
     chrome: Chrome<'_>,
 ) -> FrameOutcome {
     let mut outcome = FrameOutcome::default();
-    // The two edge panels claim their strips before the central panel
-    // takes the rest — the one order that leaves all three any space.
+    // The fields describe whatever the canvas has selected, before anything
+    // is drawn from them (`inspector.rs`).
+    inspector.sync(session.model());
+    // The edge panels claim their strips before the central panel takes the
+    // rest — the one order that leaves all of them any space.
     egui::Panel::top("toolbar").show(ui, |ui| {
         outcome.save_requested = draw_toolbar(ui, session);
     });
     egui::Panel::bottom("status_bar").show(ui, |ui| {
         draw_status_bar(ui, session, chrome);
     });
+    if session.model().is_some() {
+        egui::Panel::right("inspector")
+            .default_size(INSPECTOR_WIDTH)
+            .show(ui, |ui| {
+                draw_inspector(ui, session, inspector);
+            });
+    }
     egui::CentralPanel::default().show(ui, |ui| {
         draw_central(ui, session);
     });
@@ -163,6 +186,148 @@ fn draw_toolbar(ui: &mut egui::Ui, session: &EditorSession) -> bool {
         }
     });
     clicked
+}
+
+/// The size inspector: what the selected screen is, how big it is drawn,
+/// and the two millimetre fields that correct it.
+///
+/// A projection, as thin as the canvas is: every rule it needs — what the
+/// screen is called, what the fields hold, when they refill, what the
+/// aspect lock does, which entries are refused and in what words, whether
+/// the reset has anywhere to go — is `crate::inspector`'s, tested without a
+/// window. What is here is widgets, and which of them was clicked.
+fn draw_inspector(ui: &mut egui::Ui, session: &mut EditorSession, inspector: &mut Inspector) {
+    ui.add_space(4.0);
+    ui.heading("Screen size");
+    ui.add_space(6.0);
+
+    let facts = inspector.target().and_then(|target| {
+        session
+            .model()
+            .and_then(|model| crate::inspector::facts(model, target))
+    });
+    let Some(facts) = facts else {
+        // The empty state of a panel, in the manner of the editor's other
+        // empty states: what to do, not an apology for having nothing.
+        ui.label("Click a screen to see the size it is drawn at, and to correct it.");
+        return;
+    };
+
+    draw_inspector_identity(ui, &facts);
+    ui.add_space(8.0);
+    let request = draw_size_fields(ui, inspector, &facts);
+    if let Some((request, model)) = request.zip(session.model_mut()) {
+        inspector.act(model, request);
+    }
+    if let Some(message) = inspector.message() {
+        ui.add_space(6.0);
+        let color = if message.refused {
+            ui.visuals().error_fg_color
+        } else {
+            ui.visuals().text_color()
+        };
+        ui.colored_label(color, &message.text);
+    }
+}
+
+/// Which screen the fields below are about: its machine, its caption, its
+/// pixels, and — where it applies — why its size is a guess.
+fn draw_inspector_identity(ui: &mut egui::Ui, facts: &MonitorFacts) {
+    ui.small(&facts.machine);
+    ui.label(
+        egui::RichText::new(format!("{} · {}", facts.ordinal, facts.caption))
+            .monospace()
+            .strong(),
+    );
+    match facts.native_size {
+        Some((width, height)) => ui.small(format!("{width}×{height} pixels")),
+        // The same absence the caption shows: an arrangement can place a
+        // screen the machine no longer reports, and its size is still
+        // correctable — that rectangle is what the cursor crosses into when
+        // it is plugged back in.
+        None => ui.small("not attached right now"),
+    };
+    if facts.estimated {
+        ui.add_space(4.0);
+        ui.small(format!(
+            "{} — this machine could not measure the panel, so this rectangle is drawn \
+             from its pixels. Correcting it below is what makes the crossing land where \
+             the drawing says.",
+            crate::caption::SIZE_ESTIMATED_BADGE
+        ));
+    }
+}
+
+/// The editable half: two millimetre fields, the aspect lock, and the two
+/// actions. Reports which action the user asked for, if either.
+fn draw_size_fields(
+    ui: &mut egui::Ui,
+    inspector: &mut Inspector,
+    facts: &MonitorFacts,
+) -> Option<Request> {
+    let mut request = None;
+    // Enter commits from either field, because a two-field form where the
+    // only way to commit is a mouse trip to a button is a form nobody
+    // finishes with the keyboard.
+    let entered = |ui: &egui::Ui, response: &egui::Response| {
+        response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+    };
+
+    ui.horizontal(|ui| {
+        ui.label("Width");
+        let response = ui.add(
+            egui::TextEdit::singleline(inspector.width_field())
+                .desired_width(56.0)
+                .horizontal_align(egui::Align::RIGHT),
+        );
+        ui.label("mm");
+        if response.changed() {
+            inspector.width_edited();
+        }
+        if entered(ui, &response) {
+            request = Some(Request::Apply);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Height");
+        let response = ui.add(
+            egui::TextEdit::singleline(inspector.height_field())
+                .desired_width(56.0)
+                .horizontal_align(egui::Align::RIGHT),
+        );
+        ui.label("mm");
+        if response.changed() {
+            inspector.height_edited();
+        }
+        if entered(ui, &response) {
+            request = Some(Request::Apply);
+        }
+    });
+
+    let mut locked = inspector.lock_aspect();
+    if ui
+        .checkbox(&mut locked, "Keep the current proportions")
+        .changed()
+    {
+        inspector.set_lock_aspect(locked);
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Apply").clicked() {
+            request = Some(Request::Apply);
+        }
+        // Offered only when there is a measurement to go back to and the
+        // rectangle has been moved away from it — a screen nothing could
+        // measure has nothing to reset *to* (`inspector.rs`).
+        if ui
+            .add_enabled(facts.resettable(), egui::Button::new("Use detected size"))
+            .clicked()
+        {
+            request = Some(Request::Reset);
+        }
+    });
+    request
 }
 
 /// Paint the bottom status line: freshness and peer state, whatever
@@ -415,6 +580,7 @@ fn draw_scene(ui: &mut egui::Ui, model: &mut Model) {
     let local_hue = base_hsva(ui.visuals());
     let peer_hue = rotated(local_hue);
     let authoritative_scene = !model.seeded;
+    let selected = model.selected();
 
     paint_group(
         &painter,
@@ -424,6 +590,7 @@ fn draw_scene(ui: &mut egui::Ui, model: &mut Model) {
         local_hue,
         authoritative_scene,
         model.diagnostics(),
+        selected,
         ui,
     );
     if let Some(peer) = &model.peer {
@@ -435,6 +602,7 @@ fn draw_scene(ui: &mut egui::Ui, model: &mut Model) {
             peer_hue,
             authoritative_scene,
             model.diagnostics(),
+            selected,
             ui,
         );
     }
@@ -457,7 +625,15 @@ fn apply_pointer(
     let point = |position: egui::Pos2| {
         viewport.to_layout((position.x - canvas_origin.x, position.y - canvas_origin.y))
     };
-    if response.drag_started() {
+    if response.clicked() {
+        // A press that never became a drag: the user is pointing at a
+        // screen rather than moving one, which is what the inspector
+        // follows. A click on empty canvas clears the selection, so
+        // "never mind" needs no separate gesture.
+        if let Some(position) = response.interact_pointer_pos() {
+            model.select_at(point(position));
+        }
+    } else if response.drag_started() {
         if let Some(position) = response.interact_pointer_pos() {
             let grabbed = point(position);
             if let Some(target) = model.monitor_at(grabbed) {
@@ -536,6 +712,7 @@ fn paint_group(
     hue: egui::ecolor::Hsva,
     authoritative_scene: bool,
     diagnostics: &Diagnostics,
+    selected: Option<&MonitorKey>,
     ui: &egui::Ui,
 ) {
     let stroke_color: Color32 = hue.into();
@@ -566,7 +743,7 @@ fn paint_group(
     // One call per machine, before anything is painted: the duplicate rule
     // is a property of the group, so it cannot be decided a rectangle at a
     // time. Positionally aligned with `group.monitors`.
-    let captions = crate::caption::captions(&caption_inputs(group));
+    let captions = crate::caption::captions(&group.caption_inputs());
 
     for (monitor, caption) in group.monitors.iter().zip(&captions) {
         let top_left = to_absolute(
@@ -606,6 +783,19 @@ fn paint_group(
         };
         painter.rect(rect, 2.0, fill, stroke, egui::StrokeKind::Inside);
 
+        // The selection ring sits *outside* the rectangle, in the style's
+        // own selection colour: what the inspector is about to talk about
+        // is the rectangle's size, so nothing about selecting it may change
+        // the size or the colour of the shape itself.
+        if selected.is_some_and(|key| key.device == group.device && key.id == monitor.id) {
+            painter.rect_stroke(
+                rect.expand(SELECTION_RING_GAP),
+                4.0,
+                egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+                egui::StrokeKind::Outside,
+            );
+        }
+
         if rect.width() >= MIN_LABEL_DIMENSION && rect.height() >= MIN_LABEL_DIMENSION {
             let mut label = caption.clone();
             if unplaced {
@@ -620,22 +810,6 @@ fn paint_group(
             );
         }
     }
-}
-
-/// One machine's monitors in the shape [`crate::caption`] reads — the whole
-/// of this renderer's captioning logic, which is to say none of it.
-fn caption_inputs(group: &MachineGroup) -> Vec<crate::caption::CaptionInput<'_>> {
-    group
-        .monitors
-        .iter()
-        .map(|monitor| crate::caption::CaptionInput {
-            id: &monitor.id,
-            label: monitor.label.as_ref(),
-            ordinal: monitor.ordinal,
-            native_size: monitor.native_size,
-            size_estimated: monitor.size_estimated,
-        })
-        .collect()
 }
 
 fn to_absolute(viewport: &Viewport, origin: egui::Pos2, point: (f64, f64)) -> egui::Pos2 {
@@ -1076,6 +1250,122 @@ mod tests {
         assert!(painted.says("Discard"), "{}", painted.text);
         assert!(painted.says("Cancel"), "{}", painted.text);
         assert!(painted.says("worker is still using"), "{}", painted.text);
+    }
+
+    /// The inspector's own empty state: with nothing selected it says what
+    /// to do, in the manner of the editor's other empty screens, rather
+    /// than showing two blank fields about no screen in particular.
+    #[test]
+    fn the_size_panel_asks_for_a_selection_before_it_says_anything() {
+        let painted = paint(
+            &editing(Model::from_state(&arranged_document(0))),
+            Chrome::default(),
+        );
+        assert!(painted.says("Screen size"), "{}", painted.text);
+        assert!(painted.says("Click a screen"), "{}", painted.text);
+        assert!(!painted.says("Use detected size"), "{}", painted.text);
+    }
+
+    /// A selected screen is named the way the canvas names it, described by
+    /// its pixels, and offered in **millimetres** — the drawn rectangle,
+    /// divided out, which is what the user is being asked to correct.
+    #[test]
+    fn the_size_panel_offers_the_selected_screens_size_in_millimetres() {
+        use crossover_topology::{LiveMonitor, PhysicalSizeMm};
+
+        let mut state = document(Some(peer_state(true)), 0);
+        state.local.monitors = vec![LiveMonitor {
+            physical_size: Some(PhysicalSizeMm::new(597, 336).unwrap()),
+            ..crate::test_support::labelled_monitor(r"\\.\DISPLAY1", "DELL U2720Q")
+        }];
+        let mut model = Model::from_state(&state);
+        model.select(Some(&key(LOCAL_DEVICE)));
+
+        let mut inspector = crate::inspector::Inspector::new();
+        let painted =
+            crate::test_support::paint_with(&editing(model), Chrome::default(), &mut inspector);
+
+        assert!(painted.says("DELL U2720Q"), "{}", painted.text);
+        assert!(painted.says("1920×1080 pixels"), "{}", painted.text);
+        assert!(painted.says("Width"), "{}", painted.text);
+        assert!(painted.says("Height"), "{}", painted.text);
+        assert!(painted.says("mm"), "{}", painted.text);
+        assert!(
+            painted.says("597"),
+            "the drawn width in mm: {}",
+            painted.text
+        );
+        assert!(painted.says("336"), "{}", painted.text);
+        assert!(painted.says("Apply"), "{}", painted.text);
+        // Measured, and drawn at what was measured, so there is nothing to
+        // go back to — the control is painted but disabled.
+        assert!(painted.says("Use detected size"), "{}", painted.text);
+        assert!(
+            painted.says("proportions"),
+            "the aspect lock: {}",
+            painted.text
+        );
+    }
+
+    /// A refused entry reaches the user *in the panel*, beside the fields
+    /// it refused, rather than in the status bar with the save diagnostics
+    /// — and nothing is drawn at the refused size.
+    #[test]
+    fn a_refused_size_is_reported_in_the_panel_that_refused_it() {
+        let mut model = Model::from_state(&arranged_document(0));
+        model.select(Some(&key(LOCAL_DEVICE)));
+        let mut inspector = crate::inspector::Inspector::new();
+        inspector.sync(Some(&model));
+        inspector.typed("9000", "5000");
+        inspector.act(&mut model, crate::inspector::Request::Apply);
+        assert!(!model.is_dirty(), "nothing was drawn at that size");
+
+        let painted =
+            crate::test_support::paint_with(&editing(model), Chrome::default(), &mut inspector);
+        assert!(painted.says("3000 mm"), "{}", painted.text);
+        assert!(painted.says("not a size to draw from"), "{}", painted.text);
+    }
+
+    /// A screen nobody could measure says so where it is being corrected,
+    /// not only on the canvas — the panel is where the user is looking when
+    /// they are about to fix it.
+    #[test]
+    fn the_size_panel_explains_an_estimated_rectangle() {
+        // The peer measured itself and the local machine did not, so the
+        // local rectangle is a guess with something to be a guess *against*
+        // — which is the only condition the badge is painted under.
+        let mut state = document(Some(peer_state(true)), 0);
+        state.peer.as_mut().unwrap().monitors = vec![crossover_topology::LiveMonitor {
+            physical_size: Some(crossover_topology::PhysicalSizeMm::new(286, 179).unwrap()),
+            ..live_monitor(r"\\.\DISPLAY1")
+        }];
+        let mut model = Model::from_state(&state);
+        model.select(Some(&key(LOCAL_DEVICE)));
+        assert!(model.local.monitors[0].size_estimated);
+
+        let mut inspector = crate::inspector::Inspector::new();
+        let painted =
+            crate::test_support::paint_with(&editing(model), Chrome::default(), &mut inspector);
+        assert!(painted.says("(size estimated)"), "{}", painted.text);
+        assert!(painted.says("could not measure"), "{}", painted.text);
+    }
+
+    /// The selected rectangle is ringed on the canvas, so the panel and the
+    /// picture are visibly about the same screen. Counted against the same
+    /// frame with nothing selected, because a monitor is a rectangle too —
+    /// the difference is the ring.
+    #[test]
+    fn the_selected_screen_is_ringed_on_the_canvas() {
+        let plain =
+            crate::test_support::paint_canvas(&editing(Model::from_state(&arranged_document(0))));
+        let mut model = Model::from_state(&arranged_document(0));
+        model.select(Some(&key(LOCAL_DEVICE)));
+        let ringed = crate::test_support::paint_canvas(&editing(model));
+        assert_eq!(
+            ringed.rects,
+            plain.rects + 1,
+            "exactly one ring, around exactly one screen"
+        );
     }
 
     /// A save's outcome — success or the whole error chain — reaches the
