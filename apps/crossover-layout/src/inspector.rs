@@ -165,10 +165,13 @@ pub struct Inspector {
     /// The monitor the fields describe, so a changed selection refills
     /// them.
     target: Option<MonitorKey>,
-    /// The drawn size the fields were last filled from, in **units** — the
-    /// test for "the rectangle changed underneath the fields", which is
-    /// what a reset, an applied override, or a re-seeded poll all look
-    /// like from here.
+    /// The drawn size the fields were last filled from, in millimetres —
+    /// the test for "the rectangle changed underneath the fields", which is
+    /// what a reset, an applied override, or a re-seeded poll all look like
+    /// from here. In millimetres because that is what the fields show: a
+    /// rectangle that moved by a quarter of one has changed nothing the
+    /// user could read, and refilling for it would only be a chance to
+    /// overwrite something half-typed.
     filled_from: (u32, u32),
     /// The width field's text, in millimetres.
     width: String,
@@ -239,10 +242,9 @@ impl Inspector {
         if moved {
             self.message = None;
         }
-        let drawn = drawn_units(&facts);
-        if moved || self.filled_from != drawn {
+        if moved || self.filled_from != facts.drawn_mm {
             self.target = Some(target);
-            self.filled_from = drawn;
+            self.filled_from = facts.drawn_mm;
             self.width = facts.drawn_mm.0.to_string();
             self.height = facts.drawn_mm.1.to_string();
             self.aspect = aspect_of(facts.drawn_mm);
@@ -361,17 +363,6 @@ impl Inspector {
         };
         Ok((read(&self.width, "width")?, read(&self.height, "height")?))
     }
-}
-
-/// The drawn extent the fields were filled from, in units — kept as the
-/// rectangle's own numbers rather than the rounded millimetres, so a
-/// quarter-millimetre change (a reset onto a rectangle that rounds to the
-/// same millimetre) still refills the fields.
-fn drawn_units(facts: &MonitorFacts) -> (u32, u32) {
-    (
-        facts.drawn_mm.0 * UNITS_PER_MM,
-        facts.drawn_mm.1 * UNITS_PER_MM,
-    )
 }
 
 /// The aspect the lock fills by, defended against the degenerate pair no
