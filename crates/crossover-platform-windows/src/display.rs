@@ -1172,6 +1172,18 @@ mod tests {
     /// unusual. What is behind those paths is hardware-dependent and is
     /// therefore only checked for *shape*: an EDID that reads at all is
     /// within the size cap and begins with the header magic.
+    ///
+    /// And then the clause that stops the whole thing passing vacuously.
+    /// Every assertion above holds trivially if [`super::monitor_edid`]
+    /// returns `None` for every monitor — which is exactly what a broken
+    /// `SetupAPI` walk, a wrong `DIREG_*` scope, or a mistyped value name all
+    /// look like from outside. So the registry is asked the same question
+    /// by a **different route** ([`registry_edid_present`]: a string
+    /// transform onto the hardware key, no `SetupAPI` at all), and if it says
+    /// a cached EDID exists then the chain under test has to find one too.
+    /// A machine that genuinely has none — a VM, a headless CI agent, a
+    /// remote session — prints a note and skips rather than failing for
+    /// behaviour that is correct.
     #[test]
     fn every_active_target_names_a_device_path_and_any_edid_behind_one_is_an_edid() {
         let Ok((paths, _modes)) = super::query_display_config() else {
@@ -1198,12 +1210,14 @@ mod tests {
             targets.len()
         );
 
+        let mut read_any = false;
         for path in &device_paths {
             let Some(edid) = super::monitor_edid(path) else {
                 // A monitor whose EDID Windows did not cache. Ordinary on a
                 // VM, a remote session, or a non-PnP display.
                 continue;
             };
+            read_any = true;
             assert!(
                 edid.len() <= super::MAX_EDID_BYTES as usize,
                 "an EDID past the read cap came back: {} bytes",
@@ -1220,6 +1234,98 @@ mod tests {
                 "the value read for {path:?} is not an EDID — wrong registry value or key"
             );
         }
+
+        // The independent oracle, so silence cannot pass for success.
+        let cached: Vec<&String> = device_paths
+            .iter()
+            .filter(|path| registry_edid_present(path))
+            .collect();
+        if cached.is_empty() {
+            println!(
+                "note: none of this machine's {} display devices has a cached EDID; \
+                 the acquisition assertion is skipped rather than failed",
+                device_paths.len()
+            );
+            return;
+        }
+        assert!(
+            read_any,
+            "the registry holds a cached EDID for {cached:?}, and the SetupAPI walk \
+             found none — the acquisition chain is broken (scope, value name, or the \
+             device-interface open)"
+        );
+    }
+
+    /// Does the registry hold a cached `EDID` for the monitor at device
+    /// interface path `device_path`?
+    ///
+    /// The oracle for the test above, and it earns that role by **not
+    /// sharing a step** with the code it checks. Where
+    /// [`super::monitor_edid`] walks `SetupAPI` — create an info list, open
+    /// the interface by path, enumerate the member, open its registry key —
+    /// this derives the hardware key's path as a string and opens it
+    /// directly. A fault in any `SetupAPI` step therefore shows up as the two
+    /// disagreeing rather than as both going quiet together.
+    ///
+    /// The derivation is the documented correspondence: a device interface
+    /// path `\\?\DISPLAY#DEL41A1#5&abc&0&UID1#{guid}` names the device
+    /// `SYSTEM\CurrentControlSet\Enum\DISPLAY\DEL41A1\5&abc&0&UID1`, whose
+    /// `Device Parameters` subkey is where `DIREG_DEV` lands.
+    fn registry_edid_present(device_path: &str) -> bool {
+        use windows::Win32::Foundation::ERROR_SUCCESS;
+        use windows::Win32::System::Registry::{
+            HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+        };
+        use windows::core::PCWSTR;
+
+        // `\\?\` prefix off, the trailing interface-class GUID off, and the
+        // remaining `#` separators become key separators.
+        let Some(rest) = device_path.strip_prefix(r"\\?\") else {
+            return false;
+        };
+        let Some((device, _guid)) = rest.rsplit_once('#') else {
+            return false;
+        };
+        let key_path = format!(
+            r"SYSTEM\CurrentControlSet\Enum\{}\Device Parameters",
+            device.replace('#', r"\")
+        );
+        let wide: Vec<u16> = key_path.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut key = HKEY::default();
+        // SAFETY: `wide` is NUL-terminated and lives for the call; `key` is
+        // a live local the call writes an opened key into, which is closed
+        // below on every path that opens one.
+        let opened = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(wide.as_ptr()),
+                None,
+                KEY_READ,
+                &raw mut key,
+            )
+        };
+        if opened != ERROR_SUCCESS {
+            return false;
+        }
+
+        let name: Vec<u16> = "EDID".encode_utf16().chain(std::iter::once(0)).collect();
+        let mut length: u32 = 0;
+        // SAFETY: a null data pointer asks only for the value's size, which
+        // the call writes into `length`; every pointer is a live local.
+        let queried = unsafe {
+            RegQueryValueExW(
+                key,
+                PCWSTR(name.as_ptr()),
+                None,
+                None,
+                None,
+                Some(&raw mut length),
+            )
+        };
+        // SAFETY: `key` is the key opened above and unused after this.
+        let _ = unsafe { RegCloseKey(key) };
+        queried == ERROR_SUCCESS && length > 0
     }
 
     /// The join key itself, asserted directly — because the test above
