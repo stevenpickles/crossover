@@ -44,6 +44,23 @@ Builds that are not tagged releases identify themselves as such —
   your back, and a rectangle you are in the middle of dragging is never
   resized under the pointer.
 
+- **You can correct a screen's size in the layout editor.** Click any
+  screen and a panel on the right names it, shows its resolution, and gives
+  its drawn width and height in millimetres to edit. Type the real size of
+  a screen your machine measured wrongly — or could not measure at all —
+  and the rectangle is redrawn at it, with the screens beside it shuffling
+  along so the seams on that machine stay closed. Editing one dimension
+  fills the other in the screen's current proportions unless you untick the
+  lock. A size no panel could be (under 50 mm or over 3000 mm on a side) is
+  refused with a note rather than quietly rounded into range, and **Use
+  detected size** puts a rectangle back on the size your machine reported —
+  greyed out for a screen captioned `(size estimated)`, since there is no
+  measurement to go back to. A size you have stated stops being captioned
+  as a guess, is not undone by the editor's once-a-second re-read of the
+  worker, and is kept by saving the arrangement like any other change: the
+  correction *is* the rectangle, so there is nothing else to store and
+  nothing new on the wire.
+
 - **Monitors report how big they physically are.** Each machine now reads
   the real width and height of every attached panel — in millimetres, off
   the monitor's own EDID — and reports it to the other machine and to the

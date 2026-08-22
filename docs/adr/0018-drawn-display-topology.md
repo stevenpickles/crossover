@@ -830,6 +830,62 @@ because they are the part a reader cannot re-derive:
   measured and estimated arms; the only transition left is a size learned
   for the first time mid-edit, which the transplant covers.
 
+**Addendum (2026-08-22), feature/161 — the manual size override, which
+closes the physical-size story.** The amendment above named three branches:
+the size travels (`feature/159`), the editor seeds from it (`feature/160`),
+and a person can correct it. This is the third, and it is deliberately the
+smallest of them:
+
+- **An override is a resize of the drawn rectangle, and nothing else.** The
+  decision's own rule — the drawn rectangle *is* the size, because crossings
+  map proportionally along drawn edges — means a correction needs no new
+  persistence, no config or state-file schema change, and no protocol
+  change. A saved arrangement already carries every rectangle's extent and
+  reads it back as authoritative, so an override survives a save and a
+  restart as an ordinary saved rectangle, with nothing anywhere recording
+  that it was ever overridden. It dirties the scene exactly as a drag does;
+  the Save button, the revision assignment, and the newest-revision-wins
+  sync are untouched.
+- **The plausible range is enforced by refusal, not by a clamp.** The
+  editor's own entry meets the same 50..=3000 mm gate the EDID reader and
+  the seeder apply (`MIN_PLAUSIBLE_PHYSICAL_MM` / `MAX_PLAUSIBLE_PHYSICAL_MM`
+  in `crossover-topology`), and an entry outside it is refused *with the
+  range in the message* rather than quietly drawn at the nearest legal size.
+  Silently drawing something other than what was typed is how a typo becomes
+  a crossing seam in the wrong place, and the range is worth keeping for the
+  reason the seeder keeps it: a size is a proportion, so one absurd number
+  misdraws the desk rather than one rectangle.
+- **A stated size is not a guess, so the badge goes.** `(size estimated)`
+  marks a rectangle the *editor* inferred; once the user has said how big
+  the screen is, there is nothing left to hedge about. The flag is re-set
+  only by a fresh seed of a scene the statement is no longer part of.
+- **A size change re-packs its machine through the seeder's own abutment.**
+  Intra-machine geometry is the OS's fact and a machine drags rigidly, so
+  the one gesture that can open an intra-machine seam is a width that
+  changes. The re-pack reuses the seeding packing (each x derived from the
+  width actually drawn, monitors keeping their drawn order, the group
+  keeping its own leftmost edge and each rectangle its own `y`) rather than
+  restating it, because the model's abutment tolerance is zero and a seam a
+  unit out is not a seam at all. Its invariants — exact abutment,
+  non-overlap, determinism, idempotence, totality — are property-tested.
+- **Preservation.** A stated size is user work, so the once-a-second
+  transplant holds it exactly as it holds a dragged position, and holds it
+  *harder*: unconditionally, including over an authoritative rectangle
+  (whose saved size is precisely what is being corrected) and across a
+  resolution or DPI change (which are news about pixels and say nothing
+  about how many millimetres wide a panel is). The selection the panel
+  follows is carried across polls too, though it is not unsaved work — a
+  scene nobody has edited is rebuilt from the document every second, and an
+  inspector that emptied itself on that cadence could not be used to correct
+  anything.
+- **"Use detected size" is offered only where there is a measurement to
+  return to** and the rectangle is not already drawn at it. A screen nothing
+  could measure — the badged case — has no reset, because there is nothing
+  to reset *to*; the seeder's estimate is the editor's guess, not a
+  detection. The reset re-draws from the same orientation-matched
+  measurement the seed used, so a portrait screen does not reset to a
+  landscape rectangle.
+
 **Amendment (2026-08-20):** the `config` feature also carries `serde_json`,
 for the state-file schema this ADR places in the same crate — versioned
 JSON needs a JSON implementation, which the decision's dependency sentence
