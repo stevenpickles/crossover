@@ -218,6 +218,15 @@ fn draw_inspector(ui: &mut egui::Ui, session: &mut EditorSession, inspector: &mu
     let request = draw_size_fields(ui, inspector, &facts);
     if let Some((request, model)) = request.zip(session.model_mut()) {
         inspector.act(model, request);
+        // The toolbar and the status bar claimed their strips before this
+        // panel ran, so they are showing the diagnostics and the Save
+        // button of the arrangement as it was a moment ago. Ask for another
+        // frame rather than reordering the panels — a right panel drawn
+        // before the top one takes the full window height and pushes the
+        // toolbar out of the way, which is a worse picture than a Save
+        // button that lights one frame late. The staleness is bounded at
+        // that one frame, not at the ~1 s poll.
+        ui.ctx().request_repaint();
     }
     if let Some(message) = inspector.message() {
         ui.add_space(6.0);
