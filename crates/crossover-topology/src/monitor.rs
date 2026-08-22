@@ -18,6 +18,23 @@
 //! it is held to printable ASCII, which no real device string exceeds and
 //! which leaves no room for a control character or a bidi override to
 //! misrepresent which screen a diagnostic is talking about.
+//!
+//! # Identity is not the same thing as a label
+//!
+//! [`MonitorLabel`] is the second string a monitor can carry, and it is
+//! deliberately the *opposite* kind of value: the human-readable product
+//! name Windows Settings shows (`DELL U2720Q`, from the EDID), optional,
+//! **not unique**, and never a key. Nothing about layout matching, the
+//! config `[layout]` section, `EntryPoint`, or crossing derivation ever
+//! consults it — see ADR 0018's 2026-08-21 amendment. It exists because
+//! `\\.\DISPLAY1` is the right identity and the wrong caption: a user
+//! arranging three screens cannot tell which rectangle is which from a
+//! device string, and the platform already knows the name they read on the
+//! bezel.
+//!
+//! Being display-only relaxes the charset (a product name is legitimately
+//! not ASCII) but not the bound: it still arrives over the wire, so it is
+//! still bounded before allocation and refused rather than repaired.
 
 use core::fmt;
 use core::str::FromStr;
@@ -157,11 +174,159 @@ impl<'de> Deserialize<'de> for MonitorId {
     }
 }
 
+/// Maximum encoded length of a monitor label.
+///
+/// The same 64 bytes as [`MAX_MONITOR_ID_BYTES`], and for the same reason
+/// rather than by coincidence: this is a short human-readable name that
+/// arrives over the wire, so the ceiling has to be generous over every real
+/// EDID product name (the longest are around 20 bytes) and small enough
+/// that a full `MonitorTopology` stays trivially bounded. Bytes, not
+/// characters, because bytes are what the wire and the file carry — and a
+/// label may legitimately be non-ASCII, so the two counts differ here in a
+/// way they never do for an id.
+pub const MAX_MONITOR_LABEL_BYTES: usize = 64;
+
+/// A monitor's human-readable name — the EDID product name Windows Settings
+/// shows, e.g. `DELL U2720Q` — validated on construction.
+///
+/// **Display only, never identity.** It is optional (a platform that cannot
+/// read one reports none), it is **not unique** (two identical monitors on
+/// one desk share a name, which is exactly the case the editor's `(1)` /
+/// `(2)` suffixes exist for), and nothing keys off it: layout matching,
+/// `[layout]`, `EntryPoint`, and crossing derivation all address a monitor
+/// by its [`MonitorId`] and never look here (ADR 0018, amended
+/// 2026-08-21).
+///
+/// A conforming label is 1..=[`MAX_MONITOR_LABEL_BYTES`] bytes of UTF-8
+/// with no control characters. Unlike an id it is **not** held to ASCII: a
+/// product name is a manufacturer's string, and refusing a legitimate
+/// non-ASCII one would cost the caption for nothing — the value steers no
+/// behaviour. Control characters are refused for the reason they are
+/// refused in an id: a label is rendered in the editor and in log lines,
+/// and a newline or an escape in one misrepresents what it is naming.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MonitorLabel(String);
+
+impl MonitorLabel {
+    /// The label `label` names.
+    ///
+    /// # Errors
+    ///
+    /// [`MonitorLabelError`], one variant per rejection class.
+    pub fn new(label: &str) -> Result<Self, MonitorLabelError> {
+        validate_monitor_label(label)?;
+        Ok(Self(label.to_owned()))
+    }
+
+    /// The name, as the platform reported it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why a monitor label was refused.
+///
+/// As with [`MonitorIdError`], a variant carries a length or one code
+/// point, never the string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum MonitorLabelError {
+    /// Nothing at all. A platform with no name to report says `None`; an
+    /// empty string is a different claim, and a caption of nothing is worse
+    /// than falling back to the id.
+    #[error("the monitor label is empty")]
+    Empty,
+    /// Over [`MAX_MONITOR_LABEL_BYTES`] once encoded. Checked before the
+    /// character scan, so the scan is bounded by that constant.
+    #[error("the monitor label is {bytes} bytes, over the {MAX_MONITOR_LABEL_BYTES}-byte maximum")]
+    TooManyBytes {
+        /// Encoded length that was offered.
+        bytes: usize,
+    },
+    /// A control character — anything [`char::is_control`] admits, which is
+    /// the C0 and C1 ranges plus `U+007F`.
+    #[error("the monitor label contains the control character U+{codepoint:04X}")]
+    ControlCharacter {
+        /// The offending code point.
+        codepoint: u32,
+    },
+}
+
+/// Validate a monitor label.
+///
+/// Pure and total: every input is a value, nothing allocates, and the
+/// bounded check runs before the scan.
+///
+/// # Errors
+///
+/// [`MonitorLabelError`], naming what was wrong without quoting the label.
+pub fn validate_monitor_label(label: &str) -> Result<(), MonitorLabelError> {
+    if label.is_empty() {
+        return Err(MonitorLabelError::Empty);
+    }
+    // The bound first: it is what says how far the scan below can go.
+    if label.len() > MAX_MONITOR_LABEL_BYTES {
+        return Err(MonitorLabelError::TooManyBytes { bytes: label.len() });
+    }
+    if let Some(control) = label.chars().find(|character| character.is_control()) {
+        return Err(MonitorLabelError::ControlCharacter {
+            codepoint: u32::from(control),
+        });
+    }
+    Ok(())
+}
+
+impl FromStr for MonitorLabel {
+    type Err = MonitorLabelError;
+
+    /// # Errors
+    ///
+    /// [`MonitorLabelError`], as [`MonitorLabel::new`].
+    fn from_str(label: &str) -> Result<Self, Self::Err> {
+        Self::new(label)
+    }
+}
+
+impl fmt::Display for MonitorLabel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for MonitorLabel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MonitorLabel({:?})", self.0)
+    }
+}
+
+impl Serialize for MonitorLabel {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorLabel {
+    /// Validating, in every format — the same property [`MonitorId`]'s
+    /// decoder has, so no decoder (wire or state file) can introduce an
+    /// unusable label by forgetting to check. On the wire this is the
+    /// rejection, not a truncation: a peer sending an over-long or
+    /// control-bearing label has sent a malformed `MonitorTopology`.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let label = String::deserialize(deserializer)?;
+        validate_monitor_label(&label).map_err(serde::de::Error::custom)?;
+        Ok(Self(label))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
 
-    use super::{MAX_MONITOR_ID_BYTES, MonitorId, MonitorIdError, validate_monitor_id};
+    use super::{
+        MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MonitorId, MonitorIdError, MonitorLabel,
+        MonitorLabelError, validate_monitor_id, validate_monitor_label,
+    };
 
     #[test]
     fn real_device_strings_are_accepted() {
@@ -271,6 +436,96 @@ mod tests {
         assert!(rendered.contains("0x07"), "{rendered}");
     }
 
+    // ---- labels ---------------------------------------------------------
+
+    #[test]
+    fn real_product_names_are_accepted() {
+        for label in [
+            "DELL U2720Q",
+            "LG ULTRAGEAR",
+            "Generic PnP Monitor",
+            "Built-in Retina Display",
+            // Non-ASCII is legitimate here, unlike an id: a label steers
+            // nothing, and a manufacturer's string is theirs to choose.
+            "LG \u{30E2}\u{30CB}\u{30BF}\u{30FC}",
+            "x",
+        ] {
+            assert!(
+                MonitorLabel::new(label).is_ok(),
+                "a legitimate product name was refused: {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sixty_four_label_bytes_is_accepted_and_sixty_five_is_not() {
+        let at_the_cap = "x".repeat(MAX_MONITOR_LABEL_BYTES);
+        assert!(MonitorLabel::new(&at_the_cap).is_ok());
+
+        let one_over = "x".repeat(MAX_MONITOR_LABEL_BYTES + 1);
+        assert_eq!(
+            validate_monitor_label(&one_over),
+            Err(MonitorLabelError::TooManyBytes {
+                bytes: MAX_MONITOR_LABEL_BYTES + 1
+            })
+        );
+    }
+
+    /// The bound counts **bytes**, so a label well under 64 *characters*
+    /// can still be over the cap — the axis the wire and the file use.
+    #[test]
+    fn the_label_bound_counts_bytes_not_characters() {
+        // 22 characters, 66 bytes: legal UTF-8, legal characters, over the
+        // cap on the axis that matters.
+        let wide = "\u{30E2}".repeat(22);
+        assert_eq!(wide.chars().count(), 22);
+        assert_eq!(
+            validate_monitor_label(&wide),
+            Err(MonitorLabelError::TooManyBytes { bytes: wide.len() })
+        );
+    }
+
+    #[test]
+    fn an_empty_label_is_refused() {
+        assert_eq!(validate_monitor_label(""), Err(MonitorLabelError::Empty));
+    }
+
+    #[test]
+    fn control_characters_are_refused_in_a_label() {
+        for control in ['\u{0}', '\n', '\r', '\t', '\u{7F}', '\u{1B}', '\u{85}'] {
+            assert_eq!(
+                validate_monitor_label(&format!("DELL{control}U2720Q")),
+                Err(MonitorLabelError::ControlCharacter {
+                    codepoint: u32::from(control)
+                }),
+                "a control character was admitted: U+{:04X}",
+                u32::from(control)
+            );
+        }
+    }
+
+    #[test]
+    fn label_deserialization_validates_rather_than_trusting_the_format() {
+        let good: MonitorLabel = serde_json::from_str(r#""DELL U2720Q""#).unwrap();
+        assert_eq!(good.as_str(), "DELL U2720Q");
+        assert_eq!(serde_json::to_string(&good).unwrap(), r#""DELL U2720Q""#);
+
+        assert!(serde_json::from_str::<MonitorLabel>(r#""""#).is_err());
+        assert!(
+            serde_json::from_str::<MonitorLabel>(&format!("\"{}\"", "x".repeat(65))).is_err(),
+            "an over-long label must not survive a decoder"
+        );
+        assert!(serde_json::from_str::<MonitorLabel>(r#""bad\u0000label""#).is_err());
+    }
+
+    #[test]
+    fn a_label_refusal_names_the_fault_and_never_the_label() {
+        let error = validate_monitor_label("secret-monitor\u{7}").unwrap_err();
+        let rendered = error.to_string();
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert!(rendered.contains("0007"), "{rendered}");
+    }
+
     proptest! {
         /// Arbitrary text is a value, never a panic, and the verdict is a
         /// pure function of the input.
@@ -297,6 +552,22 @@ mod tests {
             if validate_monitor_id(&id).is_ok() {
                 prop_assert!(id.is_ascii());
                 prop_assert!(!id.chars().any(char::is_control));
+            }
+        }
+
+        /// The same total, pure, never-panicking contract for a label —
+        /// and an accepted one satisfies exactly the two rules the type
+        /// documents, no more (non-ASCII is admitted on purpose).
+        #[test]
+        fn arbitrary_labels_never_panic(label in ".{0,200}") {
+            let verdict = validate_monitor_label(&label);
+            prop_assert_eq!(verdict, validate_monitor_label(&label));
+            if verdict.is_ok() {
+                prop_assert!(!label.is_empty());
+                prop_assert!(label.len() <= MAX_MONITOR_LABEL_BYTES);
+                prop_assert!(!label.chars().any(char::is_control));
+                let accepted = MonitorLabel::new(&label).unwrap();
+                prop_assert_eq!(accepted.as_str(), label.as_str());
             }
         }
     }
