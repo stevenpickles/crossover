@@ -661,6 +661,74 @@ monitor — because a caption is the half that does not matter.
 [PROTOCOL.md](../PROTOCOL.md) §6.2 and §8, [ARCHITECTURE.md](../ARCHITECTURE.md)
 §4, and [TESTING.md](../TESTING.md) §3.2 carry the same amendment.
 
+**Amendment (2026-08-22), a monitor may also carry a *physical size*, which
+is a seeding datum and not an identity either:** the decision above seeds
+the editor's rectangles from pixel counts corrected by `scale_percent`,
+which draws in DIPs. That is right for legibility and wrong for
+*proportion*: two screens at the same DIP size draw the same size whether
+one is 13 inches and the other 27. A cursor leaving one desk a third of the
+way up a bezel then arrives somewhere else on the other, and the
+arrangement the user drew is not the arrangement they experience.
+
+So a monitor now additionally carries an optional **physical size** — the
+panel's real width and height in millimetres — and it sits on the same side
+of the identity line as the label:
+
+- **Proportion-only.** Nothing matches, keys, or derives on it. Layout
+  matching, `[layout]`, `EntryPoint`, and crossing derivation all address a
+  monitor by its id. Crossing stays proportional through the **drawn**
+  geometry, so a peer that lies about a size draws a rectangle at the wrong
+  scale at the other desk and cannot move a crossing.
+- **Optional**, because most reasons a platform cannot measure a panel are
+  ordinary: a virtual display has no panel, a remote session's screen is
+  somebody else's, and a real panel's EDID can be absent or unreadable. A
+  monitor without a size draws the way every monitor drew before sizes
+  existed.
+- **Not unique.** Two identical screens measure identically, exactly as
+  they share a label.
+- **Still network input**, bounded like everything else: `1..=`
+  `MAX_PHYSICAL_SIZE_MM` (10 000) millimetres per axis, validated on encode
+  and decode alike, rejected rather than clamped.
+
+**Two gates, deliberately at different tightnesses.** The wire's bound
+refuses the *impossible* — a decoder's business is arithmetic and
+allocation safety, and a 5 m video wall reporting itself honestly is not a
+malformed frame worth terminating a session over. The **acquiring
+platform** refuses the merely *implausible*: the Windows EDID reader admits
+only 50–3000 mm, because projectors describe their current throw,
+televisions and virtual displays invent numbers, and a partially-cached
+EDID reports whatever was in those bytes. The asymmetry is the point — a
+size is a proportion, so one screen claiming 40 mm does not draw one
+rectangle wrong, it draws every rectangle on the desk wrong, while
+withholding a size costs only the improvement. Keeping the policy at the
+acquisition end means it can be tightened for a newly-discovered class of
+lying display with no protocol change and no peer to coordinate with.
+
+**Acquisition and retention.** The size comes from the monitor's EDID,
+which Windows caches under the monitor's own driver key; the
+`QueryDisplayConfig` sweep that already reads product names hands back the
+device interface path that key sits behind, so it costs one SetupAPI open
+and one bounded registry read per monitor on the same ~1 s cadence and
+nothing on the 8 ms edge path. Every failure — no device, no cached value,
+a bad header or checksum, an implausible measurement — degrades to no size,
+never an error and never a lost monitor. And like the label it is
+**remembered per monitor id**: a read that fails while the geometry beside
+it does not must not defeat the state writer's change gate, or a transient
+failure would put a `MonitorTopology` on the wire once a second. The worker
+keeps one small per-id record holding both descriptive fields, learned and
+filled independently, forgotten when the id leaves the enumeration.
+
+`MonitorTopology` gains the optional per-monitor field, so ADR 0017's rule
+applies unchanged for the third time on this message and **both ends of the
+protocol version range move to 6**.
+
+**What this branch deliberately does not do.** The datum only travels here.
+Seeding the editor's rectangles from it is `feature/160`, and the manual
+per-monitor override for a screen the platform will not measure is
+`feature/161`. Until those land the size is carried, stored, and sent, and
+nothing reads it. [PROTOCOL.md](../PROTOCOL.md) §3, §6.2, and §8 carry the
+same amendment.
+
 **Amendment (2026-08-20):** the `config` feature also carries `serde_json`,
 for the state-file schema this ADR places in the same crate — versioned
 JSON needs a JSON implementation, which the decision's dependency sentence

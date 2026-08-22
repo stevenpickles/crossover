@@ -27,8 +27,28 @@ Builds that are not tagged releases identify themselves as such —
   and where the cursor crosses all still address a monitor by its device
   string, unchanged.
 
+- **Monitors report how big they physically are.** Each machine now reads
+  the real width and height of every attached panel — in millimetres, off
+  the monitor's own EDID — and reports it to the other machine and to the
+  layout editor's state file. Nothing draws differently yet: this release
+  carries the measurement end to end, and the editor starts *using* it to
+  size rectangles in a following change. A screen whose size cannot be read
+  or does not look believable (a projector, a virtual display, a remote
+  session) simply reports none, and is drawn exactly as before. The
+  measurement is proportion only — arrangements, saved layouts, and where
+  the cursor crosses all still address a monitor by its device string.
+
 ### Changed
 
+- **Wire protocol moves to version 6, and does not accept version 5**
+  ([ADR 0018](docs/adr/0018-drawn-display-topology.md), amended
+  2026-08-22). Each monitor a machine reports now also carries its optional
+  physical size, which adds a byte to every monitor of every report and
+  which no feature bit can hide. **Both machines must be upgraded
+  together**; a mixed pair refuses cleanly at the handshake naming both
+  version ranges. As with the product name, nothing about crossing changed
+  — the size is display-only — but the byte is on the wire regardless,
+  which is what forces the bump.
 - **Wire protocol moves to version 5, and does not accept version 4**
   ([ADR 0018](docs/adr/0018-drawn-display-topology.md), amended
   2026-08-21). Each monitor a machine reports now carries an optional

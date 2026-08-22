@@ -193,12 +193,19 @@ Guidelines:
     in force this is what edge detection polls, because matching a live
     screen to a drawn rectangle is a match on device string. It must stay
     about as cheap as `monitors()`.
-  - `monitor_descriptions()` — adds the human-readable name the editor
-    captions with. Display-only, never identity, and on Windows a whole
-    second `QueryDisplayConfig` sweep, so **only** the ~1 s topology-sync
-    cadence calls it. This is the line the tiering exists to draw: a
-    caption is the one thing here expensive enough that the edge path
-    must not be able to reach it by accident.
+  - `monitor_descriptions()` — adds what the platform *says about* a
+    monitor rather than where it is: the human-readable name the editor
+    captions with, and the panel's physical size in millimetres, which the
+    editor draws rectangles in proportion to. Both display-only, never
+    identity, and on Windows both come out of a whole second
+    `QueryDisplayConfig` sweep — the size additionally costing a SetupAPI
+    walk and a registry read per monitor to reach its EDID — so **only**
+    the ~1 s topology-sync cadence calls it. This is the line the tiering
+    exists to draw: these are the facts expensive enough that the edge path
+    must not be able to reach them by accident. They ride one method
+    rather than two because they are acquired by the same sweep at the same
+    cadence and fail the same way; a fourth method would buy a second call
+    to the same OS interface and one more chance to put it on a hot path.
 
   Two rules hold across all three: the lists always describe the *same*
   monitors in the same order, so a name the OS will not give costs a
