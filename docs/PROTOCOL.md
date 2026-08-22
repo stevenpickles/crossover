@@ -176,6 +176,20 @@ refuses every v3 peer at `Hello`, so the only peers that can receive them
 are peers that understand them, and a bit both sides always set would be a
 gate that never closes.
 
+And once more for v4 → **v5** ([ADR 0018](adr/0018-drawn-display-topology.md)'s
+2026-08-21 amendment): `MonitorTopology`'s per-monitor entry gains an
+optional `label`, the EDID product name, so the peer's editor can caption a
+rectangle `DELL U2720Q` instead of `\\.\DISPLAY1` (§6.2). The rule decides
+it the same way it decided v3 and v4 — `MonitorTopology` travels between
+every pair of v4 peers and is gated by no bit, so the `Option`
+discriminant byte rides every monitor of every report whatever either side
+wants, and a v4 peer would read it as trailing data and fail the payload
+(§7, fatal). Both ends of the range move to 5. Worth stating plainly
+because the two facts pull in opposite directions: the label is
+**display-only and never identity**, so nothing about crossing changes —
+but the byte is on the wire regardless, and it is the byte that forces the
+bump.
+
 ## 4. Message classes
 
 Four logical classes, initially multiplexed over the single TLS connection:
@@ -509,7 +523,7 @@ messages carry it, both added at v4 and both base protocol — no feature bit
 
 ```
 MonitorTopology   { monitors: [ { id, x, y, width, height,         // type 17
-                                  scale_percent } ] }
+                                  scale_percent, label? } ] }
 LayoutSync        { revision, origin,                              // type 18
                     monitors: [ { device, id, x, y, width, height } ] }
 ```
@@ -524,6 +538,28 @@ LayoutSync        { revision, origin,                              // type 18
   machine's editor draw the peer's screens and lets layout validation tell
   a real monitor id from a fiction. It is not an arrangement and never
   changes crossing behaviour on its own.
+- **`label` is optional, and is a caption rather than a name** (added at
+  v5). It is the monitor's EDID product name — `DELL U2720Q`, the string
+  Windows Settings shows — so the receiver's editor can label a rectangle
+  with what the user reads off the bezel instead of with `\\.\DISPLAY1`.
+  Three properties, all deliberate and all load-bearing:
+  - **Display-only, never identity.** Nothing keys off it. Layout
+    matching, `[layout]`, `EntryPoint`, crossing derivation, and the
+    adjacency rules below all address a monitor by `id` and never look at
+    `label`. A peer that lies about a label misdraws a caption at the
+    other desk; it cannot move a crossing.
+  - **Not unique.** Two identical screens on one desk report the same
+    string, so a repeated label is a valid message where a repeated `id`
+    is malformed. Disambiguating them (`(1)`, `(2)`, as Windows does) is
+    the editor's job, not the wire's.
+  - **Bounded and refused, not repaired.** At most
+    `MAX_MONITOR_LABEL_BYTES` bytes of UTF-8 with no control characters,
+    validated on encode and decode alike. An over-long or
+    control-bearing label is malformed and fatal (§7) — a *truncating*
+    decoder would let a peer decide how much of a frame this side
+    believes. Unlike an id, a label is not held to ASCII: a product name
+    is the manufacturer's string, it steers nothing, and refusing a
+    legitimate non-ASCII one would cost the caption for no containment.
 - **`LayoutSync` states the arrangement**, which describes *both* machines:
   a `u64` revision, `origin` (the editing device's identity), and the
   placed monitors. It is sent after `Hello` when the sender holds an
@@ -538,13 +574,15 @@ Invariants, all of them checked before anything is adopted:
   would be right to refuse.
 - **Bounds**: at most `MAX_MONITORS_PER_MACHINE` monitors from one machine
   and `MAX_LAYOUT_MONITORS` in a layout; a monitor id of at most
-  `MAX_MONITOR_ID_BYTES` printable-ASCII bytes, unique within a machine;
-  `1 ≤ width, height ≤ MAX_MONITOR_EXTENT`; `|x|, |y| ≤
-  MAX_LAYOUT_COORDINATE`. Every derivation runs in `i64`, where those
-  bounds make overflow impossible rather than merely unlikely.
+  `MAX_MONITOR_ID_BYTES` printable-ASCII bytes, unique within a machine; a
+  monitor label of at most `MAX_MONITOR_LABEL_BYTES` UTF-8 bytes with no
+  control characters, *not* required to be unique; `1 ≤ width, height ≤
+  MAX_MONITOR_EXTENT`; `|x|, |y| ≤ MAX_LAYOUT_COORDINATE`. Every
+  derivation runs in `i64`, where those bounds make overflow impossible
+  rather than merely unlikely.
 - **Malformed is fatal** (§7): a count past its cap, a zero or oversized
-  dimension, an out-of-range coordinate, a non-ASCII or overlong id — the
-  session terminates, fail closed.
+  dimension, an out-of-range coordinate, a non-ASCII or overlong id, an
+  overlong or control-bearing label — the session terminates, fail closed.
 - **Well-formed but semantically impossible is rejected, never adopted**: a
   layout naming a device that is not this session's pair, or rectangles
   that overlap. It is logged and charged as a protocol violation on §7's
@@ -611,6 +649,7 @@ Invariants, all of them checked before anything is adopted:
 | Max monitors per machine | 16, `MAX_MONITORS_PER_MACHINE` (ADR 0018) — bounds `MonitorTopology` and one machine's share of a layout |
 | Max monitors in a layout | 32, `MAX_LAYOUT_MONITORS` (ADR 0018) — a layout describes exactly two machines |
 | Max monitor id | 64 bytes, `MAX_MONITOR_ID_BYTES` (ADR 0018), printable ASCII — the platform's device string (`szDevice` on Windows), which survives a restart where an enumeration index does not |
+| Max monitor label | 64 bytes, `MAX_MONITOR_LABEL_BYTES` (ADR 0018 as amended 2026-08-21), UTF-8 with no control characters — the EDID product name the editor captions with. Optional, non-unique, display-only: never an identity, so nothing matches or derives on it |
 | Max monitor extent | 65 535, `MAX_MONITOR_EXTENT` (ADR 0018); minimum 1 — a zero-sized monitor has no edge to cross |
 | Max layout coordinate | 2^24, `MAX_LAYOUT_COORDINATE` (ADR 0018) — with the extent cap this keeps every derivation under 2^42 in `i64`, so overflow is impossible rather than improbable |
 | Monitor scale bounds | 25–500 percent, `MIN_SCALE_PERCENT` / `MAX_SCALE_PERCENT` (ADR 0018) — seeds the editor's to-scale drawing only; never enters crossing mapping |

@@ -33,15 +33,27 @@ use crate::ProtocolError;
 /// encoding) and fail the payload — fatal per docs/PROTOCOL.md §7 — so
 /// the bump turns that into a clean, diagnosable refusal at `Hello`
 /// instead.
-pub const PROTOCOL_VERSION: u16 = 4;
+///
+/// v5 (Phase 8, ADR 0018's 2026-08-21 amendment): `MonitorTopology`'s
+/// per-monitor entry gains an optional monitor `label` — the EDID product
+/// name, so the peer's editor can caption a rectangle `DELL U2720Q`
+/// instead of `\\.\DISPLAY1` (docs/PROTOCOL.md §6.2). ADR 0017's rule one
+/// more time: `MonitorTopology` travels between every pair of v4 peers
+/// and carries no feature bit, so the extra `Option` byte on every
+/// monitor of every report is on the wire whatever either side wants. A
+/// v4 peer would read it as trailing data and fail the payload — fatal
+/// per docs/PROTOCOL.md §7 — so the bump turns that into a refusal at
+/// `Hello`. The label itself is display-only and never identity; the
+/// bump is about the byte, not about what it means.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// The lowest protocol version this build accepts. Each bump has been an
 /// incompatible layout change (v1's control messages cannot be decoded by
 /// v2; v2's offers cannot be decoded by v3; v3's `entry` cannot be decoded
-/// by v4), and peers are deployed in lockstep, so the floor tracks the
-/// ceiling rather than carrying compatibility code for a version nobody
-/// runs.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 4;
+/// by v4; v4's `MonitorTopology` cannot be decoded by v5), and peers are
+/// deployed in lockstep, so the floor tracks the ceiling rather than
+/// carrying compatibility code for a version nobody runs.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 5;
 
 /// An inclusive range of supported protocol versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
