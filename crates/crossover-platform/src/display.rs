@@ -40,6 +40,18 @@
 //! So a backend that can enumerate rectangles but cannot name them is a
 //! first-class backend: it implements `monitors()`, inherits the default
 //! `monitor_layout()`, and loses the placement nicety and nothing else.
+//!
+//! **A third query, for the same reason one more time.**
+//! [`DisplayInfo::monitor_descriptions`] adds the *human* name — the EDID
+//! product name (`DELL U2720Q`) a user reads off the bezel — on top of
+//! `monitor_layout()`, and is defaulted the same way. It is a separate
+//! method rather than a field on [`MonitorInfo`] because of where each
+//! query is called from: `monitor_layout()` is on the edge detector's ~8 ms
+//! poll and feeds its equality checks, while a friendly name costs a
+//! `QueryDisplayConfig` sweep on Windows — orders of magnitude more
+//! expensive, and a value that has no business changing what the detector
+//! considers "the same layout". Only the ~1 s topology-sync side asks for
+//! descriptions.
 
 use thiserror::Error;
 
@@ -121,6 +133,30 @@ pub struct MonitorInfo {
     pub rect: MonitorRect,
 }
 
+/// One monitor's geometry and identity, plus the human-readable name the
+/// platform advertises for it when it has one (ADR 0018, amended
+/// 2026-08-21).
+///
+/// The label is the EDID product name — `DELL U2720Q`, what Windows
+/// Settings shows — and it is **display only**: optional, not unique, and
+/// never a key. Two identical screens on one desk report the same label,
+/// which is legal and is the editor's problem to caption, not this trait's
+/// to disambiguate. Identity remains [`MonitorInfo::id`] and nothing else.
+///
+/// `label` is a plain `String`, unvalidated, for exactly the reason
+/// [`MonitorInfo::id`] is: this is "whatever the OS said". The bound and
+/// the character rule (`MAX_MONITOR_LABEL_BYTES`, no control characters)
+/// belong to `crossover-topology`, which this crate must not depend on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorDescription {
+    /// The geometry and identity [`DisplayInfo::monitor_layout`] reports
+    /// for this monitor, unchanged.
+    pub info: MonitorInfo,
+    /// Its advertised human-readable name, or `None` where the platform
+    /// has none, could not read one, or reported an empty one.
+    pub label: Option<String>,
+}
+
 /// Failures from a [`DisplayInfo`] backend.
 #[non_exhaustive]
 #[derive(Debug, Error)]
@@ -195,6 +231,39 @@ pub trait DisplayInfo: Send + Sync {
             .collect())
     }
 
+    /// Every monitor, with its identity *and* the human-readable name the
+    /// platform advertises for it where there is one (ADR 0018, amended
+    /// 2026-08-21).
+    ///
+    /// The list holds **the same entries [`DisplayInfo::monitor_layout`]
+    /// reports, in the same order, always** — a label is added per monitor,
+    /// best effort, and its absence shows up as `label: None` rather than
+    /// as a missing or reordered entry.
+    ///
+    /// **Not on the hot path, and that is the point.** This is the query
+    /// the ~1 s topology poll uses to fill the state file and the peer's
+    /// `MonitorTopology`; edge detection keeps calling `monitors()` every
+    /// few milliseconds and never comes here. A backend is free to make
+    /// this the expensive one (on Windows it is a whole
+    /// `QueryDisplayConfig` sweep).
+    ///
+    /// Defaulted to the identified enumeration with nothing labelled, so a
+    /// backend with no way to ask for product names is still a working
+    /// backend: its monitors caption by device string, which is what the
+    /// editor did before labels existed.
+    ///
+    /// # Errors
+    ///
+    /// [`DisplayError::Unavailable`] if the platform cannot enumerate the
+    /// monitors. Failing to *label* one is not an error.
+    fn monitor_descriptions(&self) -> Result<Vec<MonitorDescription>, DisplayError> {
+        Ok(self
+            .monitor_layout()?
+            .into_iter()
+            .map(|info| MonitorDescription { info, label: None })
+            .collect())
+    }
+
     /// The cursor's current position, normalized to the virtual desktop's
     /// top-left origin.
     ///
@@ -203,4 +272,135 @@ pub trait DisplayInfo: Send + Sync {
     /// [`DisplayError::Unavailable`] if the platform cannot report the
     /// cursor position.
     fn cursor_position(&self) -> Result<CursorPoint, DisplayError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CursorPoint, DisplayError, DisplayInfo, MonitorInfo, MonitorRect, Screen};
+
+    /// The minimum a backend can be: geometry and a cursor, no identity, no
+    /// labels. Both defaulted methods are inherited, which is the property
+    /// under test — a port that can only enumerate rectangles still
+    /// compiles and still answers every query.
+    struct GeometryOnly;
+
+    fn rect(left: i32) -> MonitorRect {
+        MonitorRect {
+            left,
+            top: 0,
+            width: 100,
+            height: 100,
+        }
+    }
+
+    impl DisplayInfo for GeometryOnly {
+        fn desktop_bounds(&self) -> Result<Screen, DisplayError> {
+            Ok(Screen {
+                width: 200,
+                height: 100,
+            })
+        }
+
+        fn monitors(&self) -> Result<Vec<MonitorRect>, DisplayError> {
+            Ok(vec![rect(0), rect(100)])
+        }
+
+        fn cursor_position(&self) -> Result<CursorPoint, DisplayError> {
+            Ok(CursorPoint { x: 0, y: 0 })
+        }
+    }
+
+    /// A backend that names nothing describes nothing — but it never loses
+    /// or reorders a monitor doing so. An absent label is `None` on a
+    /// present entry, exactly as an absent id is.
+    #[test]
+    fn the_default_description_query_labels_nothing_and_drops_nothing() {
+        let display = GeometryOnly;
+        let descriptions = display.monitor_descriptions().unwrap();
+
+        assert_eq!(
+            descriptions
+                .iter()
+                .map(|description| description.info.rect)
+                .collect::<Vec<_>>(),
+            display.monitors().unwrap(),
+            "the default description query lost or reordered a monitor"
+        );
+        assert!(
+            descriptions
+                .iter()
+                .all(|description| description.label.is_none())
+        );
+        assert!(
+            descriptions
+                .iter()
+                .all(|description| description.info.id.is_none())
+        );
+    }
+
+    /// The defaulted layer sits on `monitor_layout()`, so a backend that
+    /// *can* identify a monitor keeps that identity in its descriptions
+    /// even when it cannot label one.
+    #[test]
+    fn the_default_description_query_keeps_whatever_identity_exists() {
+        struct Identified;
+
+        impl DisplayInfo for Identified {
+            fn desktop_bounds(&self) -> Result<Screen, DisplayError> {
+                Ok(Screen {
+                    width: 100,
+                    height: 100,
+                })
+            }
+
+            fn monitors(&self) -> Result<Vec<MonitorRect>, DisplayError> {
+                Ok(vec![rect(0)])
+            }
+
+            fn monitor_layout(&self) -> Result<Vec<MonitorInfo>, DisplayError> {
+                Ok(vec![MonitorInfo {
+                    id: Some("SCREEN-1".to_owned()),
+                    rect: rect(0),
+                }])
+            }
+
+            fn cursor_position(&self) -> Result<CursorPoint, DisplayError> {
+                Ok(CursorPoint { x: 0, y: 0 })
+            }
+        }
+
+        let descriptions = Identified.monitor_descriptions().unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].info.id.as_deref(), Some("SCREEN-1"));
+        assert_eq!(descriptions[0].label, None);
+    }
+
+    /// An enumeration failure is still a failure: a defaulted method must
+    /// propagate it rather than reporting an empty desk.
+    #[test]
+    fn an_enumeration_failure_propagates_through_the_default() {
+        struct Broken;
+
+        impl DisplayInfo for Broken {
+            fn desktop_bounds(&self) -> Result<Screen, DisplayError> {
+                Err(DisplayError::Unavailable {
+                    reason: "no session".to_owned(),
+                })
+            }
+
+            fn monitors(&self) -> Result<Vec<MonitorRect>, DisplayError> {
+                Err(DisplayError::Unavailable {
+                    reason: "no session".to_owned(),
+                })
+            }
+
+            fn cursor_position(&self) -> Result<CursorPoint, DisplayError> {
+                Err(DisplayError::Unavailable {
+                    reason: "no session".to_owned(),
+                })
+            }
+        }
+
+        assert!(Broken.monitor_descriptions().is_err());
+    }
 }

@@ -13,7 +13,9 @@ use crate::clipboard::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
 };
 use crate::cursor::{CursorMask, CursorMaskError};
-use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorInfo, MonitorRect, Screen};
+use crate::display::{
+    CursorPoint, DisplayError, DisplayInfo, MonitorDescription, MonitorInfo, MonitorRect, Screen,
+};
 use crate::file_blob::{BlobNaming, FileBlob, FileBlobBuilder, FileBlobRefusal};
 use crate::input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerEvent,
@@ -479,11 +481,14 @@ pub fn fake_monitor_id(index: usize) -> String {
 pub struct FakeDisplay {
     screen: Mutex<Screen>,
     cursor: Mutex<CursorPoint>,
-    /// The monitor layout, ids and all. Defaults to a single monitor
-    /// covering the whole screen; multi-monitor tests override it via
-    /// [`Self::set_monitors`] (geometry only, ids synthesized) or
-    /// [`Self::set_monitor_layout`] (both).
-    monitors: Mutex<Vec<MonitorInfo>>,
+    /// The monitor layout, ids and labels and all — one list, projected
+    /// three ways by the three queries, so they cannot disagree about
+    /// which monitors exist. Defaults to a single unlabelled monitor
+    /// covering the whole screen; tests override it via
+    /// [`Self::set_monitors`] (geometry only, ids synthesized),
+    /// [`Self::set_monitor_layout`] (geometry and ids), or
+    /// [`Self::set_monitor_descriptions`] (all three).
+    monitors: Mutex<Vec<MonitorDescription>>,
     /// When set, both queries fail with this reason — the platform
     /// refusing to report geometry.
     fail: Mutex<Option<String>>,
@@ -497,14 +502,20 @@ impl FakeDisplay {
         Self {
             screen: Mutex::new(screen),
             cursor: Mutex::new(CursorPoint { x: 0, y: 0 }),
-            monitors: Mutex::new(vec![MonitorInfo {
-                id: Some(fake_monitor_id(0)),
-                rect: MonitorRect {
-                    left: 0,
-                    top: 0,
-                    width: screen.width,
-                    height: screen.height,
+            monitors: Mutex::new(vec![MonitorDescription {
+                info: MonitorInfo {
+                    id: Some(fake_monitor_id(0)),
+                    rect: MonitorRect {
+                        left: 0,
+                        top: 0,
+                        width: screen.width,
+                        height: screen.height,
+                    },
                 },
+                // Unlabelled by default: the ordinary backend is the one
+                // that cannot read a product name, and a test that cares
+                // about labels says so.
+                label: None,
             }]),
             fail: Mutex::new(None),
         }
@@ -525,7 +536,8 @@ impl FakeDisplay {
     /// edge-mapping tests. Tests written before monitors had identities
     /// keep working unchanged.
     ///
-    /// **A monitor that survives the change keeps its id.** A rectangle
+    /// **A monitor that survives the change keeps its id** — and its label,
+    /// for the same reason. A rectangle
     /// present before and after is the same screen, and relabelling it
     /// would model the one thing ADR 0018 chose device strings to avoid: a
     /// screen whose identity silently moves when the list around it
@@ -536,32 +548,36 @@ impl FakeDisplay {
     /// neighbour's name either.
     pub fn set_monitors(&self, monitors: Vec<MonitorRect>) {
         let mut previous = lock(&self.monitors);
-        let mut unclaimed: Vec<MonitorInfo> = previous.clone();
-        let mut next: Vec<MonitorInfo> = monitors
+        let mut unclaimed: Vec<MonitorDescription> = previous.clone();
+        let mut next: Vec<MonitorDescription> = monitors
             .into_iter()
             .map(|rect| {
-                // Same rectangle as one we had? Same screen, same id.
-                match unclaimed.iter().position(|held| held.rect == rect) {
+                // Same rectangle as one we had? Same screen, same id, same
+                // label.
+                match unclaimed.iter().position(|held| held.info.rect == rect) {
                     Some(index) => unclaimed.remove(index),
-                    None => MonitorInfo { id: None, rect },
+                    None => MonitorDescription {
+                        info: MonitorInfo { id: None, rect },
+                        label: None,
+                    },
                 }
             })
             .collect();
 
         // Name the newcomers from the lowest index nothing else holds.
         for index in 0.. {
-            if next.iter().all(|monitor| monitor.id.is_some()) {
+            if next.iter().all(|monitor| monitor.info.id.is_some()) {
                 break;
             }
             let candidate = fake_monitor_id(index);
             if next
                 .iter()
-                .any(|monitor| monitor.id.as_deref() == Some(candidate.as_str()))
+                .any(|monitor| monitor.info.id.as_deref() == Some(candidate.as_str()))
             {
                 continue;
             }
-            if let Some(unnamed) = next.iter_mut().find(|monitor| monitor.id.is_none()) {
-                unnamed.id = Some(candidate);
+            if let Some(unnamed) = next.iter_mut().find(|monitor| monitor.info.id.is_none()) {
+                unnamed.info.id = Some(candidate);
             }
         }
         *previous = next;
@@ -574,8 +590,23 @@ impl FakeDisplay {
     ///
     /// Whatever is given is stored verbatim, including `None` and including
     /// ids [`Self::set_monitors`] would never mint — that is the point of
-    /// having both setters.
+    /// having both setters. Every monitor comes out **unlabelled**: this is
+    /// the identity setter, and a test that wants product names uses
+    /// [`Self::set_monitor_descriptions`].
     pub fn set_monitor_layout(&self, monitors: Vec<MonitorInfo>) {
+        *lock(&self.monitors) = monitors
+            .into_iter()
+            .map(|info| MonitorDescription { info, label: None })
+            .collect();
+    }
+
+    /// Replace the monitor layout including each monitor's human-readable
+    /// label — for a test about captions: a labelled screen, an unlabelled
+    /// one, two screens sharing a label (the duplicate case the editor
+    /// suffixes), or a label the layout model will refuse.
+    ///
+    /// Stored verbatim, like [`Self::set_monitor_layout`], labels included.
+    pub fn set_monitor_descriptions(&self, monitors: Vec<MonitorDescription>) {
         *lock(&self.monitors) = monitors;
     }
 
@@ -613,11 +644,19 @@ impl DisplayInfo for FakeDisplay {
         // real backend must not withhold it.
         Ok(lock(&self.monitors)
             .iter()
-            .map(|monitor| monitor.rect)
+            .map(|monitor| monitor.info.rect)
             .collect())
     }
 
     fn monitor_layout(&self) -> Result<Vec<MonitorInfo>, DisplayError> {
+        self.guard()?;
+        Ok(lock(&self.monitors)
+            .iter()
+            .map(|monitor| monitor.info.clone())
+            .collect())
+    }
+
+    fn monitor_descriptions(&self) -> Result<Vec<MonitorDescription>, DisplayError> {
         self.guard()?;
         Ok(lock(&self.monitors).clone())
     }
