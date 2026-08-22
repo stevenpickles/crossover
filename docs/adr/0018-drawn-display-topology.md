@@ -731,6 +731,64 @@ per-monitor override for a screen the platform will not measure is
 nothing reads it. [PROTOCOL.md](../PROTOCOL.md) §3, §6.2, and §8 carry the
 same amendment.
 
+**Addendum (2026-08-22), feature/160 — what the editor does with a size.**
+The seeding rule the amendment above promised, recorded with its constants
+because they are the part a reader cannot re-derive:
+
+- **One layout unit is a quarter of a millimetre** (`UNITS_PER_MM` = 4). The
+  units are abstract, so the constant buys nothing but consistency and
+  *magnitude*: an ordinary 27" panel is 597 mm wide and seeds 2388 units,
+  which sits in the same range as the 1920–2560 its DIP seeding produced, so
+  arrangements drawn before and after this rule zoom and snap alike. It is
+  also small enough that the largest size the wire admits (10 000 mm) seeds
+  40 000 units, inside `MAX_MONITOR_EXTENT` with room to spare — no legal
+  measurement can reach a clamp.
+- **A monitor that did not measure itself seeds at its DIP size times the
+  machine's median millimetres-per-DIP**, so it stays in proportion with its
+  measured siblings rather than being drawn at a magnitude from another
+  scale entirely. The *median* rather than the mean: one lying panel — a
+  television, a partially-cached EDID — should not drag every unmeasured
+  rectangle on the desk with it, and a desk has few enough screens that one
+  outlier is a large share of a mean.
+- **A machine that measured nothing at all borrows the other machine's
+  ratio**, and only when neither desk measured anything does the ratio
+  become 1:1 — at which point the whole scene seeds in DIPs, **exactly** as
+  it did before sizes existed. That degenerate case is a literal third arm
+  in the code rather than the general one with a ratio of 1.0, so
+  "unmeasurable platforms draw what they always drew" is a property of the
+  code's shape and not of an argument about rounding. It is property-tested
+  as such.
+- **EDID measures the panel in the panel's own orientation**, so a rotated
+  screen's millimetres are matched to the pixel rectangle's orientation
+  before use. That is a decision about proportion, so it lives in the
+  editor's seeding rule rather than in the platform backend that reads the
+  bytes.
+- **Sizes are seeded, never rescaled.** The rule applies where the editor
+  already seeds — a machine drawn for the first time, a monitor newly docked
+  into an existing arrangement. A saved arrangement's rectangles are the
+  user's and are left alone: rescaling them would silently redraw a crossing
+  they had already agreed to. For the same reason the editor's transplant
+  (its once-a-second reconciliation with the worker's state file) now holds a
+  rectangle's *size* as well as its position while the screen behind it is
+  unchanged — the worker learns a panel's size a moment after it learns the
+  panel exists, and a rectangle that resized under a drag in progress would
+  be the drag-wipe of feature/156 in a form nobody would recognise.
+- **The abutment invariant is a property of the packing, not a repair.** The
+  editor seeds a machine's monitors abutting left to right in their live
+  order, each x derived from the width actually drawn, so exact abutment
+  (the model's tolerance is zero) and non-overlap survive any change to the
+  widths. Seeding *positions* from the live pixel geometry was considered
+  and rejected for this branch: it would guarantee neither — cloned displays
+  share a pixel rectangle exactly, which would seed two rectangles on top of
+  one another and block a save the user never caused — and it would change
+  what an unmeasured desk draws, which this branch promises not to do.
+- **A rectangle seeded from the fallback is badged** (`size estimated`) on
+  the canvas, non-blocking, in the manner of the existing `unplaced` cue:
+  nothing is wrong, the arrangement saves, and what the user is owed is the
+  reason one rectangle's proportions may not match the screen in front of
+  them. A rectangle an authoritative arrangement placed is never badged —
+  its size is what the user saved, whatever the panel says today.
+
 **Amendment (2026-08-20):** the `config` feature also carries `serde_json`,
 for the state-file schema this ADR places in the same crate — versioned
 JSON needs a JSON implementation, which the decision's dependency sentence
