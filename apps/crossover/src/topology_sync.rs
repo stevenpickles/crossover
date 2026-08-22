@@ -1355,6 +1355,11 @@ fn live_of(report: MonitorReport) -> LiveMonitor {
         // unvalidated, and the wire decoder refused anything else before
         // this frame got here.
         label: report.label,
+        // Not yet on the wire: `MonitorReport` gains the field in the very
+        // next step of this feature, and until it does the peer's screens
+        // are recorded unmeasured — which is what a peer with no size to
+        // give reports anyway, so the editor above already handles it.
+        physical_size: None,
     }
 }
 
@@ -2391,6 +2396,7 @@ mod tests {
                     },
                 },
                 label: Some("DELL U2720Q".to_owned()),
+                physical_size: None,
             },
             MonitorDescription {
                 info: MonitorInfo {
@@ -2403,6 +2409,7 @@ mod tests {
                     },
                 },
                 label: None,
+                physical_size: None,
             },
         ]);
         a.feed(TopologyEvent::LocalDisplayChanged).await;
@@ -2447,6 +2454,7 @@ mod tests {
             // Over the byte bound, and carrying a control character: both
             // rejection classes at once.
             label: Some(format!("DELL\n{}", "x".repeat(80))),
+            physical_size: None,
         }]);
         a.feed(TopologyEvent::LocalDisplayChanged).await;
 

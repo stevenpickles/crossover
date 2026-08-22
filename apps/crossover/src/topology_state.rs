@@ -73,8 +73,8 @@ use tokio::task::JoinHandle;
 use crossover_platform::{DisplayError, DisplayInfo};
 use crossover_topology::{
     AtomicWriteError, DeviceId, LayoutRect, LayoutState, LiveMonitor, MAX_MONITORS_PER_MACHINE,
-    MachineState, MonitorId, MonitorLabel, PeerState, StateError, TOPOLOGY_STATE_VERSION,
-    TopologyState, now_unix_millis, serialize_state, write_atomic,
+    MachineState, MonitorId, MonitorLabel, PeerState, PhysicalSizeMm, StateError,
+    TOPOLOGY_STATE_VERSION, TopologyState, now_unix_millis, serialize_state, write_atomic,
 };
 
 use crate::config::LayoutSource;
@@ -520,13 +520,13 @@ pub enum LiveMonitorsError {
 /// no real platform report should) is likewise omitted and logged, rather
 /// than the whole document being refused for one bad entry.
 ///
-/// **A label is weaker than any of that.** It is
+/// **The descriptive fields are weaker than any of that.** It is
 /// [`crossover_platform::DisplayInfo::monitor_descriptions`] this asks —
-/// the ~1 s query, never the 8 ms one — and a label that will not validate
-/// costs the *label* and not the monitor: the monitor is reported
-/// unlabelled, exactly as one the platform never named would be. A caption
-/// is display-only, so refusing a screen over one would trade something
-/// that matters for something that does not.
+/// the ~1 s query, never the 8 ms one — and a label or a physical size that
+/// will not validate costs *that field* and not the monitor: the monitor is
+/// reported without it, exactly as one the platform never described would
+/// be. Both are display-only, so refusing a screen over either would trade
+/// something that matters for something that does not.
 ///
 /// # Errors
 ///
@@ -586,10 +586,25 @@ pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, Live
                     None
                 }
             });
+        let physical_size = monitor.physical_size.and_then(|size| {
+            match PhysicalSizeMm::new(size.width_mm, size.height_mm) {
+                Ok(size) => Some(size),
+                Err(error) => {
+                    tracing::debug!(
+                        monitor = %id,
+                        error = %error,
+                        "topology state: an unusable monitor size; the monitor is reported \
+                         without one"
+                    );
+                    None
+                }
+            }
+        });
         live.push(LiveMonitor {
             id,
             rect,
             label,
+            physical_size,
             // `DisplayInfo` has no per-monitor scale query yet
             // (crossover-platform's `display` module: `MonitorInfo` carries
             // geometry and an id, not a scale). Until a later branch adds
@@ -892,10 +907,12 @@ mod tests {
             MonitorDescription {
                 info: monitor_at(0, 0),
                 label: Some("DELL U2720Q".to_owned()),
+                physical_size: None,
             },
             MonitorDescription {
                 info: monitor_at(1, 100),
                 label: None,
+                physical_size: None,
             },
         ]);
 
@@ -911,6 +928,79 @@ mod tests {
         assert_eq!(live[1].label, None);
     }
 
+    /// A measured panel size reaches the state file, and an unmeasured
+    /// monitor is reported without one rather than skipped — the fallback
+    /// the editor's seeding will depend on.
+    #[test]
+    fn a_measured_panel_reaches_the_state_file_and_its_absence_costs_nothing() {
+        use crossover_platform::{MonitorDescription, PhysicalSizeMm as PlatformSize};
+
+        let display = display(1920, 1080);
+        display.set_monitor_descriptions(vec![
+            MonitorDescription {
+                info: monitor_at(0, 0),
+                label: None,
+                physical_size: Some(PlatformSize {
+                    width_mm: 597,
+                    height_mm: 336,
+                }),
+            },
+            MonitorDescription {
+                info: monitor_at(1, 100),
+                label: None,
+                physical_size: None,
+            },
+        ]);
+
+        let live = live_monitors(&display).unwrap();
+        assert_eq!(live.len(), 2);
+        assert_eq!(
+            live[0].physical_size,
+            Some(crossover_topology::PhysicalSizeMm::new(597, 336).unwrap())
+        );
+        assert_eq!(live[1].physical_size, None);
+    }
+
+    /// A size the layout model refuses costs the size, never the monitor —
+    /// the same trade the label gets, and for the same reason. A platform
+    /// that measures a panel as zero millimetres wide, or as ten metres
+    /// past the cap, has told us nothing usable about proportion; it has
+    /// not stopped being a screen.
+    #[test]
+    fn an_unusable_physical_size_leaves_the_monitor_reported_without_one() {
+        use crossover_platform::{MonitorDescription, PhysicalSizeMm as PlatformSize};
+
+        for (width_mm, height_mm) in [(0, 336), (597, 0), (u16::MAX, 336)] {
+            let display = display(1920, 1080);
+            display.set_monitor_descriptions(vec![MonitorDescription {
+                info: monitor_at(0, 0),
+                label: Some("DELL U2720Q".to_owned()),
+                physical_size: Some(PlatformSize {
+                    width_mm,
+                    height_mm,
+                }),
+            }]);
+
+            let live = live_monitors(&display).unwrap();
+            assert_eq!(
+                live.len(),
+                1,
+                "a screen was dropped over {width_mm}x{height_mm}"
+            );
+            assert_eq!(live[0].id.as_str(), fake_monitor_id(0));
+            assert_eq!(live[0].physical_size, None);
+            // The caption beside it is untouched: one unusable field does
+            // not cost the monitor its other one.
+            assert_eq!(
+                live[0]
+                    .label
+                    .as_ref()
+                    .map(crossover_topology::MonitorLabel::as_str),
+                Some("DELL U2720Q")
+            );
+        }
+    }
+
     /// A label the layout model refuses costs the label, never the
     /// monitor: it is display-only, so dropping a screen over one would
     /// trade geometry for a caption.
@@ -922,6 +1012,7 @@ mod tests {
         display.set_monitor_descriptions(vec![MonitorDescription {
             info: monitor_at(0, 0),
             label: Some("x".repeat(200)),
+            physical_size: None,
         }]);
 
         let live = live_monitors(&display).unwrap();
@@ -949,6 +1040,7 @@ mod tests {
         let labelled = |label: Option<&str>| MonitorDescription {
             info: monitor_at(0, 0),
             label: label.map(str::to_owned),
+            physical_size: None,
         };
 
         display.set_monitor_descriptions(vec![labelled(Some("DELL U2720Q"))]);
@@ -1000,6 +1092,7 @@ mod tests {
         let described = |label: &str| MonitorDescription {
             info: monitor_at(0, 0),
             label: Some(label.to_owned()),
+            physical_size: None,
         };
 
         display.set_monitor_descriptions(vec![described("DELL U2720Q")]);
@@ -1042,6 +1135,7 @@ mod tests {
         display.set_monitor_descriptions(vec![MonitorDescription {
             info: monitor_at(0, 0),
             label: Some("DELL U2720Q".to_owned()),
+            physical_size: None,
         }]);
         let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
         let writer = TopologyStateWriter::start(path, state);
@@ -1050,6 +1144,7 @@ mod tests {
         display.set_monitor_descriptions(vec![MonitorDescription {
             info: monitor_at(1, 0),
             label: None,
+            physical_size: None,
         }]);
         assert!(writer.set_monitors(live_monitors(&display).unwrap()));
 
@@ -1059,6 +1154,7 @@ mod tests {
         display.set_monitor_descriptions(vec![MonitorDescription {
             info: monitor_at(0, 0),
             label: None,
+            physical_size: None,
         }]);
         assert!(writer.set_monitors(live_monitors(&display).unwrap()));
         assert_eq!(
@@ -1083,6 +1179,7 @@ mod tests {
         display.set_monitor_descriptions(vec![MonitorDescription {
             info: monitor_at(0, 0),
             label: Some("DELL U2720Q".to_owned()),
+            physical_size: None,
         }]);
         let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
         let writer = TopologyStateWriter::start(path, state);
@@ -1090,6 +1187,7 @@ mod tests {
         display.set_monitor_descriptions(vec![MonitorDescription {
             info: monitor_at(0, 0),
             label: None,
+            physical_size: None,
         }]);
         let mut fresh = live_monitors(&display).unwrap();
         assert_eq!(fresh[0].label, None);
@@ -1115,6 +1213,7 @@ mod tests {
             },
             scale_percent: 100,
             label: None,
+            physical_size: None,
         }];
         writer.fill_remembered_labels(&mut stranger);
         assert_eq!(stranger[0].label, None);
@@ -1223,6 +1322,7 @@ mod tests {
             },
             scale_percent: 100,
             label: None,
+            physical_size: None,
         });
         assert!(writer.set_monitors(with_second));
 
@@ -1320,6 +1420,7 @@ mod tests {
         let described = |label: Option<&str>| MonitorDescription {
             info: monitor_at(0, 0),
             label: label.map(str::to_owned),
+            physical_size: None,
         };
 
         display.set_monitor_descriptions(vec![described(Some("DELL U2720Q"))]);
@@ -1462,6 +1563,7 @@ mod tests {
             },
             scale_percent: 100,
             label: None,
+            physical_size: None,
         });
         assert!(writer.set_monitors(with_second.clone()));
 

@@ -1226,6 +1226,7 @@ mod tests {
             },
             scale_percent,
             label: None,
+            physical_size: None,
         }
     }
 
