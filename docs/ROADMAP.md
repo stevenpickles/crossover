@@ -10,7 +10,19 @@
 > (egui through eframe, in its own on-demand user-session binary,
 > `apps/crossover-layout`, which the service never touches).
 >
-> Implementation is well past groundwork. Landed so far: the v4
+> Implementation is well past groundwork. **`PROTOCOL_VERSION` now stands
+> at 6, floor 6** — v4 brought the `EntryPoint` shape (feature/147), v5 the
+> per-monitor product name so the editor captions a rectangle `DELL U2720Q`
+> rather than `\\.\DISPLAY1` (feature/158), and v6 the panel's physical size
+> in millimetres so two desks can be drawn in proportion to each other
+> (feature/159). Each was ADR 0017's rule applied unchanged: a field
+> appended to `MonitorTopology`, which every pair of peers exchanges and no
+> feature bit gates, so the byte is on the wire regardless and the floor
+> moves with the ceiling. The size only *travels* so far — seeding the
+> editor's rectangles from it is feature/160 and the manual per-monitor
+> override is feature/161.
+>
+> Landed so far: the v4
 > `EntryPoint` protocol shape and `PROTOCOL_VERSION` 4 (feature/147); the
 > `crossover-topology` crate — the layout model, its validation, the
 > format-preserving config writer, and the state-file schema; the worker's
