@@ -73,8 +73,10 @@ pub use layout::{
 };
 pub use monitor::{
     FORMAT_CHARACTERS, MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MAX_PHYSICAL_SIZE_MM,
-    MonitorId, MonitorIdError, MonitorLabel, MonitorLabelError, PhysicalSizeError, PhysicalSizeMm,
-    validate_monitor_id, validate_monitor_label, validate_physical_size,
+    MAX_PLAUSIBLE_PHYSICAL_MM, MIN_PLAUSIBLE_PHYSICAL_MM, MonitorId, MonitorIdError, MonitorLabel,
+    MonitorLabelError, PhysicalSizeError, PhysicalSizeMm, is_plausible_millimetres,
+    is_plausible_physical_size, validate_monitor_id, validate_monitor_label,
+    validate_physical_size,
 };
 
 #[cfg(any(test, feature = "config"))]
