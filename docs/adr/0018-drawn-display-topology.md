@@ -750,6 +750,23 @@ because they are the part a reader cannot re-derive:
   television, a partially-cached EDID — should not drag every unmeasured
   rectangle on the desk with it, and a desk has few enough screens that one
   outlier is a large share of a mean.
+- **The plausibility gate is the editor's too, and the range is shared.**
+  The 50..=3000 mm range the Windows EDID reader applies now lives in
+  `crossover-topology` (`MIN_PLAUSIBLE_PHYSICAL_MM` /
+  `MAX_PLAUSIBLE_PHYSICAL_MM`, beside `validate_physical_size`), and the
+  editor applies the same test before drawing from any size — its own or a
+  peer's. The amendment above placed the gate "at the acquisition end", and
+  implementation showed that half a gate: the wire admits 1..=10 000 mm by
+  design, so a peer that is trusted to be *itself* rather than to be
+  *correct* could otherwise put a 1 mm screen (a four-unit sliver on a real
+  crossing seam, too small to grab) or a 10 m one (40 000 units, swallowing
+  the scene) straight into drawn geometry, with no repair gesture in the
+  editor until `feature/161`. An implausible size is therefore treated as
+  **no size**: the estimated arm that already exists draws the rectangle
+  from its pixels and badges it. The loose wire bound is unchanged and
+  still never terminates a session — the asymmetry the amendment describes
+  is intact, with the belief half now applied wherever a size is *drawn*
+  rather than only where one is *claimed*.
 - **A machine that measured nothing at all borrows the other machine's
   ratio**, and only when neither desk measured anything does the ratio
   become 1:1 — at which point the whole scene seeds in DIPs, **exactly** as
@@ -757,7 +774,13 @@ because they are the part a reader cannot re-derive:
   in the code rather than the general one with a ratio of 1.0, so
   "unmeasurable platforms draw what they always drew" is a property of the
   code's shape and not of an argument about rounding. It is property-tested
-  as such.
+  as such. One deliberate difference from the pre-sizes seeding, and only
+  one: a drawn extent is now **clamped to `MAX_MONITOR_EXTENT`**. Before,
+  an absurd-but-legal desk (a maximal-extent monitor at 25 % scale seeds
+  262 140) drew a rectangle `Layout::new` then refused, which reached the
+  user as a disabled Save button and an empty offender list — a dead end
+  with nothing to act on. The clamp cannot alter any arrangement that could
+  have been saved.
 - **EDID measures the panel in the panel's own orientation**, so a rotated
   screen's millimetres are matched to the pixel rectangle's orientation
   before use. That is a decision about proportion, so it lives in the
@@ -769,10 +792,17 @@ because they are the part a reader cannot re-derive:
   user's and are left alone: rescaling them would silently redraw a crossing
   they had already agreed to. For the same reason the editor's transplant
   (its once-a-second reconciliation with the worker's state file) now holds a
-  rectangle's *size* as well as its position while the screen behind it is
-  unchanged — the worker learns a panel's size a moment after it learns the
-  panel exists, and a rectangle that resized under a drag in progress would
-  be the drag-wipe of feature/156 in a form nobody would recognise.
+  **seeded** rectangle's size as well as its position while the screen behind
+  it is unchanged — the worker learns a panel's size a moment after it learns
+  the panel exists, and a rectangle that resized under a drag in progress
+  would be the drag-wipe of feature/156 in a form nobody would recognise.
+  Two limits on that hold, both of which the rule needs to stay coherent:
+  "unchanged" means the same pixels **and** the same `scale_percent`, since
+  a DPI change is news about the screen exactly as a resolution change is
+  and reports the same pixel count; and the hold applies only to a *seed* —
+  a rectangle the fresh document places authoritatively is the user's own
+  saved size, freshly read, so it wins outright and is never left carrying a
+  seed's badge.
 - **The abutment invariant is a property of the packing, not a repair.** The
   editor seeds a machine's monitors abutting left to right in their live
   order, each x derived from the width actually drawn, so exact abutment
@@ -787,7 +817,18 @@ because they are the part a reader cannot re-derive:
   nothing is wrong, the arrangement saves, and what the user is owed is the
   reason one rectangle's proportions may not match the screen in front of
   them. A rectangle an authoritative arrangement placed is never badged —
-  its size is what the user saved, whatever the panel says today.
+  its size is what the user saved, whatever the panel says today. And the
+  badge marks a **difference** in fidelity, so it is suppressed where there
+  is none: on a scene in which nothing anywhere measured itself, every
+  rectangle is seeded from pixels exactly as every rectangle always was, and
+  a third caption line on all of them would say nothing. Partial
+  measurement — one machine, or one screen — badges as described.
+- **The badge does not flicker, and does not need editor-side state to
+  avoid it.** The worker's per-monitor retention record (the acquisition
+  amendment above) already holds a size across a sweep that fails to
+  re-read one panel's EDID, so a rectangle does not oscillate between the
+  measured and estimated arms; the only transition left is a size learned
+  for the first time mid-edit, which the transplant covers.
 
 **Amendment (2026-08-20):** the `config` feature also carries `serde_json`,
 for the state-file schema this ADR places in the same crate — versioned
