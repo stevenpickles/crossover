@@ -43,6 +43,7 @@ mod model;
 mod paths;
 mod render;
 mod save;
+mod seeding;
 mod session;
 mod snap;
 mod state_file;

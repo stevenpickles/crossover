@@ -417,21 +417,84 @@ impl<'de> Deserialize<'de> for MonitorLabel {
 ///   arithmetic safety and allocation safety, and it must not be in the
 ///   business of second-guessing what hardware exists — a 5 m video wall
 ///   reporting itself honestly is not a malformed frame, and a decoder that
-///   called it one would terminate a healthy session over a number nothing
-///   keys off. Ten metres is far past any panel and far short of anything
-///   that could overflow the `i32` arithmetic a drawn layout does.
-/// - *At the platform*, the rule refuses the merely **implausible** —
-///   `crossover-platform-windows`' EDID reader admits only 50..=3000 mm,
-///   because projectors, TVs, and virtual displays report sizes that are
-///   fiction, and a wrong size drawn confidently is worse than no size at
-///   all. That gate is an acquisition policy: it decides what this machine
-///   is willing to *claim*, and it can be tightened or loosened without
-///   touching what a peer is allowed to *say*.
+///   called it one would terminate a healthy session over a value that
+///   steers nothing. Ten metres is far past any panel and far short of
+///   anything that could overflow the `i32` arithmetic a drawn layout does.
+///   The editor *does* seed rectangles from a size, so "steers nothing" is
+///   not "changes nothing" — but a value this loose bound admits and
+///   [`MIN_PLAUSIBLE_PHYSICAL_MM`] does not is drawn as an **estimate**
+///   rather than as a measurement, so the loose bound still cannot distort
+///   a drawing, and it still never costs a session.
+/// - *At the consumers*, the rule refuses the merely **implausible** —
+///   [`MIN_PLAUSIBLE_PHYSICAL_MM`]`..=`[`MAX_PLAUSIBLE_PHYSICAL_MM`],
+///   applied both by the platform backend that reads an EDID and by the
+///   editor that seeds a rectangle. That gate is a *policy about belief*,
+///   not a decoding rule, and it can be tightened for a newly-discovered
+///   class of lying display with no protocol change and no peer to
+///   coordinate with.
 ///
 /// Zero is refused on both sides, on the same reasoning a zero-sized
 /// rectangle is: a screen with no width is not a screen, and a proportion
 /// derived from it would divide by zero.
 pub const MAX_PHYSICAL_SIZE_MM: u16 = 10_000;
+
+/// Smallest panel dimension anything in this workspace will *believe*, in
+/// millimetres.
+///
+/// 50 mm is under two inches on the short axis — smaller than any display a
+/// desktop OS drives, and comfortably below a 7" panel's ~87 mm height.
+///
+/// **This is a plausibility gate, not a validity bound**, and it is
+/// deliberately far tighter than [`MAX_PHYSICAL_SIZE_MM`]. The two answer
+/// different questions, and both answers are needed:
+///
+/// - The wire bound decides whether a *peer's* claim is decodable and safe
+///   to do arithmetic on. It refuses the impossible and no more, because
+///   terminating a healthy session over an eccentric measurement would be
+///   absurd.
+/// - This range decides whether a measurement is worth **drawing from**. A
+///   size is a *proportion*: the editor seeds every rectangle against every
+///   other, so one monitor claiming 1 mm or 10 m does not draw one wrong
+///   rectangle, it draws every rectangle on the desk wrong — and there is
+///   no gesture in the editor to repair a size by hand yet. Withholding a
+///   size costs the improvement and nothing else: the rectangle is seeded
+///   from its pixels instead, and says so.
+///
+/// It lives here, rather than in the EDID reader that first needed it, so
+/// that the acquiring platform and the consuming editor cannot drift apart
+/// about what counts as believable — one of them is looking at local
+/// hardware and the other at whatever a peer sent, and a size that this
+/// machine would have refused to claim must not be one it will draw from
+/// merely because it arrived over the network.
+pub const MIN_PLAUSIBLE_PHYSICAL_MM: u16 = 50;
+
+/// Largest panel dimension anything in this workspace will *believe*, in
+/// millimetres.
+///
+/// 3000 mm is a 3-metre screen — past any panel sold as a monitor, and past
+/// most walls. Anything larger is a projector describing its current throw,
+/// a driver reporting garbage, or a virtual display inventing a number. See
+/// [`MIN_PLAUSIBLE_PHYSICAL_MM`] for why this range is tighter than the
+/// wire's, and why it is shared rather than per-crate.
+pub const MAX_PLAUSIBLE_PHYSICAL_MM: u16 = 3_000;
+
+/// Whether both axes of `size` are inside the plausible range — the one
+/// question every consumer of a physical size asks before drawing from it.
+///
+/// Pure, total, and `const`: it is a comparison, and every caller wants it
+/// on a path where an allocation or an error would be absurd.
+#[must_use]
+pub const fn is_plausible_physical_size(size: PhysicalSizeMm) -> bool {
+    is_plausible_millimetres(size.width_mm) && is_plausible_millimetres(size.height_mm)
+}
+
+/// Whether one dimension is inside the plausible range — the single-axis
+/// half of [`is_plausible_physical_size`], for a producer (an EDID reader)
+/// that is still holding two loose integers rather than a validated size.
+#[must_use]
+pub const fn is_plausible_millimetres(millimetres: u16) -> bool {
+    millimetres >= MIN_PLAUSIBLE_PHYSICAL_MM && millimetres <= MAX_PLAUSIBLE_PHYSICAL_MM
+}
 
 /// A monitor's physical size — the panel's real width and height in
 /// millimetres, as the platform measured it — validated on construction.
@@ -454,6 +517,10 @@ pub const MAX_PHYSICAL_SIZE_MM: u16 = 10_000;
 /// A conforming size is 1..=[`MAX_PHYSICAL_SIZE_MM`] millimetres on each
 /// axis ([`validate_physical_size`] states the rule, and
 /// [`MAX_PHYSICAL_SIZE_MM`] says why that ceiling is the loose one).
+/// **Conforming is not the same as believable**: a size outside
+/// [`MIN_PLAUSIBLE_PHYSICAL_MM`]`..=`[`MAX_PLAUSIBLE_PHYSICAL_MM`] decodes
+/// and travels perfectly well, and every consumer that *draws* from a size
+/// treats it as absent — see [`is_plausible_physical_size`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "RawPhysicalSizeMm")]
 pub struct PhysicalSizeMm {
@@ -593,8 +660,10 @@ mod tests {
 
     use super::{
         FORMAT_CHARACTERS, MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MAX_PHYSICAL_SIZE_MM,
-        MonitorId, MonitorIdError, MonitorLabel, MonitorLabelError, PhysicalSizeError,
-        PhysicalSizeMm, validate_monitor_id, validate_monitor_label, validate_physical_size,
+        MAX_PLAUSIBLE_PHYSICAL_MM, MIN_PLAUSIBLE_PHYSICAL_MM, MonitorId, MonitorIdError,
+        MonitorLabel, MonitorLabelError, PhysicalSizeError, PhysicalSizeMm,
+        is_plausible_physical_size, validate_monitor_id, validate_monitor_label,
+        validate_physical_size,
     };
 
     #[test]
@@ -876,6 +945,42 @@ mod tests {
                     height_mm: height
                 }),
                 "{width}x{height} mm was admitted"
+            );
+        }
+    }
+
+    /// The plausibility range is a *belief* policy layered on top of the
+    /// wire's validity bound, so it must sit strictly inside it — and both
+    /// its edges are inclusive, which is the half a range check is most
+    /// often written one off from.
+    #[test]
+    fn the_plausible_range_sits_inside_the_valid_one_and_includes_its_edges() {
+        const {
+            assert!(MIN_PLAUSIBLE_PHYSICAL_MM >= 1);
+            assert!(MAX_PLAUSIBLE_PHYSICAL_MM < MAX_PHYSICAL_SIZE_MM);
+        }
+
+        let size = |width, height| PhysicalSizeMm::new(width, height).unwrap();
+        for (width, height) in [
+            (MIN_PLAUSIBLE_PHYSICAL_MM, MIN_PLAUSIBLE_PHYSICAL_MM),
+            (MAX_PLAUSIBLE_PHYSICAL_MM, MAX_PLAUSIBLE_PHYSICAL_MM),
+            (597, 336),
+        ] {
+            assert!(is_plausible_physical_size(size(width, height)));
+        }
+        for (width, height) in [
+            (MIN_PLAUSIBLE_PHYSICAL_MM - 1, 300),
+            (300, MIN_PLAUSIBLE_PHYSICAL_MM - 1),
+            (MAX_PLAUSIBLE_PHYSICAL_MM + 1, 300),
+            (300, MAX_PLAUSIBLE_PHYSICAL_MM + 1),
+            (1, 1),
+            (MAX_PHYSICAL_SIZE_MM, MAX_PHYSICAL_SIZE_MM),
+        ] {
+            // Valid on the wire, and still not something to draw from.
+            assert!(validate_physical_size(width, height).is_ok());
+            assert!(
+                !is_plausible_physical_size(size(width, height)),
+                "{width}x{height} mm was believed"
             );
         }
     }

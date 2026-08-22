@@ -27,14 +27,30 @@ Builds that are not tagged releases identify themselves as such —
   and where the cursor crosses all still address a monitor by its device
   string, unchanged.
 
+- **The layout editor draws your screens in their real proportions.** A
+  rectangle is now seeded from the panel's actual size in millimetres, so a
+  13" laptop screen beside a 27" monitor is drawn about half its height
+  instead of the same size — and the arrangement you draw is the
+  arrangement you experience, since a cursor crosses at the height the
+  drawing says it does. Screens whose size cannot be read (a virtual or
+  remote display, a panel with no readable EDID) — or whose reported size
+  is not one a real panel could have — are drawn from their pixel counts,
+  scaled to sit believably beside the screens that could be measured, and
+  captioned `(size estimated)` so it is clear which rectangles are guesses.
+  Where *nothing* on either machine can be measured, every rectangle is
+  drawn from pixels exactly as before and nothing is captioned, since there
+  is no difference to point out. Only *new* rectangles are sized this way: an
+  arrangement you have already drawn and saved is never rescaled behind
+  your back, and a rectangle you are in the middle of dragging is never
+  resized under the pointer.
+
 - **Monitors report how big they physically are.** Each machine now reads
   the real width and height of every attached panel — in millimetres, off
   the monitor's own EDID — and reports it to the other machine and to the
-  layout editor's state file. Nothing draws differently yet: this release
-  carries the measurement end to end, and the editor starts *using* it to
-  size rectangles in a following change. A screen whose size cannot be read
-  or does not look believable (a projector, a virtual display, a remote
-  session) simply reports none, and is drawn exactly as before. The
+  layout editor's state file, which is what the editor's proportional
+  drawing (above) is built on. A screen whose size cannot be read or does
+  not look believable (a projector, a virtual display, a remote session)
+  simply reports none, and is drawn from its pixels as described above. The
   measurement is proportion only — arrangements, saved layouts, and where
   the cursor crosses all still address a monitor by its device string.
 

@@ -45,7 +45,10 @@
 //! sizes that are fiction (a projector's "size" is whatever it is currently
 //! throwing at a wall), and a monitor with a corrupt or partially-cached
 //! EDID reports whatever happens to be in those bytes. So this refuses far
-//! more aggressively than the wire does — see [`MIN_PLAUSIBLE_MM`].
+//! more aggressively than the wire does — see [`MIN_PLAUSIBLE_MM`], whose
+//! range is shared with the editor rather than owned here: the same
+//! asymmetry applies to a size that arrives from a peer, and one gate that
+//! two crates apply is one policy rather than two.
 
 use crossover_platform::PhysicalSizeMm;
 
@@ -66,32 +69,27 @@ const DESCRIPTOR_BYTES: usize = 18;
 
 /// Smallest panel dimension this build will believe, in millimetres.
 ///
-/// 50 mm is under two inches on the short axis — smaller than any display a
-/// desktop OS drives, and comfortably below a 7" panel's ~87 mm height.
+/// **The normative definition of this range is
+/// `crossover_topology::MIN_PLAUSIBLE_PHYSICAL_MM`**, where its argument
+/// lives, because the gate turned out not to be an acquisition policy: the
+/// *editor* asks the same question of a size that arrived from a peer, and
+/// a size this machine would have refused to claim must not be one it will
+/// draw from merely because somebody else sent it.
 ///
-/// **This gate is an acquisition policy, and it is deliberately far tighter
-/// than the protocol's own bound** (`MAX_PHYSICAL_SIZE_MM`, ten metres).
-/// The two are answering different questions. The wire has to decide
-/// whether a *peer's* claim is decodable and safe to do arithmetic on, so
-/// it refuses the impossible and no more — a 5 m video wall reporting
-/// itself honestly is not a malformed frame, and terminating a healthy
-/// session over one would be absurd. This gate decides whether *this
-/// machine* believes its own hardware enough to make a claim at all, and
-/// there the incentives run the other way: the cost of staying quiet is one
-/// missing improvement, and the cost of being wrong is every rectangle on
-/// two desks drawn to a false scale.
-///
-/// Keeping them separate means this range can be tightened the day a
-/// particular class of lying display turns up, with no protocol change and
-/// no peer to coordinate with.
+/// This is a mirror of it rather than a reference to it, because a platform
+/// crate does not depend on the layout model at build time (this crate's
+/// `Cargo.toml`, and ARCHITECTURE §3): a backend reports what the hardware
+/// says, and a trait that could only describe monitors the model already
+/// accepts could never report that a machine's configuration is unusable.
+/// The two are pinned together by a test — the same treatment, and the same
+/// reasoning, as this crate's `MonitorId` bounds.
 pub const MIN_PLAUSIBLE_MM: u16 = 50;
 
 /// Largest panel dimension this build will believe, in millimetres.
 ///
-/// 3000 mm is a 3-metre screen — past any panel sold as a monitor, and past
-/// most walls. Anything larger is a projector describing its current throw,
-/// a driver reporting garbage, or a virtual display inventing a number.
-/// See [`MIN_PLAUSIBLE_MM`] for why this range is tighter than the wire's.
+/// The other half of [`MIN_PLAUSIBLE_MM`]'s range, mirrored from
+/// `crossover_topology::MAX_PLAUSIBLE_PHYSICAL_MM` and pinned to it by the
+/// same test, for the same reason.
 pub const MAX_PLAUSIBLE_MM: u16 = 3000;
 
 /// The panel size `edid` describes, or `None` if it does not describe one
@@ -205,6 +203,27 @@ mod tests {
         block[54..72].copy_from_slice(&descriptor);
         fix_checksum(&mut block);
         block
+    }
+
+    /// The gate this reader applies and the gate the *editor* applies to a
+    /// size that arrived from a peer are one policy, and the layout model
+    /// holds its normative definition. This crate mirrors the two numbers
+    /// rather than depending on that model at build time (see
+    /// [`MIN_PLAUSIBLE_MM`]), so the mirror is pinned here — imported
+    /// rather than restated, exactly as this crate's `MonitorId` bounds
+    /// are, and for the same reason: a machine that refuses to *claim* a
+    /// 40 mm panel must not turn round and *draw* one because a peer said
+    /// it.
+    #[test]
+    fn the_plausible_range_is_the_layout_models_own() {
+        assert_eq!(
+            MIN_PLAUSIBLE_MM,
+            crossover_topology::MIN_PLAUSIBLE_PHYSICAL_MM
+        );
+        assert_eq!(
+            MAX_PLAUSIBLE_MM,
+            crossover_topology::MAX_PLAUSIBLE_PHYSICAL_MM
+        );
     }
 
     /// Set the last byte so the block sums to zero mod 256.
