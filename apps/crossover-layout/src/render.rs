@@ -23,7 +23,7 @@
 
 use eframe::egui::{self, Color32};
 
-use crate::model::{Diagnostics, DrawnMonitor, MachineGroup, Model, Severity};
+use crate::model::{Diagnostics, MachineGroup, Model, Severity};
 use crate::session::{EditorSession, Freshness};
 use crate::snap::{Axis, Guide};
 use crate::viewport::Viewport;
@@ -563,7 +563,12 @@ fn paint_group(
         );
     }
 
-    for monitor in &group.monitors {
+    // One call per machine, before anything is painted: the duplicate rule
+    // is a property of the group, so it cannot be decided a rectangle at a
+    // time. Positionally aligned with `group.monitors`.
+    let captions = crate::caption::captions(&caption_inputs(group));
+
+    for (monitor, caption) in group.monitors.iter().zip(&captions) {
         let top_left = to_absolute(
             viewport,
             canvas_origin,
@@ -602,7 +607,7 @@ fn paint_group(
         painter.rect(rect, 2.0, fill, stroke, egui::StrokeKind::Inside);
 
         if rect.width() >= MIN_LABEL_DIMENSION && rect.height() >= MIN_LABEL_DIMENSION {
-            let mut label = monitor_label(monitor);
+            let mut label = caption.clone();
             if unplaced {
                 label.push_str("\n(unplaced)");
             }
@@ -617,13 +622,19 @@ fn paint_group(
     }
 }
 
-fn monitor_label(monitor: &DrawnMonitor) -> String {
-    match monitor.native_size {
-        Some((width, height)) => {
-            format!("{} · {}\n{width}×{height}", monitor.ordinal, monitor.id)
-        }
-        None => format!("{} · {}", monitor.ordinal, monitor.id),
-    }
+/// One machine's monitors in the shape [`crate::caption`] reads — the whole
+/// of this renderer's captioning logic, which is to say none of it.
+fn caption_inputs(group: &MachineGroup) -> Vec<crate::caption::CaptionInput<'_>> {
+    group
+        .monitors
+        .iter()
+        .map(|monitor| crate::caption::CaptionInput {
+            id: &monitor.id,
+            label: monitor.label.as_ref(),
+            ordinal: monitor.ordinal,
+            native_size: monitor.native_size,
+        })
+        .collect()
 }
 
 fn to_absolute(viewport: &Viewport, origin: egui::Pos2, point: (f64, f64)) -> egui::Pos2 {
@@ -705,6 +716,44 @@ mod tests {
         assert!(painted.contains("different versions"), "{painted}");
         assert!(!painted.contains("crossover run"), "{painted}");
         assert!(painted.contains("state file unreadable"), "{painted}");
+    }
+
+    /// The caption a user actually sees: the product name where there is
+    /// one, the device string where there is not, duplicates numbered — the
+    /// whole rule painted, not merely computed.
+    #[test]
+    fn a_monitor_is_captioned_by_its_product_name_and_falls_back_to_its_id() {
+        use crate::test_support::{labelled_monitor, live_monitor};
+
+        let mut state = document(None, 0);
+        state.local.monitors = vec![
+            labelled_monitor("A", "DELL U2720Q"),
+            labelled_monitor("B", "DELL U2720Q"),
+            live_monitor(r"\\.\DISPLAY9"),
+        ];
+        // The monitors are seeded side by side, so give each one room to
+        // carry its caption rather than being dropped as too small.
+        for (index, monitor) in state.local.monitors.iter_mut().enumerate() {
+            monitor.rect.x = i32::try_from(index).unwrap() * 1920;
+        }
+
+        let session = EditorSession::WaitingForPeer {
+            model: Model::from_state(&state),
+            staleness: Freshness::Fresh,
+        };
+        let painted = painted_text(&session);
+
+        assert!(painted.contains("DELL U2720Q (1)"), "{painted}");
+        assert!(painted.contains("DELL U2720Q (2)"), "{painted}");
+        assert!(painted.contains(r"\\.\DISPLAY9"), "{painted}");
+        // The bare, un-numbered name never appears on its own line: both
+        // copies are numbered, so a user cannot mistake one for "the" one.
+        assert!(
+            !painted.lines().any(|line| line.ends_with("· DELL U2720Q")),
+            "{painted}"
+        );
+        // And the secondary information the editor always showed survives.
+        assert!(painted.contains("1920×1080"), "{painted}");
     }
 
     #[test]

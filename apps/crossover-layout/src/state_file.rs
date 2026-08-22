@@ -193,6 +193,7 @@ mod tests {
                 height: 1080,
             },
             scale_percent: 100,
+            label: None,
         }
     }
 
