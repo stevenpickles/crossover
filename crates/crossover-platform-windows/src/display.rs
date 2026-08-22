@@ -339,6 +339,44 @@ impl PathDescription {
     fn is_empty(&self) -> bool {
         self.label.is_none() && self.physical_size.is_none()
     }
+
+    /// Both halves known, so no further target on the same source could add
+    /// anything and none needs to be asked.
+    fn is_complete(&self) -> bool {
+        self.label.is_some() && self.physical_size.is_some()
+    }
+
+    /// Take from `other` whatever this does not already have, and nothing
+    /// it does. First answer wins **per field**, so an earlier target's
+    /// name is never replaced by a later one's while a gap it left is still
+    /// fillable.
+    fn fill_from(&mut self, other: Self) {
+        if self.label.is_none() {
+            self.label = other.label;
+        }
+        if self.physical_size.is_none() {
+            self.physical_size = other.physical_size;
+        }
+    }
+}
+
+/// Fold one target's answer into the descriptions gathered so far.
+///
+/// Pure, and separated from the Win32 loop below purely so it can be tested
+/// against the shape that motivated it: two paths on one `szDevice` where
+/// each carries a different half of the answer.
+fn record_description(
+    described: &mut Vec<(String, PathDescription)>,
+    device: String,
+    found: PathDescription,
+) {
+    if found.is_empty() {
+        return;
+    }
+    match described.iter_mut().find(|(held, _)| held == &device) {
+        Some((_, existing)) => existing.fill_from(found),
+        None => described.push((device, found)),
+    }
 }
 
 /// Every active display path's `szDevice` paired with what Windows' own
@@ -359,6 +397,24 @@ impl PathDescription {
 /// or that yields neither a name nor a size, contributes nothing and stops
 /// nothing. The `Err` case is reserved for a failure of the *sweep* — the
 /// caller logs it once per streak and carries on describing nothing.
+///
+/// # One rectangle, possibly several targets
+///
+/// A source can drive several targets at once (clone mode), and the model
+/// has one rectangle to describe, so the several answers have to become
+/// one. They are merged **per field, first answer wins**, rather than
+/// first-answer-wins for the whole description: the two halves come from
+/// different places (a product name from the target request, a size from
+/// the EDID behind it) and a target is perfectly capable of supplying one
+/// and not the other. Letting the first target that says *anything* claim
+/// the device outright would mean a clone path that could only measure the
+/// panel permanently suppressed a later path that knew its name — the same
+/// per-field retention policy the worker's description cache applies over
+/// time, applied here across targets.
+///
+/// A device whose description is already complete needs no further target
+/// asked at all, which keeps the ordinary one-target-per-source case to
+/// exactly one query and one EDID read.
 fn path_descriptions() -> Result<Vec<(String, PathDescription)>, String> {
     let (paths, _modes) = query_display_config()?;
 
@@ -367,24 +423,25 @@ fn path_descriptions() -> Result<Vec<(String, PathDescription)>, String> {
         let Some(device) = source_device_name(path) else {
             continue;
         };
-        // A source can drive several targets (clone mode). The first target
-        // that answers describes the screen; a second description for the
-        // same `szDevice` would be a second caption and a second size for
-        // one rectangle, which the model has no way to show.
-        if described.iter().any(|(held, _)| held == &device) {
+        // Nothing further to learn about this screen: skip before paying
+        // for the target request and the registry read.
+        if described
+            .iter()
+            .any(|(held, description)| held == &device && description.is_complete())
+        {
             continue;
         }
         let Some(target) = target_device_name(path) else {
             continue;
         };
-        let description = PathDescription {
-            label: friendly_name_of(&target),
-            physical_size: panel_size_of(&target),
-        };
-        if description.is_empty() {
-            continue;
-        }
-        described.push((device, description));
+        record_description(
+            &mut described,
+            device,
+            PathDescription {
+                label: friendly_name_of(&target),
+                physical_size: panel_size_of(&target),
+            },
+        );
     }
     Ok(described)
 }
@@ -988,6 +1045,113 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Clone mode: two paths on one `szDevice`, each knowing a different
+    /// half of the answer. The rectangle must end up with both.
+    ///
+    /// This is a regression test with a specific shape, because the obvious
+    /// implementation gets it wrong in a way no machine here would show.
+    /// Skipping every path after the first that said *anything* about a
+    /// device was correct while a description was only a product name — a
+    /// nameless target contributed nothing, so a later one still got its
+    /// turn. Adding the panel size broke that silently: a target with a
+    /// readable EDID and no friendly name now claims the device outright
+    /// and permanently suppresses the clone path that knew what to call it.
+    #[test]
+    fn a_second_path_on_one_device_fills_what_the_first_one_lacked() {
+        let sized = || super::PathDescription {
+            label: None,
+            physical_size: Some(crossover_platform::PhysicalSizeMm {
+                width_mm: 597,
+                height_mm: 336,
+            }),
+        };
+        let named = || super::PathDescription {
+            label: Some("DELL U2720Q".to_owned()),
+            physical_size: None,
+        };
+
+        // The order that used to lose the name.
+        let mut described = Vec::new();
+        super::record_description(&mut described, r"\\.\DISPLAY1".to_owned(), sized());
+        super::record_description(&mut described, r"\\.\DISPLAY1".to_owned(), named());
+        assert_eq!(described.len(), 1, "one source became two rectangles");
+        assert_eq!(described[0].1.label.as_deref(), Some("DELL U2720Q"));
+        assert_eq!(described[0].1.physical_size, sized().physical_size);
+
+        // And the reverse order, which must lose nothing either.
+        let mut described = Vec::new();
+        super::record_description(&mut described, r"\\.\DISPLAY1".to_owned(), named());
+        super::record_description(&mut described, r"\\.\DISPLAY1".to_owned(), sized());
+        assert_eq!(described.len(), 1);
+        assert_eq!(described[0].1.label.as_deref(), Some("DELL U2720Q"));
+        assert_eq!(described[0].1.physical_size, sized().physical_size);
+    }
+
+    /// Merging is per field and **first answer wins**, so a later clone
+    /// target cannot overwrite what an earlier one already said. Two
+    /// targets on one source can disagree — they are different physical
+    /// outputs — and the model has one rectangle, so a value that flipped
+    /// between sweeps on enumeration order would read as a display change
+    /// and put a `MonitorTopology` on the wire for nothing.
+    #[test]
+    fn a_later_path_never_overwrites_what_an_earlier_one_reported() {
+        let describe = |label: &str, width_mm: u16| super::PathDescription {
+            label: Some(label.to_owned()),
+            physical_size: Some(crossover_platform::PhysicalSizeMm {
+                width_mm,
+                height_mm: 336,
+            }),
+        };
+
+        let mut described = Vec::new();
+        super::record_description(
+            &mut described,
+            r"\\.\DISPLAY1".to_owned(),
+            describe("DELL U2720Q", 597),
+        );
+        super::record_description(
+            &mut described,
+            r"\\.\DISPLAY1".to_owned(),
+            describe("LG ULTRAGEAR", 286),
+        );
+        assert_eq!(described.len(), 1);
+        assert_eq!(described[0].1.label.as_deref(), Some("DELL U2720Q"));
+        assert_eq!(described[0].1.physical_size.unwrap().width_mm, 597);
+    }
+
+    /// A target that knows nothing records nothing — it must not create an
+    /// entry that then claims the device slot against a later target that
+    /// does know something.
+    #[test]
+    fn a_target_that_answers_nothing_claims_no_device() {
+        let mut described = Vec::new();
+        super::record_description(
+            &mut described,
+            r"\\.\DISPLAY1".to_owned(),
+            super::PathDescription::default(),
+        );
+        assert!(described.is_empty(), "an empty description was recorded");
+
+        // Two genuinely different sources stay two rectangles.
+        super::record_description(
+            &mut described,
+            r"\\.\DISPLAY1".to_owned(),
+            super::PathDescription {
+                label: Some("DELL U2720Q".to_owned()),
+                physical_size: None,
+            },
+        );
+        super::record_description(
+            &mut described,
+            r"\\.\DISPLAY2".to_owned(),
+            super::PathDescription {
+                label: Some("LG ULTRAGEAR".to_owned()),
+                physical_size: None,
+            },
+        );
+        assert_eq!(described.len(), 2);
     }
 
     /// The EDID read itself, exercised against whatever this machine has —
