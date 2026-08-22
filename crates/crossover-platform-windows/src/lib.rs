@@ -17,6 +17,11 @@ pub mod clipboard;
 pub mod cursor;
 #[cfg(windows)]
 pub mod display;
+// Pure EDID parsing (ADR 0018), deliberately not Windows-gated so the
+// bytes-in/size-out half is compiled and unit-tested on every CI OS even
+// though only the Windows backend can fetch the bytes — the same reasoning
+// as `worker_supervisor` below.
+pub mod edid;
 #[cfg(windows)]
 pub mod file_blob;
 #[cfg(windows)]

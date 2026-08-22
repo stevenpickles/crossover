@@ -194,6 +194,7 @@ mod tests {
             },
             scale_percent: 100,
             label: None,
+            physical_size: None,
         }
     }
 

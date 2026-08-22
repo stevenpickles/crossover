@@ -152,6 +152,7 @@ pub(crate) fn live_monitor(id: &str) -> crossover_topology::LiveMonitor {
         },
         scale_percent: 100,
         label: None,
+        physical_size: None,
     }
 }
 

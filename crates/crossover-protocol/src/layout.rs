@@ -2,9 +2,10 @@
 //! `MonitorTopology` and `LayoutSync`, both CONTROL class, both base
 //! protocol at v4 — no feature bit, because a v3 peer is already excluded
 //! at `Hello` by the `entry` shape change ([`crate::control`]).
-//! `MonitorReport::label` arrives at v5, which raised the floor again for
-//! the same reason: no bit gates this message, so its extra `Option` byte
-//! is on the wire whatever either side wants ([`crate::version`]).
+//! `MonitorReport::label` arrives at v5 and `MonitorReport::physical_size`
+//! at v6, each of which raised the floor again for the same reason: no bit
+//! gates this message, so an extra `Option` byte per monitor is on the wire
+//! whatever either side wants ([`crate::version`]).
 //!
 //! `MonitorTopology` states a fact about the sender: its own live
 //! monitors, in its own local coordinates. `LayoutSync` states the drawn
@@ -31,6 +32,15 @@
 //!   would let a peer decide how much of a frame this side believes, and
 //!   the invisible-character rule in particular is defending the editor's
 //!   duplicate-caption logic rather than merely tidying text.
+//! - A physical size is [`crossover_topology::PhysicalSizeMm`], the same
+//!   pattern for a third rule: both axes
+//!   `1..=`[`crossover_topology::MAX_PHYSICAL_SIZE_MM`] millimetres,
+//!   enforced by its `Deserialize` on the decode path rather than by a
+//!   check here that could be forgotten. That cap is deliberately *looser*
+//!   than the plausibility gate a platform applies before it will claim a
+//!   size at all — this side refuses the impossible, the acquiring side
+//!   refuses the merely implausible; the constant's own docs say why the
+//!   split is where it is.
 //! - A device identity is [`crossover_topology::DeviceId`] — sixteen raw
 //!   bytes, postcard-encoded with **no length prefix** (unlike
 //!   `uuid::Uuid`'s length-prefixed form). The goldens below pin this
@@ -132,17 +142,38 @@ pub struct MonitorReport {
     /// so a decoded label is already inside its byte bound and free of
     /// control characters, exactly as a decoded id is.
     pub label: Option<crossover_topology::MonitorLabel>,
+    /// How large the sender's panel physically is, in millimetres, where
+    /// the sender's platform could measure it and believed the measurement
+    /// (ADR 0018, amended 2026-08-22).
+    ///
+    /// **Proportion only, never identity.** It is the seeding input that
+    /// lets the receiver's editor draw the sender's screens at sizes
+    /// proportional to the real ones, which is what makes a crossing look
+    /// physically continuous across the seam between two desks. Like
+    /// [`MonitorReport::label`] it steers nothing: the monitor is addressed
+    /// by [`MonitorReport::id`] here as everywhere else, and a peer that
+    /// lies about a size draws a rectangle at the wrong scale at the other
+    /// desk — it cannot move a crossing, which stays proportional through
+    /// the *drawn* geometry.
+    ///
+    /// Optional because a platform may have nothing to measure — a virtual
+    /// display has no panel — and, like a label, not unique: two identical
+    /// screens measure identically.
+    ///
+    /// Validated by construction ([`crossover_topology::PhysicalSizeMm`]),
+    /// so a decoded size is already inside its bounds on both axes.
+    pub physical_size: Option<crossover_topology::PhysicalSizeMm>,
 }
 
 impl MonitorReport {
     /// Semantic validation: the rectangle satisfies
     /// [`LayoutRect::check_bounds`], and `scale_percent` is within range.
     ///
-    /// `id` and `label` are absent from this function on purpose: both are
-    /// smart constructors that cannot hold an invalid value, so their rules
-    /// are enforced by the type on encode and by its `Deserialize` on
-    /// decode. There is nothing left here for a re-check to catch, and a
-    /// duplicated rule is a rule that can drift.
+    /// `id`, `label`, and `physical_size` are absent from this function on
+    /// purpose: all three are smart constructors that cannot hold an
+    /// invalid value, so their rules are enforced by the type on encode and
+    /// by its `Deserialize` on decode. There is nothing left here for a
+    /// re-check to catch, and a duplicated rule is a rule that can drift.
     ///
     /// # Errors
     ///
@@ -357,7 +388,10 @@ impl LayoutSync {
 
 #[cfg(test)]
 mod tests {
-    use crossover_topology::{DeviceId, LayoutRect, MonitorId, MonitorLabel, PlacedMonitor};
+    use crossover_topology::{
+        DeviceId, LayoutRect, MAX_PHYSICAL_SIZE_MM, MonitorId, MonitorLabel, PhysicalSizeMm,
+        PlacedMonitor,
+    };
 
     use super::{
         LayoutSync, MAX_LAYOUT_MONITORS, MAX_MONITOR_LABEL_BYTES, MAX_MONITORS_PER_MACHINE,
@@ -385,12 +419,20 @@ mod tests {
             rect: rect(x, y, width, height),
             scale_percent: scale,
             label: None,
+            physical_size: None,
         }
     }
 
     fn labelled(report: MonitorReport, label: &str) -> MonitorReport {
         MonitorReport {
             label: Some(MonitorLabel::new(label).unwrap()),
+            ..report
+        }
+    }
+
+    fn measured(report: MonitorReport, width_mm: u16, height_mm: u16) -> MonitorReport {
+        MonitorReport {
+            physical_size: Some(PhysicalSizeMm::new(width_mm, height_mm).unwrap()),
             ..report
         }
     }
@@ -474,6 +516,45 @@ mod tests {
                     &"x".repeat(MAX_MONITOR_LABEL_BYTES),
                 )],
             },
+            // Physical sizes: present, absent, and — legally — repeated,
+            // for the same reason a label may repeat. A matched pair of
+            // screens measures the same on both.
+            MonitorTopology {
+                monitors: vec![measured(
+                    labelled(
+                        report(r"\\.\DISPLAY1", 0, 0, 3840, 2160, 150),
+                        "DELL U2720Q",
+                    ),
+                    597,
+                    336,
+                )],
+            },
+            MonitorTopology {
+                monitors: vec![
+                    measured(report("A", 0, 0, 100, 100, 100), 597, 336),
+                    measured(report("B", 200, 0, 100, 100, 100), 597, 336),
+                    report("C", 400, 0, 100, 100, 100),
+                ],
+            },
+            // Both ends of the size bound, exactly.
+            MonitorTopology {
+                monitors: vec![
+                    measured(report("A", 0, 0, 100, 100, 100), 1, 1),
+                    measured(
+                        report("B", 200, 0, 100, 100, 100),
+                        MAX_PHYSICAL_SIZE_MM,
+                        MAX_PHYSICAL_SIZE_MM,
+                    ),
+                ],
+            },
+            // A size with no name and a name with no size, which is what a
+            // half-successful sweep at the far end actually looks like.
+            MonitorTopology {
+                monitors: vec![
+                    measured(report("A", 0, 0, 100, 100, 100), 286, 179),
+                    labelled(report("B", 200, 0, 100, 100, 100), "LG ULTRAGEAR"),
+                ],
+            },
         ] {
             let encoded = topology.encode_payload().unwrap();
             assert_eq!(MonitorTopology::decode_payload(&encoded).unwrap(), topology);
@@ -516,9 +597,12 @@ mod tests {
     // documented difference from `uuid::Uuid`'s length-prefixed form,
     // pinned here on purpose. An `Option<T>` is a single discriminant byte
     // — `0x00` for `None`, `0x01` then `T` for `Some` — which is exactly
-    // the byte that made `label` a protocol version bump (v4 → v5): it
-    // rides every monitor of every report, whether or not anyone has a
-    // name to put in it.
+    // the byte that made `label` a protocol version bump (v4 → v5) and
+    // `physical_size` the next one (v5 → v6): each rides every monitor of
+    // every report, whether or not anyone has anything to put in it. A
+    // `Some` physical size is that byte then two LEB128 `u16`s, width
+    // first, because postcard encodes a struct as its fields in
+    // declaration order with no names and no framing.
 
     #[test]
     fn golden_monitor_topology_single_monitor() {
@@ -536,6 +620,7 @@ mod tests {
                 0xB8, 0x08, // height: 1080 (LEB128)
                 0x64, // scale_percent: 100
                 0x00, // label: None
+                0x00, // physical_size: None
             ],
             "MonitorTopology wire layout changed: bump the protocol version"
         );
@@ -560,6 +645,7 @@ mod tests {
                 0x64, // height: 100
                 0x19, // scale_percent: 25 (MIN_SCALE_PERCENT)
                 0x00, // label: None
+                0x00, // physical_size: None
                 0x02, b'B', b'B', // id: "BB"
                 0x02, // x: 1 (zigzag: 1 -> 2)
                 0x01, // y: -1 (zigzag: -1 -> 1)
@@ -567,6 +653,7 @@ mod tests {
                 0xAC, 0x02, // height: 300
                 0xF4, 0x03, // scale_percent: 500 (MAX_SCALE_PERCENT), LEB128
                 0x00, // label: None
+                0x00, // physical_size: None
             ],
             "MonitorTopology wire layout changed: bump the protocol version"
         );
@@ -592,6 +679,73 @@ mod tests {
             0x0B, // label length: 11 bytes
         ];
         expected.extend_from_slice(b"DELL U2720Q");
+        expected.push(0x00); // physical_size: None
+        assert_eq!(
+            topology.encode_payload().unwrap(),
+            expected,
+            "MonitorTopology wire layout changed: bump the protocol version"
+        );
+    }
+
+    /// The `Some` half of the field this version added, so the golden pins
+    /// both arms of its discriminant rather than only the one every
+    /// pre-size build would also have produced — and pins the field *order*
+    /// inside it, which is the half a reader cannot check by eye: postcard
+    /// writes width then height with nothing naming either.
+    #[test]
+    fn golden_monitor_topology_measured_monitor() {
+        let topology = MonitorTopology {
+            monitors: vec![measured(report("A", 0, 0, 3840, 2160, 150), 597, 336)],
+        };
+        assert_eq!(
+            topology.encode_payload().unwrap(),
+            vec![
+                0x01, // monitors: 1 element
+                0x01, b'A', // id: "A"
+                0x00, // x: 0
+                0x00, // y: 0
+                0x80, 0x1E, // width: 3840 (LEB128)
+                0xF0, 0x10, // height: 2160 (LEB128)
+                0x96, 0x01, // scale_percent: 150 (LEB128)
+                0x00, // label: None
+                0x01, // physical_size: Some
+                0xD5, 0x04, // width_mm: 597 (LEB128)
+                0xD0, 0x02, // height_mm: 336 (LEB128)
+            ],
+            "MonitorTopology wire layout changed: bump the protocol version"
+        );
+    }
+
+    /// Both optional fields present at once, in declaration order — the
+    /// arrangement an ordinary external monitor actually produces, and the
+    /// one that would catch the two `Option`s being written the other way
+    /// round.
+    #[test]
+    fn golden_monitor_topology_labelled_and_measured_monitor() {
+        let topology = MonitorTopology {
+            monitors: vec![measured(
+                labelled(report("A", 0, 0, 100, 100, 100), "LG"),
+                286,
+                179,
+            )],
+        };
+        let mut expected = vec![
+            0x01, // monitors: 1 element
+            0x01, b'A', // id: "A"
+            0x00, // x: 0
+            0x00, // y: 0
+            0x64, // width: 100
+            0x64, // height: 100
+            0x64, // scale_percent: 100
+            0x01, // label: Some
+            0x02, // label length: 2 bytes
+        ];
+        expected.extend_from_slice(b"LG");
+        expected.extend_from_slice(&[
+            0x01, // physical_size: Some
+            0x9E, 0x02, // width_mm: 286 (LEB128)
+            0xB3, 0x01, // height_mm: 179 (LEB128)
+        ]);
         assert_eq!(
             topology.encode_payload().unwrap(),
             expected,
@@ -1082,7 +1236,128 @@ mod tests {
         );
         payload.push(u8::try_from(bytes.len()).unwrap());
         payload.extend_from_slice(bytes);
+        payload.push(0x00); // physical_size: None
         payload
+    }
+
+    /// One `MonitorTopology` of one monitor, with `physical_size` written
+    /// as raw millimetres rather than through
+    /// [`crossover_topology::PhysicalSizeMm`] — the only way to build a
+    /// payload this build would refuse to *send*, which is exactly what a
+    /// peer skipping its own validation produces.
+    fn topology_bytes_with_size(width_mm: u32, height_mm: u32) -> Vec<u8> {
+        let mut payload = vec![
+            0x01, // monitors: 1 element
+            0x01, b'A', // id: "A"
+            0x00, // x
+            0x00, // y
+            0x64, // width: 100
+            0x64, // height: 100
+            0x64, // scale_percent: 100
+            0x00, // label: None
+            0x01, // physical_size: Some
+        ];
+        // Unsigned LEB128, written out rather than borrowed from postcard,
+        // so the fixture can express a value the encoder would not.
+        for mut value in [width_mm, height_mm] {
+            loop {
+                let byte = u8::try_from(value & 0x7F).unwrap();
+                value >>= 7;
+                if value == 0 {
+                    payload.push(byte);
+                    break;
+                }
+                payload.push(byte | 0x80);
+            }
+        }
+        payload
+    }
+
+    /// Both ends of the size bound and one past each, decoded from bytes a
+    /// peer could actually send. The type makes an out-of-range size
+    /// unconstructable locally, so this builds the payload by hand — the
+    /// case that matters, a hostile or buggy peer skipping its own checks.
+    #[test]
+    fn a_physical_size_outside_its_bound_is_rejected_on_decode() {
+        let cap = u32::from(MAX_PHYSICAL_SIZE_MM);
+        for (width_mm, height_mm, admitted) in [
+            (1, 1, true),
+            (597, 336, true),
+            (cap, cap, true),
+            // Zero on either axis: a screen with no width is not a screen,
+            // and a proportion derived from one would divide by zero.
+            (0, 336, false),
+            (597, 0, false),
+            (0, 0, false),
+            // One past the cap on either axis.
+            (cap + 1, cap, false),
+            (cap, cap + 1, false),
+            // And well past what the field can even hold, which a LEB128
+            // stream can express and a `u16` cannot: this must be a typed
+            // refusal, not a wrapped value that lands back in range.
+            (70_000, 336, false),
+            (u32::from(u16::MAX) + 1, 336, false),
+        ] {
+            let payload = topology_bytes_with_size(width_mm, height_mm);
+            assert_eq!(
+                MonitorTopology::decode_payload(&payload).is_ok(),
+                admitted,
+                "a {width_mm}x{height_mm} mm size was handled wrong"
+            );
+        }
+    }
+
+    /// Trailing bytes after a measured monitor, and every truncation of
+    /// one: the strict-decode rule exercised on the shape that just grew a
+    /// field, where an over-read would be easiest to miss.
+    #[test]
+    fn a_truncated_or_overlong_physical_size_never_panics() {
+        let payload = topology_bytes_with_size(597, 336);
+        assert!(MonitorTopology::decode_payload(&payload).is_ok());
+
+        for cut in 0..payload.len() {
+            assert!(
+                matches!(
+                    MonitorTopology::decode_payload(&payload[..cut]),
+                    Err(ProtocolError::Malformed { .. })
+                ),
+                "truncation at {cut} bytes was not rejected"
+            );
+        }
+
+        let mut trailing = payload.clone();
+        trailing.push(0xAA);
+        assert!(matches!(
+            MonitorTopology::decode_payload(&trailing),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // A LEB128 run that never terminates: the continuation bit set on
+        // every byte to the end of the payload.
+        let mut unterminated = topology_bytes_with_size(597, 336);
+        unterminated.truncate(unterminated.len() - 2);
+        unterminated.extend_from_slice(&[0xFF; 8]);
+        assert!(matches!(
+            MonitorTopology::decode_payload(&unterminated),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// A size is a proportion, not a key: two screens reporting the same
+    /// measurements is an ordinary desk, exactly as two sharing a label is.
+    #[test]
+    fn a_repeated_physical_size_is_accepted_where_a_repeated_id_is_not() {
+        assert!(
+            MonitorTopology {
+                monitors: vec![
+                    measured(report("A", 0, 0, 100, 100, 100), 597, 336),
+                    measured(report("B", 200, 0, 100, 100, 100), 597, 336),
+                ],
+            }
+            .encode_payload()
+            .is_ok(),
+            "a matched pair of screens is an ordinary desk"
+        );
     }
 
     #[test]
@@ -1210,6 +1485,16 @@ mod tests {
                                 crossover_topology::FORMAT_CHARACTERS.contains(&character)
                             });
                         proptest::prop_assert!(!hides);
+                    }
+                    if let Some(size) = monitor.physical_size {
+                        proptest::prop_assert!(size.width_mm() >= 1);
+                        proptest::prop_assert!(size.height_mm() >= 1);
+                        proptest::prop_assert!(
+                            size.width_mm() <= crossover_topology::MAX_PHYSICAL_SIZE_MM
+                        );
+                        proptest::prop_assert!(
+                            size.height_mm() <= crossover_topology::MAX_PHYSICAL_SIZE_MM
+                        );
                     }
                 }
             }

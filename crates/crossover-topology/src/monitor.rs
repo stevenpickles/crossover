@@ -36,6 +36,23 @@
 //! Being display-only relaxes the charset (a product name is legitimately
 //! not ASCII) but not the bound: it still arrives over the wire, so it is
 //! still bounded before allocation and refused rather than repaired.
+//!
+//! # And nor is a *physical size*
+//!
+//! [`PhysicalSizeMm`] is the third thing a monitor can carry, and it joins
+//! the label on the display-only side of that line rather than the identity
+//! side: how many millimetres wide a panel is says nothing about *which*
+//! panel it is. Two identical screens report identical sizes, a projector
+//! reports a number that is a polite fiction, and a virtual display reports
+//! nothing at all — none of which may be allowed to decide where a crossing
+//! goes. It exists so the editor can draw rectangles in proportion to real
+//! screens, which is what makes a crossing look continuous across the seam
+//! between two desks (ADR 0018, amended 2026-08-22).
+//!
+//! It is bounded like everything else that arrives over the wire, and the
+//! bound here is deliberately loose — see [`MAX_PHYSICAL_SIZE_MM`] for why
+//! the *wire* refuses the impossible while the *platform* refuses the
+//! merely implausible.
 
 use core::fmt;
 use core::str::FromStr;
@@ -390,14 +407,194 @@ impl<'de> Deserialize<'de> for MonitorLabel {
     }
 }
 
+/// Largest physical dimension, in millimetres, either side of a monitor may
+/// claim — ten metres.
+///
+/// **This is the wire's bound, and it is not the platform's.** The split is
+/// deliberate and the two halves are doing different jobs:
+///
+/// - *Here*, the rule refuses the **impossible**. A decoder's business is
+///   arithmetic safety and allocation safety, and it must not be in the
+///   business of second-guessing what hardware exists — a 5 m video wall
+///   reporting itself honestly is not a malformed frame, and a decoder that
+///   called it one would terminate a healthy session over a number nothing
+///   keys off. Ten metres is far past any panel and far short of anything
+///   that could overflow the `i32` arithmetic a drawn layout does.
+/// - *At the platform*, the rule refuses the merely **implausible** —
+///   `crossover-platform-windows`' EDID reader admits only 50..=3000 mm,
+///   because projectors, TVs, and virtual displays report sizes that are
+///   fiction, and a wrong size drawn confidently is worse than no size at
+///   all. That gate is an acquisition policy: it decides what this machine
+///   is willing to *claim*, and it can be tightened or loosened without
+///   touching what a peer is allowed to *say*.
+///
+/// Zero is refused on both sides, on the same reasoning a zero-sized
+/// rectangle is: a screen with no width is not a screen, and a proportion
+/// derived from it would divide by zero.
+pub const MAX_PHYSICAL_SIZE_MM: u16 = 10_000;
+
+/// A monitor's physical size — the panel's real width and height in
+/// millimetres, as the platform measured it — validated on construction.
+///
+/// **Proportion only, never identity**, exactly as [`MonitorLabel`] is
+/// caption only. Nothing matches, keys, or derives on it: layout matching,
+/// the config `[layout]` section, `EntryPoint`, and crossing derivation all
+/// address a monitor by its [`MonitorId`] and never look here. Its one job
+/// is to let the editor seed a rectangle at a size proportional to the real
+/// screen, so a cursor leaving one desk at some height up its bezel arrives
+/// at the same physical height on the other (ADR 0018, amended
+/// 2026-08-22).
+///
+/// It is optional wherever it appears, because most of the reasons a
+/// platform cannot measure a panel are ordinary: a virtual display has no
+/// panel, a remote session's screen is somebody else's, and an EDID can be
+/// absent, unreadable, or lying. A monitor without a size is drawn the way
+/// every monitor was drawn before sizes existed.
+///
+/// A conforming size is 1..=[`MAX_PHYSICAL_SIZE_MM`] millimetres on each
+/// axis ([`validate_physical_size`] states the rule, and
+/// [`MAX_PHYSICAL_SIZE_MM`] says why that ceiling is the loose one).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "RawPhysicalSizeMm")]
+pub struct PhysicalSizeMm {
+    width_mm: u16,
+    height_mm: u16,
+}
+
+impl PhysicalSizeMm {
+    /// The size `width_mm` × `height_mm` names.
+    ///
+    /// # Errors
+    ///
+    /// [`PhysicalSizeError`], one variant per rejection class.
+    pub fn new(width_mm: u16, height_mm: u16) -> Result<Self, PhysicalSizeError> {
+        validate_physical_size(width_mm, height_mm)?;
+        Ok(Self {
+            width_mm,
+            height_mm,
+        })
+    }
+
+    /// The panel's width in millimetres.
+    #[must_use]
+    pub const fn width_mm(self) -> u16 {
+        self.width_mm
+    }
+
+    /// The panel's height in millimetres.
+    #[must_use]
+    pub const fn height_mm(self) -> u16 {
+        self.height_mm
+    }
+}
+
+/// [`PhysicalSizeMm`] before its bounds have been checked — the shape serde
+/// builds, which [`TryFrom`] then admits or refuses. Same field names and
+/// same order as the validated type, so the encoded form is identical in
+/// every format (postcard is positional; JSON is by name).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPhysicalSizeMm {
+    width_mm: u16,
+    height_mm: u16,
+}
+
+impl TryFrom<RawPhysicalSizeMm> for PhysicalSizeMm {
+    type Error = PhysicalSizeError;
+
+    fn try_from(raw: RawPhysicalSizeMm) -> Result<Self, Self::Error> {
+        Self::new(raw.width_mm, raw.height_mm)
+    }
+}
+
+/// Why a physical size was refused.
+///
+/// Unlike [`MonitorIdError`] and [`MonitorLabelError`], these variants quote
+/// the whole value rather than only naming the fault — and that is not an
+/// exception to the house rule but the rule applied. A size *is* two
+/// integers, so the value and the fault are the same thing; there is no
+/// string here that could carry something a diagnostic should not repeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PhysicalSizeError {
+    /// One axis or both measured zero. A screen with no width is not a
+    /// screen, and a proportion derived from one would divide by zero.
+    #[error("the monitor's physical size {width_mm}x{height_mm} mm has a zero dimension")]
+    ZeroDimension {
+        /// The width that was offered.
+        width_mm: u16,
+        /// The height that was offered.
+        height_mm: u16,
+    },
+    /// One axis or both is over [`MAX_PHYSICAL_SIZE_MM`].
+    #[error(
+        "the monitor's physical size {width_mm}x{height_mm} mm is over the \
+         {MAX_PHYSICAL_SIZE_MM} mm maximum"
+    )]
+    TooLarge {
+        /// The width that was offered.
+        width_mm: u16,
+        /// The height that was offered.
+        height_mm: u16,
+    },
+}
+
+/// Validate a physical size (ADR 0018, amended 2026-08-22).
+///
+/// Pure and total: every input is a value, and nothing allocates.
+///
+/// A conforming size is 1..=[`MAX_PHYSICAL_SIZE_MM`] millimetres on each
+/// axis. See [`MAX_PHYSICAL_SIZE_MM`] for why this ceiling is deliberately
+/// looser than the plausibility gate the Windows backend applies before it
+/// will claim a size at all.
+///
+/// # Errors
+///
+/// [`PhysicalSizeError`], naming which rule the pair broke.
+pub const fn validate_physical_size(
+    width_mm: u16,
+    height_mm: u16,
+) -> Result<(), PhysicalSizeError> {
+    if width_mm == 0 || height_mm == 0 {
+        return Err(PhysicalSizeError::ZeroDimension {
+            width_mm,
+            height_mm,
+        });
+    }
+    if width_mm > MAX_PHYSICAL_SIZE_MM || height_mm > MAX_PHYSICAL_SIZE_MM {
+        return Err(PhysicalSizeError::TooLarge {
+            width_mm,
+            height_mm,
+        });
+    }
+    Ok(())
+}
+
+impl fmt::Display for PhysicalSizeMm {
+    /// `597x336 mm` — the shape a log line or a status bar wants.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}x{} mm", self.width_mm, self.height_mm)
+    }
+}
+
+impl fmt::Debug for PhysicalSizeMm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "PhysicalSizeMm({}x{} mm)",
+            self.width_mm, self.height_mm
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
 
     use super::{
-        FORMAT_CHARACTERS, MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MonitorId,
-        MonitorIdError, MonitorLabel, MonitorLabelError, validate_monitor_id,
-        validate_monitor_label,
+        FORMAT_CHARACTERS, MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MAX_PHYSICAL_SIZE_MM,
+        MonitorId, MonitorIdError, MonitorLabel, MonitorLabelError, PhysicalSizeError,
+        PhysicalSizeMm, validate_monitor_id, validate_monitor_label, validate_physical_size,
     };
 
     #[test]
@@ -647,6 +844,100 @@ mod tests {
         assert!(rendered.contains("0007"), "{rendered}");
     }
 
+    // ---- physical sizes -------------------------------------------------
+
+    #[test]
+    fn real_panel_sizes_are_accepted_and_read_back_unchanged() {
+        // A 27" 16:9 desktop panel, a 13" laptop panel, and a 5 m video
+        // wall — the last one is why the wire's ceiling is not the
+        // platform's plausibility gate.
+        for (width, height) in [(597, 336), (286, 179), (5_000, 2_812), (1, 1)] {
+            let size = PhysicalSizeMm::new(width, height).unwrap();
+            assert_eq!(size.width_mm(), width);
+            assert_eq!(size.height_mm(), height);
+        }
+    }
+
+    /// The exact boundary in both directions, on both axes — the edge a
+    /// range check is most often written one off from.
+    #[test]
+    fn ten_thousand_millimetres_is_accepted_and_ten_thousand_and_one_is_not() {
+        assert!(PhysicalSizeMm::new(MAX_PHYSICAL_SIZE_MM, MAX_PHYSICAL_SIZE_MM).is_ok());
+
+        for (width, height) in [
+            (MAX_PHYSICAL_SIZE_MM + 1, MAX_PHYSICAL_SIZE_MM),
+            (MAX_PHYSICAL_SIZE_MM, MAX_PHYSICAL_SIZE_MM + 1),
+            (u16::MAX, u16::MAX),
+        ] {
+            assert_eq!(
+                validate_physical_size(width, height),
+                Err(PhysicalSizeError::TooLarge {
+                    width_mm: width,
+                    height_mm: height
+                }),
+                "{width}x{height} mm was admitted"
+            );
+        }
+    }
+
+    /// Zero on either axis, because a proportion derived from it would
+    /// divide by zero — the same reasoning a zero-sized rectangle is
+    /// refused on.
+    #[test]
+    fn a_zero_dimension_is_refused_on_either_axis() {
+        for (width, height) in [(0, 336), (597, 0), (0, 0)] {
+            assert_eq!(
+                validate_physical_size(width, height),
+                Err(PhysicalSizeError::ZeroDimension {
+                    width_mm: width,
+                    height_mm: height
+                }),
+                "{width}x{height} mm was admitted"
+            );
+        }
+    }
+
+    /// Validating on deserialize, in every format — the property that makes
+    /// the newtype worth having, and the one that means the wire decoder
+    /// needs no check of its own to write.
+    #[test]
+    fn size_deserialization_validates_rather_than_trusting_the_format() {
+        let good: PhysicalSizeMm =
+            serde_json::from_str(r#"{"width_mm":597,"height_mm":336}"#).unwrap();
+        assert_eq!(good, PhysicalSizeMm::new(597, 336).unwrap());
+        assert_eq!(
+            serde_json::to_string(&good).unwrap(),
+            r#"{"width_mm":597,"height_mm":336}"#
+        );
+
+        for json in [
+            r#"{"width_mm":0,"height_mm":336}"#,
+            r#"{"width_mm":597,"height_mm":0}"#,
+            r#"{"width_mm":10001,"height_mm":336}"#,
+            r#"{"width_mm":597,"height_mm":10001}"#,
+            // The shape itself, not only the range.
+            r#"{"width_mm":597}"#,
+            r#"{"width_mm":597,"height_mm":336,"depth_mm":50}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PhysicalSizeMm>(json).is_err(),
+                "an unusable size survived a decoder: {json}"
+            );
+        }
+    }
+
+    /// A size is two integers, so a refusal quoting them tells the whole
+    /// story — and the rendered form is the one a log line wants.
+    #[test]
+    fn a_size_refusal_and_its_display_both_name_the_measurements() {
+        let error = validate_physical_size(0, 336).unwrap_err();
+        assert!(error.to_string().contains("0x336"), "{error}");
+        assert_eq!(
+            PhysicalSizeMm::new(597, 336).unwrap().to_string(),
+            "597x336 mm"
+        );
+    }
+
     proptest! {
         /// Arbitrary text is a value, never a panic, and the verdict is a
         /// pure function of the input.
@@ -692,6 +983,22 @@ mod tests {
                 );
                 let accepted = MonitorLabel::new(&label).unwrap();
                 prop_assert_eq!(accepted.as_str(), label.as_str());
+            }
+        }
+
+        /// The same contract for a size, over the whole `u16` square: a
+        /// value or a typed refusal, never a panic, and an accepted pair
+        /// reads back exactly as it went in.
+        #[test]
+        fn arbitrary_sizes_never_panic(width in any::<u16>(), height in any::<u16>()) {
+            let verdict = validate_physical_size(width, height);
+            prop_assert_eq!(verdict, validate_physical_size(width, height));
+            if verdict.is_ok() {
+                prop_assert!((1..=MAX_PHYSICAL_SIZE_MM).contains(&width));
+                prop_assert!((1..=MAX_PHYSICAL_SIZE_MM).contains(&height));
+                let accepted = PhysicalSizeMm::new(width, height).unwrap();
+                prop_assert_eq!(accepted.width_mm(), width);
+                prop_assert_eq!(accepted.height_mm(), height);
             }
         }
     }

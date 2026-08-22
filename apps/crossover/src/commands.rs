@@ -3776,6 +3776,7 @@ mod tests {
                 rect,
                 scale_percent: 100,
                 label: None,
+                physical_size: None,
             }],
         };
         let layout = LayoutSync {

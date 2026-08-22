@@ -21,9 +21,10 @@
 //!   instead of presenting stale facts as current.
 //!
 //! **Nothing secret is in it** — device names and ids, monitor device
-//! strings and product names, rectangles, and scale factors; no key
-//! material, no clipboard content, no peer credentials (docs/SECURITY.md
-//! invariant 6). It needs no protection beyond the profile it sits in.
+//! strings, product names, panel sizes, rectangles, and scale factors; no
+//! key material, no clipboard content, no peer credentials
+//! (docs/SECURITY.md invariant 6). It needs no protection beyond the
+//! profile it sits in.
 //!
 //! This module is the *schema*: the types, the strict version check, and
 //! the round trip. The writer task — the heartbeat, the atomic write, the
@@ -54,9 +55,10 @@
 //!   element past the cap, so an over-long list is never built.
 //! - **Every monitor id** is a validated [`MonitorId`], **every rectangle**
 //!   satisfies [`LayoutRect::check_bounds`], **every `scale_percent`** is
-//!   within [`MIN_SCALE_PERCENT`]..=[`MAX_SCALE_PERCENT`], and **every
-//!   monitor label** is a validated [`MonitorLabel`] — all at the decoder,
-//!   so an unusable value cannot exist in a decoded document.
+//!   within [`MIN_SCALE_PERCENT`]..=[`MAX_SCALE_PERCENT`], **every monitor
+//!   label** is a validated [`MonitorLabel`], and **every physical size** a
+//!   validated [`PhysicalSizeMm`] — all at the decoder, so an unusable
+//!   value cannot exist in a decoded document.
 //!
 //! What is *not* enforced here is the arrangement's own semantics — the
 //! overlap rule, the pair, both machines present. Those need the current
@@ -72,7 +74,7 @@ use crate::layout::{
     DevicePair, Layout, LayoutError, LayoutRect, MAX_LAYOUT_MONITORS, MAX_MONITORS_PER_MACHINE,
     MAX_SCALE_PERCENT, MIN_SCALE_PERCENT, PlacedMonitor,
 };
-use crate::monitor::{MonitorId, MonitorLabel};
+use crate::monitor::{MonitorId, MonitorLabel, PhysicalSizeMm};
 
 /// The schema version this build writes and is willing to read.
 ///
@@ -130,8 +132,32 @@ pub const MAX_STATE_FILE_BYTES: usize = 256 * 1024;
 ///
 /// Every field is checked on decode — the id by [`MonitorId`]'s own
 /// validation, the rectangle by [`LayoutRect::check_bounds`], the scale
-/// against its two constants, the label by [`MonitorLabel`]'s — so an
-/// unusable [`LiveMonitor`] cannot be constructed by deserializing one.
+/// against its two constants, the label by [`MonitorLabel`]'s, the physical
+/// size by [`PhysicalSizeMm`]'s — so an unusable [`LiveMonitor`] cannot be
+/// constructed by deserializing one.
+///
+/// # The optional fields, and which direction they are compatible in
+///
+/// [`Self::label`] and [`Self::physical_size`] are both omitted from the
+/// document entirely when absent and both default to absent when a document
+/// does not carry them, which is what let each be added **without moving
+/// [`TOPOLOGY_STATE_VERSION`]**: a file written before either existed
+/// parses unchanged here, rather than meeting the whole-document refusal
+/// that constant exists to enforce.
+///
+/// **Forward, not backward — and the asymmetry is deliberate.**
+/// [`RawLiveMonitor`] is `deny_unknown_fields`, so an *older* build pointed
+/// at a document this one wrote refuses that document whole. That hardening
+/// predates both fields and stays: a state file is a report about
+/// arrangements that steer where control is handed away, and silently
+/// ignoring a key it does not understand is how a reader half-believes a
+/// document. The cost is bounded and transient rather than permanent, which
+/// is why it is acceptable — a downgraded worker rewrites this file at
+/// startup and on its next poll, so the refusal lasts until the old worker
+/// is running and no longer. What it costs meanwhile is an editor that says
+/// the worker is not reporting, on a machine mid-downgrade; it cannot
+/// corrupt an arrangement, because the config file, not this one, is where
+/// a layout lives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawLiveMonitor")]
 pub struct LiveMonitor {
@@ -146,31 +172,21 @@ pub struct LiveMonitor {
     ///
     /// **Display-only, never identity**, exactly as on the wire: the
     /// editor captions a rectangle with it and nothing matches on it. It
-    /// is optional and not unique.
-    ///
-    /// Omitted from the document entirely when absent, and defaulted to
-    /// absent when a document does not carry it, so the **schema stays at
-    /// version 1 for a reader moving forward**: a file written before
-    /// labels existed parses unchanged here, which is what lets the field
-    /// be added without the whole-document refusal
-    /// [`TOPOLOGY_STATE_VERSION`] exists to enforce.
-    ///
-    /// **Forward, not backward — and the asymmetry is deliberate.**
-    /// [`RawLiveMonitor`] is `deny_unknown_fields`, so an *older* build
-    /// pointed at a document this one wrote with a label refuses that
-    /// document whole. That hardening predates labels and stays: a state
-    /// file is a report about arrangements that steer where control is
-    /// handed away, and silently ignoring a key it does not understand is
-    /// how a reader half-believes a document. The cost is bounded and
-    /// transient rather than permanent, which is why it is acceptable — a
-    /// downgraded worker rewrites this file at startup and on its next
-    /// poll, so the refusal lasts until the old worker is running and no
-    /// longer. What it costs meanwhile is an editor that says the worker
-    /// is not reporting, on a machine mid-downgrade; it cannot corrupt an
-    /// arrangement, because the config file, not this one, is where a
-    /// layout lives.
+    /// is optional and not unique. See this type's own docs for what
+    /// "optional" costs a reader of another vintage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<MonitorLabel>,
+    /// How large the panel physically is, where the owning machine's
+    /// platform could measure it and believed the measurement.
+    ///
+    /// **Proportion-only, never identity**, on the same footing as the
+    /// label: it seeds the size the editor draws a rectangle at, so two
+    /// desks are drawn in proportion to each other and a crossing looks
+    /// physically continuous. Nothing matches, keys, or derives on it. It
+    /// is optional and, like a label, not unique — two identical screens
+    /// measure identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_size: Option<PhysicalSizeMm>,
 }
 
 /// [`LiveMonitor`] before its bounds have been checked — the shape serde
@@ -183,6 +199,8 @@ struct RawLiveMonitor {
     scale_percent: u16,
     #[serde(default)]
     label: Option<MonitorLabel>,
+    #[serde(default)]
+    physical_size: Option<PhysicalSizeMm>,
 }
 
 impl TryFrom<RawLiveMonitor> for LiveMonitor {
@@ -202,9 +220,11 @@ impl TryFrom<RawLiveMonitor> for LiveMonitor {
             id: raw.id,
             rect: raw.rect,
             scale_percent: raw.scale_percent,
-            // Nothing to check: `MonitorLabel` cannot exist unvalidated,
-            // so a decoded label is already inside its bounds.
+            // Nothing to check for either: `MonitorLabel` and
+            // `PhysicalSizeMm` cannot exist unvalidated, so a decoded one
+            // of either is already inside its bounds.
             label: raw.label,
+            physical_size: raw.physical_size,
         })
     }
 }
@@ -443,7 +463,7 @@ pub fn now_unix_millis() -> u64 {
 mod tests {
     use super::{
         HEARTBEAT_STALE_AFTER_MS, LayoutState, LiveMonitor, MAX_STATE_FILE_BYTES, MachineState,
-        MonitorLabel, PeerState, StateError, TOPOLOGY_STATE_VERSION, TopologyState,
+        MonitorLabel, PeerState, PhysicalSizeMm, StateError, TOPOLOGY_STATE_VERSION, TopologyState,
         now_unix_millis, parse_state, serialize_state,
     };
     use crate::layout::tests::{LOCAL, PEER, pair, valid_layout};
@@ -464,6 +484,7 @@ mod tests {
             },
             scale_percent,
             label: None,
+            physical_size: None,
         }
     }
 
@@ -474,6 +495,55 @@ mod tests {
         }
     }
 
+    fn measured(monitor: LiveMonitor, width_mm: u16, height_mm: u16) -> LiveMonitor {
+        LiveMonitor {
+            physical_size: Some(PhysicalSizeMm::new(width_mm, height_mm).unwrap()),
+            ..monitor
+        }
+    }
+
+    /// A pretty-printed document with every occurrence of `key` — and its
+    /// value, object or scalar — deleted, commas and all.
+    ///
+    /// This is how the optional fields' *forward* compatibility is proven:
+    /// what an older writer that had never heard of the field would
+    /// genuinely have produced, rather than the same JSON with a hole in
+    /// it. Deleting rather than nulling matters, because absent and `null`
+    /// are different claims and only one of them is what an old build
+    /// wrote.
+    fn without_key(json: &str, key: &str) -> String {
+        let needle = format!("\"{key}\"");
+        let mut lines: Vec<String> = json.lines().map(str::to_owned).collect();
+        while let Some(start) = lines.iter().position(|line| line.contains(&needle)) {
+            let indent = |line: &str| line.len() - line.trim_start().len();
+            // A value that opens a brace runs until the brace at the same
+            // indentation closes it.
+            let end = if lines[start].trim_end().ends_with('{') {
+                let opened = indent(&lines[start]);
+                start
+                    + lines[start..]
+                        .iter()
+                        .position(|line| {
+                            line.trim_end().trim_end_matches(',').ends_with('}')
+                                && indent(line) == opened
+                        })
+                        .expect("the deleted object closes")
+            } else {
+                start
+            };
+            // A trailing comma means something followed it, so the
+            // remaining lines are already well-formed. No comma means it
+            // was the last field of its object, and the line above it must
+            // give up the comma that introduced it.
+            let followed = lines[end].trim_end().ends_with(',');
+            lines.drain(start..=end);
+            if !followed && start > 0 {
+                lines[start - 1] = lines[start - 1].trim_end().trim_end_matches(',').to_owned();
+            }
+        }
+        lines.join("\n")
+    }
+
     fn document() -> TopologyState {
         TopologyState {
             version: TOPOLOGY_STATE_VERSION,
@@ -482,10 +552,15 @@ mod tests {
                 device: LOCAL,
                 name: "workstation-left".to_owned(),
                 monitors: vec![
-                    labelled(live(r"\\.\DISPLAY1", 0, 150), "DELL U2720Q"),
-                    // The second is deliberately unlabelled: a real desk
-                    // mixes screens the platform can name with ones it
-                    // cannot, and the round trip has to carry both.
+                    measured(
+                        labelled(live(r"\\.\DISPLAY1", 0, 150), "DELL U2720Q"),
+                        597,
+                        336,
+                    ),
+                    // The second is deliberately undescribed: a real desk
+                    // mixes screens the platform can name and measure with
+                    // ones it cannot, and the round trip has to carry
+                    // both.
                     live(r"\\.\DISPLAY2", 1920, 100),
                 ],
             },
@@ -620,19 +695,7 @@ mod tests {
         // A document from a build that predates labels — no `label` key at
         // all — parses, with every monitor unlabelled. This is what lets
         // the schema stay at version 1 rather than refusing the whole file.
-        // Built by deleting the key's line and the comma that introduced
-        // it, so the result is what an older writer would genuinely have
-        // produced rather than JSON with a hole in it.
-        let older = {
-            let mut lines: Vec<String> = json.lines().map(str::to_owned).collect();
-            let index = lines
-                .iter()
-                .position(|line| line.contains("\"label\""))
-                .expect("the fixture carries a label");
-            lines.remove(index);
-            lines[index - 1] = lines[index - 1].trim_end().trim_end_matches(',').to_owned();
-            lines.join("\n")
-        };
+        let older = without_key(&json, "label");
         assert!(!older.contains("label"), "{older}");
         let parsed = parse_state(&older).unwrap();
         assert!(
@@ -697,6 +760,109 @@ mod tests {
                 "admitted the label {label:?}"
             );
         }
+    }
+
+    /// The physical size round-trips beside the label, is omitted when
+    /// absent, and — the property that keeps the schema at version 1 for
+    /// the second field running — a document written without it parses.
+    #[test]
+    fn physical_sizes_round_trip_and_their_absence_costs_nothing() {
+        let state = document();
+        let json = serialize_state(&state).unwrap();
+        let parsed = parse_state(&json).unwrap();
+        assert_eq!(parsed, state);
+        assert_eq!(
+            parsed.local.monitors[0].physical_size,
+            Some(PhysicalSizeMm::new(597, 336).unwrap())
+        );
+        assert_eq!(parsed.local.monitors[1].physical_size, None);
+
+        // Absent means absent from the document, not `null` in it — the
+        // same rule the label follows, for the same reason: a human reads
+        // this file.
+        assert_eq!(
+            json.matches("\"physical_size\"").count(),
+            1,
+            "an absent size was written out anyway: {json}"
+        );
+        // And the size a measured monitor carries is the nested pair, not
+        // a flattened one: the document names both axes.
+        assert!(json.contains("\"width_mm\""), "{json}");
+        assert!(json.contains("\"height_mm\""), "{json}");
+
+        // A document from a build that predates sizes — the `physical_size`
+        // key absent everywhere — parses, with every monitor unmeasured.
+        let older = without_key(&json, "physical_size");
+        assert!(!older.contains("physical_size"), "{older}");
+        let parsed = parse_state(&older).unwrap();
+        assert_eq!(parsed.local.monitors.len(), 2);
+        assert!(
+            parsed
+                .local
+                .monitors
+                .iter()
+                .all(|monitor| monitor.physical_size.is_none())
+        );
+        // The label beside it survived, so the deletion took out one field
+        // rather than the whole entry.
+        assert_eq!(
+            parsed.local.monitors[0]
+                .label
+                .as_ref()
+                .map(MonitorLabel::as_str),
+            Some("DELL U2720Q")
+        );
+    }
+
+    /// A size that could not exist is refused at the decoder, because
+    /// `PhysicalSizeMm` validates on deserialize — the same property
+    /// `MonitorId` and `MonitorLabel` have, for a third rule.
+    ///
+    /// Written by hand rather than mutated out of a pretty-printed
+    /// document, because the shapes that matter most here are the ones a
+    /// serializer would never produce — a size with one axis, or a bare
+    /// number where an object belongs.
+    #[test]
+    fn an_unusable_physical_size_does_not_survive_the_decoder() {
+        let with_size = |size: &str| {
+            format!(
+                r#"{{"version":1,"written_at":1,"self":{{"device":"{LOCAL}","name":"x","monitors":[{{"id":"A","rect":{{"x":0,"y":0,"width":10,"height":10}},"scale_percent":100,"physical_size":{size}}}]}},"peer":null,"layout":null}}"#
+            )
+        };
+        for (size, admitted) in [
+            (r#"{"width_mm":597,"height_mm":336}"#, true),
+            (r#"{"width_mm":10000,"height_mm":10000}"#, true),
+            (r#"{"width_mm":1,"height_mm":1}"#, true),
+            (r#"{"width_mm":0,"height_mm":336}"#, false),
+            (r#"{"width_mm":597,"height_mm":0}"#, false),
+            (r#"{"width_mm":10001,"height_mm":336}"#, false),
+            (r#"{"width_mm":597,"height_mm":10001}"#, false),
+            // Shapes a serializer would never write, which is exactly why
+            // a hand-edited or hostile file can hold them.
+            (r#"{"width_mm":597}"#, false),
+            (r#"{"width_mm":597,"height_mm":336,"depth_mm":50}"#, false),
+            ("597", false),
+        ] {
+            assert_eq!(
+                parse_state(&with_size(size)).is_ok(),
+                admitted,
+                "the size {size} was handled wrong"
+            );
+        }
+    }
+
+    /// Two screens may share a size for the same reason they may share a
+    /// label: it is a proportion, not a key. A desk with a matched pair is
+    /// an ordinary desk.
+    #[test]
+    fn two_screens_may_share_a_physical_size() {
+        let mut state = document();
+        state.local.monitors = vec![
+            measured(live("A", 0, 100), 597, 336),
+            measured(live("B", 1920, 100), 597, 336),
+        ];
+        let json = serialize_state(&state).unwrap();
+        assert_eq!(parse_state(&json).unwrap(), state);
     }
 
     /// An id that could not exist is refused at the decoder, because

@@ -481,13 +481,13 @@ pub fn fake_monitor_id(index: usize) -> String {
 pub struct FakeDisplay {
     screen: Mutex<Screen>,
     cursor: Mutex<CursorPoint>,
-    /// The monitor layout, ids and labels and all — one list, projected
-    /// three ways by the three queries, so they cannot disagree about
-    /// which monitors exist. Defaults to a single unlabelled monitor
-    /// covering the whole screen; tests override it via
+    /// The monitor layout, ids and labels and panel sizes and all — one
+    /// list, projected three ways by the three queries, so they cannot
+    /// disagree about which monitors exist. Defaults to a single
+    /// undescribed monitor covering the whole screen; tests override it via
     /// [`Self::set_monitors`] (geometry only, ids synthesized),
     /// [`Self::set_monitor_layout`] (geometry and ids), or
-    /// [`Self::set_monitor_descriptions`] (all three).
+    /// [`Self::set_monitor_descriptions`] (everything).
     monitors: Mutex<Vec<MonitorDescription>>,
     /// When set, both queries fail with this reason — the platform
     /// refusing to report geometry.
@@ -512,10 +512,11 @@ impl FakeDisplay {
                         height: screen.height,
                     },
                 },
-                // Unlabelled by default: the ordinary backend is the one
-                // that cannot read a product name, and a test that cares
-                // about labels says so.
+                // Undescribed by default: the ordinary backend is the one
+                // that cannot read a product name or measure a panel, and a
+                // test that cares about either says so.
                 label: None,
+                physical_size: None,
             }]),
             fail: Mutex::new(None),
         }
@@ -536,14 +537,14 @@ impl FakeDisplay {
     /// edge-mapping tests. Tests written before monitors had identities
     /// keep working unchanged.
     ///
-    /// **A monitor that survives the change keeps its id** — and its label,
-    /// for the same reason. A rectangle
+    /// **A monitor that survives the change keeps its id** — and its label
+    /// and its measured size, for the same reason. A rectangle
     /// present before and after is the same screen, and relabelling it
     /// would model the one thing ADR 0018 chose device strings to avoid: a
     /// screen whose identity silently moves when the list around it
-    /// changes. So surviving rectangles carry their id across (each
-    /// matched once, so duplicates stay distinct), and only genuinely new
-    /// ones are named — with the lowest [`fake_monitor_id`] index not
+    /// changes. So surviving rectangles carry their description across
+    /// (each matched once, so duplicates stay distinct), and only genuinely
+    /// new ones are named — with the lowest [`fake_monitor_id`] index not
     /// already in use, so a new monitor can never inherit a live
     /// neighbour's name either.
     pub fn set_monitors(&self, monitors: Vec<MonitorRect>) {
@@ -553,12 +554,13 @@ impl FakeDisplay {
             .into_iter()
             .map(|rect| {
                 // Same rectangle as one we had? Same screen, same id, same
-                // label.
+                // description.
                 match unclaimed.iter().position(|held| held.info.rect == rect) {
                     Some(index) => unclaimed.remove(index),
                     None => MonitorDescription {
                         info: MonitorInfo { id: None, rect },
                         label: None,
+                        physical_size: None,
                     },
                 }
             })
@@ -590,22 +592,30 @@ impl FakeDisplay {
     ///
     /// Whatever is given is stored verbatim, including `None` and including
     /// ids [`Self::set_monitors`] would never mint — that is the point of
-    /// having both setters. Every monitor comes out **unlabelled**: this is
-    /// the identity setter, and a test that wants product names uses
-    /// [`Self::set_monitor_descriptions`].
+    /// having both setters. Every monitor comes out **undescribed** — no
+    /// label, no measured size: this is the identity setter, and a test
+    /// that wants either uses [`Self::set_monitor_descriptions`].
     pub fn set_monitor_layout(&self, monitors: Vec<MonitorInfo>) {
         *lock(&self.monitors) = monitors
             .into_iter()
-            .map(|info| MonitorDescription { info, label: None })
+            .map(|info| MonitorDescription {
+                info,
+                label: None,
+                physical_size: None,
+            })
             .collect();
     }
 
-    /// Replace the monitor layout including each monitor's human-readable
-    /// label — for a test about captions: a labelled screen, an unlabelled
-    /// one, two screens sharing a label (the duplicate case the editor
-    /// suffixes), or a label the layout model will refuse.
+    /// Replace the monitor layout including everything the description
+    /// query adds — each monitor's human-readable label and its physical
+    /// panel size. For a test about captions (a labelled screen, an
+    /// unlabelled one, two screens sharing a label, a label the layout
+    /// model will refuse) or about proportion (a measured panel, an
+    /// unmeasured one, a size the model will refuse).
     ///
-    /// Stored verbatim, like [`Self::set_monitor_layout`], labels included.
+    /// Stored verbatim, like [`Self::set_monitor_layout`] — which is what
+    /// lets a test model the case retention exists for: a description sweep
+    /// that keeps the geometry and drops what it says *about* it.
     pub fn set_monitor_descriptions(&self, monitors: Vec<MonitorDescription>) {
         *lock(&self.monitors) = monitors;
     }
@@ -1363,6 +1373,84 @@ mod display_tests {
             display.monitors(),
             Err(DisplayError::Unavailable { .. })
         ));
+    }
+
+    /// The description half: labels and panel sizes are scriptable
+    /// independently of each other and of identity, they reach only the
+    /// description query, and neither ever gates geometry.
+    ///
+    /// Independently is the point. A real sweep can hand back a name with
+    /// no size (a panel whose EDID is unreadable but which Windows names
+    /// anyway) or a size with no name (an EDID with measurements and no
+    /// product string), so a fake that could only supply both or neither
+    /// would make the retention rules above it untestable.
+    #[test]
+    fn monitor_descriptions_carry_labels_and_sizes_independently() {
+        use crate::display::{MonitorDescription, MonitorInfo, PhysicalSizeMm};
+
+        let display = FakeDisplay::new(Screen {
+            width: 3840,
+            height: 1080,
+        });
+        let described = |index: usize,
+                         left: i32,
+                         label: Option<&str>,
+                         size: Option<PhysicalSizeMm>| MonitorDescription {
+            info: MonitorInfo {
+                id: Some(fake_monitor_id(index)),
+                rect: MonitorRect {
+                    left,
+                    top: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            label: label.map(str::to_owned),
+            physical_size: size,
+        };
+        let panel = PhysicalSizeMm {
+            width_mm: 597,
+            height_mm: 336,
+        };
+
+        display.set_monitor_descriptions(vec![
+            described(0, 0, Some("DELL U2720Q"), Some(panel)),
+            described(1, 1920, Some("LG ULTRAGEAR"), None),
+            described(2, 3840, None, Some(panel)),
+        ]);
+
+        let descriptions = display.monitor_descriptions().unwrap();
+        assert_eq!(descriptions[0].physical_size, Some(panel));
+        assert_eq!(descriptions[1].physical_size, None);
+        assert_eq!(descriptions[2].label, None);
+        assert_eq!(descriptions[2].physical_size, Some(panel));
+
+        // Neither reaches the two cheaper queries, and neither can lose a
+        // monitor: all three lists describe the same three screens.
+        assert_eq!(display.monitors().unwrap().len(), 3);
+        assert_eq!(
+            display.monitor_layout().unwrap(),
+            descriptions
+                .iter()
+                .map(|description| description.info.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // The identity setter clears both, so a test about ids is never
+        // accidentally also a test about descriptions.
+        display.set_monitor_layout(
+            descriptions
+                .into_iter()
+                .map(|description| description.info)
+                .collect(),
+        );
+        assert!(
+            display
+                .monitor_descriptions()
+                .unwrap()
+                .iter()
+                .all(|d| d.label.is_none() && d.physical_size.is_none())
+        );
     }
 
     /// A rectangle that survives a `set_monitors` keeps the id it had.

@@ -27,17 +27,31 @@ Builds that are not tagged releases identify themselves as such —
   and where the cursor crosses all still address a monitor by its device
   string, unchanged.
 
+- **Monitors report how big they physically are.** Each machine now reads
+  the real width and height of every attached panel — in millimetres, off
+  the monitor's own EDID — and reports it to the other machine and to the
+  layout editor's state file. Nothing draws differently yet: this release
+  carries the measurement end to end, and the editor starts *using* it to
+  size rectangles in a following change. A screen whose size cannot be read
+  or does not look believable (a projector, a virtual display, a remote
+  session) simply reports none, and is drawn exactly as before. The
+  measurement is proportion only — arrangements, saved layouts, and where
+  the cursor crosses all still address a monitor by its device string.
+
 ### Changed
 
-- **Wire protocol moves to version 5, and does not accept version 4**
-  ([ADR 0018](docs/adr/0018-drawn-display-topology.md), amended
-  2026-08-21). Each monitor a machine reports now carries an optional
-  product name so the *other* machine's editor can caption it, which adds
-  a byte to every monitor of every report and which no feature bit can
-  hide. **Both machines must be upgraded together**; a mixed pair refuses
-  cleanly at the handshake naming both version ranges. Nothing about
-  crossing changed — the name is display-only — but the byte is on the
-  wire regardless, which is what forces the bump.
+- **Wire protocol moves to version 6, and accepts nothing older**
+  ([ADR 0018](docs/adr/0018-drawn-display-topology.md), amended 2026-08-21
+  and 2026-08-22). Each monitor a machine reports now carries two further
+  optional facts about itself, added since version 4: its **product name**,
+  so the *other* machine's editor can caption the rectangle, and its
+  **physical size**, so that editor can draw it in proportion to the real
+  screen. Each adds a byte to every monitor of every report, and no feature
+  bit can hide either. **Both machines must be upgraded together**; a mixed
+  pair refuses cleanly at the handshake naming both version ranges, rather
+  than establishing a session that dies on the first report. Nothing about
+  crossing changed — both fields are display-only — but the bytes are on
+  the wire regardless, and it is the bytes that force the bump.
 - **Wire protocol moves to version 4, and does not accept version 3**
   ([ADR 0018](docs/adr/0018-drawn-display-topology.md)). Crossing control
   now carries an `EntryPoint` — destination monitor, edge, fraction, and

@@ -561,16 +561,16 @@ impl TopologySync {
             );
             return;
         }
-        // Captions the display would not repeat this instant, filled in
-        // from what the state writer last saw. Geometry is always this
-        // query's own; only the labels come from memory, and only where
-        // this query had none — see `TopologyStateWriter::set_monitors`
-        // for why a caption is remembered rather than re-read. Without
-        // this the state file and the wire would describe the same desk
-        // differently whenever a label sweep failed to coincide with a
-        // real display change.
+        // Captions and panel sizes the display would not repeat this
+        // instant, filled in from what the state writer last saw. Geometry
+        // is always this query's own; only the descriptive fields come from
+        // memory, and only where this query had none — see
+        // `TopologyStateWriter::set_monitors` for why a description is
+        // remembered rather than re-read. Without this the state file and
+        // the wire would describe the same desk differently whenever a
+        // description sweep failed to coincide with a real display change.
         if let Some(writer) = &self.state {
-            writer.fill_remembered_labels(&mut monitors);
+            writer.fill_remembered(&mut monitors);
         }
         let message = MonitorTopology {
             monitors: monitors.iter().map(report_of).collect(),
@@ -1338,10 +1338,12 @@ fn report_of(monitor: &LiveMonitor) -> MonitorReport {
         id: monitor.id.clone(),
         rect: monitor.rect,
         scale_percent: monitor.scale_percent,
-        // Field for field, the label included: the desk the peer is told
-        // about and the desk the local editor draws are the same desk, and
-        // the peer's editor captions rectangles from exactly this.
+        // Field for field, the label and the panel size included: the desk
+        // the peer is told about and the desk the local editor draws are
+        // the same desk, and the peer's editor captions and proportions
+        // rectangles from exactly this.
         label: monitor.label.clone(),
+        physical_size: monitor.physical_size,
     }
 }
 
@@ -1351,10 +1353,11 @@ fn live_of(report: MonitorReport) -> LiveMonitor {
         id: report.id,
         rect: report.rect,
         scale_percent: report.scale_percent,
-        // Already validated — it is a `MonitorLabel`, which cannot exist
-        // unvalidated, and the wire decoder refused anything else before
-        // this frame got here.
+        // Both already validated — a `MonitorLabel` and a `PhysicalSizeMm`
+        // cannot exist unvalidated, and the wire decoder refused anything
+        // else before this frame got here.
         label: report.label,
+        physical_size: report.physical_size,
     }
 }
 
@@ -2253,6 +2256,7 @@ mod tests {
                 },
                 scale_percent: 150,
                 label: Some(crossover_topology::MonitorLabel::new("DELL U2720Q").unwrap()),
+                physical_size: Some(crossover_topology::PhysicalSizeMm::new(597, 336).unwrap()),
             }],
         };
         a.receive(
@@ -2274,6 +2278,13 @@ mod tests {
                 .as_ref()
                 .map(crossover_topology::MonitorLabel::as_str),
             Some("DELL U2720Q")
+        );
+        // And so does the panel's real size, which is what will let the
+        // local editor draw the other desk in proportion rather than by
+        // pixel count.
+        assert_eq!(
+            peer.monitors[0].physical_size,
+            Some(crossover_topology::PhysicalSizeMm::new(597, 336).unwrap())
         );
         assert_eq!(peer.monitors[0].rect.width, 2560);
 
@@ -2307,6 +2318,7 @@ mod tests {
                     },
                     scale_percent: 100,
                     label: None,
+                    physical_size: None,
                 }],
             }
             .encode_payload()
@@ -2365,11 +2377,11 @@ mod tests {
         assert!(a.drain().is_empty());
     }
 
-    /// This machine's own product names reach the peer, and a screen the
-    /// platform would not name still travels — unlabelled, never dropped.
-    /// The peer's editor draws this desk from exactly this message, so a
-    /// label that stopped at the state file would caption one desk and not
-    /// the other.
+    /// This machine's own product names and panel sizes reach the peer, and
+    /// a screen the platform would neither name nor measure still travels —
+    /// undescribed, never dropped. The peer's editor draws this desk from
+    /// exactly this message, so either field stopping at the state file
+    /// would describe one desk and not the other.
     #[tokio::test]
     async fn the_monitors_this_machine_states_carry_their_product_names() {
         use crossover_platform::MonitorDescription;
@@ -2391,6 +2403,10 @@ mod tests {
                     },
                 },
                 label: Some("DELL U2720Q".to_owned()),
+                physical_size: Some(crossover_platform::PhysicalSizeMm {
+                    width_mm: 597,
+                    height_mm: 336,
+                }),
             },
             MonitorDescription {
                 info: MonitorInfo {
@@ -2403,6 +2419,7 @@ mod tests {
                     },
                 },
                 label: None,
+                physical_size: None,
             },
         ]);
         a.feed(TopologyEvent::LocalDisplayChanged).await;
@@ -2419,6 +2436,66 @@ mod tests {
             Some("DELL U2720Q")
         );
         assert_eq!(decoded.monitors[1].label, None);
+        assert_eq!(
+            decoded.monitors[0].physical_size,
+            Some(crossover_topology::PhysicalSizeMm::new(597, 336).unwrap())
+        );
+        assert_eq!(decoded.monitors[1].physical_size, None);
+    }
+
+    /// A panel size the layout model would refuse costs the *size* and not
+    /// the monitor, on the same trade the label gets. This is the one that
+    /// would hurt most if it went the other way: an implausible EDID is
+    /// exactly what a projector or a virtual display reports, and losing a
+    /// rectangle at the peer's desk over one would break the arrangement
+    /// rather than merely draw it at the wrong scale.
+    #[tokio::test]
+    async fn an_unusable_panel_size_costs_the_size_and_not_the_screen() {
+        use crossover_platform::{MonitorDescription, PhysicalSizeMm as PlatformSize};
+
+        let sandbox = Sandbox::new("unusable-size");
+        let mut a = engine(&sandbox, "a", A, None);
+        a.connect(B).await;
+        let _ = a.drain();
+
+        a.display.set_monitor_descriptions(vec![MonitorDescription {
+            info: MonitorInfo {
+                id: Some("a-SCREEN".to_owned()),
+                rect: MonitorRect {
+                    left: 0,
+                    top: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            label: Some("DELL U2720Q".to_owned()),
+            // Zero on one axis and past the wire cap on the other: both
+            // rejection classes at once.
+            physical_size: Some(PlatformSize {
+                width_mm: 0,
+                height_mm: u16::MAX,
+            }),
+        }]);
+        a.feed(TopologyEvent::LocalDisplayChanged).await;
+
+        let topologies = payloads(&a.drain(), MessageType::MonitorTopology);
+        assert_eq!(topologies.len(), 1);
+        let decoded = MonitorTopology::decode_payload(&topologies[0]).unwrap();
+        assert_eq!(
+            decoded.monitors.len(),
+            1,
+            "a screen was dropped over a size"
+        );
+        assert_eq!(decoded.monitors[0].id.as_str(), "a-SCREEN");
+        assert_eq!(decoded.monitors[0].physical_size, None);
+        // The caption beside it still travelled.
+        assert_eq!(
+            decoded.monitors[0]
+                .label
+                .as_ref()
+                .map(crossover_topology::MonitorLabel::as_str),
+            Some("DELL U2720Q")
+        );
     }
 
     /// A product name the layout model would refuse costs the *label* and
@@ -2447,6 +2524,7 @@ mod tests {
             // Over the byte bound, and carrying a control character: both
             // rejection classes at once.
             label: Some(format!("DELL\n{}", "x".repeat(80))),
+            physical_size: None,
         }]);
         a.feed(TopologyEvent::LocalDisplayChanged).await;
 
