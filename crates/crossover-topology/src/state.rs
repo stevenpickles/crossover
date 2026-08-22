@@ -150,12 +150,25 @@ pub struct LiveMonitor {
     ///
     /// Omitted from the document entirely when absent, and defaulted to
     /// absent when a document does not carry it, so the **schema stays at
-    /// version 1**: a file written before labels existed parses unchanged,
-    /// and a file written by this build is readable by a build that
-    /// predates them. That is the whole reason for the two attributes —
-    /// this field can be added without the whole-document refusal
-    /// [`TOPOLOGY_STATE_VERSION`] exists to enforce, because a reader that
-    /// does not know it loses a caption and nothing else.
+    /// version 1 for a reader moving forward**: a file written before
+    /// labels existed parses unchanged here, which is what lets the field
+    /// be added without the whole-document refusal
+    /// [`TOPOLOGY_STATE_VERSION`] exists to enforce.
+    ///
+    /// **Forward, not backward — and the asymmetry is deliberate.**
+    /// [`RawLiveMonitor`] is `deny_unknown_fields`, so an *older* build
+    /// pointed at a document this one wrote with a label refuses that
+    /// document whole. That hardening predates labels and stays: a state
+    /// file is a report about arrangements that steer where control is
+    /// handed away, and silently ignoring a key it does not understand is
+    /// how a reader half-believes a document. The cost is bounded and
+    /// transient rather than permanent, which is why it is acceptable — a
+    /// downgraded worker rewrites this file at startup and on its next
+    /// poll, so the refusal lasts until the old worker is running and no
+    /// longer. What it costs meanwhile is an editor that says the worker
+    /// is not reporting, on a machine mid-downgrade; it cannot corrupt an
+    /// arrangement, because the config file, not this one, is where a
+    /// layout lives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<MonitorLabel>,
 }
@@ -630,6 +643,27 @@ mod tests {
                 .all(|monitor| monitor.label.is_none())
         );
         assert_eq!(parsed.local.monitors.len(), 2);
+    }
+
+    /// The other direction of that compatibility claim, pinned rather than
+    /// asserted in prose: `deny_unknown_fields` means a document carrying a
+    /// per-monitor key this build does not know is refused **whole**.
+    ///
+    /// That is what makes the `label` field one-way compatible — new
+    /// readers accept old files, old readers refuse new ones — and it is
+    /// the hardening, not an oversight. The cost is transient: a
+    /// downgraded worker rewrites this file at startup, so the refusal
+    /// lasts only until the older build is actually running.
+    #[test]
+    fn a_document_with_a_monitor_key_this_build_does_not_know_is_refused() {
+        let json = serialize_state(&document()).unwrap().replace(
+            "\"scale_percent\": 150",
+            "\"scale_percent\": 150, \"hdr_nits\": 400",
+        );
+        assert!(
+            matches!(parse_state(&json), Err(StateError::Malformed { .. })),
+            "an unknown per-monitor key was silently ignored"
+        );
     }
 
     /// A label repeating within one machine is legal — it is a caption,
