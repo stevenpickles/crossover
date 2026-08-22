@@ -154,6 +154,12 @@ windows = { version = "0.62", features = [
     # FILE_FS_FULL_SIZE_INFORMATION: the spool's free-space check, asked of
     # the volume behind the open root handle rather than of a path (F15).
     "Wdk_System_SystemServices",
+    # QueryDisplayConfig + DisplayConfigGetDeviceInfo: the only Win32 route
+    # to a monitor's EDID product name ("DELL U2720Q"), which the layout
+    # editor captions rectangles with. Display-only, and deliberately off
+    # the edge detector's hot path — see crossover-platform's `display`
+    # module.
+    "Win32_Devices_Display",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

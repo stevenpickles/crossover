@@ -4,12 +4,21 @@
 //! as one rectangle — via `GetSystemMetrics(SM_*VIRTUALSCREEN)`, the
 //! per-monitor layout via `EnumDisplayMonitors` plus `GetMonitorInfoW` for
 //! each monitor's `szDevice` identity (ADR 0018), and the cursor via
-//! `GetCursorPos`, all normalized to the desktop's top-left. The two
+//! `GetCursorPos`, all normalized to the desktop's top-left. The three
 //! monitor queries share one `EnumDisplayMonitors` sweep and differ only in
-//! whether the per-monitor `GetMonitorInfoW` runs: `monitors()` is pure
-//! geometry for the edge detector's hot path, and `monitor_layout()` adds
-//! best-effort identity, so a monitor the OS declines to name is reported
-//! unnamed and never dropped. The desktop
+//! how much they lay over it: `monitors()` is pure geometry for the edge
+//! detector's hot path, `monitor_layout()` adds best-effort identity, so a
+//! monitor the OS declines to name is reported unnamed and never dropped,
+//! and `monitor_descriptions()` adds the EDID product name on top of that.
+//!
+//! The product name is a **second sweep**, `QueryDisplayConfig` rather than
+//! `EnumDisplayMonitors`, because it is the only Win32 route to the string
+//! Windows Settings shows. It is far more expensive than the geometry
+//! enumeration, which is precisely why it sits behind its own trait method
+//! and why the ~8 ms edge poll never reaches it. The two sweeps are joined
+//! by `szDevice` — the DisplayConfig source's `viewGdiDeviceName` is the
+//! same string `GetMonitorInfoW` reports — never by enumeration position.
+//! A failure anywhere in it costs captions and nothing else. The desktop
 //! bounds keep the seam *between* two monitors from being treated as the
 //! crossing edge (a primary-only region put a false edge at the primary's
 //! boundary, so roaming onto the second monitor triggered spurious
@@ -19,10 +28,20 @@
 //! per-monitor DPI awareness, R-3) are real pixels; cross-machine mapping
 //! goes through the fraction in core's topology model.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crossover_platform::{
-    CursorPoint, DisplayError, DisplayInfo, MonitorInfo, MonitorRect, Screen,
+    CursorPoint, DisplayError, DisplayInfo, MonitorDescription, MonitorInfo, MonitorRect, Screen,
 };
-use windows::Win32::Foundation::{LPARAM, POINT, RECT, TRUE};
+use windows::Win32::Devices::Display::{
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo,
+    GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+};
+use windows::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LPARAM, POINT, RECT, TRUE,
+};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
@@ -32,15 +51,40 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::BOOL;
 
-/// Win32 [`DisplayInfo`]. Stateless — the queries read live system state.
+/// Win32 [`DisplayInfo`]. Effectively stateless — the queries read live
+/// system state; the one field is a log-once latch, not cached data.
 #[derive(Debug, Default)]
-pub struct WindowsDisplayInfo;
+pub struct WindowsDisplayInfo {
+    /// Whether the current run of failed label lookups has already been
+    /// logged. `QueryDisplayConfig` failing is a nuisance, not an error —
+    /// the caller loses captions and nothing else — and this query runs
+    /// once a second, so an unlatched log line would be a debug line every
+    /// second for as long as the condition lasts.
+    label_lookup_failed: AtomicBool,
+}
 
 impl WindowsDisplayInfo {
     /// A new display-info provider.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Note that a label lookup failed, logging `reason` only on the first
+    /// failure of a streak.
+    fn note_label_failure(&self, reason: &str) {
+        if !self.label_lookup_failed.swap(true, Ordering::Relaxed) {
+            tracing::debug!(
+                reason,
+                "could not read monitor product names; the editor will caption \
+                 monitors by device string until this clears"
+            );
+        }
+    }
+
+    /// Note that a label lookup succeeded, so the next failure logs again.
+    fn note_label_success(&self) {
+        self.label_lookup_failed.store(false, Ordering::Relaxed);
     }
 }
 
@@ -132,6 +176,231 @@ impl DisplayInfo for WindowsDisplayInfo {
             })
             .collect())
     }
+
+    fn monitor_descriptions(&self) -> Result<Vec<MonitorDescription>, DisplayError> {
+        // The identified enumeration is the spine: same monitors, same
+        // order, same rectangles. Labels are a third best-effort pass laid
+        // over it, joined by the very device string `monitor_layout()`
+        // already read — `viewGdiDeviceName` from a DisplayConfig source is
+        // literally `szDevice`, which is what makes the join exact rather
+        // than positional.
+        let layout = self.monitor_layout()?;
+        let labels = match friendly_names() {
+            Ok(labels) => {
+                self.note_label_success();
+                labels
+            }
+            Err(reason) => {
+                // Never an error and never a panic: a failure here costs
+                // captions, and a monitor with no caption still draws, still
+                // crosses, and is still addressable by its id.
+                self.note_label_failure(&reason);
+                Vec::new()
+            }
+        };
+
+        Ok(layout
+            .into_iter()
+            .map(|info| {
+                let label = info.id.as_ref().and_then(|id| {
+                    labels
+                        .iter()
+                        .find(|(device, _)| device == id)
+                        .map(|(_, label)| label.clone())
+                });
+                MonitorDescription { info, label }
+            })
+            .collect())
+    }
+}
+
+/// How many active display paths this build will ask the OS to describe.
+///
+/// A real desk has a handful; `MAX_MONITORS_PER_MACHINE` upstream is 16.
+/// This is two orders of magnitude of headroom over any of that, and exists
+/// so an implausible count from a driver costs a comparison rather than a
+/// multi-megabyte allocation — the house rule applied to a value that is
+/// not network input but is still someone else's number.
+const MAX_DISPLAY_CONFIG_PATHS: u32 = 1024;
+
+/// How many times to retry the size-then-query pair before giving up.
+///
+/// `GetDisplayConfigBufferSizes` and `QueryDisplayConfig` are two calls
+/// with a window between them, and a display arriving or leaving in that
+/// window makes the second one return `ERROR_INSUFFICIENT_BUFFER` — the
+/// documented, expected race. Retrying re-reads the sizes; a small bound
+/// keeps a display configuration changing continuously from spinning here.
+const DISPLAY_CONFIG_ATTEMPTS: usize = 8;
+
+/// Every active display path's `(szDevice, friendly name)` pair, as
+/// Windows' own display configuration reports them.
+///
+/// `viewGdiDeviceName` from `DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME`
+/// **is** the `szDevice` string `GetMonitorInfoW` reports, which is what
+/// lets this join onto the monitor ids ADR 0018 already uses; the friendly
+/// name is `monitorFriendlyDeviceName` from
+/// `DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME`, the EDID product name
+/// Windows Settings shows.
+///
+/// Best effort throughout: a path whose source or target will not answer,
+/// or whose friendly name is empty, contributes nothing and stops nothing.
+/// The `Err` case is reserved for a failure of the *sweep* — the caller
+/// logs it once per streak and carries on with no labels at all.
+fn friendly_names() -> Result<Vec<(String, String)>, String> {
+    let (paths, _modes) = query_display_config()?;
+
+    let mut named: Vec<(String, String)> = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let Some(device) = source_device_name(path) else {
+            continue;
+        };
+        // A source can drive several targets (clone mode). The first target
+        // that answers names the screen; a second name for the same
+        // `szDevice` would be a second caption for one rectangle, which the
+        // model has no way to show.
+        if named.iter().any(|(held, _)| held == &device) {
+            continue;
+        }
+        if let Some(label) = target_friendly_name(path) {
+            named.push((device, label));
+        }
+    }
+    Ok(named)
+}
+
+/// The active display paths, sized and fetched with the documented retry.
+///
+/// The buffer can grow *between* the two calls — a monitor plugged in at
+/// exactly the wrong moment — so `ERROR_INSUFFICIENT_BUFFER` re-reads the
+/// sizes rather than failing (Microsoft documents this loop).
+fn query_display_config()
+-> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
+    for _ in 0..DISPLAY_CONFIG_ATTEMPTS {
+        let mut path_count: u32 = 0;
+        let mut mode_count: u32 = 0;
+        // SAFETY: both out-parameters are live locals for the whole call;
+        // the function only writes counts into them.
+        let sized = unsafe {
+            GetDisplayConfigBufferSizes(
+                QDC_ONLY_ACTIVE_PATHS,
+                &raw mut path_count,
+                &raw mut mode_count,
+            )
+        };
+        if sized != ERROR_SUCCESS {
+            return Err(format!("GetDisplayConfigBufferSizes failed: {sized:?}"));
+        }
+        if path_count == 0 {
+            // No active paths is a legitimate answer (a locked or headless
+            // session), and an empty label set is exactly right for it.
+            return Ok((Vec::new(), Vec::new()));
+        }
+        // Bound before allocating, as everywhere else.
+        if path_count > MAX_DISPLAY_CONFIG_PATHS {
+            return Err(format!(
+                "the display configuration claims {path_count} active paths, over the \
+                 {MAX_DISPLAY_CONFIG_PATHS} this build will describe"
+            ));
+        }
+
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        // SAFETY: the two count variables hold the true element counts of
+        // the two buffers we pass, both live for the whole call; the OS
+        // writes at most that many elements and updates the counts with how
+        // many it actually wrote. `None` declines the optional topology
+        // out-parameter.
+        let queried = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &raw mut path_count,
+                paths.as_mut_ptr(),
+                &raw mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        if queried == ERROR_INSUFFICIENT_BUFFER {
+            // The configuration changed between the two calls. Re-read.
+            continue;
+        }
+        if queried != ERROR_SUCCESS {
+            return Err(format!("QueryDisplayConfig failed: {queried:?}"));
+        }
+        // The OS may have written fewer elements than it sized for.
+        paths.truncate(path_count as usize);
+        modes.truncate(mode_count as usize);
+        return Ok((paths, modes));
+    }
+    Err(format!(
+        "the display configuration kept changing across {DISPLAY_CONFIG_ATTEMPTS} attempts"
+    ))
+}
+
+/// The `szDevice` string for `path`'s source (`\\.\DISPLAY1`), or `None`
+/// where the OS declines to answer or reports an empty name.
+fn source_device_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
+    let mut request = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+            size: u32::try_from(size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>()).ok()?,
+            adapterId: path.sourceInfo.adapterId,
+            id: path.sourceInfo.id,
+        },
+        ..Default::default()
+    };
+    // SAFETY: `DisplayConfigGetDeviceInfo` fills the packet behind the
+    // header pointer, using the `size` we just set to know how much of it
+    // there is — the documented calling convention for every
+    // `DISPLAYCONFIG_*` request struct, which all begin with an embedded
+    // header. `request` is a live local for the whole call.
+    let status = unsafe { DisplayConfigGetDeviceInfo((&raw mut request).cast()) };
+    if status != 0 {
+        return None;
+    }
+    wide_string(&request.viewGdiDeviceName)
+}
+
+/// The EDID product name for `path`'s target (`DELL U2720Q`), or `None`
+/// where the OS declines to answer or reports an empty name.
+fn target_friendly_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
+    let mut request = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+            size: u32::try_from(size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>()).ok()?,
+            adapterId: path.targetInfo.adapterId,
+            id: path.targetInfo.id,
+        },
+        ..Default::default()
+    };
+    // SAFETY: as `source_device_name` above — same documented convention,
+    // same live local, a different request type and size.
+    let status = unsafe { DisplayConfigGetDeviceInfo((&raw mut request).cast()) };
+    if status != 0 {
+        return None;
+    }
+    wide_string(&request.monitorFriendlyDeviceName)
+}
+
+/// A fixed-size `WCHAR` field as a `String`: the run of units before the
+/// first NUL, trimmed, or `None` when that leaves nothing.
+///
+/// Trimming matters because some drivers pad the friendly name with
+/// spaces, and a caption of `"DELL U2720Q   "` would look like a rendering
+/// bug. Lossy decoding for the reason `device_string` gives: a name with
+/// one unpaired surrogate in it is still a better caption than none, and
+/// the layout model validates it before trusting it either way.
+fn wide_string(units: &[u16]) -> Option<String> {
+    let name: Vec<u16> = units
+        .iter()
+        .copied()
+        .take_while(|&unit| unit != 0)
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    let text = String::from_utf16_lossy(&name).trim().to_owned();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// One monitor as the enumeration found it: the handle identity can later
@@ -316,6 +585,63 @@ mod tests {
         let unique = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), unique, "two monitors share a device string");
+    }
+
+    /// Descriptions are the identified enumeration with labels laid over
+    /// it: never a monitor lost, never one reordered, and every label the
+    /// layout model would accept.
+    ///
+    /// The last clause is what stops a driver's padded or exotic product
+    /// name reaching the wire as something a peer would be right to
+    /// refuse — imported from `crossover_topology` rather than restated, so
+    /// the two cannot drift. A headless agent has no display and every
+    /// query fails cleanly, which is an acceptable outcome; a panic is not.
+    #[test]
+    fn descriptions_are_the_identified_enumeration_with_usable_labels() {
+        use crossover_topology::{MAX_MONITOR_LABEL_BYTES, validate_monitor_label};
+
+        let display = WindowsDisplayInfo::new();
+        let (Ok(descriptions), Ok(layout)) =
+            (display.monitor_descriptions(), display.monitor_layout())
+        else {
+            return;
+        };
+
+        assert_eq!(
+            descriptions
+                .iter()
+                .map(|description| description.info.clone())
+                .collect::<Vec<_>>(),
+            layout,
+            "the described enumeration lost, renamed, or reordered a monitor"
+        );
+
+        for description in &descriptions {
+            let Some(label) = description.label.as_deref() else {
+                continue;
+            };
+            assert!(
+                validate_monitor_label(label).is_ok(),
+                "product name {label:?} is not a usable monitor label"
+            );
+            assert!(label.len() <= MAX_MONITOR_LABEL_BYTES, "{label:?}");
+            assert_eq!(label.trim(), label, "a product name kept its padding");
+        }
+    }
+
+    /// Repeated sweeps agree. A `QueryDisplayConfig` join that depended on
+    /// enumeration order rather than on the device string would drift here
+    /// as soon as anything re-enumerated.
+    #[test]
+    fn repeated_description_sweeps_agree() {
+        let display = WindowsDisplayInfo::new();
+        let (Ok(first), Ok(second)) = (
+            display.monitor_descriptions(),
+            display.monitor_descriptions(),
+        ) else {
+            return;
+        };
+        assert_eq!(first, second);
     }
 
     /// On a real Windows session the primary display has a positive size
