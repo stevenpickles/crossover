@@ -139,17 +139,16 @@ pub struct TopologyStateWriter {
 /// other — a panel Windows names but whose EDID will not read, or an EDID
 /// with measurements and no product string — so "remembered" is per field,
 /// not per monitor.
+///
+/// **A record that exists always holds at least one `Some`.** One is
+/// created only when there is something to learn, and a field is only ever
+/// set *to* a `Some` — never cleared. So an id absent from the map means
+/// "nothing has ever been learned about this screen", and the map holds
+/// exactly the monitors that have told this run something.
 #[derive(Clone, Default)]
 struct RememberedDescription {
     label: Option<MonitorLabel>,
     physical_size: Option<PhysicalSizeMm>,
-}
-
-impl RememberedDescription {
-    /// Nothing left to remember: the id can be dropped from the map.
-    fn is_empty(&self) -> bool {
-        self.label.is_none() && self.physical_size.is_none()
-    }
 }
 
 impl TopologyStateWriter {
@@ -175,7 +174,12 @@ impl TopologyStateWriter {
                     },
                 )
             })
-            .filter(|(_, description)| !description.is_empty())
+            // Only the monitors that actually told `initial_state`
+            // something: an id with nothing behind it would be an entry
+            // that never answers a fill.
+            .filter(|(_, description)| {
+                description.label.is_some() || description.physical_size.is_some()
+            })
             .collect();
         let (state, updates) = watch::channel(initial);
         let writer_task = tokio::spawn(run_writer(path.clone(), updates));
@@ -252,10 +256,22 @@ impl TopologyStateWriter {
     fn remember_descriptions(&self, monitors: &mut [LiveMonitor]) {
         let mut known = lock(&self.remembered);
         for monitor in monitors.iter_mut() {
-            // Learning and filling are the same pass, per field: whichever
-            // of the two the sweep managed this tick is remembered, and
-            // whichever it did not is restored.
-            let held = known.entry(monitor.id.clone()).or_default();
+            // A record is created only when this sweep has something to put
+            // in it. A monitor nobody has ever described gets no entry at
+            // all rather than an empty one written on every poll — which
+            // would churn the map once a second and make the prune below
+            // load-bearing for correctness rather than merely for size.
+            let held = if monitor.label.is_some() || monitor.physical_size.is_some() {
+                Some(known.entry(monitor.id.clone()).or_default())
+            } else {
+                known.get_mut(&monitor.id)
+            };
+            let Some(held) = held else {
+                continue;
+            };
+            // Learning and filling are then the same pass, per field:
+            // whichever of the two the sweep managed this tick is
+            // remembered, and whichever it did not is restored.
             match &monitor.label {
                 Some(label) => held.label = Some(label.clone()),
                 None => monitor.label.clone_from(&held.label),
@@ -266,12 +282,8 @@ impl TopologyStateWriter {
             }
         }
         // Bounded by the enumeration: an id nothing reports any more is an
-        // id whose description can never be wanted again. An entry the loop
-        // above created for a monitor it learned nothing about goes too,
-        // rather than lingering empty.
-        known.retain(|id, description| {
-            !description.is_empty() && monitors.iter().any(|monitor| &monitor.id == id)
-        });
+        // id whose description can never be wanted again.
+        known.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
     }
 
     /// Fill in the description fields `monitors` does not carry from what
@@ -299,6 +311,18 @@ impl TopologyStateWriter {
                 monitor.physical_size = held.physical_size;
             }
         }
+    }
+
+    /// Whether this writer is remembering anything about any monitor.
+    ///
+    /// Exists for the one property that is otherwise unobservable: a poll
+    /// that learns nothing must not record anything. See
+    /// [`RememberedDescription`] for why an entry can never be empty, which
+    /// is what makes "the map is empty" the same question as "nothing has
+    /// been learned".
+    #[cfg(test)]
+    fn remembered_is_empty(&self) -> bool {
+        lock(&self.remembered).is_empty()
     }
 
     /// Record who is at the other end and whether a session is up right
@@ -1324,6 +1348,57 @@ mod tests {
                 Some(crossover_topology::PhysicalSizeMm::new(597, 336).unwrap())
             );
         }
+
+        drop(writer);
+    }
+
+    /// A monitor the platform has never described gets no record at all —
+    /// not an empty one rewritten on every poll.
+    ///
+    /// The distinction is invisible from the outside, which is why it is
+    /// asserted here: a poll that learned nothing must leave the memory
+    /// untouched, so that pruning departed ids stays a matter of bounding
+    /// size rather than something correctness rests on. A desk of screens
+    /// the platform will not describe is the ordinary case on a VM, and it
+    /// would otherwise write an entry per monitor per second forever.
+    #[tokio::test]
+    async fn a_monitor_nobody_has_described_is_not_remembered_at_all() {
+        use crossover_platform::MonitorDescription;
+
+        let sandbox = Sandbox::new("no-empty-records");
+        let path = sandbox.path("topology.json");
+        let display = display(1920, 1080);
+        display.set_monitor_descriptions(vec![MonitorDescription {
+            info: monitor_at(0, 0),
+            label: None,
+            physical_size: None,
+        }]);
+
+        let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
+        let writer = TopologyStateWriter::start(path, state);
+        assert!(
+            writer.remembered_is_empty(),
+            "startup recorded a monitor it learned nothing about"
+        );
+
+        // Several polls of the same undescribed desk change nothing, and
+        // record nothing.
+        for _ in 0..3 {
+            assert!(!writer.set_monitors(live_monitors(&display).unwrap()));
+            assert!(
+                writer.remembered_is_empty(),
+                "a poll that learned nothing wrote a record anyway"
+            );
+        }
+
+        // The moment the platform does describe it, a record appears.
+        display.set_monitor_descriptions(vec![MonitorDescription {
+            info: monitor_at(0, 0),
+            label: Some("DELL U2720Q".to_owned()),
+            physical_size: None,
+        }]);
+        assert!(writer.set_monitors(live_monitors(&display).unwrap()));
+        assert!(!writer.remembered_is_empty());
 
         drop(writer);
     }
