@@ -25,9 +25,12 @@
 //! - A monitor label is [`crossover_topology::MonitorLabel`], the same
 //!   pattern for a different rule: at most
 //!   [`crossover_topology::MAX_MONITOR_LABEL_BYTES`] bytes of UTF-8 with no
-//!   control characters. On the wire an over-long or control-bearing label
-//!   is **rejected, never truncated** — a truncating decoder would let a
-//!   peer decide how much of a frame this side believes.
+//!   control, bidirectional, or invisible format characters
+//!   ([`crossover_topology::FORMAT_CHARACTERS`]). On the wire such a label
+//!   is **rejected, never truncated or scrubbed** — a repairing decoder
+//!   would let a peer decide how much of a frame this side believes, and
+//!   the invisible-character rule in particular is defending the editor's
+//!   duplicate-caption logic rather than merely tidying text.
 //! - A device identity is [`crossover_topology::DeviceId`] — sixteen raw
 //!   bytes, postcard-encoded with **no length prefix** (unlike
 //!   `uuid::Uuid`'s length-prefixed form). The goldens below pin this
@@ -953,6 +956,43 @@ mod tests {
         }
     }
 
+    /// The label rule's other half, on the decode path: a character that
+    /// renders as nothing, or that reorders what renders around it.
+    ///
+    /// This is the one label rejection with a *behavioural* reason rather
+    /// than a hygienic one. The editor decides "two screens share a name"
+    /// by string equality, so `DELL\u{200B} U2720Q` beside `DELL U2720Q`
+    /// would render two identical captions that compare unequal — neither
+    /// suffixed, and the user unable to tell the rectangles apart, which is
+    /// exactly what labels were added to fix. A peer can send it, so the
+    /// decoder refuses it.
+    #[test]
+    fn invisible_and_reordering_labels_are_rejected_on_decode() {
+        for label in [
+            "DELL\u{200B} U2720Q", // zero-width space: forges a duplicate
+            "DELL\u{202E}U2720Q",  // right-to-left override: forges a rendering
+            "DELL\u{FEFF}U2720Q",  // byte order mark
+            "DELL\u{2069}U2720Q",  // pop directional isolate
+        ] {
+            assert!(
+                matches!(
+                    MonitorTopology::decode_payload(&topology_bytes_with_label(label)),
+                    Err(ProtocolError::Malformed { .. })
+                ),
+                "an invisible or reordering label survived the decoder: {label:?}"
+            );
+        }
+
+        // And the ordinary non-ASCII name it must not catch by accident.
+        assert!(
+            MonitorTopology::decode_payload(&topology_bytes_with_label(
+                "LG \u{30E2}\u{30CB}\u{30BF}\u{30FC}"
+            ))
+            .is_ok(),
+            "a legitimate non-ASCII product name was refused"
+        );
+    }
+
     /// Control characters and invalid UTF-8, both rejected rather than
     /// repaired: a caption that carries a newline or a replacement
     /// character misrepresents the screen it names.
@@ -1163,6 +1203,13 @@ mod tests {
                         proptest::prop_assert!(
                             !label.as_str().chars().any(char::is_control)
                         );
+                        let hides = label
+                            .as_str()
+                            .chars()
+                            .any(|character| {
+                                crossover_topology::FORMAT_CHARACTERS.contains(&character)
+                            });
+                        proptest::prop_assert!(!hides);
                     }
                 }
             }

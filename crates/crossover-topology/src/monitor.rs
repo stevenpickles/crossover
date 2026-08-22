@@ -198,12 +198,11 @@ pub const MAX_MONITOR_LABEL_BYTES: usize = 64;
 /// 2026-08-21).
 ///
 /// A conforming label is 1..=[`MAX_MONITOR_LABEL_BYTES`] bytes of UTF-8
-/// with no control characters. Unlike an id it is **not** held to ASCII: a
-/// product name is a manufacturer's string, and refusing a legitimate
-/// non-ASCII one would cost the caption for nothing — the value steers no
-/// behaviour. Control characters are refused for the reason they are
-/// refused in an id: a label is rendered in the editor and in log lines,
-/// and a newline or an escape in one misrepresents what it is naming.
+/// with no control, bidirectional, or invisible format characters
+/// ([`validate_monitor_label`] states the exact rule). Unlike an id it is
+/// **not** held to ASCII: a product name is a manufacturer's string, and
+/// refusing a legitimate non-ASCII one would cost the caption for nothing —
+/// the value steers no behaviour.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MonitorLabel(String);
 
@@ -251,12 +250,73 @@ pub enum MonitorLabelError {
         /// The offending code point.
         codepoint: u32,
     },
+    /// A character that renders as nothing, or that reorders what renders
+    /// around it — see [`FORMAT_CHARACTERS`] for the list and the reason.
+    #[error("the monitor label contains the format character U+{codepoint:04X}")]
+    FormatCharacter {
+        /// The offending code point.
+        codepoint: u32,
+    },
 }
+
+/// Code points a label may not contain because they are **invisible or
+/// reordering**, and a caption that does not render as itself is a caption
+/// that lies.
+///
+/// This is not fastidiousness about Unicode; it is the duplicate rule in
+/// `crossover-layout`'s `caption` module, defended. That rule suffixes
+/// `(1)` / `(2)` onto labels that repeat, and it decides "repeat" by string
+/// equality. A peer sending `DELL\u{200B} U2720Q` alongside `DELL U2720Q`
+/// sends two labels that render **identically** in the editor and compare
+/// **unequal** — so neither is suffixed, and the user is looking at two
+/// rectangles captioned the same, which is precisely the failure labels
+/// exist to prevent. Reachable from the wire, so it is refused at the
+/// decoder like every other malformed field.
+///
+/// The bidi half is the older concern (and the one an id is held to ASCII
+/// for): an override or isolate can make a caption render in an order the
+/// bytes do not have.
+///
+/// **An explicit list rather than a Unicode general-category test**, so
+/// this crate keeps the dependency graph ADR 0018 fixes for it (`serde` and
+/// `thiserror`, nothing else) and so the rule is auditable by reading it.
+/// It is a deny-list, which means it is not exhaustive over everything
+/// Unicode can hide with — accepted, because the containment that matters
+/// is elsewhere: a label is display-only and never an identity, so the
+/// worst a novel invisible character buys is the ambiguous caption above,
+/// never a mis-crossing.
+pub const FORMAT_CHARACTERS: &[char] = &[
+    // Bidirectional controls: marks, embeddings, overrides, isolates.
+    '\u{061C}', // ARABIC LETTER MARK
+    '\u{200E}', // LEFT-TO-RIGHT MARK
+    '\u{200F}', // RIGHT-TO-LEFT MARK
+    '\u{202A}', // LEFT-TO-RIGHT EMBEDDING
+    '\u{202B}', // RIGHT-TO-LEFT EMBEDDING
+    '\u{202C}', // POP DIRECTIONAL FORMATTING
+    '\u{202D}', // LEFT-TO-RIGHT OVERRIDE
+    '\u{202E}', // RIGHT-TO-LEFT OVERRIDE
+    '\u{2066}', // LEFT-TO-RIGHT ISOLATE
+    '\u{2067}', // RIGHT-TO-LEFT ISOLATE
+    '\u{2068}', // FIRST STRONG ISOLATE
+    '\u{2069}', // POP DIRECTIONAL ISOLATE
+    // Zero-width and joining controls: render as nothing at all.
+    '\u{200B}', // ZERO WIDTH SPACE
+    '\u{200C}', // ZERO WIDTH NON-JOINER
+    '\u{200D}', // ZERO WIDTH JOINER
+    '\u{2060}', // WORD JOINER
+    '\u{FEFF}', // ZERO WIDTH NO-BREAK SPACE (byte order mark)
+];
 
 /// Validate a monitor label.
 ///
 /// Pure and total: every input is a value, nothing allocates, and the
 /// bounded check runs before the scan.
+///
+/// A conforming label is 1..=[`MAX_MONITOR_LABEL_BYTES`] bytes of UTF-8
+/// containing no control character ([`char::is_control`]) and none of
+/// [`FORMAT_CHARACTERS`]. Everything else — every script, every accent, a
+/// space, punctuation — is admitted, because a product name is the
+/// manufacturer's string and this value steers nothing.
 ///
 /// # Errors
 ///
@@ -269,10 +329,20 @@ pub fn validate_monitor_label(label: &str) -> Result<(), MonitorLabelError> {
     if label.len() > MAX_MONITOR_LABEL_BYTES {
         return Err(MonitorLabelError::TooManyBytes { bytes: label.len() });
     }
-    if let Some(control) = label.chars().find(|character| character.is_control()) {
-        return Err(MonitorLabelError::ControlCharacter {
-            codepoint: u32::from(control),
-        });
+    // One pass, both rules, bounded by the check above: at most
+    // `MAX_MONITOR_LABEL_BYTES` characters each compared against a
+    // fixed-size list.
+    for character in label.chars() {
+        if character.is_control() {
+            return Err(MonitorLabelError::ControlCharacter {
+                codepoint: u32::from(character),
+            });
+        }
+        if FORMAT_CHARACTERS.contains(&character) {
+            return Err(MonitorLabelError::FormatCharacter {
+                codepoint: u32::from(character),
+            });
+        }
     }
     Ok(())
 }
@@ -324,8 +394,9 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MonitorId, MonitorIdError, MonitorLabel,
-        MonitorLabelError, validate_monitor_id, validate_monitor_label,
+        FORMAT_CHARACTERS, MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MonitorId,
+        MonitorIdError, MonitorLabel, MonitorLabelError, validate_monitor_id,
+        validate_monitor_label,
     };
 
     #[test]
@@ -504,6 +575,55 @@ mod tests {
         }
     }
 
+    /// The attack the deny-list exists for: a label that renders exactly
+    /// like another one but does not compare equal to it, so the editor's
+    /// duplicate rule gives neither a suffix and the user sees two
+    /// identical captions.
+    #[test]
+    fn invisible_and_reordering_characters_are_refused_in_a_label() {
+        for &format in FORMAT_CHARACTERS {
+            assert_eq!(
+                validate_monitor_label(&format!("DELL{format} U2720Q")),
+                Err(MonitorLabelError::FormatCharacter {
+                    codepoint: u32::from(format)
+                }),
+                "an invisible or reordering character was admitted: U+{:04X}",
+                u32::from(format)
+            );
+        }
+
+        // The two shapes named in review, spelled out rather than only
+        // covered by the loop above: a zero-width space that forges a
+        // duplicate, and a right-to-left override that forges a rendering.
+        assert!(validate_monitor_label("DELL\u{200B} U2720Q").is_err());
+        assert!(validate_monitor_label("DELL\u{202E}U2720Q").is_err());
+
+        // A label that merely *looks* like it might be suspicious is not:
+        // the rule denies a listed code point, not non-ASCII text.
+        assert!(validate_monitor_label("LG \u{30E2}\u{30CB}\u{30BF}\u{30FC}").is_ok());
+    }
+
+    /// A rule stated as a list is only as good as the list, so the list
+    /// itself is held to being a list — sorted-unique would be nicer to
+    /// read but is not what `contains` needs; what it does need is that
+    /// nothing in it is already covered by the control-character check,
+    /// which would make the variant it reports wrong.
+    #[test]
+    fn the_format_deny_list_is_disjoint_from_the_control_characters() {
+        for &format in FORMAT_CHARACTERS {
+            assert!(
+                !format.is_control(),
+                "U+{:04X} is a control character and would report the wrong variant",
+                u32::from(format)
+            );
+        }
+        let mut seen: Vec<char> = FORMAT_CHARACTERS.to_vec();
+        seen.sort_unstable();
+        let total = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "the deny-list repeats a code point");
+    }
+
     #[test]
     fn label_deserialization_validates_rather_than_trusting_the_format() {
         let good: MonitorLabel = serde_json::from_str(r#""DELL U2720Q""#).unwrap();
@@ -566,6 +686,9 @@ mod tests {
                 prop_assert!(!label.is_empty());
                 prop_assert!(label.len() <= MAX_MONITOR_LABEL_BYTES);
                 prop_assert!(!label.chars().any(char::is_control));
+                prop_assert!(
+                    !label.chars().any(|c| FORMAT_CHARACTERS.contains(&c))
+                );
                 let accepted = MonitorLabel::new(&label).unwrap();
                 prop_assert_eq!(accepted.as_str(), label.as_str());
             }

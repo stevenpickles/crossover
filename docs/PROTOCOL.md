@@ -553,13 +553,26 @@ LayoutSync        { revision, origin,                              // type 18
     is malformed. Disambiguating them (`(1)`, `(2)`, as Windows does) is
     the editor's job, not the wire's.
   - **Bounded and refused, not repaired.** At most
-    `MAX_MONITOR_LABEL_BYTES` bytes of UTF-8 with no control characters,
-    validated on encode and decode alike. An over-long or
-    control-bearing label is malformed and fatal (§7) — a *truncating*
-    decoder would let a peer decide how much of a frame this side
-    believes. Unlike an id, a label is not held to ASCII: a product name
-    is the manufacturer's string, it steers nothing, and refusing a
-    legitimate non-ASCII one would cost the caption for no containment.
+    `MAX_MONITOR_LABEL_BYTES` bytes of UTF-8 with no control,
+    bidirectional, or invisible format characters, validated on encode and
+    decode alike. Such a label is malformed and fatal (§7) — a
+    *truncating or scrubbing* decoder would let a peer decide how much of
+    a frame this side believes. Unlike an id, a label is not held to
+    ASCII: a product name is the manufacturer's string, it steers nothing,
+    and refusing a legitimate non-ASCII one would cost the caption for no
+    containment. The invisible-character half of the rule is the one with
+    a behavioural reason rather than a hygienic one: the editor decides
+    that two screens share a name by string equality, so a label carrying
+    a zero-width space would render identically to its neighbour and
+    compare unequal to it — neither suffixed, and the user unable to tell
+    the two rectangles apart, which is the exact failure labels were added
+    to fix. The denied set is an explicit list
+    (`FORMAT_CHARACTERS` in `crossover-topology`) rather than a Unicode
+    category test, so the model crate keeps the dependency graph ADR 0018
+    fixes for it; it is a deny-list and therefore not exhaustive, which is
+    acceptable because a label is never an identity — the worst a novel
+    invisible character buys is an ambiguous caption, never a
+    mis-crossing.
 - **`LayoutSync` states the arrangement**, which describes *both* machines:
   a `u64` revision, `origin` (the editing device's identity), and the
   placed monitors. It is sent after `Hello` when the sender holds an
@@ -576,13 +589,15 @@ Invariants, all of them checked before anything is adopted:
   and `MAX_LAYOUT_MONITORS` in a layout; a monitor id of at most
   `MAX_MONITOR_ID_BYTES` printable-ASCII bytes, unique within a machine; a
   monitor label of at most `MAX_MONITOR_LABEL_BYTES` UTF-8 bytes with no
-  control characters, *not* required to be unique; `1 ≤ width, height ≤
+  control, bidirectional, or invisible format characters, *not* required
+  to be unique; `1 ≤ width, height ≤
   MAX_MONITOR_EXTENT`; `|x|, |y| ≤ MAX_LAYOUT_COORDINATE`. Every
   derivation runs in `i64`, where those bounds make overflow impossible
   rather than merely unlikely.
 - **Malformed is fatal** (§7): a count past its cap, a zero or oversized
   dimension, an out-of-range coordinate, a non-ASCII or overlong id, an
-  overlong or control-bearing label — the session terminates, fail closed.
+  overlong label or one carrying a control, bidirectional, or invisible
+  format character — the session terminates, fail closed.
 - **Well-formed but semantically impossible is rejected, never adopted**: a
   layout naming a device that is not this session's pair, or rectangles
   that overlap. It is logged and charged as a protocol violation on §7's
@@ -649,7 +664,7 @@ Invariants, all of them checked before anything is adopted:
 | Max monitors per machine | 16, `MAX_MONITORS_PER_MACHINE` (ADR 0018) — bounds `MonitorTopology` and one machine's share of a layout |
 | Max monitors in a layout | 32, `MAX_LAYOUT_MONITORS` (ADR 0018) — a layout describes exactly two machines |
 | Max monitor id | 64 bytes, `MAX_MONITOR_ID_BYTES` (ADR 0018), printable ASCII — the platform's device string (`szDevice` on Windows), which survives a restart where an enumeration index does not |
-| Max monitor label | 64 bytes, `MAX_MONITOR_LABEL_BYTES` (ADR 0018 as amended 2026-08-21), UTF-8 with no control characters — the EDID product name the editor captions with. Optional, non-unique, display-only: never an identity, so nothing matches or derives on it |
+| Max monitor label | 64 bytes, `MAX_MONITOR_LABEL_BYTES` (ADR 0018 as amended 2026-08-21), UTF-8 with no control, bidirectional, or invisible format characters (`FORMAT_CHARACTERS`) — the human-readable monitor name the editor captions with, from EDID where the platform has one. Optional, non-unique, display-only: never an identity, so nothing matches or derives on it |
 | Max monitor extent | 65 535, `MAX_MONITOR_EXTENT` (ADR 0018); minimum 1 — a zero-sized monitor has no edge to cross |
 | Max layout coordinate | 2^24, `MAX_LAYOUT_COORDINATE` (ADR 0018) — with the extent cap this keeps every derivation under 2^42 in `i64`, so overflow is impossible rather than improbable |
 | Monitor scale bounds | 25–500 percent, `MIN_SCALE_PERCENT` / `MAX_SCALE_PERCENT` (ADR 0018) — seeds the editor's to-scale drawing only; never enters crossing mapping |

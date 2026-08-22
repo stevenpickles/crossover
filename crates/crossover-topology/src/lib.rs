@@ -72,8 +72,8 @@ pub use layout::{
     PlacedMonitor, RawPlacedMonitor, check_structure,
 };
 pub use monitor::{
-    MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MonitorId, MonitorIdError, MonitorLabel,
-    MonitorLabelError, validate_monitor_id, validate_monitor_label,
+    FORMAT_CHARACTERS, MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MonitorId, MonitorIdError,
+    MonitorLabel, MonitorLabelError, validate_monitor_id, validate_monitor_label,
 };
 
 #[cfg(any(test, feature = "config"))]
