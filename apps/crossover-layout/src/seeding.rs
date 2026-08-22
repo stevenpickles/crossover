@@ -704,12 +704,18 @@ mod tests {
             panel.sort_unstable();
             sides.sort_unstable();
             prop_assert_eq!(sides, panel, "the drawn sides are the panel's");
-            prop_assert_eq!(
-                drawn.width >= drawn.height,
-                width >= height,
-                "the drawing follows the pixels, not the panel: {:?}",
-                drawn
-            );
+            if width_mm == height_mm {
+                // A square panel has no orientation to follow, whichever
+                // way round the screen is turned.
+                prop_assert_eq!(drawn.width, drawn.height);
+            } else {
+                prop_assert_eq!(
+                    drawn.width >= drawn.height,
+                    width >= height,
+                    "the drawing follows the pixels, not the panel: {:?}",
+                    drawn
+                );
+            }
             prop_assert!(!drawn.estimated);
         }
     }
