@@ -398,8 +398,8 @@ mod tests {
             None,
         )
         .size_of(&unmeasured);
-        let without = MachineScale::of(&[honest, other, unmeasured.clone()], None)
-            .size_of(&unmeasured);
+        let without =
+            MachineScale::of(&[honest, other, unmeasured.clone()], None).size_of(&unmeasured);
 
         // Not bit-identical — three ratios take the middle one and two take
         // the midpoint of both — but moved by a unit, not by a multiple.
@@ -423,7 +423,7 @@ mod tests {
 
         let fallback = median_mm_per_dip(&measured_machine);
         assert!(fallback.is_some());
-        let borrowed = MachineScale::of(&[unmeasured.clone()], fallback);
+        let borrowed = MachineScale::of(std::slice::from_ref(&unmeasured), fallback);
         let drawn = borrowed.size_of(&unmeasured);
 
         let reference = MachineScale::of(&measured_machine, None).size_of(&measured_machine[0]);
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn a_rotated_panel_draws_in_the_orientation_the_os_reports() {
         let portrait = measured(1440, 2560, 100, 597, 336);
-        let drawn = MachineScale::of(&[portrait.clone()], None).size_of(&portrait);
+        let drawn = MachineScale::of(std::slice::from_ref(&portrait), None).size_of(&portrait);
         assert_eq!(drawn.width, 336 * UNITS_PER_MM);
         assert_eq!(drawn.height, 597 * UNITS_PER_MM);
         assert!(drawn.height > drawn.width, "a portrait screen draws tall");
@@ -536,7 +536,7 @@ mod tests {
             height in 480u32..=4320,
         ) {
             let monitor = measured(width, height, 100, width_mm, height_mm);
-            let drawn = MachineScale::of(&[monitor.clone()], None).size_of(&monitor);
+            let drawn = MachineScale::of(std::slice::from_ref(&monitor), None).size_of(&monitor);
             let landscape_alike = (width_mm >= height_mm) == (width >= height);
             let (expected_w, expected_h) = if landscape_alike {
                 (width_mm, height_mm)

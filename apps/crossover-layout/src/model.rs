@@ -538,13 +538,7 @@ impl Model {
         let start_x = local
             .bounds()
             .map_or(0, |bounds| bounds.max_x.ceil() as i64 + SEED_GROUP_GAP);
-        let peer_group = seed_group(
-            peer.device,
-            &peer.name,
-            &peer.monitors,
-            peer_scale,
-            start_x,
-        );
+        let peer_group = seed_group(peer.device, &peer.name, &peer.monitors, peer_scale, start_x);
         Self::assemble(
             local,
             Some(peer_group),
@@ -1297,8 +1291,8 @@ mod tests {
     };
     use crossover_topology::{
         DeviceId, DevicePair, Layout, LayoutRect, LayoutState, LiveMonitor, MachineState,
-        MonitorId, MonitorLabel, PeerState, PhysicalSizeMm, PlacedMonitor,
-        TOPOLOGY_STATE_VERSION, TopologyState,
+        MonitorId, MonitorLabel, PeerState, PhysicalSizeMm, PlacedMonitor, TOPOLOGY_STATE_VERSION,
+        TopologyState,
     };
 
     fn live(id: &str, x: i32, width: u32, height: u32, scale_percent: u16) -> LiveMonitor {
