@@ -16,7 +16,7 @@
 //! Windows Settings shows. It is far more expensive than the geometry
 //! enumeration, which is precisely why it sits behind its own trait method
 //! and why the ~8 ms edge poll never reaches it. The two sweeps are joined
-//! by `szDevice` — the DisplayConfig source's `viewGdiDeviceName` is the
+//! by `szDevice` — the `DisplayConfig` source's `viewGdiDeviceName` is the
 //! same string `GetMonitorInfoW` reports — never by enumeration position.
 //! A failure anywhere in it costs captions and nothing else. The desktop
 //! bounds keep the seam *between* two monitors from being treated as the

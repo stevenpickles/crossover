@@ -37,7 +37,7 @@
 //! Every producer treats a failure to learn something new as a reason to
 //! say nothing, not a reason to erase what is already known:
 //!
-//! - **A transient enumeration failure** (`DisplayInfo::monitor_layout`
+//! - **A transient enumeration failure** (`DisplayInfo::monitor_descriptions`
 //!   erroring — reachable on the 1 s poll from a session lock, an RDP
 //!   disconnect, or a display waking from sleep) leaves the previously
 //!   reported monitor list untouched, logged once on the way in and once
@@ -64,18 +64,20 @@ use tokio::task::JoinHandle;
 use crossover_platform::{DisplayError, DisplayInfo};
 use crossover_topology::{
     AtomicWriteError, DeviceId, LayoutRect, LayoutState, LiveMonitor, MAX_MONITORS_PER_MACHINE,
-    MachineState, MonitorId, PeerState, StateError, TOPOLOGY_STATE_VERSION, TopologyState,
-    now_unix_millis, serialize_state, write_atomic,
+    MachineState, MonitorId, MonitorLabel, PeerState, StateError, TOPOLOGY_STATE_VERSION,
+    TopologyState, now_unix_millis, serialize_state, write_atomic,
 };
 
 use crate::config::LayoutSource;
 
-/// How often the own-display poll samples `monitor_layout()` for a change,
-/// so the state file picks one up without waiting on a config re-read.
-/// Deliberately separate from the 8 ms edge-detection poll
+/// How often the own-display poll samples `monitor_descriptions()` for a
+/// change, so the state file picks one up without waiting on a config
+/// re-read. Deliberately separate from the 8 ms edge-detection poll
 /// (`commands::EDGE_POLL_INTERVAL`): the state file is a report for a
 /// human editor, not a control-transfer input, and a monitor
-/// reconfiguration is not latency-sensitive the way a crossing is.
+/// reconfiguration is not latency-sensitive the way a crossing is. It is
+/// also the *only* cadence that pays for the product-name query — the edge
+/// path keeps calling `monitors()` and never comes near this.
 const DISPLAY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The writer's coalescing window: the same cadence as
@@ -418,6 +420,14 @@ pub enum LiveMonitorsError {
 /// no real platform report should) is likewise omitted and logged, rather
 /// than the whole document being refused for one bad entry.
 ///
+/// **A label is weaker than any of that.** It is
+/// [`crossover_platform::DisplayInfo::monitor_descriptions`] this asks —
+/// the ~1 s query, never the 8 ms one — and a label that will not validate
+/// costs the *label* and not the monitor: the monitor is reported
+/// unlabelled, exactly as one the platform never named would be. A caption
+/// is display-only, so refusing a screen over one would trade something
+/// that matters for something that does not.
+///
 /// # Errors
 ///
 /// [`LiveMonitorsError`] — the caller decides what "nothing new to report"
@@ -425,7 +435,7 @@ pub enum LiveMonitorsError {
 /// poll; see this module's header).
 pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, LiveMonitorsError> {
     let monitors = display
-        .monitor_layout()
+        .monitor_descriptions()
         .map_err(LiveMonitorsError::Unavailable)?;
     if monitors.len() > MAX_MONITORS_PER_MACHINE {
         return Err(LiveMonitorsError::TooManyMonitors {
@@ -435,7 +445,7 @@ pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, Live
 
     let mut live = Vec::with_capacity(monitors.len());
     for monitor in monitors {
-        let Some(id) = monitor.id else {
+        let Some(id) = monitor.info.id else {
             continue;
         };
         let id = match MonitorId::new(&id) {
@@ -449,10 +459,10 @@ pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, Live
             }
         };
         let rect = LayoutRect {
-            x: monitor.rect.left,
-            y: monitor.rect.top,
-            width: monitor.rect.width,
-            height: monitor.rect.height,
+            x: monitor.info.rect.left,
+            y: monitor.info.rect.top,
+            width: monitor.info.rect.width,
+            height: monitor.info.rect.height,
         };
         if let Err(violation) = rect.check_bounds() {
             tracing::warn!(
@@ -462,9 +472,24 @@ pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, Live
             );
             continue;
         }
+        let label = monitor
+            .label
+            .and_then(|label| match MonitorLabel::new(&label) {
+                Ok(label) => Some(label),
+                Err(error) => {
+                    tracing::debug!(
+                        monitor = %id,
+                        error = %error,
+                        "topology state: an unusable monitor label; the monitor is reported \
+                         without one"
+                    );
+                    None
+                }
+            });
         live.push(LiveMonitor {
             id,
             rect,
+            label,
             // `DisplayInfo` has no per-monitor scale query yet
             // (crossover-platform's `display` module: `MonitorInfo` carries
             // geometry and an id, not a scale). Until a later branch adds
@@ -729,6 +754,56 @@ mod tests {
         assert_eq!(live[0].id.as_str(), fake_monitor_id(0));
     }
 
+    /// A product name the platform supplies reaches the state file, and a
+    /// monitor without one is reported unlabelled rather than skipped —
+    /// the fallback the editor's caption chain depends on.
+    #[test]
+    fn a_product_name_reaches_the_state_file_and_its_absence_costs_nothing() {
+        use crossover_platform::MonitorDescription;
+
+        let display = display(1920, 1080);
+        display.set_monitor_descriptions(vec![
+            MonitorDescription {
+                info: monitor_at(0, 0),
+                label: Some("DELL U2720Q".to_owned()),
+            },
+            MonitorDescription {
+                info: monitor_at(1, 100),
+                label: None,
+            },
+        ]);
+
+        let live = live_monitors(&display).unwrap();
+        assert_eq!(live.len(), 2);
+        assert_eq!(
+            live[0]
+                .label
+                .as_ref()
+                .map(crossover_topology::MonitorLabel::as_str),
+            Some("DELL U2720Q")
+        );
+        assert_eq!(live[1].label, None);
+    }
+
+    /// A label the layout model refuses costs the label, never the
+    /// monitor: it is display-only, so dropping a screen over one would
+    /// trade geometry for a caption.
+    #[test]
+    fn an_unusable_label_leaves_the_monitor_reported_without_one() {
+        use crossover_platform::MonitorDescription;
+
+        let display = display(1920, 1080);
+        display.set_monitor_descriptions(vec![MonitorDescription {
+            info: monitor_at(0, 0),
+            label: Some("x".repeat(200)),
+        }]);
+
+        let live = live_monitors(&display).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id.as_str(), fake_monitor_id(0));
+        assert_eq!(live[0].label, None);
+    }
+
     /// The exact boundary ADR 0018's per-machine cap is held to: exactly
     /// [`MAX_MONITORS_PER_MACHINE`] real monitors is a machine this build
     /// can fully describe, not one to refuse.
@@ -802,6 +877,7 @@ mod tests {
                 height: 1024,
             },
             scale_percent: 100,
+            label: None,
         });
         assert!(writer.set_monitors(with_second));
 
@@ -988,6 +1064,7 @@ mod tests {
                 height: 1024,
             },
             scale_percent: 100,
+            label: None,
         });
         assert!(writer.set_monitors(with_second.clone()));
 

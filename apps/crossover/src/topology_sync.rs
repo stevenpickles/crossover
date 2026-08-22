@@ -1319,6 +1319,10 @@ fn report_of(monitor: &LiveMonitor) -> MonitorReport {
         id: monitor.id.clone(),
         rect: monitor.rect,
         scale_percent: monitor.scale_percent,
+        // Field for field, the label included: the desk the peer is told
+        // about and the desk the local editor draws are the same desk, and
+        // the peer's editor captions rectangles from exactly this.
+        label: monitor.label.clone(),
     }
 }
 
@@ -1328,6 +1332,10 @@ fn live_of(report: MonitorReport) -> LiveMonitor {
         id: report.id,
         rect: report.rect,
         scale_percent: report.scale_percent,
+        // Already validated — it is a `MonitorLabel`, which cannot exist
+        // unvalidated, and the wire decoder refused anything else before
+        // this frame got here.
+        label: report.label,
     }
 }
 
@@ -2225,6 +2233,7 @@ mod tests {
                     height: 1440,
                 },
                 scale_percent: 150,
+                label: Some(crossover_topology::MonitorLabel::new("DELL U2720Q").unwrap()),
             }],
         };
         a.receive(
@@ -2237,6 +2246,16 @@ mod tests {
         assert_eq!(peer.monitors.len(), 1);
         assert_eq!(peer.monitors[0].id.as_str(), "B-SCREEN");
         assert_eq!(peer.monitors[0].scale_percent, 150);
+        // The peer's caption crosses the wire and lands in the state file,
+        // so the local editor draws the other desk with the names its
+        // owner reads off their own bezels rather than device strings.
+        assert_eq!(
+            peer.monitors[0]
+                .label
+                .as_ref()
+                .map(crossover_topology::MonitorLabel::as_str),
+            Some("DELL U2720Q")
+        );
         assert_eq!(peer.monitors[0].rect.width, 2560);
 
         // The link drops: last-known geometry stays, so the editor is still
@@ -2268,6 +2287,7 @@ mod tests {
                         height: 100,
                     },
                     scale_percent: 100,
+                    label: None,
                 }],
             }
             .encode_payload()
@@ -2324,6 +2344,103 @@ mod tests {
         a.disconnect().await;
         a.feed(TopologyEvent::LocalDisplayChanged).await;
         assert!(a.drain().is_empty());
+    }
+
+    /// This machine's own product names reach the peer, and a screen the
+    /// platform would not name still travels — unlabelled, never dropped.
+    /// The peer's editor draws this desk from exactly this message, so a
+    /// label that stopped at the state file would caption one desk and not
+    /// the other.
+    #[tokio::test]
+    async fn the_monitors_this_machine_states_carry_their_product_names() {
+        use crossover_platform::MonitorDescription;
+
+        let sandbox = Sandbox::new("stated-labels");
+        let mut a = engine(&sandbox, "a", A, None);
+        a.connect(B).await;
+        let _ = a.drain();
+
+        a.display.set_monitor_descriptions(vec![
+            MonitorDescription {
+                info: MonitorInfo {
+                    id: Some("a-SCREEN".to_owned()),
+                    rect: MonitorRect {
+                        left: 0,
+                        top: 0,
+                        width: 1920,
+                        height: 1080,
+                    },
+                },
+                label: Some("DELL U2720Q".to_owned()),
+            },
+            MonitorDescription {
+                info: MonitorInfo {
+                    id: Some("a-SECOND".to_owned()),
+                    rect: MonitorRect {
+                        left: 1920,
+                        top: 0,
+                        width: 1280,
+                        height: 1024,
+                    },
+                },
+                label: None,
+            },
+        ]);
+        a.feed(TopologyEvent::LocalDisplayChanged).await;
+
+        let topologies = payloads(&a.drain(), MessageType::MonitorTopology);
+        assert_eq!(topologies.len(), 1);
+        let decoded = MonitorTopology::decode_payload(&topologies[0]).unwrap();
+        assert_eq!(decoded.monitors.len(), 2, "an unlabelled monitor was lost");
+        assert_eq!(
+            decoded.monitors[0]
+                .label
+                .as_ref()
+                .map(crossover_topology::MonitorLabel::as_str),
+            Some("DELL U2720Q")
+        );
+        assert_eq!(decoded.monitors[1].label, None);
+    }
+
+    /// A product name the layout model would refuse costs the *label* and
+    /// not the monitor. A caption is display-only, so refusing a screen
+    /// over one would trade something that matters for something that does
+    /// not — and the peer would lose a rectangle rather than a word.
+    #[tokio::test]
+    async fn an_unusable_product_name_costs_the_label_and_not_the_screen() {
+        use crossover_platform::MonitorDescription;
+
+        let sandbox = Sandbox::new("unusable-label");
+        let mut a = engine(&sandbox, "a", A, None);
+        a.connect(B).await;
+        let _ = a.drain();
+
+        a.display.set_monitor_descriptions(vec![MonitorDescription {
+            info: MonitorInfo {
+                id: Some("a-SCREEN".to_owned()),
+                rect: MonitorRect {
+                    left: 0,
+                    top: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            // Over the byte bound, and carrying a control character: both
+            // rejection classes at once.
+            label: Some(format!("DELL\n{}", "x".repeat(80))),
+        }]);
+        a.feed(TopologyEvent::LocalDisplayChanged).await;
+
+        let topologies = payloads(&a.drain(), MessageType::MonitorTopology);
+        assert_eq!(topologies.len(), 1);
+        let decoded = MonitorTopology::decode_payload(&topologies[0]).unwrap();
+        assert_eq!(
+            decoded.monitors.len(),
+            1,
+            "a screen was dropped over a name"
+        );
+        assert_eq!(decoded.monitors[0].id.as_str(), "a-SCREEN");
+        assert_eq!(decoded.monitors[0].label, None);
     }
 
     /// An edit made in the editor reaches the peer: the config poll offers
