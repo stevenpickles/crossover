@@ -179,6 +179,25 @@ Guidelines:
   practical. Platform quirks (hook timeout budgets, clipboard retry,
   DPI mapping — see SPECIFICATION.md §6) are handled *inside*
   `crossover-platform-windows`, surfacing as normalized events/errors.
+- **The display trait is tiered by call frequency, not by convenience.**
+  Edge detection polls it every few milliseconds and its results feed the
+  detector's layout-equality check, so what that path asks for has to stay
+  cheap and has to stay stable. The three queries are therefore separate
+  methods rather than one struct with optional fields, each defaulted onto
+  the one below it:
+  - `monitors()` — geometry only, required of every backend, the hot path.
+  - `monitor_layout()` — adds the per-monitor identity a drawn layout
+    addresses (ADR 0018). Consulted on the paths that care about identity.
+  - `monitor_descriptions()` — adds the human-readable product name the
+    editor captions with. Display-only, never identity, and on Windows a
+    whole second `QueryDisplayConfig` sweep, so **only** the ~1 s
+    topology-sync cadence calls it.
+
+  Two rules hold across all three: the lists always describe the *same*
+  monitors in the same order, so a name the OS will not give costs a
+  `None` on a present entry and never a missing one; and a defaulted
+  method means a port that cannot answer is still a complete port,
+  losing exactly the nicety that method adds.
 - `ClipboardProvider` on Windows handles two content types, each in the
   OS's own representation (ADR 0014, and the rules that fall out of it are
   written up on `crossover-platform-windows::clipboard`):

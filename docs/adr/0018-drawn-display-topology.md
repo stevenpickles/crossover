@@ -606,6 +606,52 @@ of this machine's attached screens warns at that moment, naming the drawn
 ids and the attached ones. [PROTOCOL.md](../PROTOCOL.md) §6.2 and
 [SECURITY.md](../SECURITY.md) T23 carry the same amendment.
 
+**Amendment (2026-08-21), a monitor may also carry a *label*, which is
+not an identity:** the decision above chooses the platform device string
+as monitor identity, and that is unchanged. A monitor now additionally
+carries an optional **label** — the EDID product name the platform
+advertises (`DELL U2720Q`, what Windows Settings shows) — for one reason:
+`\\.\DISPLAY1` is the right identity and the wrong caption, and a user
+arranging three rectangles cannot tell which is which from a device
+string.
+
+The two are deliberately different kinds of value, and the distinction is
+the whole of this amendment:
+
+- **The label is display-only.** Nothing keys off it. Layout matching, the
+  config `[layout]` section, `EntryPoint`, and crossing derivation all
+  address a monitor by its id and never consult a label. A peer that lies
+  about one misdraws a caption at the other desk; it cannot move a
+  crossing.
+- **It is optional**, because a platform may have no name to give, and a
+  monitor without one captions by its id.
+- **It is not unique.** Two identical screens on one desk report the same
+  string, so a repeated label is legal where a repeated id is malformed.
+  Disambiguating them — `(1)`, `(2)`, as Windows does — is the editor's
+  job, and belongs nowhere near the model.
+- **It is still network input**, so it is bounded like everything else:
+  at most `MAX_MONITOR_LABEL_BYTES` (64) bytes of UTF-8 with no control
+  characters, validated on encode and decode alike, **rejected rather
+  than truncated** on the wire. Unlike an id it is not held to ASCII: a
+  product name is the manufacturer's string, it steers nothing, and
+  refusing a legitimate non-ASCII one would cost the caption for no
+  containment in return.
+
+Two consequences worth stating rather than leaving to be discovered.
+`MonitorTopology` gains an optional per-monitor field, which is a
+structural change to a message that already travels and carries no
+feature bit — so ADR 0017's rule applies unchanged and **both ends of the
+protocol version range move to 5**. And the platform display trait gains a
+*third* query, `monitor_descriptions()`, rather than a field on the
+existing one: the edge detector polls `monitor_layout()` every 8 ms and
+its results feed the detector's equality check, while reading product
+names costs a whole `QueryDisplayConfig` sweep on Windows. Only the ~1 s
+topology-sync cadence pays for it; the hot path is untouched. Every
+failure in that sweep degrades to no label — never an error, never a lost
+monitor — because a caption is the half that does not matter.
+[PROTOCOL.md](../PROTOCOL.md) §6.2 and §8, [ARCHITECTURE.md](../ARCHITECTURE.md)
+§4, and [TESTING.md](../TESTING.md) §3.2 carry the same amendment.
+
 **Amendment (2026-08-20):** the `config` feature also carries `serde_json`,
 for the state-file schema this ADR places in the same crate — versioned
 JSON needs a JSON implementation, which the decision's dependency sentence

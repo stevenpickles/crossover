@@ -14,8 +14,29 @@ Builds that are not tagged releases identify themselves as such —
 
 ## Unreleased
 
+### Added
+
+- **The layout editor names monitors the way you do.** A rectangle is now
+  captioned with the monitor's product name — `DELL U2720Q`, the same
+  string Windows Settings shows — instead of its device string
+  (`\\.\DISPLAY1`), for both machines' screens. A monitor whose name the
+  OS will not give still shows its device string, and two identical
+  screens on one machine are numbered `(1)` and `(2)` so the pair stays
+  tellable apart. The name is a caption only: arrangements, saved layouts,
+  and where the cursor crosses all still address a monitor by its device
+  string, unchanged.
+
 ### Changed
 
+- **Wire protocol moves to version 5, and does not accept version 4**
+  ([ADR 0018](docs/adr/0018-drawn-display-topology.md), amended
+  2026-08-21). Each monitor a machine reports now carries an optional
+  product name so the *other* machine's editor can caption it, which adds
+  a byte to every monitor of every report and which no feature bit can
+  hide. **Both machines must be upgraded together**; a mixed pair refuses
+  cleanly at the handshake naming both version ranges. Nothing about
+  crossing changed — the name is display-only — but the byte is on the
+  wire regardless, which is what forces the bump.
 - **Wire protocol moves to version 4, and does not accept version 3**
   ([ADR 0018](docs/adr/0018-drawn-display-topology.md)). Crossing control
   now carries an `EntryPoint` — destination monitor, edge, fraction, and
