@@ -5,10 +5,12 @@
 //! EDID is the block of bytes a monitor reports about itself over the
 //! display cable, and it is the only place a panel's real dimensions come
 //! from. Windows caches it verbatim in the registry, under the monitor's
-//! own device key, which is where [`crate::display`] fetches it — the
-//! *fetching* is Win32 and lives there. Everything in this module is pure:
-//! bytes in, an [`Option<PhysicalSizeMm>`] out, no Win32, no allocation, no
-//! failure path but `None`.
+//! own device key, which is where this crate's `display` module fetches it
+//! — the *fetching* is Win32 and lives there, which is why it is named in
+//! prose rather than linked: it does not exist on the other two OSes this
+//! module compiles for. Everything here is pure: bytes in, an optional
+//! [`PhysicalSizeMm`] out, no Win32, no allocation, no failure path but
+//! `None`.
 //!
 //! **Deliberately not Windows-gated**, for the same reason
 //! [`crate::worker_supervisor`] is not: a parser of somebody else's bytes
