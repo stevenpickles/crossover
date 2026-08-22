@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use crate::inspector::Inspector;
 use crate::render::{self, Chrome, CloseChoice};
 use crate::save;
 use crate::session::{SessionEvent, SessionTracker};
@@ -136,6 +137,12 @@ struct LayoutEditor {
     last_poll: Instant,
     status: Option<SaveStatus>,
     close_state: CloseState,
+    /// The size inspector's two fields and its aspect lock
+    /// (`inspector.rs`). Here rather than in the model because a model is
+    /// rebuilt from the state file once a second and a half-typed number is
+    /// not something to reconcile; the *selection* it follows does live in
+    /// the model, because a monitor can stop being drawn.
+    inspector: Inspector,
 }
 
 impl LayoutEditor {
@@ -149,6 +156,7 @@ impl LayoutEditor {
             last_poll: Instant::now(),
             status: None,
             close_state: CloseState::Open,
+            inspector: Inspector::new(),
         };
         editor.poll();
         editor
@@ -346,7 +354,8 @@ impl eframe::App for LayoutEditor {
                 .map(|status| (status.text.as_str(), status.failed)),
             confirming_close: self.close_state == CloseState::Confirming,
         };
-        let outcome = render::draw_frame(ui, self.session.session_mut(), chrome);
+        let outcome =
+            render::draw_frame(ui, self.session.session_mut(), &mut self.inspector, chrome);
         let context = ui.ctx().clone();
         self.apply(outcome, &context);
     }
@@ -367,6 +376,7 @@ impl LayoutEditor {
             last_poll: Instant::now(),
             status: None,
             close_state: CloseState::Open,
+            inspector: Inspector::new(),
         }
     }
 

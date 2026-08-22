@@ -303,10 +303,17 @@ impl SessionTracker {
         {
             let previous = self.current.model().or(self.retained.as_ref());
             if let (Some(previous), Some(fresh)) = (previous, next.model_mut())
-                && (previous.has_unsaved_work() || self.awaiting_revision.is_some())
                 && previous.describes_the_same_machines(fresh)
             {
-                fresh.transplant_from(previous);
+                // Where the user is *looking* survives every good read, not
+                // only the ones with work to move: a scene nobody has
+                // edited is rebuilt from the document once a second, and an
+                // inspector whose selection was rebuilt away with it would
+                // empty itself under the user's hands (`model.rs`).
+                fresh.adopt_selection_from(previous);
+                if previous.has_unsaved_work() || self.awaiting_revision.is_some() {
+                    fresh.transplant_from(previous);
+                }
             }
         }
         // Either it was just transplanted or the fresh document describes
@@ -507,6 +514,55 @@ mod tests {
             }
             other => panic!("expected Editing, got {other:?}"),
         }
+    }
+
+    /// A stated size is unsaved work, so the poll that lands a moment later
+    /// keeps it — the same protection a dropped drag gets, through the same
+    /// transplant, because an override exists nowhere but this window until
+    /// the arrangement is saved (`model.rs`).
+    #[test]
+    fn a_stated_size_survives_the_polls_that_follow_it() {
+        let mut tracker = SessionTracker::new();
+        let _ = tracker.on_read(StateFileStatus::Fresh(document(Some(peer_state(true)), 0)));
+        let target = monitor_key(LOCAL_DEVICE, r"\\.\DISPLAY1");
+        let model = tracker.session_mut().model_mut().expect("a scene");
+        assert!(model.set_size_mm(&target, 597, 336));
+        let stated = model.local.monitors[0].rect;
+
+        let _ = tracker.on_read(StateFileStatus::Fresh(document(Some(peer_state(true)), 1)));
+        assert_eq!(
+            screen(&tracker).model().expect("a scene").local.monitors[0].rect,
+            stated,
+            "the poll redrew a size the user had stated"
+        );
+        assert!(tracker.has_unsaved_work(), "and it is still unsaved");
+    }
+
+    /// A **selection** survives a poll even though it is not unsaved work
+    /// and nothing is being transplanted: a clean scene is rebuilt from the
+    /// document once a second, and an inspector that emptied itself on that
+    /// cadence could not be used to correct anything.
+    #[test]
+    fn the_selected_screen_survives_a_poll_on_an_unedited_scene() {
+        let mut tracker = SessionTracker::new();
+        let _ = tracker.on_read(StateFileStatus::Fresh(arranged_document(0)));
+        let target = monitor_key(LOCAL_DEVICE, r"\\.\DISPLAY1");
+        tracker
+            .session_mut()
+            .model_mut()
+            .expect("a scene")
+            .select(Some(&target));
+
+        let _ = tracker.on_read(StateFileStatus::Fresh(arranged_document(1)));
+        let model = screen(&tracker).model().expect("a scene");
+        assert_eq!(model.selected(), Some(&target));
+        assert!(!model.is_dirty(), "and nothing was transplanted with it");
+
+        // A re-pair discards the drawing, and a selection into it with it.
+        let mut stranger = peer_state(true);
+        stranger.device = crossover_topology::DeviceId::from_bytes([0x77; 16]);
+        let _ = tracker.on_read(StateFileStatus::Fresh(document(Some(stranger), 2)));
+        assert_eq!(screen(&tracker).model().expect("a scene").selected(), None);
     }
 
     /// **A drag in flight survives the poll too.** `is_dirty` is false for

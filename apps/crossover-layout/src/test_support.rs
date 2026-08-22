@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::app::install_fonts;
+use crate::inspector::Inspector;
 use crate::model::Model;
 use crate::render::Chrome;
 use crate::session::EditorSession;
@@ -31,6 +32,9 @@ pub(crate) struct Painted {
     /// How many line segments it painted — the snap guides, which have no
     /// text of their own to assert on.
     pub(crate) line_segments: usize,
+    /// How many rectangles it painted — the monitors, and the ring around
+    /// the selected one, which likewise says nothing in words.
+    pub(crate) rects: usize,
 }
 
 impl Painted {
@@ -54,7 +58,20 @@ impl Painted {
 /// screen that needs more than one is [`paint_settled`]'s business, and
 /// says so at its call site.
 pub(crate) fn paint(session: &EditorSession, chrome: Chrome<'_>) -> Painted {
-    paint_frames(session, chrome, 1)
+    paint_frames(session, chrome, 1, &mut Inspector::new())
+}
+
+/// [`paint`], driving a caller-owned [`Inspector`] — for the tests that
+/// need the size panel to be pointing somewhere, or to still be pointing
+/// there afterwards. The inspector is the one piece of editor state the
+/// frame keeps *outside* the session (`app.rs` owns it in the real window),
+/// so a test that wants to inspect it has to own it too.
+pub(crate) fn paint_with(
+    session: &EditorSession,
+    chrome: Chrome<'_>,
+    inspector: &mut Inspector,
+) -> Painted {
+    paint_frames(session, chrome, 1, inspector)
 }
 
 /// [`paint`], but reporting the **second** frame.
@@ -66,15 +83,37 @@ pub(crate) fn paint(session: &EditorSession, chrome: Chrome<'_>) -> Painted {
 /// structurally unable to see one — reporting its absence as a pass. Every
 /// other screen is steady from the first frame and uses [`paint`].
 pub(crate) fn paint_settled(session: &EditorSession, chrome: Chrome<'_>) -> Painted {
-    paint_frames(session, chrome, 2)
+    paint_frames(session, chrome, 2, &mut Inspector::new())
+}
+
+/// The canvas **alone**, with no toolbar, status bar, or size panel around
+/// it — for an assertion about what the *scene* painted, which a count over
+/// the whole window could not make: the panels paint shapes of their own,
+/// and how many depends on what is selected.
+pub(crate) fn paint_canvas(session: &EditorSession) -> Painted {
+    let mut session = session.clone();
+    run_frames(1, |ui| crate::render::draw_central(ui, &mut session))
 }
 
 /// Run `frames` headless passes and report what the last one drew.
-fn paint_frames(session: &EditorSession, chrome: Chrome<'_>, frames: usize) -> Painted {
+fn paint_frames(
+    session: &EditorSession,
+    chrome: Chrome<'_>,
+    frames: usize,
+    inspector: &mut Inspector,
+) -> Painted {
+    let mut session = session.clone();
+    run_frames(frames, |ui| {
+        let _ = crate::render::draw_frame(ui, &mut session, inspector, chrome);
+    })
+}
+
+/// Run `frames` headless passes of `draw` and report what the last one
+/// drew.
+fn run_frames(frames: usize, mut draw: impl FnMut(&mut egui::Ui)) -> Painted {
     assert!(frames >= 1, "a pass needs at least one frame");
     let context = egui::Context::default();
     install_fonts(&context);
-    let mut session = session.clone();
     let mut output = None;
     for _ in 0..frames {
         let mut frame = context.run_ui(
@@ -85,9 +124,7 @@ fn paint_frames(session: &EditorSession, chrome: Chrome<'_>, frames: usize) -> P
                 )),
                 ..egui::RawInput::default()
             },
-            |ui| {
-                let _ = crate::render::draw_frame(ui, &mut session, chrome);
-            },
+            &mut draw,
         );
         // No renderer here to upload the font atlas to, and epaint treats
         // an unapplied texture delta as a defect rather than letting it
@@ -100,6 +137,7 @@ fn paint_frames(session: &EditorSession, chrome: Chrome<'_>, frames: usize) -> P
     let mut painted = Painted {
         text: String::new(),
         line_segments: 0,
+        rects: 0,
     };
     for clipped in output.shapes {
         collect(&clipped.shape, &mut painted);
@@ -120,6 +158,7 @@ fn collect(shape: &egui::epaint::Shape, into: &mut Painted) {
             into.text.push('\n');
         }
         egui::epaint::Shape::LineSegment { .. } => into.line_segments += 1,
+        egui::epaint::Shape::Rect(_) => into.rects += 1,
         egui::epaint::Shape::Vec(shapes) => {
             for shape in shapes {
                 collect(shape, into);
