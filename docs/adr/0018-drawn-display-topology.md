@@ -609,11 +609,20 @@ ids and the attached ones. [PROTOCOL.md](../PROTOCOL.md) §6.2 and
 **Amendment (2026-08-21), a monitor may also carry a *label*, which is
 not an identity:** the decision above chooses the platform device string
 as monitor identity, and that is unchanged. A monitor now additionally
-carries an optional **label** — the EDID product name the platform
-advertises (`DELL U2720Q`, what Windows Settings shows) — for one reason:
-`\\.\DISPLAY1` is the right identity and the wrong caption, and a user
-arranging three rectangles cannot tell which is which from a device
+carries an optional **label** — the human-readable name the platform
+advertises for it (`DELL U2720Q`, from the monitor's EDID) — for one
+reason: `\\.\DISPLAY1` is the right identity and the wrong caption, and a
+user arranging three rectangles cannot tell which is which from a device
 string.
+
+Where a panel's EDID carries no name — a laptop's built-in display is the
+ordinary case, not an edge case — the platform backend may substitute one,
+and the Windows backend does (`Internal Display`). Without that, the
+feature would be inert on exactly the machine that most needs it: a laptop
+has one screen, and `\\.\DISPLAY1` is the least useful thing to call it.
+The substitute is the backend's own string rather than the OS's, because
+the Windows shell synthesizes *and localizes* a name there, and a caption
+does not need to reproduce the shell's wording to do its job.
 
 The two are deliberately different kinds of value, and the distinction is
 the whole of this amendment:

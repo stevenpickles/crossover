@@ -17,10 +17,11 @@ Builds that are not tagged releases identify themselves as such —
 ### Added
 
 - **The layout editor names monitors the way you do.** A rectangle is now
-  captioned with the monitor's product name — `DELL U2720Q`, the same
-  string Windows Settings shows — instead of its device string
-  (`\\.\DISPLAY1`), for both machines' screens. A monitor whose name the
-  OS will not give still shows its device string, and two identical
+  captioned with the monitor's own name — `DELL U2720Q`, the string
+  Windows Settings shows for it — instead of its device string
+  (`\\.\DISPLAY1`), for both machines' screens. A laptop's built-in panel,
+  which has no such name to read, reads `Internal Display`. Anything else
+  the OS will not name still shows its device string, and two identical
   screens on one machine are numbered `(1)` and `(2)` so the pair stays
   tellable apart. The name is a caption only: arrangements, saved layouts,
   and where the cursor crosses all still address a monitor by its device

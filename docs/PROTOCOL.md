@@ -539,9 +539,13 @@ LayoutSync        { revision, origin,                              // type 18
   a real monitor id from a fiction. It is not an arrangement and never
   changes crossing behaviour on its own.
 - **`label` is optional, and is a caption rather than a name** (added at
-  v5). It is the monitor's EDID product name — `DELL U2720Q`, the string
-  Windows Settings shows — so the receiver's editor can label a rectangle
-  with what the user reads off the bezel instead of with `\\.\DISPLAY1`.
+  v5). It is the monitor's human-readable name — `DELL U2720Q`, from its
+  EDID — so the receiver's editor can label a rectangle with what the user
+  reads off the bezel instead of with `\\.\DISPLAY1`. A sender whose panel
+  has no EDID name may substitute one of its own (the Windows backend
+  labels an internal panel `Internal Display`); the receiver neither knows
+  nor cares which it got, because it never does anything with a label but
+  draw it.
   Three properties, all deliberate and all load-bearing:
   - **Display-only, never identity.** Nothing keys off it. Layout
     matching, `[layout]`, `EntryPoint`, crossing derivation, and the

@@ -137,9 +137,12 @@ pub struct MonitorInfo {
 /// platform advertises for it when it has one (ADR 0018, amended
 /// 2026-08-21).
 ///
-/// The label is the EDID product name — `DELL U2720Q`, what Windows
-/// Settings shows — and it is **display only**: optional, not unique, and
-/// never a key. Two identical screens on one desk report the same label,
+/// The label is the monitor's human-readable name — `DELL U2720Q`, from
+/// its EDID, and usually the string the OS's own display settings show for
+/// it. A backend may substitute a name of its own where a panel's EDID
+/// carries none (a laptop's built-in display is the usual case, and the
+/// Windows backend does exactly that). It is **display only**: optional,
+/// not unique, and never a key. Two identical screens on one desk report the same label,
 /// which is legal and is the editor's problem to caption, not this trait's
 /// to disambiguate. Identity remains [`MonitorInfo::id`] and nothing else.
 ///

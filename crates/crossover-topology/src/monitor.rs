@@ -22,8 +22,9 @@
 //! # Identity is not the same thing as a label
 //!
 //! [`MonitorLabel`] is the second string a monitor can carry, and it is
-//! deliberately the *opposite* kind of value: the human-readable product
-//! name Windows Settings shows (`DELL U2720Q`, from the EDID), optional,
+//! deliberately the *opposite* kind of value: the monitor's human-readable
+//! name (`DELL U2720Q`, from its EDID — or a name the platform substitutes
+//! for a panel whose EDID carries none, such as a laptop's), optional,
 //! **not unique**, and never a key. Nothing about layout matching, the
 //! config `[layout]` section, `EntryPoint`, or crossing derivation ever
 //! consults it — see ADR 0018's 2026-08-21 amendment. It exists because
