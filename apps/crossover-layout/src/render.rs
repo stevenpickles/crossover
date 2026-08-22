@@ -633,6 +633,7 @@ fn caption_inputs(group: &MachineGroup) -> Vec<crate::caption::CaptionInput<'_>>
             label: monitor.label.as_ref(),
             ordinal: monitor.ordinal,
             native_size: monitor.native_size,
+            size_estimated: monitor.size_estimated,
         })
         .collect()
 }
@@ -824,6 +825,38 @@ mod tests {
         assert!(painted.contains("not responding"), "{painted}");
         // The peer's last-known screens are still drawn.
         assert!(painted.contains("laptop"), "{painted}");
+    }
+
+    /// A rectangle whose size nobody could measure says so on the canvas,
+    /// and one that was measured does not — the badge is the *only* thing
+    /// that tells the two apart, since a seeded proportion looks exactly as
+    /// confident as a measured one.
+    #[test]
+    fn a_screen_that_could_not_be_measured_paints_its_badge() {
+        use crate::test_support::live_monitor;
+        use crossover_topology::{LiveMonitor, PhysicalSizeMm};
+
+        let measured = |id: &str| LiveMonitor {
+            physical_size: Some(PhysicalSizeMm::new(597, 336).unwrap()),
+            ..live_monitor(id)
+        };
+
+        // Neither machine could measure anything: both rectangles are
+        // guesses, and both say so.
+        let state = document(Some(peer_state(true)), 0);
+        let painted = painted_text(&editing(Model::from_state(&state)));
+        assert!(painted.contains("(size estimated)"), "{painted}");
+
+        // Both measured: nothing is badged, because nothing is a guess.
+        let mut state = document(Some(peer_state(true)), 0);
+        state.local.monitors = vec![measured(r"\\.\DISPLAY1")];
+        state.peer.as_mut().unwrap().monitors = vec![measured(r"\\.\DISPLAY1")];
+        let painted = painted_text(&editing(Model::from_state(&state)));
+        assert!(
+            painted.contains(r"\\.\DISPLAY1"),
+            "the screens are still drawn and captioned: {painted}"
+        );
+        assert!(!painted.contains("(size estimated)"), "{painted}");
     }
 
     /// Issue 5: an unplaced live monitor is painted with a visible cue,

@@ -50,6 +50,10 @@ pub struct CaptionInput<'a> {
     /// Its live pixel size, where the machine currently reports it as
     /// attached.
     pub native_size: Option<(u32, u32)>,
+    /// Whether the rectangle's *size* is a guess — seeded from pixels
+    /// because the panel would not say how big it physically is
+    /// ([`crate::model::DrawnMonitor::size_estimated`]).
+    pub size_estimated: bool,
 }
 
 /// The display names for one machine's monitors, in the order given.
@@ -89,8 +93,9 @@ pub fn display_names(monitors: &[CaptionInput<'_>]) -> Vec<String> {
 }
 
 /// The full caption painted inside one monitor's rectangle: its ordinal,
-/// its display name, and — where the machine reports it attached — its
-/// native pixel size on a second line.
+/// its display name, — where the machine reports it attached — its native
+/// pixel size on a second line, and the [`SIZE_ESTIMATED_BADGE`] where the
+/// rectangle's size is a guess.
 ///
 /// The ordinal and the resolution are what the editor showed before
 /// product names existed and still show: the ordinal because a rectangle
@@ -99,13 +104,33 @@ pub fn display_names(monitors: &[CaptionInput<'_>]) -> Vec<String> {
 /// are *not* actually identical.
 #[must_use]
 pub fn caption(monitor: &CaptionInput<'_>, display_name: &str) -> String {
-    match monitor.native_size {
+    let mut caption = match monitor.native_size {
         Some((width, height)) => {
             format!("{} · {display_name}\n{width}×{height}", monitor.ordinal)
         }
         None => format!("{} · {display_name}", monitor.ordinal),
+    };
+    if monitor.size_estimated {
+        caption.push('\n');
+        caption.push_str(SIZE_ESTIMATED_BADGE);
     }
+    caption
 }
+
+/// What a rectangle whose size nobody measured says about itself.
+///
+/// A badge rather than a diagnostic, deliberately. Nothing is wrong: a
+/// screen that will not report its physical size is drawn from its pixels,
+/// which is what every screen was drawn from until panels started
+/// measuring themselves, and the arrangement is perfectly savable. What the
+/// user is owed is the *reason* one rectangle's proportions might not match
+/// the screen on their desk — because the fix, when there is one, is to
+/// drag it into shape rather than to go looking for a fault.
+///
+/// Parenthesised and lowercase to read as an aside beside the caption
+/// proper, matching the renderer's existing `(unplaced)` cue, which is the
+/// same kind of statement about the same kind of rectangle.
+pub const SIZE_ESTIMATED_BADGE: &str = "(size estimated)";
 
 /// [`display_names`] and [`caption`] together: every monitor's finished
 /// caption, in the order given.
@@ -142,6 +167,7 @@ mod tests {
             label,
             ordinal,
             native_size: Some((1920, 1080)),
+            size_estimated: false,
         }
     }
 
@@ -289,8 +315,42 @@ mod tests {
             label: None,
             ordinal: 3,
             native_size: None,
+            size_estimated: false,
         };
         assert_eq!(caption(&unplugged, r"\\.\DISPLAY1"), r"3 · \\.\DISPLAY1");
+    }
+
+    /// A rectangle whose size nobody measured says so, on its own line
+    /// after the facts that are not in doubt — and a measured one says
+    /// nothing, because the ordinary case should not be annotated.
+    #[test]
+    fn an_estimated_size_is_badged_and_a_measured_one_is_not() {
+        let one = id(r"\\.\DISPLAY1");
+        let name = label("DELL U2720Q");
+        let estimated = CaptionInput {
+            size_estimated: true,
+            ..monitor(&one, Some(&name), 2)
+        };
+        assert_eq!(
+            caption(&estimated, "DELL U2720Q"),
+            "2 · DELL U2720Q\n1920×1080\n(size estimated)"
+        );
+        assert_eq!(
+            caption(&monitor(&one, Some(&name), 2), "DELL U2720Q"),
+            "2 · DELL U2720Q\n1920×1080"
+        );
+
+        // A monitor with nothing else to say still carries the badge: the
+        // resolution line is not what it hangs off.
+        let bare = CaptionInput {
+            native_size: None,
+            size_estimated: true,
+            ..monitor(&one, None, 1)
+        };
+        assert_eq!(
+            caption(&bare, r"\\.\DISPLAY1"),
+            "1 · \\\\.\\DISPLAY1\n(size estimated)"
+        );
     }
 
     /// The two halves compose positionally: one caption per monitor, in
