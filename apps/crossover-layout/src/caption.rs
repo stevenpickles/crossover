@@ -237,6 +237,33 @@ mod tests {
         );
     }
 
+    /// Numbering stops at the machine boundary, which is a property of
+    /// *how this is called* — once per machine — rather than of the rule
+    /// inside it. Worth an automated test anyway: both desks legitimately
+    /// own a `DELL U2720Q`, they are drawn in separate groups under their
+    /// own machine names, and suffixing across the pair would number
+    /// screens the user has no reason to think of as a set.
+    ///
+    /// A regression here would most likely arrive as "compute captions
+    /// once for the whole scene", which reads as a tidy-up and is not one.
+    #[test]
+    fn identical_screens_on_different_machines_are_not_numbered_together() {
+        let (local, peer) = (id("A"), id("B"));
+        let name = label("DELL U2720Q");
+
+        // Each machine's group is captioned on its own, which is the
+        // contract `render`'s `paint_group` keeps.
+        let local_names = display_names(&[monitor(&local, Some(&name), 1)]);
+        let peer_names = display_names(&[monitor(&peer, Some(&name), 1)]);
+
+        assert_eq!(local_names, vec!["DELL U2720Q"]);
+        assert_eq!(peer_names, vec!["DELL U2720Q"]);
+        assert!(
+            !local_names[0].contains('('),
+            "a lone screen was numbered against the *other* machine's"
+        );
+    }
+
     #[test]
     fn an_empty_group_captions_nothing() {
         assert!(display_names(&[]).is_empty());

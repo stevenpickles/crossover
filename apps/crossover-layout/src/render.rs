@@ -756,6 +756,29 @@ mod tests {
         assert!(painted.contains("1920×1080"), "{painted}");
     }
 
+    /// The machine boundary, painted rather than only computed: both desks
+    /// own a `DELL U2720Q`, and neither is numbered — they are drawn in
+    /// separate groups under their own machine names, so numbering across
+    /// the pair would group screens the user has no reason to see as a set.
+    #[test]
+    fn the_same_model_on_both_machines_is_not_numbered_across_the_pair() {
+        use crate::test_support::labelled_monitor;
+
+        let mut peer = peer_state(true);
+        peer.monitors = vec![labelled_monitor(r"\\.\DISPLAY1", "DELL U2720Q")];
+        let mut state = document(Some(peer), 0);
+        state.local.monitors = vec![labelled_monitor(r"\\.\DISPLAY1", "DELL U2720Q")];
+
+        let session = editing(Model::from_state(&state));
+        let painted = painted_text(&session);
+
+        assert!(painted.contains("DELL U2720Q"), "{painted}");
+        assert!(
+            !painted.contains("DELL U2720Q ("),
+            "one machine's screen was numbered against the other's: {painted}"
+        );
+    }
+
     #[test]
     fn waiting_for_peer_paints_the_banner_and_the_local_machine() {
         let model = Model::from_state(&document(None, 0));

@@ -28,11 +28,17 @@
 //! separation is not tidiness — it is the safety property ADR 0018 states
 //! as **an unknown id degrades placement, never geometry**:
 //!
-//! - The edge detector polls `monitors()` every few milliseconds and never
-//!   looks at an id. A monitor that vanished from that list because the OS
-//!   would not name it would move the desktop's outer edge inward, turning
-//!   an interior seam into a crossing edge — a false handoff, which is the
-//!   release-blocking class of defect.
+//! - **Both are hot.** Which one the edge detector polls every few
+//!   milliseconds depends on the arrangement in force: `monitors()` for a
+//!   side-model (geometry-only) crossing source, `monitor_layout()` for a
+//!   drawn one, which matches live screens to drawn rectangles by device
+//!   string (`crossover-core`'s `CrossingSource`). So neither may become
+//!   expensive, and — the point of the split — neither may lose a monitor
+//!   for want of a *name*. A monitor missing from either list would move
+//!   the desktop's outer edge inward, turning an interior seam into a
+//!   crossing edge: a false handoff, the release-blocking class of defect.
+//!   That is why an unreadable id is `id: None` on a present entry and
+//!   never a shorter list.
 //! - An unnamed monitor costs only what the ADR says it should: the layout
 //!   cannot address it, so a crossing onto it falls back to desktop-bounds
 //!   placement with a diagnostic. Control correctness never depended on it.
@@ -213,9 +219,13 @@ pub trait DisplayInfo: Send + Sync {
     /// The list holds **the same rectangles [`DisplayInfo::monitors`]
     /// reports, always** — identity is added per monitor, best effort, and
     /// its absence shows up as `MonitorInfo::id == None` rather than as a
-    /// missing entry. Consulted on the rare paths that care about identity
-    /// (publishing the local topology, matching a layout), never on the
-    /// hot edge-detection path.
+    /// missing entry.
+    ///
+    /// **This is a hot query whenever a drawn layout is in force**: the
+    /// edge detector polls it every few milliseconds to match live screens
+    /// to drawn rectangles by device string. It must therefore stay about
+    /// as cheap as [`DisplayInfo::monitors`] — anything more expensive
+    /// belongs behind [`DisplayInfo::monitor_descriptions`] instead.
     ///
     /// Defaulted to the geometry enumeration with nothing named, so a
     /// backend with no stable per-monitor identifier is still a working
