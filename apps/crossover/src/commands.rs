@@ -3775,6 +3775,7 @@ mod tests {
                 id: MonitorId::new("A").unwrap(),
                 rect,
                 scale_percent: 100,
+                label: None,
             }],
         };
         let layout = LayoutSync {

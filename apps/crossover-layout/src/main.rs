@@ -37,6 +37,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod caption;
 mod logging;
 mod model;
 mod paths;

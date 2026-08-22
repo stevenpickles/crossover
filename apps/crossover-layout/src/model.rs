@@ -95,7 +95,7 @@ use std::collections::BTreeSet;
 
 use crossover_topology::{
     DeviceId, DevicePair, Layout, LayoutError, LayoutRect, LayoutState, LiveMonitor, MonitorId,
-    MonitorKey, PlacedMonitor, TopologyState,
+    MonitorKey, MonitorLabel, PlacedMonitor, TopologyState,
 };
 
 use crate::snap::{self, Guide};
@@ -113,8 +113,14 @@ const SEED_GROUP_GAP: i64 = 96;
 /// One monitor as the editor draws it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrawnMonitor {
-    /// Its platform-supplied identity — the text a monitor label shows.
+    /// Its platform-supplied identity — what a caption falls back to when
+    /// there is no product name, and what every diagnostic names.
     pub id: MonitorId,
+    /// Its owning machine's product name for it, where that machine's
+    /// platform advertised one. Display-only and *not unique*: two
+    /// identical screens on one desk carry the same string, which
+    /// [`crate::caption`] disambiguates rather than the model.
+    pub label: Option<MonitorLabel>,
     /// 1-based position within its machine's group, in the order drawn —
     /// what a short label ("1", "2") shows when the id itself does not fit.
     pub ordinal: usize,
@@ -1075,6 +1081,7 @@ fn seed_monitors(
         let height = dip_size(monitor.rect.height, monitor.scale_percent);
         drawn.push(DrawnMonitor {
             id: monitor.id.clone(),
+            label: monitor.label.clone(),
             ordinal: starting_ordinal + index + 1,
             rect: LayoutRect {
                 x: clamp_coordinate(x),
@@ -1132,15 +1139,21 @@ fn authoritative_group(
     let mut monitors: Vec<DrawnMonitor> = placed
         .iter()
         .enumerate()
-        .map(|(index, monitor)| DrawnMonitor {
-            id: monitor.id.clone(),
-            ordinal: index + 1,
-            rect: monitor.rect,
-            native_size: live
-                .iter()
-                .find(|candidate| candidate.id == monitor.id)
-                .map(|candidate| (candidate.rect.width, candidate.rect.height)),
-            authoritative: true,
+        .map(|(index, monitor)| {
+            // The live entry, if this placed monitor is one this machine
+            // currently reports: the source of both its native size and
+            // its caption. A placed-but-unplugged monitor has neither,
+            // which is the ordinary saved-arrangement case, and its
+            // caption falls back to the id it was saved under.
+            let live = live.iter().find(|candidate| candidate.id == monitor.id);
+            DrawnMonitor {
+                id: monitor.id.clone(),
+                label: live.and_then(|candidate| candidate.label.clone()),
+                ordinal: index + 1,
+                rect: monitor.rect,
+                native_size: live.map(|candidate| (candidate.rect.width, candidate.rect.height)),
+                authoritative: true,
+            }
         })
         .collect();
 
@@ -1199,7 +1212,7 @@ mod tests {
     };
     use crossover_topology::{
         DeviceId, DevicePair, Layout, LayoutRect, LayoutState, LiveMonitor, MachineState,
-        MonitorId, PeerState, PlacedMonitor, TOPOLOGY_STATE_VERSION, TopologyState,
+        MonitorId, MonitorLabel, PeerState, PlacedMonitor, TOPOLOGY_STATE_VERSION, TopologyState,
     };
 
     fn live(id: &str, x: i32, width: u32, height: u32, scale_percent: u16) -> LiveMonitor {
@@ -1212,6 +1225,7 @@ mod tests {
                 height,
             },
             scale_percent,
+            label: None,
         }
     }
 
@@ -1260,6 +1274,84 @@ mod tests {
         ];
         let layout = Layout::new(5, LOCAL, monitors, &pair).unwrap();
         LayoutState::from_layout(&layout)
+    }
+
+    /// The product name reaches the drawn monitor on **both** paths a
+    /// group can be built by — a seeded scene and an authoritative one —
+    /// and on both machines.
+    #[test]
+    fn a_drawn_monitor_carries_the_product_name_of_the_live_screen() {
+        let named = |id: &str, label: &str| LiveMonitor {
+            label: Some(crossover_topology::MonitorLabel::new(label).unwrap()),
+            ..live(id, 0, 1920, 1080, 100)
+        };
+
+        // Seeded: no saved arrangement, so every rectangle comes from
+        // `seed_monitors`.
+        let scene = Model::from_state(&state(
+            vec![named(r"\\.\DISPLAY1", "DELL U2720Q")],
+            vec![named(r"\\.\DISPLAY1", "LG ULTRAGEAR")],
+            None,
+        ));
+        assert!(scene.seeded);
+        assert_eq!(
+            scene.local.monitors[0]
+                .label
+                .as_ref()
+                .map(MonitorLabel::as_str),
+            Some("DELL U2720Q")
+        );
+        assert_eq!(
+            scene.peer.unwrap().monitors[0]
+                .label
+                .as_ref()
+                .map(MonitorLabel::as_str),
+            Some("LG ULTRAGEAR")
+        );
+
+        // Authoritative: the same monitors, now placed by a saved layout,
+        // so every rectangle comes from `authoritative_group` instead.
+        let scene = Model::from_state(&state(
+            vec![named(r"\\.\DISPLAY1", "DELL U2720Q")],
+            vec![named(r"\\.\DISPLAY1", "LG ULTRAGEAR")],
+            Some(side_by_side_layout()),
+        ));
+        assert!(!scene.seeded);
+        assert!(scene.local.monitors[0].authoritative);
+        assert_eq!(
+            scene.local.monitors[0]
+                .label
+                .as_ref()
+                .map(MonitorLabel::as_str),
+            Some("DELL U2720Q")
+        );
+    }
+
+    /// A monitor the arrangement places but the machine no longer reports
+    /// live has no caption to take — the same `None` its `native_size`
+    /// takes, and from the same absence. Its caption falls back to the id
+    /// it was saved under, which is exactly the id a user needs to see to
+    /// understand why it is not there.
+    #[test]
+    fn a_placed_but_unplugged_monitor_has_no_product_name() {
+        let scene = Model::from_state(&state(
+            // Nothing live matching the layout's `\\.\DISPLAY1`.
+            vec![live(r"\\.\DISPLAY7", 0, 1920, 1080, 100)],
+            vec![LiveMonitor {
+                label: Some(crossover_topology::MonitorLabel::new("LG ULTRAGEAR").unwrap()),
+                ..live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)
+            }],
+            Some(side_by_side_layout()),
+        ));
+        let placed = scene
+            .local
+            .monitors
+            .iter()
+            .find(|monitor| monitor.id.as_str() == r"\\.\DISPLAY1")
+            .expect("the layout's monitor is drawn even though it is unplugged");
+        assert!(placed.authoritative);
+        assert_eq!(placed.native_size, None);
+        assert_eq!(placed.label, None);
     }
 
     #[test]

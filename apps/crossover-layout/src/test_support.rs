@@ -138,7 +138,9 @@ pub(crate) const LOCAL_DEVICE: crossover_topology::DeviceId =
 pub(crate) const PEER_DEVICE: crossover_topology::DeviceId =
     crossover_topology::DeviceId::from_bytes([0x22; 16]);
 
-/// One ordinary 1920×1080, 100%-scale live monitor.
+/// One ordinary 1920×1080, 100%-scale live monitor, unlabelled — the
+/// ordinary case, since a platform that cannot read product names is a
+/// first-class platform.
 pub(crate) fn live_monitor(id: &str) -> crossover_topology::LiveMonitor {
     crossover_topology::LiveMonitor {
         id: crossover_topology::MonitorId::new(id).unwrap(),
@@ -149,6 +151,15 @@ pub(crate) fn live_monitor(id: &str) -> crossover_topology::LiveMonitor {
             height: 1080,
         },
         scale_percent: 100,
+        label: None,
+    }
+}
+
+/// The same, carrying the product name a platform advertised for it.
+pub(crate) fn labelled_monitor(id: &str, label: &str) -> crossover_topology::LiveMonitor {
+    crossover_topology::LiveMonitor {
+        label: Some(crossover_topology::MonitorLabel::new(label).unwrap()),
+        ..live_monitor(id)
     }
 }
 

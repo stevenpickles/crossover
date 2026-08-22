@@ -21,9 +21,9 @@
 //!   instead of presenting stale facts as current.
 //!
 //! **Nothing secret is in it** — device names and ids, monitor device
-//! strings, rectangles, and scale factors; no key material, no clipboard
-//! content, no peer credentials (docs/SECURITY.md invariant 6). It needs no
-//! protection beyond the profile it sits in.
+//! strings and product names, rectangles, and scale factors; no key
+//! material, no clipboard content, no peer credentials (docs/SECURITY.md
+//! invariant 6). It needs no protection beyond the profile it sits in.
 //!
 //! This module is the *schema*: the types, the strict version check, and
 //! the round trip. The writer task — the heartbeat, the atomic write, the
@@ -53,9 +53,10 @@
 //!   per machine, `MAX_LAYOUT_MONITORS` for the layout — refusing on the
 //!   element past the cap, so an over-long list is never built.
 //! - **Every monitor id** is a validated [`MonitorId`], **every rectangle**
-//!   satisfies [`LayoutRect::check_bounds`], and **every `scale_percent`**
-//!   is within [`MIN_SCALE_PERCENT`]..=[`MAX_SCALE_PERCENT`] — all three at
-//!   the decoder, so an unusable value cannot exist in a decoded document.
+//!   satisfies [`LayoutRect::check_bounds`], **every `scale_percent`** is
+//!   within [`MIN_SCALE_PERCENT`]..=[`MAX_SCALE_PERCENT`], and **every
+//!   monitor label** is a validated [`MonitorLabel`] — all at the decoder,
+//!   so an unusable value cannot exist in a decoded document.
 //!
 //! What is *not* enforced here is the arrangement's own semantics — the
 //! overlap rule, the pair, both machines present. Those need the current
@@ -71,7 +72,7 @@ use crate::layout::{
     DevicePair, Layout, LayoutError, LayoutRect, MAX_LAYOUT_MONITORS, MAX_MONITORS_PER_MACHINE,
     MAX_SCALE_PERCENT, MIN_SCALE_PERCENT, PlacedMonitor,
 };
-use crate::monitor::MonitorId;
+use crate::monitor::{MonitorId, MonitorLabel};
 
 /// The schema version this build writes and is willing to read.
 ///
@@ -129,8 +130,8 @@ pub const MAX_STATE_FILE_BYTES: usize = 256 * 1024;
 ///
 /// Every field is checked on decode — the id by [`MonitorId`]'s own
 /// validation, the rectangle by [`LayoutRect::check_bounds`], the scale
-/// against its two constants — so an unusable [`LiveMonitor`] cannot be
-/// constructed by deserializing one.
+/// against its two constants, the label by [`MonitorLabel`]'s — so an
+/// unusable [`LiveMonitor`] cannot be constructed by deserializing one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawLiveMonitor")]
 pub struct LiveMonitor {
@@ -140,6 +141,36 @@ pub struct LiveMonitor {
     pub rect: LayoutRect,
     /// Its display scale in percent, 100 being unscaled.
     pub scale_percent: u16,
+    /// The human-readable name the owning machine's platform advertises
+    /// for it — its EDID product name — where there is one.
+    ///
+    /// **Display-only, never identity**, exactly as on the wire: the
+    /// editor captions a rectangle with it and nothing matches on it. It
+    /// is optional and not unique.
+    ///
+    /// Omitted from the document entirely when absent, and defaulted to
+    /// absent when a document does not carry it, so the **schema stays at
+    /// version 1 for a reader moving forward**: a file written before
+    /// labels existed parses unchanged here, which is what lets the field
+    /// be added without the whole-document refusal
+    /// [`TOPOLOGY_STATE_VERSION`] exists to enforce.
+    ///
+    /// **Forward, not backward — and the asymmetry is deliberate.**
+    /// [`RawLiveMonitor`] is `deny_unknown_fields`, so an *older* build
+    /// pointed at a document this one wrote with a label refuses that
+    /// document whole. That hardening predates labels and stays: a state
+    /// file is a report about arrangements that steer where control is
+    /// handed away, and silently ignoring a key it does not understand is
+    /// how a reader half-believes a document. The cost is bounded and
+    /// transient rather than permanent, which is why it is acceptable — a
+    /// downgraded worker rewrites this file at startup and on its next
+    /// poll, so the refusal lasts until the old worker is running and no
+    /// longer. What it costs meanwhile is an editor that says the worker
+    /// is not reporting, on a machine mid-downgrade; it cannot corrupt an
+    /// arrangement, because the config file, not this one, is where a
+    /// layout lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<MonitorLabel>,
 }
 
 /// [`LiveMonitor`] before its bounds have been checked — the shape serde
@@ -150,6 +181,8 @@ struct RawLiveMonitor {
     id: MonitorId,
     rect: LayoutRect,
     scale_percent: u16,
+    #[serde(default)]
+    label: Option<MonitorLabel>,
 }
 
 impl TryFrom<RawLiveMonitor> for LiveMonitor {
@@ -169,6 +202,9 @@ impl TryFrom<RawLiveMonitor> for LiveMonitor {
             id: raw.id,
             rect: raw.rect,
             scale_percent: raw.scale_percent,
+            // Nothing to check: `MonitorLabel` cannot exist unvalidated,
+            // so a decoded label is already inside its bounds.
+            label: raw.label,
         })
     }
 }
@@ -407,8 +443,8 @@ pub fn now_unix_millis() -> u64 {
 mod tests {
     use super::{
         HEARTBEAT_STALE_AFTER_MS, LayoutState, LiveMonitor, MAX_STATE_FILE_BYTES, MachineState,
-        PeerState, StateError, TOPOLOGY_STATE_VERSION, TopologyState, now_unix_millis, parse_state,
-        serialize_state,
+        MonitorLabel, PeerState, StateError, TOPOLOGY_STATE_VERSION, TopologyState,
+        now_unix_millis, parse_state, serialize_state,
     };
     use crate::layout::tests::{LOCAL, PEER, pair, valid_layout};
     use crate::layout::{
@@ -427,6 +463,14 @@ mod tests {
                 height: 1080,
             },
             scale_percent,
+            label: None,
+        }
+    }
+
+    fn labelled(monitor: LiveMonitor, label: &str) -> LiveMonitor {
+        LiveMonitor {
+            label: Some(MonitorLabel::new(label).unwrap()),
+            ..monitor
         }
     }
 
@@ -438,7 +482,10 @@ mod tests {
                 device: LOCAL,
                 name: "workstation-left".to_owned(),
                 monitors: vec![
-                    live(r"\\.\DISPLAY1", 0, 150),
+                    labelled(live(r"\\.\DISPLAY1", 0, 150), "DELL U2720Q"),
+                    // The second is deliberately unlabelled: a real desk
+                    // mixes screens the platform can name with ones it
+                    // cannot, and the round trip has to carry both.
                     live(r"\\.\DISPLAY2", 1920, 100),
                 ],
             },
@@ -543,6 +590,111 @@ mod tests {
             assert!(
                 matches!(parse_state(json), Err(StateError::Malformed { .. })),
                 "admitted {json:?}"
+            );
+        }
+    }
+
+    /// The label survives a round trip, is omitted when absent, and — the
+    /// property that keeps the schema at version 1 — a document written
+    /// without it still parses.
+    #[test]
+    fn labels_round_trip_and_their_absence_costs_nothing() {
+        let state = document();
+        let json = serialize_state(&state).unwrap();
+        let parsed = parse_state(&json).unwrap();
+        assert_eq!(parsed, state);
+        assert_eq!(
+            parsed.local.monitors[0]
+                .label
+                .as_ref()
+                .map(MonitorLabel::as_str),
+            Some("DELL U2720Q")
+        );
+        assert_eq!(parsed.local.monitors[1].label, None);
+
+        // An absent label is absent from the document, not `null` in it:
+        // the file is one a human reads, and a column of nulls is noise.
+        let rows = json.matches("\"label\"").count();
+        assert_eq!(rows, 1, "an absent label was written out anyway: {json}");
+
+        // A document from a build that predates labels — no `label` key at
+        // all — parses, with every monitor unlabelled. This is what lets
+        // the schema stay at version 1 rather than refusing the whole file.
+        // Built by deleting the key's line and the comma that introduced
+        // it, so the result is what an older writer would genuinely have
+        // produced rather than JSON with a hole in it.
+        let older = {
+            let mut lines: Vec<String> = json.lines().map(str::to_owned).collect();
+            let index = lines
+                .iter()
+                .position(|line| line.contains("\"label\""))
+                .expect("the fixture carries a label");
+            lines.remove(index);
+            lines[index - 1] = lines[index - 1].trim_end().trim_end_matches(',').to_owned();
+            lines.join("\n")
+        };
+        assert!(!older.contains("label"), "{older}");
+        let parsed = parse_state(&older).unwrap();
+        assert!(
+            parsed
+                .local
+                .monitors
+                .iter()
+                .all(|monitor| monitor.label.is_none())
+        );
+        assert_eq!(parsed.local.monitors.len(), 2);
+    }
+
+    /// The other direction of that compatibility claim, pinned rather than
+    /// asserted in prose: `deny_unknown_fields` means a document carrying a
+    /// per-monitor key this build does not know is refused **whole**.
+    ///
+    /// That is what makes the `label` field one-way compatible — new
+    /// readers accept old files, old readers refuse new ones — and it is
+    /// the hardening, not an oversight. The cost is transient: a
+    /// downgraded worker rewrites this file at startup, so the refusal
+    /// lasts only until the older build is actually running.
+    #[test]
+    fn a_document_with_a_monitor_key_this_build_does_not_know_is_refused() {
+        let json = serialize_state(&document()).unwrap().replace(
+            "\"scale_percent\": 150",
+            "\"scale_percent\": 150, \"hdr_nits\": 400",
+        );
+        assert!(
+            matches!(parse_state(&json), Err(StateError::Malformed { .. })),
+            "an unknown per-monitor key was silently ignored"
+        );
+    }
+
+    /// A label repeating within one machine is legal — it is a caption,
+    /// not a key — where a repeated id is not (the layout model's rule).
+    #[test]
+    fn two_screens_may_share_a_label() {
+        let mut state = document();
+        state.local.monitors = vec![
+            labelled(live("A", 0, 100), "DELL U2720Q"),
+            labelled(live("B", 1920, 100), "DELL U2720Q"),
+        ];
+        let json = serialize_state(&state).unwrap();
+        assert_eq!(parse_state(&json).unwrap(), state);
+    }
+
+    /// A label that could not exist is refused at the decoder, because
+    /// `MonitorLabel` validates on deserialize — the same property
+    /// `MonitorId` has, for a different rule.
+    #[test]
+    fn an_unusable_monitor_label_does_not_survive_the_decoder() {
+        let json = serialize_state(&document()).unwrap();
+        for label in [
+            "x".repeat(65),                 // over the byte bound
+            "DELL\\u0000U2720Q".to_owned(), // a control character
+            String::new(),                  // empty is a claim, not an absence
+        ] {
+            let mutated = json.replace("DELL U2720Q", &label);
+            assert_ne!(mutated, json, "the fixture no longer carries a label");
+            assert!(
+                matches!(parse_state(&mutated), Err(StateError::Malformed { .. })),
+                "admitted the label {label:?}"
             );
         }
     }

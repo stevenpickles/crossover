@@ -37,7 +37,7 @@
 //! Every producer treats a failure to learn something new as a reason to
 //! say nothing, not a reason to erase what is already known:
 //!
-//! - **A transient enumeration failure** (`DisplayInfo::monitor_layout`
+//! - **A transient enumeration failure** (`DisplayInfo::monitor_descriptions`
 //!   erroring — reachable on the 1 s poll from a session lock, an RDP
 //!   disconnect, or a display waking from sleep) leaves the previously
 //!   reported monitor list untouched, logged once on the way in and once
@@ -49,11 +49,20 @@
 //!   list; a startup enumeration that is already over the cap has no last
 //!   good to fall back to, so it reports an empty list rather than a
 //!   truncated, falsely-complete one — both cases logged loudly.
+//! - **A label sweep that fails while the geometry beside it does not** is
+//!   the same policy one level finer, per monitor id rather than per
+//!   list: the last caption that id carried is kept, so a caption that
+//!   flaps changes nothing and therefore reports nothing. Without it the
+//!   flap would read as a changed monitor list and put a
+//!   `MonitorTopology` on the wire once a second — see
+//!   [`TopologyStateWriter::set_monitors`], which states the accepted cost
+//!   too.
 //! - **A config re-read that fails to parse or fails `[layout]`
 //!   validation** offers nothing to the hub, so the run keeps the layout
 //!   it already holds and this file keeps reporting it (see
 //!   `commands::apply_config_changes`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -64,18 +73,20 @@ use tokio::task::JoinHandle;
 use crossover_platform::{DisplayError, DisplayInfo};
 use crossover_topology::{
     AtomicWriteError, DeviceId, LayoutRect, LayoutState, LiveMonitor, MAX_MONITORS_PER_MACHINE,
-    MachineState, MonitorId, PeerState, StateError, TOPOLOGY_STATE_VERSION, TopologyState,
-    now_unix_millis, serialize_state, write_atomic,
+    MachineState, MonitorId, MonitorLabel, PeerState, StateError, TOPOLOGY_STATE_VERSION,
+    TopologyState, now_unix_millis, serialize_state, write_atomic,
 };
 
 use crate::config::LayoutSource;
 
-/// How often the own-display poll samples `monitor_layout()` for a change,
-/// so the state file picks one up without waiting on a config re-read.
-/// Deliberately separate from the 8 ms edge-detection poll
+/// How often the own-display poll samples `monitor_descriptions()` for a
+/// change, so the state file picks one up without waiting on a config
+/// re-read. Deliberately separate from the 8 ms edge-detection poll
 /// (`commands::EDGE_POLL_INTERVAL`): the state file is a report for a
 /// human editor, not a control-transfer input, and a monitor
-/// reconfiguration is not latency-sensitive the way a crossing is.
+/// reconfiguration is not latency-sensitive the way a crossing is. It is
+/// also the *only* cadence that pays for the product-name query — the edge
+/// path keeps calling `monitors()` and never comes near this.
 const DISPLAY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The writer's coalescing window: the same cadence as
@@ -109,6 +120,10 @@ pub struct TopologyStateWriter {
     /// by [`Self::write_final`] before it does its own write. `None` once
     /// that has happened.
     writer_task: Mutex<Option<JoinHandle<()>>>,
+    /// The last label each monitor was seen to carry, keyed by its id —
+    /// see [`Self::set_monitors`] for why a caption is *remembered* rather
+    /// than re-read every second.
+    remembered_labels: Mutex<BTreeMap<MonitorId, MonitorLabel>>,
 }
 
 impl TopologyStateWriter {
@@ -118,12 +133,27 @@ impl TopologyStateWriter {
     #[must_use]
     pub fn start(path: PathBuf, initial: TopologyState) -> Self {
         write_state_file_logged(&path, &initial);
+        // Seed the label memory from the startup snapshot, so the very
+        // first poll after start has something to fall back on rather than
+        // having to re-learn what `initial_state` already read.
+        let remembered = initial
+            .local
+            .monitors
+            .iter()
+            .filter_map(|monitor| {
+                monitor
+                    .label
+                    .clone()
+                    .map(|label| (monitor.id.clone(), label))
+            })
+            .collect();
         let (state, updates) = watch::channel(initial);
         let writer_task = tokio::spawn(run_writer(path.clone(), updates));
         Self {
             path,
             state,
             writer_task: Mutex::new(Some(writer_task)),
+            remembered_labels: Mutex::new(remembered),
         }
     }
 
@@ -135,7 +165,42 @@ impl TopologyStateWriter {
 
     /// Replace this machine's reported monitors, if `monitors` differs from
     /// what is already held. Returns whether anything changed.
-    pub fn set_monitors(&self, monitors: Vec<LiveMonitor>) -> bool {
+    ///
+    /// # Labels are remembered, not re-read
+    ///
+    /// `monitors` now carries a per-monitor caption, and a caption is far
+    /// less reliably readable than the geometry beside it: on Windows it
+    /// costs a whole `QueryDisplayConfig` sweep, and an RDP transition, a
+    /// session lock, a GPU reset, or one target that will not answer turns
+    /// every `Some` into `None` with the rectangles completely unchanged.
+    ///
+    /// Left alone, that would defeat this method's own change gate. The
+    /// gate compares whole [`LiveMonitor`]s, so a label flap reads as a
+    /// changed monitor list: a state-file write, an `info!` line, a
+    /// `LocalDisplayChanged` ping, and a `MonitorTopology` frame to the
+    /// peer — then all of it again, in reverse, on the next tick. At the
+    /// 1 s poll cadence that is a wire loop, and it breaks the rule
+    /// [`watch_own_display`] is written to keep: *a poll that finds
+    /// nothing new must not put a `MonitorTopology` on the wire once a
+    /// second.*
+    ///
+    /// So the label follows this module's standing policy — **a failure to
+    /// learn something new is not a reason to erase what is known** — one
+    /// level finer than the rest of it. Per monitor id: a `Some` is
+    /// learned, a `None` is filled in from the last `Some` that id
+    /// carried, and an id absent from `monitors` is forgotten (which
+    /// bounds the memory at the enumeration's own size). Only a genuinely
+    /// *different* `Some` moves it. The gate above then compares
+    /// post-retention lists and needs no special case of its own.
+    ///
+    /// **The accepted cost, stated:** a monitor that genuinely stops
+    /// advertising a name — an EDID the driver stops reporting — keeps its
+    /// last caption until it leaves the enumeration or the worker
+    /// restarts. That is the right way round. A label is display-only, so
+    /// a stale caption costs a word that is no longer strictly true, while
+    /// a flapping one costs a frame per second to the peer.
+    pub fn set_monitors(&self, mut monitors: Vec<LiveMonitor>) -> bool {
+        self.remember_labels(&mut monitors);
         self.state.send_if_modified(|state| {
             if state.local.monitors == monitors {
                 return false;
@@ -144,6 +209,43 @@ impl TopologyStateWriter {
             state.written_at = now_unix_millis();
             true
         })
+    }
+
+    /// Learn every label `monitors` carries, fill in every one it does not
+    /// from what that id carried last, and forget ids that have left the
+    /// enumeration. See [`Self::set_monitors`] for the reasoning.
+    fn remember_labels(&self, monitors: &mut [LiveMonitor]) {
+        let mut known = lock(&self.remembered_labels);
+        for monitor in monitors.iter_mut() {
+            match &monitor.label {
+                Some(label) => {
+                    known.insert(monitor.id.clone(), label.clone());
+                }
+                None => monitor.label = known.get(&monitor.id).cloned(),
+            }
+        }
+        // Bounded by the enumeration: an id nothing reports any more is an
+        // id whose caption can never be wanted again.
+        known.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
+    }
+
+    /// Fill in labels `monitors` does not carry from what this writer last
+    /// saw, without learning or forgetting anything.
+    ///
+    /// The read-only half of [`Self::set_monitors`]'s retention, for the
+    /// one other producer that reports this machine's monitors:
+    /// `topology_sync`'s `MonitorTopology`, which queries the display
+    /// itself rather than reading this snapshot (it has its own
+    /// per-machine cap rule to apply, and it must work on a run with no
+    /// state file at all). Without this the peer's editor would lose every
+    /// caption for one report whenever a label sweep failed to coincide
+    /// with a genuine display change — the state file and the wire
+    /// disagreeing about the same desk.
+    pub fn fill_remembered_labels(&self, monitors: &mut [LiveMonitor]) {
+        let known = lock(&self.remembered_labels);
+        for monitor in monitors.iter_mut().filter(|m| m.label.is_none()) {
+            monitor.label = known.get(&monitor.id).cloned();
+        }
     }
 
     /// Record who is at the other end and whether a session is up right
@@ -418,6 +520,14 @@ pub enum LiveMonitorsError {
 /// no real platform report should) is likewise omitted and logged, rather
 /// than the whole document being refused for one bad entry.
 ///
+/// **A label is weaker than any of that.** It is
+/// [`crossover_platform::DisplayInfo::monitor_descriptions`] this asks —
+/// the ~1 s query, never the 8 ms one — and a label that will not validate
+/// costs the *label* and not the monitor: the monitor is reported
+/// unlabelled, exactly as one the platform never named would be. A caption
+/// is display-only, so refusing a screen over one would trade something
+/// that matters for something that does not.
+///
 /// # Errors
 ///
 /// [`LiveMonitorsError`] — the caller decides what "nothing new to report"
@@ -425,7 +535,7 @@ pub enum LiveMonitorsError {
 /// poll; see this module's header).
 pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, LiveMonitorsError> {
     let monitors = display
-        .monitor_layout()
+        .monitor_descriptions()
         .map_err(LiveMonitorsError::Unavailable)?;
     if monitors.len() > MAX_MONITORS_PER_MACHINE {
         return Err(LiveMonitorsError::TooManyMonitors {
@@ -435,7 +545,7 @@ pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, Live
 
     let mut live = Vec::with_capacity(monitors.len());
     for monitor in monitors {
-        let Some(id) = monitor.id else {
+        let Some(id) = monitor.info.id else {
             continue;
         };
         let id = match MonitorId::new(&id) {
@@ -449,10 +559,10 @@ pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, Live
             }
         };
         let rect = LayoutRect {
-            x: monitor.rect.left,
-            y: monitor.rect.top,
-            width: monitor.rect.width,
-            height: monitor.rect.height,
+            x: monitor.info.rect.left,
+            y: monitor.info.rect.top,
+            width: monitor.info.rect.width,
+            height: monitor.info.rect.height,
         };
         if let Err(violation) = rect.check_bounds() {
             tracing::warn!(
@@ -462,9 +572,24 @@ pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, Live
             );
             continue;
         }
+        let label = monitor
+            .label
+            .and_then(|label| match MonitorLabel::new(&label) {
+                Ok(label) => Some(label),
+                Err(error) => {
+                    tracing::debug!(
+                        monitor = %id,
+                        error = %error,
+                        "topology state: an unusable monitor label; the monitor is reported \
+                         without one"
+                    );
+                    None
+                }
+            });
         live.push(LiveMonitor {
             id,
             rect,
+            label,
             // `DisplayInfo` has no per-monitor scale query yet
             // (crossover-platform's `display` module: `MonitorInfo` carries
             // geometry and an id, not a scale). Until a later branch adds
@@ -477,6 +602,32 @@ pub fn live_monitors(display: &dyn DisplayInfo) -> Result<Vec<LiveMonitor>, Live
         });
     }
     Ok(live)
+}
+
+/// This machine's live monitor **ids**, and nothing else.
+///
+/// For the callers whose whole question is *does this machine still have
+/// that screen* — no rectangles, no captions, no per-machine cap, because
+/// none of those is being asked about.
+///
+/// It goes through `monitor_layout()` rather than `monitor_descriptions()`
+/// deliberately. ADR 0018's label amendment promises that **only the ~1 s
+/// topology cadence pays for the product-name sweep**, and a question about
+/// ids answered through the description query would quietly break that
+/// promise on whatever cadence its caller happens to run at. The id query
+/// is the cheap one; ask it.
+///
+/// # Errors
+///
+/// [`DisplayError`] if the platform cannot enumerate at all. A monitor it
+/// will not name, or names unusably, is skipped rather than failing the
+/// call — the same per-monitor treatment [`live_monitors`] gives.
+pub fn live_monitor_ids(display: &dyn DisplayInfo) -> Result<Vec<MonitorId>, DisplayError> {
+    Ok(display
+        .monitor_layout()?
+        .into_iter()
+        .filter_map(|monitor| MonitorId::new(monitor.id.as_deref()?).ok())
+        .collect())
 }
 
 /// Poll this machine's own displays for a change, keep `writer` current and
@@ -729,6 +880,275 @@ mod tests {
         assert_eq!(live[0].id.as_str(), fake_monitor_id(0));
     }
 
+    /// A product name the platform supplies reaches the state file, and a
+    /// monitor without one is reported unlabelled rather than skipped —
+    /// the fallback the editor's caption chain depends on.
+    #[test]
+    fn a_product_name_reaches_the_state_file_and_its_absence_costs_nothing() {
+        use crossover_platform::MonitorDescription;
+
+        let display = display(1920, 1080);
+        display.set_monitor_descriptions(vec![
+            MonitorDescription {
+                info: monitor_at(0, 0),
+                label: Some("DELL U2720Q".to_owned()),
+            },
+            MonitorDescription {
+                info: monitor_at(1, 100),
+                label: None,
+            },
+        ]);
+
+        let live = live_monitors(&display).unwrap();
+        assert_eq!(live.len(), 2);
+        assert_eq!(
+            live[0]
+                .label
+                .as_ref()
+                .map(crossover_topology::MonitorLabel::as_str),
+            Some("DELL U2720Q")
+        );
+        assert_eq!(live[1].label, None);
+    }
+
+    /// A label the layout model refuses costs the label, never the
+    /// monitor: it is display-only, so dropping a screen over one would
+    /// trade geometry for a caption.
+    #[test]
+    fn an_unusable_label_leaves_the_monitor_reported_without_one() {
+        use crossover_platform::MonitorDescription;
+
+        let display = display(1920, 1080);
+        display.set_monitor_descriptions(vec![MonitorDescription {
+            info: monitor_at(0, 0),
+            label: Some("x".repeat(200)),
+        }]);
+
+        let live = live_monitors(&display).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id.as_str(), fake_monitor_id(0));
+        assert_eq!(live[0].label, None);
+    }
+
+    /// The wire loop a naive label field opens, closed.
+    ///
+    /// A label sweep can fail on its own — an RDP transition, a session
+    /// lock, a GPU reset, one target that will not answer — while the
+    /// geometry beside it is untouched. Without retention that reads as a
+    /// changed monitor list, so the state file is rewritten, `info!` fires,
+    /// the hub is pinged, and a `MonitorTopology` goes to the peer — then
+    /// all of it again in reverse next tick. At a 1 s cadence that is a
+    /// frame per second forever.
+    #[tokio::test]
+    async fn a_label_that_flaps_writes_nothing_and_tells_nobody() {
+        use crossover_platform::MonitorDescription;
+
+        let sandbox = Sandbox::new("label-flap");
+        let path = sandbox.path("topology.json");
+        let display = display(1920, 1080);
+        let labelled = |label: Option<&str>| MonitorDescription {
+            info: monitor_at(0, 0),
+            label: label.map(str::to_owned),
+        };
+
+        display.set_monitor_descriptions(vec![labelled(Some("DELL U2720Q"))]);
+        let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
+        let writer = TopologyStateWriter::start(path, state);
+        assert_eq!(
+            writer.snapshot().local.monitors[0]
+                .label
+                .as_ref()
+                .map(crossover_topology::MonitorLabel::as_str),
+            Some("DELL U2720Q")
+        );
+
+        // The sweep fails: same rectangles, no captions. Nothing changed
+        // about this desk, so nothing may be reported about it.
+        display.set_monitor_descriptions(vec![labelled(None)]);
+        let flapped = live_monitors(&display).unwrap();
+        assert_eq!(flapped[0].label, None, "the fixture did not model a flap");
+        assert!(
+            !writer.set_monitors(flapped),
+            "a label sweep failing reported a display change"
+        );
+        assert_eq!(
+            writer.snapshot().local.monitors[0]
+                .label
+                .as_ref()
+                .map(crossover_topology::MonitorLabel::as_str),
+            Some("DELL U2720Q"),
+            "the last known caption was erased by a failed sweep"
+        );
+
+        // And it recovers without reporting a change either, because
+        // nothing about the reported desk moved.
+        display.set_monitor_descriptions(vec![labelled(Some("DELL U2720Q"))]);
+        assert!(!writer.set_monitors(live_monitors(&display).unwrap()));
+
+        drop(writer);
+    }
+
+    /// The other half: a label that genuinely *changes* still propagates,
+    /// exactly once. Retention must not become "captions never move".
+    #[tokio::test]
+    async fn a_genuine_label_change_propagates_exactly_once() {
+        use crossover_platform::MonitorDescription;
+
+        let sandbox = Sandbox::new("label-change");
+        let path = sandbox.path("topology.json");
+        let display = display(1920, 1080);
+        let described = |label: &str| MonitorDescription {
+            info: monitor_at(0, 0),
+            label: Some(label.to_owned()),
+        };
+
+        display.set_monitor_descriptions(vec![described("DELL U2720Q")]);
+        let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
+        let writer = TopologyStateWriter::start(path, state);
+
+        display.set_monitor_descriptions(vec![described("LG ULTRAGEAR")]);
+        let renamed = live_monitors(&display).unwrap();
+        assert!(
+            writer.set_monitors(renamed.clone()),
+            "a real caption change was swallowed"
+        );
+        assert_eq!(
+            writer.snapshot().local.monitors[0]
+                .label
+                .as_ref()
+                .map(crossover_topology::MonitorLabel::as_str),
+            Some("LG ULTRAGEAR")
+        );
+        assert!(
+            !writer.set_monitors(renamed),
+            "the same caption reported a second change"
+        );
+
+        drop(writer);
+    }
+
+    /// A monitor that leaves the enumeration takes its remembered caption
+    /// with it, so the memory is bounded by the desk rather than by how
+    /// many screens have ever been plugged in — and a *different* monitor
+    /// that later takes the same id inherits nothing.
+    #[tokio::test]
+    async fn a_departed_monitor_is_forgotten_rather_than_remembered_forever() {
+        use crossover_platform::MonitorDescription;
+
+        let sandbox = Sandbox::new("label-forget");
+        let path = sandbox.path("topology.json");
+        let display = display(1920, 1080);
+
+        display.set_monitor_descriptions(vec![MonitorDescription {
+            info: monitor_at(0, 0),
+            label: Some("DELL U2720Q".to_owned()),
+        }]);
+        let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
+        let writer = TopologyStateWriter::start(path, state);
+
+        // The monitor is unplugged; a different one arrives.
+        display.set_monitor_descriptions(vec![MonitorDescription {
+            info: monitor_at(1, 0),
+            label: None,
+        }]);
+        assert!(writer.set_monitors(live_monitors(&display).unwrap()));
+
+        // Now the original id comes back, still unnamed by the platform.
+        // It must not inherit the caption the *previous* enumeration knew:
+        // the memory was pruned when the id left.
+        display.set_monitor_descriptions(vec![MonitorDescription {
+            info: monitor_at(0, 0),
+            label: None,
+        }]);
+        assert!(writer.set_monitors(live_monitors(&display).unwrap()));
+        assert_eq!(
+            writer.snapshot().local.monitors[0].label,
+            None,
+            "a caption outlived the enumeration that produced it"
+        );
+
+        drop(writer);
+    }
+
+    /// A failed label sweep must not reach the peer either: the read-only
+    /// half of the retention, which `topology_sync` applies to the
+    /// `MonitorTopology` it builds from its own display query.
+    #[tokio::test]
+    async fn the_remembered_caption_is_available_to_the_wire_producer() {
+        use crossover_platform::MonitorDescription;
+
+        let sandbox = Sandbox::new("label-wire");
+        let path = sandbox.path("topology.json");
+        let display = display(1920, 1080);
+        display.set_monitor_descriptions(vec![MonitorDescription {
+            info: monitor_at(0, 0),
+            label: Some("DELL U2720Q".to_owned()),
+        }]);
+        let state = initial_state(LOCAL, "workstation".to_owned(), &display, None);
+        let writer = TopologyStateWriter::start(path, state);
+
+        display.set_monitor_descriptions(vec![MonitorDescription {
+            info: monitor_at(0, 0),
+            label: None,
+        }]);
+        let mut fresh = live_monitors(&display).unwrap();
+        assert_eq!(fresh[0].label, None);
+        writer.fill_remembered_labels(&mut fresh);
+        assert_eq!(
+            fresh[0]
+                .label
+                .as_ref()
+                .map(crossover_topology::MonitorLabel::as_str),
+            Some("DELL U2720Q"),
+            "the wire would have described this desk without its captions"
+        );
+
+        // Read-only: filling did not teach the writer anything new, and a
+        // monitor it has never heard of stays unlabelled.
+        let mut stranger = vec![crossover_topology::LiveMonitor {
+            id: crossover_topology::MonitorId::new("NEVER-SEEN").unwrap(),
+            rect: crossover_topology::LayoutRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            scale_percent: 100,
+            label: None,
+        }];
+        writer.fill_remembered_labels(&mut stranger);
+        assert_eq!(stranger[0].label, None);
+
+        drop(writer);
+    }
+
+    /// Ids alone come from the *cheap* query, so a caller that only needs
+    /// to know which screens are attached does not drag a
+    /// `QueryDisplayConfig` sweep along behind it (ADR 0018's amendment:
+    /// only the ~1 s cadence pays for product names).
+    #[test]
+    fn live_monitor_ids_reports_ids_and_skips_what_it_cannot_name() {
+        let display = display(1920, 1080);
+        display.set_monitor_layout(vec![
+            monitor_at(0, 0),
+            MonitorInfo {
+                id: None,
+                rect: MonitorRect {
+                    left: 100,
+                    top: 0,
+                    width: 100,
+                    height: 100,
+                },
+            },
+        ]);
+        let ids = super::live_monitor_ids(&display).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].as_str(), fake_monitor_id(0));
+
+        display.fail_with("session locked");
+        assert!(super::live_monitor_ids(&display).is_err());
+    }
+
     /// The exact boundary ADR 0018's per-machine cap is held to: exactly
     /// [`MAX_MONITORS_PER_MACHINE`] real monitors is a machine this build
     /// can fully describe, not one to refuse.
@@ -802,6 +1222,7 @@ mod tests {
                 height: 1024,
             },
             scale_percent: 100,
+            label: None,
         });
         assert!(writer.set_monitors(with_second));
 
@@ -882,6 +1303,58 @@ mod tests {
             "the state file never picked up the display change within {deadline:?}"
         );
         assert!(stray_files(&sandbox.0).is_empty());
+    }
+
+    /// The flap, end to end through the real poll: a label sweep failing
+    /// and recovering across several ticks must not wake the hub even
+    /// once, because waking the hub is what puts a `MonitorTopology` on
+    /// the wire. The writer's own gate is unit-tested above; this is the
+    /// path that would have leaked a frame per second.
+    #[tokio::test]
+    async fn a_flapping_label_never_wakes_the_layout_sync_hub() {
+        use crossover_platform::MonitorDescription;
+
+        let sandbox = Sandbox::new("flap-quiet");
+        let path = sandbox.path("topology.json");
+        let display = Arc::new(display(1920, 1080));
+        let described = |label: Option<&str>| MonitorDescription {
+            info: monitor_at(0, 0),
+            label: label.map(str::to_owned),
+        };
+
+        display.set_monitor_descriptions(vec![described(Some("DELL U2720Q"))]);
+        let state = initial_state(LOCAL, "workstation".to_owned(), &*display, None);
+        let writer = Arc::new(TopologyStateWriter::start(path, state));
+
+        let display_dyn: Arc<dyn DisplayInfo> = display.clone();
+        let (topology_tx, mut topology_rx) = tokio::sync::mpsc::channel(8);
+        let poll = tokio::spawn(watch_own_display(
+            display_dyn,
+            Arc::clone(&writer),
+            topology_tx,
+        ));
+
+        // Several poll intervals of the sweep failing, recovering, and
+        // failing again — the shape an RDP session or a locking screen
+        // actually produces.
+        for labelled in [false, true, false] {
+            display.set_monitor_descriptions(vec![described(labelled.then_some("DELL U2720Q"))]);
+            tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        }
+
+        poll.abort();
+        assert!(
+            topology_rx.try_recv().is_err(),
+            "a flapping caption woke the hub, which puts a MonitorTopology on the wire"
+        );
+        assert_eq!(
+            writer.snapshot().local.monitors[0]
+                .label
+                .as_ref()
+                .map(crossover_topology::MonitorLabel::as_str),
+            Some("DELL U2720Q"),
+            "the caption did not survive the flap"
+        );
     }
 
     /// A transient enumeration failure — a session lock, RDP, a display
@@ -988,6 +1461,7 @@ mod tests {
                 height: 1024,
             },
             scale_percent: 100,
+            label: None,
         });
         assert!(writer.set_monitors(with_second.clone()));
 

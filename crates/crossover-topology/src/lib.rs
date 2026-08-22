@@ -71,7 +71,10 @@ pub use layout::{
     MAX_MONITOR_EXTENT, MAX_MONITORS_PER_MACHINE, MAX_SCALE_PERCENT, MIN_SCALE_PERCENT, MonitorKey,
     PlacedMonitor, RawPlacedMonitor, check_structure,
 };
-pub use monitor::{MAX_MONITOR_ID_BYTES, MonitorId, MonitorIdError, validate_monitor_id};
+pub use monitor::{
+    FORMAT_CHARACTERS, MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MonitorId, MonitorIdError,
+    MonitorLabel, MonitorLabelError, validate_monitor_id, validate_monitor_label,
+};
 
 #[cfg(any(test, feature = "config"))]
 pub use atomic_write::{AtomicWriteError, temp_path, write_atomic};

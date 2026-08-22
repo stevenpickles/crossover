@@ -2,6 +2,9 @@
 //! `MonitorTopology` and `LayoutSync`, both CONTROL class, both base
 //! protocol at v4 — no feature bit, because a v3 peer is already excluded
 //! at `Hello` by the `entry` shape change ([`crate::control`]).
+//! `MonitorReport::label` arrives at v5, which raised the floor again for
+//! the same reason: no bit gates this message, so its extra `Option` byte
+//! is on the wire whatever either side wants ([`crate::version`]).
 //!
 //! `MonitorTopology` states a fact about the sender: its own live
 //! monitors, in its own local coordinates. `LayoutSync` states the drawn
@@ -19,6 +22,15 @@
 //!   constructor that cannot exist unvalidated, so a decoded id is already
 //!   printable ASCII within [`crossover_topology::MAX_MONITOR_ID_BYTES`]
 //!   bytes with no check of our own to write.
+//! - A monitor label is [`crossover_topology::MonitorLabel`], the same
+//!   pattern for a different rule: at most
+//!   [`crossover_topology::MAX_MONITOR_LABEL_BYTES`] bytes of UTF-8 with no
+//!   control, bidirectional, or invisible format characters
+//!   ([`crossover_topology::FORMAT_CHARACTERS`]). On the wire such a label
+//!   is **rejected, never truncated or scrubbed** — a repairing decoder
+//!   would let a peer decide how much of a frame this side believes, and
+//!   the invisible-character rule in particular is defending the editor's
+//!   duplicate-caption logic rather than merely tidying text.
 //! - A device identity is [`crossover_topology::DeviceId`] — sixteen raw
 //!   bytes, postcard-encoded with **no length prefix** (unlike
 //!   `uuid::Uuid`'s length-prefixed form). The goldens below pin this
@@ -68,7 +80,8 @@ use serde::{Deserialize, Serialize};
 
 use crossover_topology::{DeviceId, LayoutRect, MonitorId, PlacedMonitor, bounded_seq};
 pub use crossover_topology::{
-    MAX_LAYOUT_MONITORS, MAX_MONITORS_PER_MACHINE, MAX_SCALE_PERCENT, MIN_SCALE_PERCENT,
+    MAX_LAYOUT_MONITORS, MAX_MONITOR_LABEL_BYTES, MAX_MONITORS_PER_MACHINE, MAX_SCALE_PERCENT,
+    MIN_SCALE_PERCENT,
 };
 
 use crate::ProtocolError;
@@ -104,11 +117,32 @@ pub struct MonitorReport {
     /// the editor's DIP sizing only — it never enters crossing mapping,
     /// which stays proportional through the drawn geometry (ADR 0018).
     pub scale_percent: u16,
+    /// The sender's human-readable name for this monitor — its EDID
+    /// product name — where the sender's platform could read one
+    /// (ADR 0018, amended 2026-08-21).
+    ///
+    /// **Display only, never identity.** The receiver's editor captions
+    /// the rectangle with it and nothing else consults it: the monitor is
+    /// addressed by [`MonitorReport::id`] here as everywhere else. It is
+    /// optional because a platform may have no name to give, and it is
+    /// *not* unique — two identical screens on one desk report the same
+    /// label, which is legal and is the editor's to disambiguate.
+    ///
+    /// Validated by construction ([`crossover_topology::MonitorLabel`]),
+    /// so a decoded label is already inside its byte bound and free of
+    /// control characters, exactly as a decoded id is.
+    pub label: Option<crossover_topology::MonitorLabel>,
 }
 
 impl MonitorReport {
     /// Semantic validation: the rectangle satisfies
     /// [`LayoutRect::check_bounds`], and `scale_percent` is within range.
+    ///
+    /// `id` and `label` are absent from this function on purpose: both are
+    /// smart constructors that cannot hold an invalid value, so their rules
+    /// are enforced by the type on encode and by its `Deserialize` on
+    /// decode. There is nothing left here for a re-check to catch, and a
+    /// duplicated rule is a rule that can drift.
     ///
     /// # Errors
     ///
@@ -323,11 +357,11 @@ impl LayoutSync {
 
 #[cfg(test)]
 mod tests {
-    use crossover_topology::{DeviceId, LayoutRect, MonitorId, PlacedMonitor};
+    use crossover_topology::{DeviceId, LayoutRect, MonitorId, MonitorLabel, PlacedMonitor};
 
     use super::{
-        LayoutSync, MAX_LAYOUT_MONITORS, MAX_MONITORS_PER_MACHINE, MAX_SCALE_PERCENT,
-        MIN_SCALE_PERCENT, MonitorReport, MonitorTopology,
+        LayoutSync, MAX_LAYOUT_MONITORS, MAX_MONITOR_LABEL_BYTES, MAX_MONITORS_PER_MACHINE,
+        MAX_SCALE_PERCENT, MIN_SCALE_PERCENT, MonitorReport, MonitorTopology,
     };
     use crate::ProtocolError;
     use crate::hello::MessageType;
@@ -350,6 +384,14 @@ mod tests {
             id: MonitorId::new(id).unwrap(),
             rect: rect(x, y, width, height),
             scale_percent: scale,
+            label: None,
+        }
+    }
+
+    fn labelled(report: MonitorReport, label: &str) -> MonitorReport {
+        MonitorReport {
+            label: Some(MonitorLabel::new(label).unwrap()),
+            ..report
         }
     }
 
@@ -402,6 +444,36 @@ mod tests {
             MonitorTopology {
                 monitors: vec![report("B", 0, 0, 100, 100, MAX_SCALE_PERCENT)],
             },
+            // Labels: present, absent, and — legally — repeated. A label
+            // is display-only and never a key, so two screens sharing one
+            // is a valid report, unlike two screens sharing an id.
+            MonitorTopology {
+                monitors: vec![labelled(
+                    report(r"\\.\DISPLAY1", 0, 0, 1920, 1080, 100),
+                    "DELL U2720Q",
+                )],
+            },
+            MonitorTopology {
+                monitors: vec![
+                    labelled(report("A", 0, 0, 100, 100, 100), "DELL U2720Q"),
+                    labelled(report("B", 200, 0, 100, 100, 100), "DELL U2720Q"),
+                    report("C", 400, 0, 100, 100, 100),
+                ],
+            },
+            // A non-ASCII product name, which an id could never be.
+            MonitorTopology {
+                monitors: vec![labelled(
+                    report("A", 0, 0, 100, 100, 100),
+                    "LG \u{30E2}\u{30CB}\u{30BF}\u{30FC}",
+                )],
+            },
+            // The label bound itself, exactly.
+            MonitorTopology {
+                monitors: vec![labelled(
+                    report("A", 0, 0, 100, 100, 100),
+                    &"x".repeat(MAX_MONITOR_LABEL_BYTES),
+                )],
+            },
         ] {
             let encoded = topology.encode_payload().unwrap();
             assert_eq!(MonitorTopology::decode_payload(&encoded).unwrap(), topology);
@@ -442,7 +514,11 @@ mod tests {
     // string); `Vec<T>` as a LEB128 element count then the elements; and
     // `DeviceId` as sixteen **raw bytes with no length prefix** — the
     // documented difference from `uuid::Uuid`'s length-prefixed form,
-    // pinned here on purpose.
+    // pinned here on purpose. An `Option<T>` is a single discriminant byte
+    // — `0x00` for `None`, `0x01` then `T` for `Some` — which is exactly
+    // the byte that made `label` a protocol version bump (v4 → v5): it
+    // rides every monitor of every report, whether or not anyone has a
+    // name to put in it.
 
     #[test]
     fn golden_monitor_topology_single_monitor() {
@@ -459,6 +535,7 @@ mod tests {
                 0x80, 0x0F, // width: 1920 (LEB128)
                 0xB8, 0x08, // height: 1080 (LEB128)
                 0x64, // scale_percent: 100
+                0x00, // label: None
             ],
             "MonitorTopology wire layout changed: bump the protocol version"
         );
@@ -482,13 +559,42 @@ mod tests {
                 0x64, // width: 100
                 0x64, // height: 100
                 0x19, // scale_percent: 25 (MIN_SCALE_PERCENT)
+                0x00, // label: None
                 0x02, b'B', b'B', // id: "BB"
                 0x02, // x: 1 (zigzag: 1 -> 2)
                 0x01, // y: -1 (zigzag: -1 -> 1)
                 0xC8, 0x01, // width: 200
                 0xAC, 0x02, // height: 300
                 0xF4, 0x03, // scale_percent: 500 (MAX_SCALE_PERCENT), LEB128
+                0x00, // label: None
             ],
+            "MonitorTopology wire layout changed: bump the protocol version"
+        );
+    }
+
+    /// The `Some` half of the same field, so the golden pins both arms of
+    /// the discriminant rather than only the one every pre-label build
+    /// would also have produced.
+    #[test]
+    fn golden_monitor_topology_labelled_monitor() {
+        let topology = MonitorTopology {
+            monitors: vec![labelled(report("A", 0, 0, 100, 100, 100), "DELL U2720Q")],
+        };
+        let mut expected = vec![
+            0x01, // monitors: 1 element
+            0x01, b'A', // id: "A"
+            0x00, // x: 0
+            0x00, // y: 0
+            0x64, // width: 100
+            0x64, // height: 100
+            0x64, // scale_percent: 100
+            0x01, // label: Some
+            0x0B, // label length: 11 bytes
+        ];
+        expected.extend_from_slice(b"DELL U2720Q");
+        assert_eq!(
+            topology.encode_payload().unwrap(),
+            expected,
             "MonitorTopology wire layout changed: bump the protocol version"
         );
     }
@@ -813,6 +919,172 @@ mod tests {
         );
     }
 
+    /// A label is display-only, so an id repeating is still fatal and a
+    /// *label* repeating is not — the asymmetry the type exists for.
+    #[test]
+    fn a_repeated_label_is_accepted_where_a_repeated_id_is_not() {
+        assert!(
+            MonitorTopology {
+                monitors: vec![
+                    labelled(report("A", 0, 0, 100, 100, 100), "DELL U2720Q"),
+                    labelled(report("B", 200, 0, 100, 100, 100), "DELL U2720Q"),
+                ],
+            }
+            .encode_payload()
+            .is_ok(),
+            "two identical screens on one desk is an ordinary desk"
+        );
+    }
+
+    /// The label bound and one byte past it, decoded from bytes a peer
+    /// could actually send. The type makes an over-long label
+    /// unconstructable locally, so this builds the payload by hand — which
+    /// is the case that matters: a hostile or buggy peer skipping its own
+    /// validation.
+    #[test]
+    fn an_oversized_label_is_rejected_on_decode() {
+        for (bytes, admitted) in [
+            (MAX_MONITOR_LABEL_BYTES, true),
+            (MAX_MONITOR_LABEL_BYTES + 1, false),
+        ] {
+            let payload = topology_bytes_with_label(&"x".repeat(bytes));
+            assert_eq!(
+                MonitorTopology::decode_payload(&payload).is_ok(),
+                admitted,
+                "a {bytes}-byte label was handled wrong"
+            );
+        }
+    }
+
+    /// The label rule's other half, on the decode path: a character that
+    /// renders as nothing, or that reorders what renders around it.
+    ///
+    /// This is the one label rejection with a *behavioural* reason rather
+    /// than a hygienic one. The editor decides "two screens share a name"
+    /// by string equality, so `DELL\u{200B} U2720Q` beside `DELL U2720Q`
+    /// would render two identical captions that compare unequal — neither
+    /// suffixed, and the user unable to tell the rectangles apart, which is
+    /// exactly what labels were added to fix. A peer can send it, so the
+    /// decoder refuses it.
+    #[test]
+    fn invisible_and_reordering_labels_are_rejected_on_decode() {
+        for label in [
+            "DELL\u{200B} U2720Q", // zero-width space: forges a duplicate
+            "DELL\u{202E}U2720Q",  // right-to-left override: forges a rendering
+            "DELL\u{FEFF}U2720Q",  // byte order mark
+            "DELL\u{2069}U2720Q",  // pop directional isolate
+        ] {
+            assert!(
+                matches!(
+                    MonitorTopology::decode_payload(&topology_bytes_with_label(label)),
+                    Err(ProtocolError::Malformed { .. })
+                ),
+                "an invisible or reordering label survived the decoder: {label:?}"
+            );
+        }
+
+        // And the ordinary non-ASCII name it must not catch by accident.
+        assert!(
+            MonitorTopology::decode_payload(&topology_bytes_with_label(
+                "LG \u{30E2}\u{30CB}\u{30BF}\u{30FC}"
+            ))
+            .is_ok(),
+            "a legitimate non-ASCII product name was refused"
+        );
+    }
+
+    /// Control characters and invalid UTF-8, both rejected rather than
+    /// repaired: a caption that carries a newline or a replacement
+    /// character misrepresents the screen it names.
+    #[test]
+    fn control_characters_and_invalid_utf8_labels_are_rejected() {
+        for label in ["DELL\nU2720Q", "DELL\u{0}U2720Q", "\u{1B}[31mDELL"] {
+            assert!(
+                matches!(
+                    MonitorTopology::decode_payload(&topology_bytes_with_label(label)),
+                    Err(ProtocolError::Malformed { .. })
+                ),
+                "a control character survived the decoder: {label:?}"
+            );
+        }
+
+        // Invalid UTF-8 in the label's bytes: 0xFF is not a legal lead
+        // byte in any sequence.
+        let mut payload = topology_bytes_with_label("AB");
+        let last = payload.len() - 1;
+        payload[last] = 0xFF;
+        assert!(matches!(
+            MonitorTopology::decode_payload(&payload),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Trailing bytes after a labelled monitor — the strict-decode rule,
+    /// exercised on the shape that actually grew a field.
+    #[test]
+    fn trailing_bytes_after_a_label_are_rejected() {
+        let mut payload = topology_bytes_with_label("DELL U2720Q");
+        payload.push(0xAA);
+        assert!(matches!(
+            MonitorTopology::decode_payload(&payload),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// A truncated label length, and a length claiming more bytes than the
+    /// payload holds: neither panics, both are malformed.
+    #[test]
+    fn a_lying_label_length_never_panics() {
+        let payload = topology_bytes_with_label("DELL U2720Q");
+        for cut in 0..payload.len() {
+            assert!(
+                matches!(
+                    MonitorTopology::decode_payload(&payload[..cut]),
+                    Err(ProtocolError::Malformed { .. })
+                ),
+                "truncation at {cut} bytes was not rejected"
+            );
+        }
+
+        // The length byte says 200 bytes follow; eleven do.
+        let mut lying = payload.clone();
+        let length_index = lying.len() - "DELL U2720Q".len() - 1;
+        lying[length_index] = 200;
+        assert!(matches!(
+            MonitorTopology::decode_payload(&lying),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// One `MonitorTopology` of one monitor, with `label` written as raw
+    /// bytes rather than through [`crossover_topology::MonitorLabel`] — the
+    /// only way to build a payload this build would refuse to *send*, which
+    /// is exactly what a peer skipping its own validation produces.
+    ///
+    /// `MonitorTopology` has one field, so postcard's positional encoding
+    /// makes its bytes identical to the bare list's; the label is `Some`
+    /// (`0x01`), a LEB128 byte length, then the bytes verbatim.
+    fn topology_bytes_with_label(label: &str) -> Vec<u8> {
+        let mut payload = vec![
+            0x01, // monitors: 1 element
+            0x01, b'A', // id: "A"
+            0x00, // x
+            0x00, // y
+            0x64, // width: 100
+            0x64, // height: 100
+            0x64, // scale_percent: 100
+            0x01, // label: Some
+        ];
+        let bytes = label.as_bytes();
+        assert!(
+            bytes.len() < 128,
+            "the fixture writes a single-byte LEB128 length"
+        );
+        payload.push(u8::try_from(bytes.len()).unwrap());
+        payload.extend_from_slice(bytes);
+        payload
+    }
+
     #[test]
     fn more_than_two_devices_is_rejected() {
         assert!(matches!(
@@ -925,6 +1197,20 @@ mod tests {
                     proptest::prop_assert!(
                         (MIN_SCALE_PERCENT..=MAX_SCALE_PERCENT).contains(&monitor.scale_percent)
                     );
+                    if let Some(label) = &monitor.label {
+                        proptest::prop_assert!(!label.as_str().is_empty());
+                        proptest::prop_assert!(label.as_str().len() <= MAX_MONITOR_LABEL_BYTES);
+                        proptest::prop_assert!(
+                            !label.as_str().chars().any(char::is_control)
+                        );
+                        let hides = label
+                            .as_str()
+                            .chars()
+                            .any(|character| {
+                                crossover_topology::FORMAT_CHARACTERS.contains(&character)
+                            });
+                        proptest::prop_assert!(!hides);
+                    }
                 }
             }
         }
