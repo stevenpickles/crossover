@@ -227,6 +227,26 @@ pub fn units_for_mm(millimetres: u32) -> u32 {
     bound(millimetres.saturating_mul(UNITS_PER_MM))
 }
 
+/// The whole millimetres a drawn extent reads as — [`units_for_mm`]'s
+/// inverse, rounded to the nearest millimetre and never to zero.
+///
+/// The **only** conversion back, used by the inspector to pre-fill its
+/// fields and by [`crate::model`] to decide whether a stated size is a
+/// change at all. One function because those two have to agree exactly: a
+/// size the panel shows as 263 mm must be a size that entering 263 mm draws
+/// nothing new for, or pressing Apply on untouched fields would nudge the
+/// geometry and dirty the scene.
+///
+/// Rounded rather than truncated because these are the numbers a user is
+/// shown and asked to correct: a 2389-unit rectangle is 597 mm to anyone
+/// looking at it, and offering 596 would invite a "correction" that moved
+/// it a quarter of a millimetre.
+#[must_use]
+pub const fn mm_for_units(units: u32) -> u32 {
+    let millimetres = (units + UNITS_PER_MM / 2) / UNITS_PER_MM;
+    if millimetres < 1 { 1 } else { millimetres }
+}
+
 /// The panel size to *draw from*, which is not simply the one the monitor
 /// reported: a size outside the shared plausible range
 /// (`crossover_topology::is_plausible_physical_size`) is treated exactly as
@@ -375,7 +395,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        MachineScale, UNITS_PER_MM, dip_size, measured_mm, median_mm_per_dip, units_for_mm,
+        MachineScale, UNITS_PER_MM, dip_size, measured_mm, median_mm_per_dip, mm_for_units,
+        units_for_mm,
     };
     use crossover_topology::{
         LayoutRect, LiveMonitor, MAX_MONITOR_EXTENT, MAX_PHYSICAL_SIZE_MM, MonitorId,
@@ -442,6 +463,34 @@ mod tests {
             MAX_MONITOR_EXTENT,
             "total, and bounded"
         );
+    }
+
+    /// The way back, which is what the inspector pre-fills its fields with
+    /// and what every "did this size change?" question is asked in. A
+    /// rectangle whose extent is not a whole number of millimetres — every
+    /// rectangle the DIP fallback seeds — must still read as the millimetre
+    /// it looks like, and re-stating that millimetre must not move it.
+    #[test]
+    fn a_drawn_extent_reads_as_the_millimetre_it_looks_like() {
+        assert_eq!(mm_for_units(597 * UNITS_PER_MM), 597);
+        assert_eq!(mm_for_units(2_389), 597, "2389/4 is 597.25");
+        assert_eq!(mm_for_units(2_390), 598, "and 597.5 rounds up");
+        assert_eq!(mm_for_units(0), 1, "never zero");
+        assert_eq!(mm_for_units(1), 1);
+    }
+
+    proptest! {
+        /// Every extent reads as *some* millimetre, and converting that
+        /// millimetre back lands within half a millimetre of where it
+        /// started — the round trip the no-op test in `crate::model`
+        /// depends on being stable rather than merely close.
+        #[test]
+        fn the_millimetre_round_trip_is_stable(units in 1u32..=MAX_MONITOR_EXTENT) {
+            let millimetres = mm_for_units(units);
+            let back = units_for_mm(millimetres);
+            prop_assert!(back.abs_diff(units) <= UNITS_PER_MM / 2 + 1, "{units} -> {millimetres} -> {back}");
+            prop_assert_eq!(mm_for_units(back), millimetres, "and it settles at once");
+        }
     }
 
     #[test]

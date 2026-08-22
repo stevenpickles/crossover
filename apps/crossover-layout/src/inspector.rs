@@ -48,7 +48,7 @@ use crossover_topology::{MAX_PLAUSIBLE_PHYSICAL_MM, MIN_PLAUSIBLE_PHYSICAL_MM, M
 
 use crate::caption;
 use crate::model::Model;
-use crate::seeding::UNITS_PER_MM;
+use crate::seeding;
 
 /// Everything the inspector says about one monitor, derived from the scene
 /// rather than stored: the sizes are read off the drawn rectangle every
@@ -70,9 +70,17 @@ pub struct MonitorFacts {
     /// Its live pixel size, or `None` for a monitor an arrangement places
     /// but the machine no longer reports.
     pub native_size: Option<(u32, u32)>,
-    /// The **drawn** size in millimetres — the rectangle divided by
-    /// [`UNITS_PER_MM`], which is what the fields are pre-filled with.
+    /// The **drawn** size in millimetres — the rectangle through
+    /// [`crate::seeding::mm_for_units`], which is what the fields are
+    /// pre-filled with, and the granularity every question about whether a
+    /// size *changed* is asked at.
     pub drawn_mm: (u32, u32),
+    /// The drawn rectangle itself, in layout units — carried so the aspect
+    /// lock can fill one field from the other at the proportion actually on
+    /// screen rather than at the proportion of the two rounded millimetre
+    /// figures beside it. Rounding the ratio's inputs once per correction is
+    /// how a 16:9 screen slowly becomes a 1.775:1 one over a few of them.
+    pub drawn_units: (u32, u32),
     /// What the machine says the panel measures, where it says anything
     /// believable ([`crate::model::DrawnMonitor::detected_size_mm`]).
     pub detected_mm: Option<(u32, u32)>,
@@ -93,19 +101,6 @@ impl MonitorFacts {
     }
 }
 
-/// The size of one drawn rectangle in millimetres — the inverse of
-/// [`crate::seeding::units_for_mm`], rounded to the nearest whole
-/// millimetre and never to zero.
-///
-/// Rounded rather than truncated because these two numbers are what the
-/// user is shown and asked to correct: a 2389-unit rectangle is 597 mm to
-/// anyone looking at it, and offering 596 would invite a "correction" that
-/// only moved it a quarter of a millimetre.
-#[must_use]
-fn millimetres(units: u32) -> u32 {
-    ((units + UNITS_PER_MM / 2) / UNITS_PER_MM).max(1)
-}
-
 /// What the inspector says about `target`, or `None` when the scene no
 /// longer draws it.
 #[must_use]
@@ -124,9 +119,10 @@ pub fn facts(model: &Model, target: &MonitorKey) -> Option<MonitorFacts> {
         ordinal: monitor.ordinal,
         native_size: monitor.native_size,
         drawn_mm: (
-            millimetres(monitor.rect.width),
-            millimetres(monitor.rect.height),
+            seeding::mm_for_units(monitor.rect.width),
+            seeding::mm_for_units(monitor.rect.height),
         ),
+        drawn_units: (monitor.rect.width, monitor.rect.height),
         detected_mm: monitor.detected_size_mm,
         estimated: monitor.size_estimated,
     })
@@ -184,9 +180,10 @@ pub struct Inspector {
     /// both edges, and a lock that has to be switched on is a lock nobody
     /// discovers.
     lock_aspect: bool,
-    /// The aspect the lock fills by — width ÷ height of the rectangle the
-    /// fields were filled from, so it follows the drawing rather than
-    /// whatever half-typed pair is in the fields.
+    /// The aspect the lock fills by — width ÷ height of the **rectangle**
+    /// the fields were last filled from, so it follows the drawing rather
+    /// than whatever half-typed pair is in the fields, and does not drift
+    /// through the rounding on the way to and from them.
     aspect: f64,
     /// The last thing said about an entry, until the selection moves.
     message: Option<Message>,
@@ -247,7 +244,7 @@ impl Inspector {
             self.filled_from = facts.drawn_mm;
             self.width = facts.drawn_mm.0.to_string();
             self.height = facts.drawn_mm.1.to_string();
-            self.aspect = aspect_of(facts.drawn_mm);
+            self.aspect = aspect_of(facts.drawn_units);
         }
     }
 
@@ -365,13 +362,15 @@ impl Inspector {
     }
 }
 
-/// The aspect the lock fills by, defended against the degenerate pair no
-/// drawn rectangle actually has (both axes are at least 1 mm).
-fn aspect_of((width_mm, height_mm): (u32, u32)) -> f64 {
-    if width_mm == 0 || height_mm == 0 {
+/// The aspect the lock fills by, taken from the **drawn rectangle** rather
+/// than from the millimetres shown beside it — see
+/// [`MonitorFacts::drawn_units`] — and defended against the degenerate pair
+/// no drawn rectangle actually has (every extent is at least 1).
+fn aspect_of((width, height): (u32, u32)) -> f64 {
+    if width == 0 || height == 0 {
         return 1.0;
     }
-    f64::from(width_mm) / f64::from(height_mm)
+    f64::from(width) / f64::from(height)
 }
 
 /// `value` millimetres through `ratio`, rounded, never zero, and never past
@@ -423,7 +422,7 @@ impl Inspector {
 
 #[cfg(test)]
 mod tests {
-    use super::{Inspector, Request, facts, millimetres};
+    use super::{Inspector, Request, facts};
     use crate::model::Model;
     use crate::seeding::UNITS_PER_MM;
     use crate::test_support::{
@@ -474,16 +473,6 @@ mod tests {
         assert_eq!(facts.native_size, Some((1920, 1080)), "the pixels, too");
         assert!(!facts.estimated);
         assert!(!facts.resettable(), "it is already drawn at its own size");
-    }
-
-    /// The rounding a user is shown: a rectangle is quarter-millimetres, and
-    /// the number offered for correction is the millimetre it reads as.
-    #[test]
-    fn a_drawn_rectangle_reads_as_whole_millimetres() {
-        assert_eq!(millimetres(597 * UNITS_PER_MM), 597);
-        assert_eq!(millimetres(2_389), 597, "2389/4 is 597.25");
-        assert_eq!(millimetres(2_390), 598, "and 597.5 rounds up");
-        assert_eq!(millimetres(1), 1, "never zero");
     }
 
     /// The headline gesture: type the real size of a screen the machine got
@@ -680,10 +669,57 @@ mod tests {
         assert!(inspector.width.is_empty());
     }
 
-    /// Re-stating the size a rectangle already has is not an edit: it draws
-    /// the same thing, so it does not light the Save button.
+    /// **Apply on untouched fields must do nothing.** The fields hold whole
+    /// millimetres and a drawn rectangle is quarter-millimetres, so a
+    /// rectangle whose extent is not a multiple of four — every rectangle
+    /// the DIP fallback seeds — does not survive a round trip through them
+    /// unless "already drawn at that size" is asked in *millimetres*. Asked
+    /// in units it would answer no, and an accidental Enter would nudge the
+    /// geometry, dirty the scene, shift the row, and pin the unconditional
+    /// transplant hold on a size the user never stated.
     #[test]
-    fn re_entering_the_same_size_changes_nothing() {
+    fn pressing_apply_on_untouched_fields_changes_nothing() {
+        // 1366 units wide reads as 341.5 mm, which the field rounds to 342
+        // and converts back to 1368. Nothing anywhere is measured, so this
+        // is the plain DIP seeding and the rectangle is the pixel count.
+        let mut state = document(Some(peer_state(true)), 0);
+        state.local.monitors = vec![LiveMonitor {
+            rect: crossover_topology::LayoutRect {
+                x: 0,
+                y: 0,
+                width: 1366,
+                height: 768,
+            },
+            ..live_monitor(r"\\.\DISPLAY1")
+        }];
+        let mut model = Model::from_state(&state);
+        select(&mut model, r"\\.\DISPLAY1");
+        let mut inspector = inspecting(&model);
+        assert_eq!(inspector.width, "342", "the millimetre it reads as");
+
+        inspector.act(&mut model, Request::Apply);
+
+        let (_, drawn) = model
+            .find(&monitor_key(LOCAL_DEVICE, r"\\.\DISPLAY1"))
+            .unwrap();
+        assert_eq!(drawn.rect.width, 1366, "the rectangle did not move");
+        assert!(!drawn.size_edited, "and nothing was pinned as stated");
+        assert!(!model.is_dirty(), "and the Save button did not light");
+        assert_eq!(
+            inspector.message().map(|message| message.text.as_str()),
+            Some("Already drawn at that size.")
+        );
+
+        // A millimetre either way *is* expressible, and does change it.
+        inspector.typed("343", "192");
+        inspector.act(&mut model, Request::Apply);
+        assert!(model.is_dirty());
+    }
+
+    /// The same rule where the extent came from a *saved* arrangement,
+    /// which is the other way a rectangle acquires a size nobody typed.
+    #[test]
+    fn re_entering_a_saved_rectangles_own_size_changes_nothing() {
         let mut model = Model::from_state(&arranged_document(0));
         select(&mut model, r"\\.\DISPLAY1");
         let mut inspector = inspecting(&model);

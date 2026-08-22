@@ -854,6 +854,15 @@ impl Model {
     /// stating the size of an *estimated* one does, because it replaces a
     /// guess with the user's own statement and clears the badge that said
     /// so.
+    ///
+    /// "Already has" is decided in **millimetres**, not in units
+    /// ([`seeding::mm_for_units`]): the fields the user is typing into hold
+    /// whole millimetres, so a rectangle whose extent is not a multiple of
+    /// [`seeding::UNITS_PER_MM`] — every rectangle the DIP fallback seeds —
+    /// would otherwise fail to round-trip, and Apply on *untouched* fields
+    /// would nudge the geometry, dirty the scene, re-pack the row and pin
+    /// the transplant hold. A difference the fields cannot express is not a
+    /// difference the user asked for.
     pub fn set_size_mm(&mut self, target: &MonitorKey, width_mm: u32, height_mm: u32) -> bool {
         let plausible = |millimetres: u32| {
             millimetres.clamp(
@@ -861,13 +870,7 @@ impl Model {
                 u32::from(crossover_topology::MAX_PLAUSIBLE_PHYSICAL_MM),
             )
         };
-        self.resize(
-            target,
-            (
-                seeding::units_for_mm(plausible(width_mm)),
-                seeding::units_for_mm(plausible(height_mm)),
-            ),
-        )
+        self.resize(target, (plausible(width_mm), plausible(height_mm)))
     }
 
     /// Draw `target` at the size its own machine says the panel measures —
@@ -878,56 +881,48 @@ impl Model {
     /// Does nothing, and reports `false`, when there is no believable
     /// detected size to go back to ([`DrawnMonitor::detected_size_mm`]) or
     /// when the rectangle is already drawn at it — which is exactly the
-    /// condition the inspector disables the control on, so the two agree by
-    /// construction rather than by two copies of a rule.
+    /// condition the inspector disables the control on, and *the same
+    /// comparison*: both sides ask whether the drawn rectangle reads as the
+    /// detected millimetres ([`seeding::mm_for_units`]), so an enabled
+    /// button cannot be one that does nothing.
     pub fn reset_to_detected_size(&mut self, target: &MonitorKey) -> bool {
         let Some((_, monitor)) = self.find(target) else {
             return false;
         };
-        let Some((width_mm, height_mm)) = monitor.detected_size_mm else {
+        let Some(detected) = monitor.detected_size_mm else {
             return false;
         };
-        self.resize(
-            target,
-            (
-                seeding::units_for_mm(width_mm),
-                seeding::units_for_mm(height_mm),
-            ),
-        )
+        self.resize(target, detected)
     }
 
     /// The one place a monitor's drawn extent changes: set it, clear the
-    /// badge, mark the size as the user's, re-pack its machine so the seam
-    /// beside it does not open, and re-validate.
-    ///
-    /// Re-packing is the seeder's own left-to-right abutment
-    /// ([`repack_group`]), not a second rule: a machine's monitors touch
-    /// because each x is derived from the width actually drawn, so a width
-    /// that changes has to be followed by the same derivation or the model
-    /// — whose abutment tolerance is zero (ADR 0018) — sees a gap where the
-    /// user sees a seam.
-    fn resize(&mut self, target: &MonitorKey, size: (u32, u32)) -> bool {
+    /// badge, mark the size as the user's, close the seam its neighbours
+    /// were holding, and re-validate. Takes **millimetres**, so the no-op
+    /// test is the one the fields can express (see [`Model::set_size_mm`]).
+    fn resize(&mut self, target: &MonitorKey, size_mm: (u32, u32)) -> bool {
         let Some(group) = self.group_mut(target.device) else {
             return false;
         };
-        let Some(monitor) = group
+        let Some(index) = group
             .monitors
-            .iter_mut()
-            .find(|drawn| drawn.id == target.id)
+            .iter()
+            .position(|drawn| drawn.id == target.id)
         else {
             return false;
         };
-        if (monitor.rect.width, monitor.rect.height) == size && !monitor.size_estimated {
+        let monitor = &mut group.monitors[index];
+        if drawn_mm(monitor) == size_mm && !monitor.size_estimated {
             return false;
         }
-        monitor.rect.width = size.0;
-        monitor.rect.height = size.1;
+        let before = monitor.rect;
+        monitor.rect.width = seeding::units_for_mm(size_mm.0);
+        monitor.rect.height = seeding::units_for_mm(size_mm.1);
         // The user has said how big this screen is, so it is no longer one
         // of the rectangles the canvas hedges about (ADR 0018's badge marks
         // a *guess*, and this is a statement).
         monitor.size_estimated = false;
         monitor.size_edited = true;
-        repack_group(group);
+        close_the_seam(group, index, before);
         self.dirty = true;
         self.diagnostics = self.compute_diagnostics();
         true
@@ -1436,14 +1431,14 @@ fn seed_monitors(
 /// **abutting** from `start_x` in the order given: each one begins exactly
 /// where the last one ended.
 ///
-/// Abutment is a property of this one line of arithmetic — `x +=
-/// width` — and it is shared rather than repeated because two callers now
-/// depend on it meaning the same thing: [`seed_monitors`], which packs a
-/// machine the first time it is drawn, and [`repack_group`], which packs it
-/// again after the user has corrected one rectangle's size. A seam the user
-/// can see must be a seam the layout model sees too, and the model's
-/// abutment test has zero tolerance (ADR 0018), so a re-pack that was a
-/// unit out would silently stop a crossing working.
+/// Abutment is a property of this one line of arithmetic — `x += width` —
+/// and it is named rather than left inline because it is the invariant
+/// [`close_the_seam`] then has to *preserve* when the user corrects a size.
+/// It preserves it by translating the row's followers rather than by
+/// running this again, which is the stronger guarantee: a translation
+/// cannot disturb an abutment it did not establish. A seam the user can see
+/// must be a seam the layout model sees too, and the model's abutment test
+/// has zero tolerance (ADR 0018).
 ///
 /// Total: `clamp_coordinate` holds an adversarially wide row inside the
 /// layout coordinate space, at the cost of the abutment it would not have
@@ -1460,54 +1455,84 @@ fn abutting_lefts(start_x: i64, widths: impl Iterator<Item = u32>) -> Vec<i32> {
         .collect()
 }
 
-/// Re-pack `group` so its monitors abut left to right again, in the order
-/// they are currently drawn in, from wherever the group currently starts.
+/// Close the seam a size change opened: after `group`'s monitor at `index`
+/// was redrawn from `before`, slide the rectangles that were **following it
+/// in its own row** by the width delta, and touch nothing else.
 ///
-/// Called after a size correction, and only then: a *drag* moves the whole
-/// group rigidly and cannot open a seam, while a width that changes leaves
-/// every rectangle to its right where it was — a gap on one side or an
-/// overlap on the other, neither of which the user asked for.
+/// Called after a size correction and only then. A *drag* moves a whole
+/// group rigidly and cannot open a seam; a width that changes leaves
+/// everything to its right where it was, which is a gap on one side or an
+/// overlap on the other — neither of which the user asked for, and the
+/// model's abutment tolerance is zero (ADR 0018), so a gap of one unit is a
+/// crossing that silently stops working.
 ///
-/// Three deliberate choices about what is preserved:
+/// # Why a row and not the whole machine
 ///
-/// - **The order is the drawn one**, taken from the current left edges
-///   rather than from the group's vector order (which is live-geometry
-///   order for a seed and id order for a saved arrangement). What the user
-///   is looking at is the arrangement; re-packing must not permute it.
-/// - **The anchor is the group's own leftmost edge**, so a machine the user
-///   has already dragged into place does not jump back to where it was
-///   seeded.
-/// - **Every rectangle keeps its own `y`.** The packing axis is horizontal;
-///   a vertical offset in a saved arrangement is the user's and is none of
-///   this function's business.
-fn repack_group(group: &mut MachineGroup) {
-    let Some(start_x) = group
-        .monitors
-        .iter()
-        .map(|monitor| monitor.rect.left())
-        .min()
-    else {
+/// A machine's group is not always one row. [`authoritative_group`] seeds a
+/// live monitor the saved arrangement does not name — the display plugged
+/// in after the layout was saved — on a *second* row below the placed ones,
+/// and a saved arrangement may stack screens over and under deliberately.
+/// Re-packing the whole group into a single abutting row would then move
+/// rectangles the user never touched, flatten the second row into the
+/// first, and open a real gap in the placed row's seam — an arrangement
+/// that would be saved that way and that no gesture in this editor can
+/// undo, since groups drag rigidly and another correction re-packs it the
+/// same way.
+///
+/// Shifting one row's followers has none of that: it is a translation, so
+/// every abutment inside the row survives exactly, every rectangle outside
+/// it is bit-identical, and stating the old size again shifts them back —
+/// the operation is its own inverse.
+///
+/// # What it deliberately does not repair
+///
+/// A rectangle grown wide or tall enough can still collide with the
+/// **other machine's** group, or with the row below it. That is a blocking
+/// diagnostic with the offenders outlined, and it has a recovery: the two
+/// machines drag apart, and the size itself can simply be stated again
+/// smaller. Intra-machine breakage of the kind a whole-group re-pack
+/// caused has neither, which is the whole reason the row rule exists.
+///
+/// # Which rectangles are in the row
+///
+/// Those whose vertical interval overlaps the **union** of the resized
+/// monitor's old and new bands, and whose left edge is at or beyond where
+/// its right edge used to be. The union rather than either band alone
+/// because it is symmetric — the same set is chosen going back as coming —
+/// which is what makes the inverse exact when a correction changes the
+/// height as well as the width.
+fn close_the_seam(group: &mut MachineGroup, index: usize, before: LayoutRect) {
+    let after = group.monitors[index].rect;
+    let delta = i64::from(after.width) - i64::from(before.width);
+    if delta == 0 {
         return;
-    };
-    // Ordered by where each rectangle is drawn now, with the id as a final
-    // tie-break so two rectangles at the same point (which is not a legal
-    // arrangement, but is a reachable one) pack deterministically.
-    let mut order: Vec<usize> = (0..group.monitors.len()).collect();
-    order.sort_by(|&a, &b| {
-        let (first, second) = (&group.monitors[a], &group.monitors[b]);
-        (first.rect.x, first.rect.y, first.id.as_str()).cmp(&(
-            second.rect.x,
-            second.rect.y,
-            second.id.as_str(),
-        ))
-    });
-    let lefts = abutting_lefts(
-        start_x,
-        order.iter().map(|&index| group.monitors[index].rect.width),
-    );
-    for (slot, &index) in order.iter().enumerate() {
-        group.monitors[index].rect.x = lefts[slot];
     }
+    let band = (
+        before.top().min(after.top()),
+        before.bottom().max(after.bottom()),
+    );
+    let boundary = before.right();
+    for (position, monitor) in group.monitors.iter_mut().enumerate() {
+        if position == index {
+            continue;
+        }
+        let rect = monitor.rect;
+        let follows = rect.left() >= boundary;
+        let shares_the_row = rect.bottom() > band.0 && rect.top() < band.1;
+        if follows && shares_the_row {
+            monitor.rect.x = clamp_coordinate(rect.left() + delta);
+        }
+    }
+}
+
+/// One drawn rectangle's extent in the whole millimetres the inspector
+/// shows and edits — the granularity every "is this a change?" question
+/// about a size is asked at (see [`Model::set_size_mm`]).
+fn drawn_mm(monitor: &DrawnMonitor) -> (u32, u32) {
+    (
+        seeding::mm_for_units(monitor.rect.width),
+        seeding::mm_for_units(monitor.rect.height),
+    )
 }
 
 /// The bounding box of some already-drawn monitors, in `i64` — the
@@ -2839,86 +2864,267 @@ mod tests {
         assert_eq!(fresh.selected(), None);
     }
 
-    proptest! {
-        /// The re-pack's invariants, over any desk and any size a user
-        /// could state: a machine's rectangles still abut **exactly** (the
-        /// model's tolerance is zero), none of them overlap, the group has
-        /// not walked away from where it was, and the operation is total.
-        #[test]
-        fn a_stated_size_repacks_the_machine_without_opening_or_overlapping_a_seam(
-            local in any_machine("L"),
-            peer in any_machine("P"),
-            index in 0usize..6,
-            width_mm in 50u32..=3_000,
-            height_mm in 50u32..=3_000,
-        ) {
-            let document = state(local, peer, None);
-            let mut model = Model::from_state(&document);
-            let Some(target) = model
-                .local
-                .monitors
-                .get(index % model.local.monitors.len())
-                .map(|monitor| MonitorKey { device: LOCAL, id: monitor.id.clone() })
-            else {
-                return Ok(());
-            };
-            let anchor = model
+    /// A saved arrangement placing two of this machine's screens side by
+    /// side, plus a third screen that is live but not named by it — the
+    /// display plugged in after the layout was saved, which
+    /// [`authoritative_group`] draws on a **second row** below the placed
+    /// ones. The shape a whole-group re-pack destroys.
+    fn two_placed_and_one_docked() -> Model {
+        let pair = DevicePair::new(LOCAL, PEER).unwrap();
+        let layout = Layout::new(
+            5,
+            LOCAL,
+            vec![
+                placed(LOCAL, r"\\.\DISPLAY1", 0, 1920, 1080),
+                placed(LOCAL, r"\\.\DISPLAY3", 1920, 1920, 1080),
+                placed(PEER, r"\\.\DISPLAY1", 3840, 1920, 1080),
+            ],
+            &pair,
+        )
+        .unwrap();
+        Model::from_state(&state(
+            vec![
+                live(r"\\.\DISPLAY1", 0, 1920, 1080, 100),
+                live(r"\\.\DISPLAY2", 1920, 1920, 1080, 100),
+                live(r"\\.\DISPLAY3", 3840, 1920, 1080, 100),
+            ],
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            Some(LayoutState::from_layout(&layout)),
+        ))
+    }
+
+    /// **A size correction touches one row, not the whole machine.**
+    ///
+    /// The regression this is written against: re-packing every rectangle
+    /// of the machine into one abutting row moved a screen the user never
+    /// touched (the docked one, on its own row), flattened that row into
+    /// the placed one, and opened a real gap in the placed row's seam —
+    /// which would have been *saved* that way, with no gesture in this
+    /// editor able to undo it, since groups drag rigidly and another
+    /// correction re-packs identically.
+    #[test]
+    fn correcting_one_screen_leaves_the_machines_other_rows_untouched() {
+        let mut model = two_placed_and_one_docked();
+        let row_of = |model: &Model, id: &str| {
+            model
                 .local
                 .monitors
                 .iter()
-                .map(|monitor| monitor.rect.left())
-                .min();
+                .find(|monitor| monitor.id.as_str() == id)
+                .expect("drawn")
+                .rect
+        };
+        let docked_before = row_of(&model, r"\\.\DISPLAY2");
+        let peer_before = model.peer.clone();
+        assert!(
+            docked_before.top() > 1080,
+            "the fixture's docked screen is on its own row: {docked_before:?}"
+        );
+
+        // 400 × 270 mm is 1600 × 1080 units: 320 narrower than it was.
+        assert!(model.set_size_mm(&key(LOCAL, r"\\.\DISPLAY1"), 400, 270));
+
+        let first = row_of(&model, r"\\.\DISPLAY1");
+        let third = row_of(&model, r"\\.\DISPLAY3");
+        assert_eq!((first.x, first.width), (0, 1600));
+        assert_eq!(
+            first.right(),
+            third.left(),
+            "the seam in the corrected row closed: {first:?} {third:?}"
+        );
+        assert_eq!(
+            row_of(&model, r"\\.\DISPLAY2"),
+            docked_before,
+            "a screen on another row moved"
+        );
+        assert_eq!(model.peer, peer_before, "and so did the other machine");
+
+        // And it is its own inverse: stating the old size again — 1920
+        // units is exactly 480 mm — puts every rectangle back where it was.
+        // Only `size_edited` stays behind, and rightly: the user has now
+        // stated this size, and the poll must keep it whatever it equals.
+        let before = two_placed_and_one_docked();
+        assert!(model.set_size_mm(&key(LOCAL, r"\\.\DISPLAY1"), 480, 270));
+        let rects = |model: &Model| -> Vec<LayoutRect> {
+            model
+                .local
+                .monitors
+                .iter()
+                .map(|monitor| monitor.rect)
+                .collect()
+        };
+        assert_eq!(rects(&model), rects(&before));
+        assert!(model.local.monitors[0].size_edited);
+    }
+
+    /// One machine's rectangles as **rows**: each row abutting from `x = 0`
+    /// at its own `y`, far enough apart that no size a user could state can
+    /// bridge two of them. The geometry an authoritative arrangement and
+    /// its docked-monitor supplement produce, generated directly so a
+    /// property can range over shapes `Layout::new` would take a fixture to
+    /// express.
+    const ROW_STEP: i32 = 20_000;
+
+    fn rows_into(model: &mut Model, rows: &[Vec<u32>]) {
+        let mut index = 0;
+        for (row, widths) in rows.iter().enumerate() {
+            let mut x = 0;
+            for &width in widths {
+                let rect = &mut model.local.monitors[index].rect;
+                rect.x = x;
+                rect.y = i32::try_from(row).unwrap() * ROW_STEP;
+                rect.width = width;
+                rect.height = 1_000;
+                x += i32::try_from(width).unwrap();
+                index += 1;
+            }
+        }
+    }
+
+    fn any_rows() -> impl Strategy<Value = Vec<Vec<u32>>> {
+        proptest::collection::vec(proptest::collection::vec(200u32..=3_000, 1..=3), 1..=3)
+    }
+
+    /// A scene whose local machine is laid out as `rows`, with one live
+    /// monitor per rectangle.
+    fn scene_of_rows(rows: &[Vec<u32>]) -> Model {
+        let count: usize = rows.iter().map(Vec::len).sum();
+        let locals: Vec<LiveMonitor> = (0..count)
+            .map(|index| {
+                live(
+                    &format!("L{index}"),
+                    i32::try_from(index).unwrap() * 1_920,
+                    1_920,
+                    1_080,
+                    100,
+                )
+            })
+            .collect();
+        let mut model = Model::from_state(&state(
+            locals,
+            vec![live(r"\\.\P0", 0, 1920, 1080, 100)],
+            None,
+        ));
+        rows_into(&mut model, rows);
+        model
+    }
+
+    proptest! {
+        /// The correction's invariants, over multi-row machines — the shape
+        /// the docked-monitor supplement and a stacked saved arrangement
+        /// both produce, and the one a whole-group re-pack got wrong:
+        ///
+        /// - every rectangle **outside the corrected row is bit-identical**,
+        ///   and so is the other machine's whole group;
+        /// - the abutments **inside** that row are preserved exactly (the
+        ///   model's tolerance is zero);
+        /// - no two of the machine's rectangles overlap that did not
+        ///   before;
+        /// - every extent stays legal, whatever was stated (totality).
+        #[test]
+        fn correcting_a_size_preserves_every_row_but_the_corrected_one(
+            rows in any_rows(),
+            index in 0usize..9,
+            width_mm in 50u32..=3_000,
+            height_mm in 50u32..=3_000,
+        ) {
+            let mut model = scene_of_rows(&rows);
+            let count = model.local.monitors.len();
+            let chosen = index % count;
+            let target = MonitorKey {
+                device: LOCAL,
+                id: model.local.monitors[chosen].id.clone(),
+            };
+            let before: Vec<LayoutRect> =
+                model.local.monitors.iter().map(|monitor| monitor.rect).collect();
+            let peer_before = model.peer.clone();
+            let band = before[chosen].top();
 
             model.set_size_mm(&target, width_mm, height_mm);
 
-            let drawn: Vec<LayoutRect> =
+            let after: Vec<LayoutRect> =
                 model.local.monitors.iter().map(|monitor| monitor.rect).collect();
-            prop_assert_eq!(
-                drawn.iter().map(|rect| rect.left()).min(),
-                anchor,
-                "the machine moved: {:?}",
-                drawn
-            );
-            for pair in drawn.windows(2) {
+            prop_assert_eq!(&model.peer, &peer_before, "the other machine moved");
+
+            let in_row = |rect: &LayoutRect| rect.top() == band;
+            for (position, rect) in after.iter().enumerate() {
+                if !in_row(&before[position]) {
+                    prop_assert_eq!(
+                        *rect,
+                        before[position],
+                        "a rectangle on another row moved: {:?} -> {:?}",
+                        before,
+                        after
+                    );
+                }
+                prop_assert!((1..=MAX_MONITOR_EXTENT).contains(&rect.width));
+                prop_assert!((1..=MAX_MONITOR_EXTENT).contains(&rect.height));
+            }
+
+            // The corrected row, in drawn order: still abutting exactly.
+            let mut row: Vec<LayoutRect> =
+                after.iter().copied().filter(in_row).collect();
+            row.sort_by_key(|rect| rect.left());
+            for pair in row.windows(2) {
                 prop_assert_eq!(
                     pair[0].right(),
                     pair[1].left(),
-                    "a seam opened: {:?}",
-                    drawn
+                    "a seam opened in the corrected row: {:?}",
+                    row
                 );
             }
-            for (position, first) in drawn.iter().enumerate() {
-                prop_assert!((1..=MAX_MONITOR_EXTENT).contains(&first.width));
-                prop_assert!((1..=MAX_MONITOR_EXTENT).contains(&first.height));
-                for second in &drawn[position + 1..] {
-                    prop_assert!(!first.overlaps(*second), "{first:?} overlaps {second:?}");
+
+            for (position, first) in after.iter().enumerate() {
+                for second in &after[position + 1..] {
+                    prop_assert!(
+                        !first.overlaps(*second),
+                        "{first:?} overlaps {second:?} in {after:?}"
+                    );
                 }
             }
         }
 
-        /// Determinism: the same statement about the same scene draws the
-        /// same thing, and stating it twice changes nothing the second
-        /// time — a re-pack that drifted would walk a machine across the
-        /// canvas one correction at a time.
+        /// Determinism, idempotence, and reversibility: the same statement
+        /// draws the same thing, stating it twice changes nothing the
+        /// second time, and going away from a stated size and back to it
+        /// lands on exactly the same rectangles — a correction that drifted
+        /// would walk a machine across the canvas one keystroke at a time.
+        ///
+        /// Reversibility is stated *between two corrections* rather than
+        /// against the rectangle the scene was seeded with, because a
+        /// seeded extent need not be a whole number of millimetres (1366
+        /// units is 341.5 mm) and the fields cannot express where it was.
+        /// Every rectangle a correction produces is millimetre-aligned, so
+        /// from the first one on the round trip is exact — which is the
+        /// property a user actually relies on.
         #[test]
-        fn stating_a_size_is_deterministic_and_idempotent(
-            local in any_machine("L"),
-            width_mm in 50u32..=3_000,
-            height_mm in 50u32..=3_000,
+        fn correcting_a_size_is_deterministic_idempotent_and_reversible(
+            rows in any_rows(),
+            index in 0usize..9,
+            first in (50u32..=3_000, 50u32..=3_000),
+            second in (50u32..=3_000, 50u32..=3_000),
         ) {
-            let document = state(local, vec![live(r"\\.\P0", 0, 1920, 1080, 100)], None);
+            let mut once = scene_of_rows(&rows);
+            let chosen = index % once.local.monitors.len();
             let target = MonitorKey {
                 device: LOCAL,
-                id: Model::from_state(&document).local.monitors[0].id.clone(),
+                id: once.local.monitors[chosen].id.clone(),
+            };
+            let rects = |model: &Model| -> Vec<LayoutRect> {
+                model.local.monitors.iter().map(|monitor| monitor.rect).collect()
             };
 
-            let mut once = Model::from_state(&document);
-            once.set_size_mm(&target, width_mm, height_mm);
-            let mut twice = Model::from_state(&document);
-            twice.set_size_mm(&target, width_mm, height_mm);
-            twice.set_size_mm(&target, width_mm, height_mm);
+            once.set_size_mm(&target, first.0, first.1);
+            let stated = rects(&once);
 
+            let mut twice = scene_of_rows(&rows);
+            twice.set_size_mm(&target, first.0, first.1);
+            twice.set_size_mm(&target, first.0, first.1);
             prop_assert_eq!(&once.local.monitors, &twice.local.monitors);
+
+            once.set_size_mm(&target, second.0, second.1);
+            once.set_size_mm(&target, first.0, first.1);
+            prop_assert_eq!(rects(&once), stated, "the correction did not undo");
         }
 
         /// Rigidity under any drag at all: whatever the pointer does, the
