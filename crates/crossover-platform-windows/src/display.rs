@@ -9,19 +9,23 @@
 //! how much they lay over it: `monitors()` is pure geometry for the edge
 //! detector's hot path, `monitor_layout()` adds best-effort identity, so a
 //! monitor the OS declines to name is reported unnamed and never dropped,
-//! and `monitor_descriptions()` adds the EDID product name on top of that.
+//! and `monitor_descriptions()` adds the EDID product name and the panel's
+//! physical size on top of that.
 //!
-//! The product name is a **second sweep**, `QueryDisplayConfig` rather than
-//! `EnumDisplayMonitors`, because it is the only Win32 route to a monitor's
-//! EDID product name — usually the same string Windows Settings shows,
-//! though Settings synthesizes and localizes a name for a panel whose EDID
-//! carries none (`target_friendly_name` says what this build does there).
-//! It is far more expensive than the geometry
+//! Those descriptions are a **second sweep**, `QueryDisplayConfig` rather
+//! than `EnumDisplayMonitors`, because it is the only Win32 route to a
+//! monitor's EDID product name — usually the same string Windows Settings
+//! shows, though Settings synthesizes and localizes a name for a panel
+//! whose EDID carries none (`friendly_name_of` says what this build does
+//! there) — and because the same response carries the device interface path
+//! the panel's *size* is read behind (`panel_size_of`, then
+//! [`crate::edid`]). It is far more expensive than the geometry
 //! enumeration, which is precisely why it sits behind its own trait method
 //! and why the ~8 ms edge poll never reaches it. The two sweeps are joined
 //! by `szDevice` — the `DisplayConfig` source's `viewGdiDeviceName` is the
 //! same string `GetMonitorInfoW` reports — never by enumeration position.
-//! A failure anywhere in it costs captions and nothing else. The desktop
+//! A failure anywhere in it costs captions and proportions and nothing
+//! else. The desktop
 //! bounds keep the seam *between* two monitors from being treated as the
 //! crossing edge (a primary-only region put a false edge at the primary's
 //! boundary, so roaming onto the second monitor triggered spurious
@@ -34,7 +38,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossover_platform::{
-    CursorPoint, DisplayError, DisplayInfo, MonitorDescription, MonitorInfo, MonitorRect, Screen,
+    CursorPoint, DisplayError, DisplayInfo, MonitorDescription, MonitorInfo, MonitorRect,
+    PhysicalSizeMm, Screen,
+};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    DICS_FLAG_GLOBAL, DIREG_DEV, HDEVINFO, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA,
+    SetupDiCreateDeviceInfoList, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
+    SetupDiOpenDevRegKey, SetupDiOpenDeviceInterfaceW,
 };
 use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
@@ -49,11 +59,12 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
+use windows::Win32::System::Registry::{HKEY, KEY_READ, RegCloseKey, RegQueryValueExW};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN,
 };
-use windows::core::BOOL;
+use windows::core::{BOOL, PCWSTR};
 
 /// Win32 [`DisplayInfo`]. Effectively stateless — the queries read live
 /// system state; the one field is a log-once latch, not cached data.
@@ -65,6 +76,13 @@ pub struct WindowsDisplayInfo {
     /// once a second, so an unlatched log line would be a debug line every
     /// second for as long as the condition lasts.
     label_lookup_failed: AtomicBool,
+    /// The same latch for the EDID read, kept separate because the two
+    /// halves fail independently: a product name comes from
+    /// `DisplayConfigGetDeviceInfo` and a panel size from `SetupAPI` plus the
+    /// registry, so a machine that names every screen and measures none is
+    /// an ordinary state (a VM, a remote session) and a distinct one to
+    /// diagnose.
+    size_lookup_failed: AtomicBool,
 }
 
 impl WindowsDisplayInfo {
@@ -89,6 +107,25 @@ impl WindowsDisplayInfo {
     /// Note that a label lookup succeeded, so the next failure logs again.
     fn note_label_success(&self) {
         self.label_lookup_failed.store(false, Ordering::Relaxed);
+    }
+
+    /// Note that a panel-size lookup failed, logging `reason` only on the
+    /// first failure of a streak — as [`Self::note_label_failure`], and for
+    /// the same once-a-second reason.
+    fn note_size_failure(&self, reason: &str) {
+        if !self.size_lookup_failed.swap(true, Ordering::Relaxed) {
+            tracing::debug!(
+                reason,
+                "could not read monitor panel sizes; the editor will draw \
+                 monitors by pixel count until this clears"
+            );
+        }
+    }
+
+    /// Note that a panel-size lookup succeeded, so the next failure logs
+    /// again.
+    fn note_size_success(&self) {
+        self.size_lookup_failed.store(false, Ordering::Relaxed);
     }
 }
 
@@ -183,57 +220,71 @@ impl DisplayInfo for WindowsDisplayInfo {
 
     fn monitor_descriptions(&self) -> Result<Vec<MonitorDescription>, DisplayError> {
         // The identified enumeration is the spine: same monitors, same
-        // order, same rectangles. Labels are a third best-effort pass laid
-        // over it, joined by the very device string `monitor_layout()`
+        // order, same rectangles. Descriptions are a third best-effort pass
+        // laid over it, joined by the very device string `monitor_layout()`
         // already read — `viewGdiDeviceName` from a DisplayConfig source is
         // literally `szDevice`, which is what makes the join exact rather
         // than positional.
         let layout = self.monitor_layout()?;
-        // Never an error and never a panic: a failure here costs captions,
-        // and a monitor with no caption still draws, still crosses, and is
-        // still addressable by its id.
-        let (labels, failure) = match friendly_names() {
-            Ok(labels) => (labels, None),
+        // Never an error and never a panic: a failure here costs captions
+        // and proportions, and a monitor with neither still draws, still
+        // crosses, and is still addressable by its id.
+        let (descriptions, failure) = match path_descriptions() {
+            Ok(descriptions) => (descriptions, None),
             Err(reason) => (Vec::new(), Some(reason)),
         };
 
         let described: Vec<MonitorDescription> = layout
             .into_iter()
             .map(|info| {
-                let label = info.id.as_ref().and_then(|id| {
-                    labels
+                let found = info.id.as_ref().and_then(|id| {
+                    descriptions
                         .iter()
                         .find(|(device, _)| device == id)
-                        .map(|(_, label)| label.clone())
+                        .map(|(_, description)| description)
                 });
                 MonitorDescription {
+                    label: found.and_then(|description| description.label.clone()),
+                    physical_size: found.and_then(|description| description.physical_size),
                     info,
-                    label,
-                    physical_size: None,
                 }
             })
             .collect();
 
-        // The streak flag is decided **once**, from the outcome as a whole,
+        // Each streak flag is decided **once**, from the outcome as a whole,
         // and never reset-then-set: a success followed by a failure inside
         // one call would clear the latch and log again, which at this
         // cadence is the log-per-second the latch exists to prevent.
         //
-        // NFR-3 wants both failures visible, and they are different facts:
-        // the sweep would not run, or the sweep ran and named nothing. The
-        // second is what a broken join, a wrong `header.size`, or a desk of
-        // screens the OS will not name all look like from outside, and it
-        // is otherwise indistinguishable from silence.
-        let named_nothing = !described.is_empty()
-            && described
-                .iter()
-                .all(|description| description.label.is_none());
-        match failure {
-            Some(reason) => self.note_label_failure(&reason),
-            None if named_nothing => {
+        // NFR-3 wants every failure visible, and they are different facts:
+        // the sweep would not run, or the sweep ran and named nothing, or
+        // it ran and measured nothing. The latter two are what a broken
+        // join, a wrong `header.size`, or a desk of screens the OS will not
+        // describe all look like from outside, and they are otherwise
+        // indistinguishable from silence. Two latches rather than one,
+        // because the two halves fail independently: reading a product name
+        // and reading an EDID are different calls to different subsystems,
+        // and a machine where every panel is named and none is measured is
+        // a real and diagnosable state.
+        let nothing_at_all = |pick: fn(&MonitorDescription) -> bool| {
+            !described.is_empty() && described.iter().all(pick)
+        };
+        let named_nothing = nothing_at_all(|description| description.label.is_none());
+        let measured_nothing = nothing_at_all(|description| description.physical_size.is_none());
+        if let Some(reason) = failure {
+            self.note_label_failure(&reason);
+            self.note_size_failure(&reason);
+        } else {
+            if named_nothing {
                 self.note_label_failure("the display configuration named no monitor at all");
+            } else {
+                self.note_label_success();
             }
-            None => self.note_label_success(),
+            if measured_nothing {
+                self.note_size_failure("no monitor's EDID could be read");
+            } else {
+                self.note_size_success();
+            }
         }
 
         Ok(described)
@@ -271,39 +322,71 @@ const MAX_DISPLAY_CONFIG_MODES: u32 = MAX_DISPLAY_CONFIG_PATHS * 4;
 /// keeps a display configuration changing continuously from spinning here.
 const DISPLAY_CONFIG_ATTEMPTS: usize = 8;
 
-/// Every active display path's `(szDevice, friendly name)` pair, as
-/// Windows' own display configuration reports them.
+/// What one `QueryDisplayConfig` path says *about* its monitor, as opposed
+/// to where the monitor is.
+///
+/// Both halves are best effort and independent: a target can answer with a
+/// name and no readable EDID (common — Windows names plenty of panels whose
+/// EDID it will not hand back), or with an EDID and no product string.
+#[derive(Default)]
+struct PathDescription {
+    label: Option<String>,
+    physical_size: Option<PhysicalSizeMm>,
+}
+
+impl PathDescription {
+    /// Nothing to say about this monitor, so nothing to record for it.
+    fn is_empty(&self) -> bool {
+        self.label.is_none() && self.physical_size.is_none()
+    }
+}
+
+/// Every active display path's `szDevice` paired with what Windows' own
+/// display configuration says about the monitor on it.
 ///
 /// `viewGdiDeviceName` from `DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME`
 /// **is** the `szDevice` string `GetMonitorInfoW` reports, which is what
-/// lets this join onto the monitor ids ADR 0018 already uses; the friendly
-/// name comes from `DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME` — see
-/// [`target_friendly_name`] for the two sources it draws on.
+/// lets this join onto the monitor ids ADR 0018 already uses. Both
+/// descriptive halves come out of one
+/// `DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME` response: the friendly name
+/// from its `monitorFriendlyDeviceName` (see [`friendly_name_of`]), and the
+/// panel size from the EDID behind its `monitorDevicePath` (see
+/// [`panel_size_of`]). One response, two readings — the target is asked
+/// about exactly once per path, which is what keeps the added cost of sizes
+/// to the registry read itself.
 ///
 /// Best effort throughout: a path whose source or target will not answer,
-/// or whose friendly name is empty, contributes nothing and stops nothing.
-/// The `Err` case is reserved for a failure of the *sweep* — the caller
-/// logs it once per streak and carries on with no labels at all.
-fn friendly_names() -> Result<Vec<(String, String)>, String> {
+/// or that yields neither a name nor a size, contributes nothing and stops
+/// nothing. The `Err` case is reserved for a failure of the *sweep* — the
+/// caller logs it once per streak and carries on describing nothing.
+fn path_descriptions() -> Result<Vec<(String, PathDescription)>, String> {
     let (paths, _modes) = query_display_config()?;
 
-    let mut named: Vec<(String, String)> = Vec::with_capacity(paths.len());
+    let mut described: Vec<(String, PathDescription)> = Vec::with_capacity(paths.len());
     for path in &paths {
         let Some(device) = source_device_name(path) else {
             continue;
         };
         // A source can drive several targets (clone mode). The first target
-        // that answers names the screen; a second name for the same
-        // `szDevice` would be a second caption for one rectangle, which the
-        // model has no way to show.
-        if named.iter().any(|(held, _)| held == &device) {
+        // that answers describes the screen; a second description for the
+        // same `szDevice` would be a second caption and a second size for
+        // one rectangle, which the model has no way to show.
+        if described.iter().any(|(held, _)| held == &device) {
             continue;
         }
-        if let Some(label) = target_friendly_name(path) {
-            named.push((device, label));
+        let Some(target) = target_device_name(path) else {
+            continue;
+        };
+        let description = PathDescription {
+            label: friendly_name_of(&target),
+            physical_size: panel_size_of(&target),
+        };
+        if description.is_empty() {
+            continue;
         }
+        described.push((device, description));
     }
-    Ok(named)
+    Ok(described)
 }
 
 /// The active display paths, sized and fetched with the documented retry.
@@ -418,8 +501,30 @@ fn source_device_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
 /// 16 bytes, no control or format characters.
 const INTERNAL_DISPLAY_LABEL: &str = "Internal Display";
 
-/// The human-readable name for `path`'s target (`DELL U2720Q`), or `None`
-/// where the OS declines to answer and has no substitute worth offering.
+/// Everything Windows will say about `path`'s target in one response —
+/// which is deliberately one call, because both the product name and the
+/// device path the EDID lives behind come out of the same structure.
+fn target_device_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<DISPLAYCONFIG_TARGET_DEVICE_NAME> {
+    let mut request = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+            size: u32::try_from(size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>()).ok()?,
+            adapterId: path.targetInfo.adapterId,
+            id: path.targetInfo.id,
+        },
+        ..Default::default()
+    };
+    // SAFETY: as `source_device_name` above — same documented convention,
+    // same live local, a different request type and size.
+    let status = unsafe { DisplayConfigGetDeviceInfo((&raw mut request).cast()) };
+    if status != 0 {
+        return None;
+    }
+    Some(request)
+}
+
+/// The human-readable name in `target` (`DELL U2720Q`), or `None` where the
+/// OS has none and no substitute worth offering.
 ///
 /// Two sources, in order:
 ///
@@ -436,31 +541,175 @@ const INTERNAL_DISPLAY_LABEL: &str = "Internal Display";
 /// remote, or non-PnP display genuinely has no name, and inventing one
 /// would caption several such screens identically — worse than the device
 /// strings, which at least differ.
-fn target_friendly_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
-    let mut request = DISPLAYCONFIG_TARGET_DEVICE_NAME {
-        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
-            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-            size: u32::try_from(size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>()).ok()?,
-            adapterId: path.targetInfo.adapterId,
-            id: path.targetInfo.id,
-        },
-        ..Default::default()
-    };
-    // SAFETY: as `source_device_name` above — same documented convention,
-    // same live local, a different request type and size.
-    let status = unsafe { DisplayConfigGetDeviceInfo((&raw mut request).cast()) };
-    if status != 0 {
-        return None;
-    }
-    if let Some(name) = wide_string(&request.monitorFriendlyDeviceName) {
+fn friendly_name_of(target: &DISPLAYCONFIG_TARGET_DEVICE_NAME) -> Option<String> {
+    if let Some(name) = wide_string(&target.monitorFriendlyDeviceName) {
         return Some(name);
     }
     // The response's own `outputTechnology`, not the path's: this is what
     // the OS says about the target it just described.
-    if request.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL {
+    if target.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL {
         return Some(INTERNAL_DISPLAY_LABEL.to_owned());
     }
     None
+}
+
+/// The panel size behind `target`'s `monitorDevicePath`, or `None` if it
+/// cannot be read or is not one this build believes
+/// ([`crate::edid::physical_size`] states the plausibility rule).
+///
+/// `monitorDevicePath` is a device *interface* path — the
+/// `\\?\DISPLAY#DEL41A1#...` string Device Manager knows the monitor by —
+/// and it is the handle onto the monitor's own driver key, under which
+/// Windows caches the EDID it read off the cable. Every step is best effort
+/// and every failure is `None`, because a caption-and-proportion feature has
+/// no failure worth propagating: a screen with no readable EDID draws the
+/// way every screen drew before sizes existed.
+///
+/// **Not on any hot path.** This is a `SetupAPI` walk and a registry read per
+/// monitor, on top of the `QueryDisplayConfig` sweep the product name
+/// already costs — genuinely expensive, and it happens only on the ~1 s
+/// topology cadence that already pays for descriptions (ADR 0018). The
+/// 8 ms edge poll calls `monitors()` and cannot reach here.
+fn panel_size_of(target: &DISPLAYCONFIG_TARGET_DEVICE_NAME) -> Option<PhysicalSizeMm> {
+    let path = wide_string(&target.monitorDevicePath)?;
+    let edid = monitor_edid(&path)?;
+    crate::edid::physical_size(&edid)
+}
+
+/// Most bytes this build will read out of a monitor's cached `EDID`
+/// registry value.
+///
+/// A conforming EDID is 128 bytes, or 256 with one extension block; the
+/// standard allows 255 extensions, which would be 32 KiB. 1 KiB is generous
+/// over anything real and refuses, before allocating, a value that a
+/// corrupt cache or a hostile local writer could otherwise make arbitrarily
+/// large — the house rule ("bound before allocating") applied to a number
+/// that is not network input but is still someone else's.
+///
+/// Only the base block is parsed, so nothing is lost by the cap even on a
+/// monitor with more extensions than fit.
+const MAX_EDID_BYTES: u32 = 1024;
+
+/// The `EDID` value Windows cached under the monitor at device interface
+/// path `device_path`, or `None` if it is not there or will not read.
+///
+/// The route is the documented one: an empty device information list, the
+/// interface opened *by path* onto it (which adds exactly that one device),
+/// the device information for the single member that produces, and then the
+/// device's own driver key, where the `EDID` value lives.
+///
+/// Every failure is `None` rather than an error, per [`panel_size_of`]. The
+/// list is destroyed on every exit, including the early ones — a leaked
+/// `HDEVINFO` on a query that runs once a second would be a handle leak
+/// with a clock on it.
+fn monitor_edid(device_path: &str) -> Option<Vec<u8>> {
+    let path: Vec<u16> = device_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: a null class GUID and null parent create an empty list this
+    // function owns until it destroys it below.
+    let devices = unsafe { SetupDiCreateDeviceInfoList(None, None) }.ok()?;
+    let edid = read_edid_from(devices, &path);
+    // SAFETY: `devices` is the list created above and not used after this.
+    // The result is deliberately dropped: nothing can be done about a
+    // failure to free a list, and it must not mask the value read.
+    let _ = unsafe { SetupDiDestroyDeviceInfoList(devices) };
+    edid
+}
+
+/// The body of [`monitor_edid`], split out so its every exit runs through
+/// that function's single `SetupDiDestroyDeviceInfoList` rather than
+/// repeating it on each `?`.
+fn read_edid_from(devices: HDEVINFO, path: &[u16]) -> Option<Vec<u8>> {
+    let mut interface = SP_DEVICE_INTERFACE_DATA {
+        cbSize: u32::try_from(size_of::<SP_DEVICE_INTERFACE_DATA>()).ok()?,
+        ..Default::default()
+    };
+    // SAFETY: `path` is NUL-terminated (built above), `interface` is a live
+    // local whose `cbSize` is set as the API requires, and `devices` is the
+    // list this call adds the named device to.
+    unsafe {
+        SetupDiOpenDeviceInterfaceW(devices, PCWSTR(path.as_ptr()), 0, Some(&raw mut interface))
+    }
+    .ok()?;
+
+    let mut info = SP_DEVINFO_DATA {
+        cbSize: u32::try_from(size_of::<SP_DEVINFO_DATA>()).ok()?,
+        ..Default::default()
+    };
+    // Member 0 is the device the call above just added: the list started
+    // empty and nothing else has been put in it.
+    // SAFETY: `info` is a live local with its `cbSize` set, and `devices`
+    // is the list holding that one member.
+    unsafe { SetupDiEnumDeviceInfo(devices, 0, &raw mut info) }.ok()?;
+
+    // SAFETY: `info` is the member enumerated above; the call returns a key
+    // this function closes below on every path.
+    let key = unsafe {
+        SetupDiOpenDevRegKey(
+            devices,
+            &raw const info,
+            DICS_FLAG_GLOBAL.0,
+            0,
+            DIREG_DEV,
+            KEY_READ.0,
+        )
+    }
+    .ok()?;
+    let edid = read_edid_value(key);
+    // SAFETY: `key` is the key opened above and not used after this.
+    let _ = unsafe { RegCloseKey(key) };
+    edid
+}
+
+/// The `EDID` value under an already-open monitor driver key.
+///
+/// The length is asked for first and **checked before anything is
+/// allocated**, so a value claiming to be enormous costs a comparison
+/// rather than the allocation ([`MAX_EDID_BYTES`]).
+fn read_edid_value(key: HKEY) -> Option<Vec<u8>> {
+    let name: Vec<u16> = "EDID".encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut length: u32 = 0;
+    // SAFETY: a null data pointer asks only for the size, which the call
+    // writes into `length`; every pointer passed is a live local.
+    let sized = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(name.as_ptr()),
+            None,
+            None,
+            None,
+            Some(&raw mut length),
+        )
+    };
+    if sized != ERROR_SUCCESS || length == 0 || length > MAX_EDID_BYTES {
+        return None;
+    }
+
+    let mut buffer = vec![0u8; length as usize];
+    // SAFETY: `buffer` holds exactly `length` bytes, which is what the
+    // in/out `length` tells the call it may write; both are live locals for
+    // the whole call.
+    let read = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(name.as_ptr()),
+            None,
+            None,
+            Some(buffer.as_mut_ptr()),
+            Some(&raw mut length),
+        )
+    };
+    if read != ERROR_SUCCESS {
+        return None;
+    }
+    // The second call may have written fewer bytes than the first sized
+    // for, if the value shrank between them.
+    buffer.truncate(length as usize);
+    Some(buffer)
 }
 
 /// A fixed-size `WCHAR` field as a `String`: the run of units before the
@@ -668,25 +917,28 @@ mod tests {
         assert_eq!(ids.len(), unique, "two monitors share a device string");
     }
 
-    /// Descriptions are the identified enumeration with labels laid over
-    /// it: never a monitor lost, never one reordered, and any label that
-    /// *is* produced is one the layout model would accept.
+    /// Descriptions are the identified enumeration with labels and panel
+    /// sizes laid over it: never a monitor lost, never one reordered, and
+    /// any label or size that *is* produced is one the layout model would
+    /// accept.
     ///
     /// "Any that is produced" rather than "every monitor has one" on
-    /// purpose. A virtual, remote, or non-PnP display legitimately has no
-    /// name, and a product name over 64 UTF-8 bytes — a long CJK one, say —
-    /// is legitimately dropped by `live_monitors` rather than sent. So the
-    /// contract here is `None`-or-valid, and asserting more would fail on
-    /// somebody's hardware for behaviour that is correct.
+    /// purpose. A virtual, remote, or non-PnP display legitimately has
+    /// neither a name nor a readable EDID, and a product name over 64 UTF-8
+    /// bytes — a long CJK one, say — is legitimately dropped by
+    /// `live_monitors` rather than sent. So the contract here is
+    /// `None`-or-valid, and asserting more would fail on somebody's
+    /// hardware for behaviour that is correct.
     ///
-    /// The rule itself is imported from `crossover_topology` rather than
-    /// restated, so the two cannot drift, and it is what stops a `U+FFFD`
-    /// from a lossy decode reaching the wire as something a peer would be
-    /// right to refuse. A headless agent has no display and every query
-    /// fails cleanly, which is an acceptable outcome; a panic is not.
+    /// The rules themselves are imported from `crossover_topology` rather
+    /// than restated, so the two cannot drift, and they are what stop a
+    /// `U+FFFD` from a lossy decode or a fictional millimetre count
+    /// reaching the wire as something a peer would be right to refuse. A
+    /// headless agent has no display and every query fails cleanly, which
+    /// is an acceptable outcome; a panic is not.
     #[test]
     fn descriptions_are_the_identified_enumeration_with_usable_labels() {
-        use crossover_topology::validate_monitor_label;
+        use crossover_topology::{validate_monitor_label, validate_physical_size};
 
         let display = WindowsDisplayInfo::new();
         let (Ok(descriptions), Ok(layout)) =
@@ -705,16 +957,97 @@ mod tests {
         );
 
         for description in &descriptions {
-            let Some(label) = description.label.as_deref() else {
+            if let Some(label) = description.label.as_deref() {
+                // The byte bound is part of what `validate_monitor_label`
+                // checks, so asserting it separately would only restate the
+                // rule this deliberately imports. `wide_string` already
+                // trims, likewise.
+                assert!(
+                    validate_monitor_label(label).is_ok(),
+                    "product name {label:?} is not a usable monitor label"
+                );
+            }
+            if let Some(size) = description.physical_size {
+                assert!(
+                    validate_physical_size(size.width_mm, size.height_mm).is_ok(),
+                    "panel size {size:?} is not one the layout model would carry"
+                );
+                // And the tighter rule this backend imposes on itself: a
+                // size it claims at all is one it found plausible. The
+                // constants are imported so the assertion cannot drift from
+                // the gate.
+                assert!(
+                    (crate::edid::MIN_PLAUSIBLE_MM..=crate::edid::MAX_PLAUSIBLE_MM)
+                        .contains(&size.width_mm),
+                    "an implausible width escaped the acquisition gate: {size:?}"
+                );
+                assert!(
+                    (crate::edid::MIN_PLAUSIBLE_MM..=crate::edid::MAX_PLAUSIBLE_MM)
+                        .contains(&size.height_mm),
+                    "an implausible height escaped the acquisition gate: {size:?}"
+                );
+            }
+        }
+    }
+
+    /// The EDID read itself, exercised against whatever this machine has —
+    /// and, like the join-key test above, written so it cannot pass
+    /// vacuously in the interesting direction.
+    ///
+    /// Every active path is asked for its `monitorDevicePath`. On a session
+    /// with real displays at least one target must produce one, because
+    /// that string is how the OS itself addresses the monitor; a run where
+    /// none does means the target request is malformed (a wrong
+    /// `header.size` or `adapterId`) rather than that the hardware is
+    /// unusual. What is behind those paths is hardware-dependent and is
+    /// therefore only checked for *shape*: an EDID that reads at all is
+    /// within the size cap and begins with the header magic.
+    #[test]
+    fn every_active_target_names_a_device_path_and_any_edid_behind_one_is_an_edid() {
+        let Ok((paths, _modes)) = super::query_display_config() else {
+            return;
+        };
+        if paths.is_empty() {
+            // A locked or headless session has no active paths; there is
+            // nothing to read and nothing to assert about.
+            return;
+        }
+
+        let targets: Vec<_> = paths.iter().filter_map(super::target_device_name).collect();
+        if targets.is_empty() {
+            return;
+        }
+        let device_paths: Vec<String> = targets
+            .iter()
+            .filter_map(|target| super::wide_string(&target.monitorDevicePath))
+            .collect();
+        assert!(
+            !device_paths.is_empty(),
+            "{} active targets answered and not one named a device path — the \
+             DisplayConfig target request is malformed",
+            targets.len()
+        );
+
+        for path in &device_paths {
+            let Some(edid) = super::monitor_edid(path) else {
+                // A monitor whose EDID Windows did not cache. Ordinary on a
+                // VM, a remote session, or a non-PnP display.
                 continue;
             };
-            // The byte bound is part of what `validate_monitor_label`
-            // checks, so asserting it separately would only restate the
-            // rule this deliberately imports. `wide_string` already trims,
-            // likewise.
             assert!(
-                validate_monitor_label(label).is_ok(),
-                "product name {label:?} is not a usable monitor label"
+                edid.len() <= super::MAX_EDID_BYTES as usize,
+                "an EDID past the read cap came back: {} bytes",
+                edid.len()
+            );
+            assert!(
+                edid.len() >= crate::edid::EDID_BLOCK_BYTES,
+                "a short EDID came back for {path:?}: {} bytes",
+                edid.len()
+            );
+            assert_eq!(
+                &edid[..8],
+                &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00],
+                "the value read for {path:?} is not an EDID — wrong registry value or key"
             );
         }
     }
