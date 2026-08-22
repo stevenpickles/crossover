@@ -206,7 +206,11 @@ impl DisplayInfo for WindowsDisplayInfo {
                         .find(|(device, _)| device == id)
                         .map(|(_, label)| label.clone())
                 });
-                MonitorDescription { info, label }
+                MonitorDescription {
+                    info,
+                    label,
+                    physical_size: None,
+                }
             })
             .collect();
 

@@ -58,6 +58,12 @@
 //! expensive, and a value that has no business changing what the detector
 //! considers "the same layout". Only the ~1 s topology-sync side asks for
 //! descriptions.
+//!
+//! Since ADR 0018's 2026-08-22 amendment that third query also carries a
+//! monitor's **physical size** ([`PhysicalSizeMm`]) — and it rides the same
+//! method rather than earning a fourth, because it is acquired by the same
+//! sweep at the same cadence and is display-only for the same reason a
+//! label is.
 
 use thiserror::Error;
 
@@ -164,6 +170,50 @@ pub struct MonitorDescription {
     /// Its advertised human-readable name, or `None` where the platform
     /// has none, could not read one, or reported an empty one.
     pub label: Option<String>,
+    /// How large the panel physically is, or `None` where the platform
+    /// could not measure it or does not believe what it measured
+    /// ([`PhysicalSizeMm`] says what a backend owes here).
+    pub physical_size: Option<PhysicalSizeMm>,
+}
+
+/// A monitor's physical panel size in millimetres, as a backend measured it
+/// (ADR 0018, amended 2026-08-22).
+///
+/// **Proportion only, never identity, and never geometry.** It exists so
+/// the layout editor can draw a rectangle at a size proportional to the
+/// real screen, which is what makes a crossing physically continuous across
+/// the seam between two desks: a cursor leaving one machine a third of the
+/// way up a bezel should arrive a third of the way up the other's. Nothing
+/// about control transfer consults it — the id remains the only key, and
+/// the pixel rectangle in [`MonitorRect`] remains the only geometry.
+///
+/// It is an `Option` on [`MonitorDescription`] because most reasons a
+/// platform cannot supply one are ordinary rather than exceptional: a
+/// virtual display has no panel to measure, a remote session's screen is
+/// somebody else's, and the EDID a real panel carries can be absent,
+/// unreadable, or wrong. A backend that declines to measure is a working
+/// backend; the editor draws such a monitor the way it drew every monitor
+/// before sizes existed.
+///
+/// **A backend that is unsure reports `None`, not a guess.** This is the
+/// one rule the type imposes on its producers, and it is the opposite of
+/// the usual best-effort instinct: a size drawn confidently and wrongly
+/// misplaces every rectangle beside it, while a size withheld costs only
+/// the improvement. Projectors, TVs, and virtual displays all report
+/// numbers that are fiction, so the Windows backend applies a plausibility
+/// gate before it will claim one at all.
+///
+/// The fields are plain `u16`, unvalidated, for exactly the reason
+/// [`MonitorInfo::id`] and [`MonitorDescription::label`] are plain
+/// `String`s: this is "whatever the platform measured". The bound
+/// (`MAX_PHYSICAL_SIZE_MM`) belongs to `crossover-topology`, which this
+/// crate must not depend on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicalSizeMm {
+    /// The panel's width in millimetres.
+    pub width_mm: u16,
+    /// The panel's height in millimetres.
+    pub height_mm: u16,
 }
 
 /// Failures from a [`DisplayInfo`] backend.
@@ -244,14 +294,15 @@ pub trait DisplayInfo: Send + Sync {
             .collect())
     }
 
-    /// Every monitor, with its identity *and* the human-readable name the
-    /// platform advertises for it where there is one (ADR 0018, amended
-    /// 2026-08-21).
+    /// Every monitor, with its identity *and* the descriptive facts the
+    /// platform advertises about it: the human-readable name (ADR 0018,
+    /// amended 2026-08-21) and the panel's physical size (amended
+    /// 2026-08-22).
     ///
     /// The list holds **the same entries [`DisplayInfo::monitor_layout`]
-    /// reports, in the same order, always** — a label is added per monitor,
-    /// best effort, and its absence shows up as `label: None` rather than
-    /// as a missing or reordered entry.
+    /// reports, in the same order, always** — a label and a size are added
+    /// per monitor, best effort, and the absence of either shows up as a
+    /// `None` on a present entry rather than as a missing or reordered one.
     ///
     /// **Not on the hot path, and that is the point.** This is the query
     /// the ~1 s topology poll uses to fill the state file and the peer's
@@ -260,20 +311,24 @@ pub trait DisplayInfo: Send + Sync {
     /// this the expensive one (on Windows it is a whole
     /// `QueryDisplayConfig` sweep).
     ///
-    /// Defaulted to the identified enumeration with nothing labelled, so a
-    /// backend with no way to ask for product names is still a working
-    /// backend: its monitors caption by device string, which is what the
-    /// editor did before labels existed.
+    /// Defaulted to the identified enumeration with nothing described, so a
+    /// backend with no way to ask for product names or panel sizes is still
+    /// a working backend: its monitors caption by device string and draw by
+    /// pixel count, which is what the editor did before either existed.
     ///
     /// # Errors
     ///
     /// [`DisplayError::Unavailable`] if the platform cannot enumerate the
-    /// monitors. Failing to *label* one is not an error.
+    /// monitors. Failing to *describe* one is not an error.
     fn monitor_descriptions(&self) -> Result<Vec<MonitorDescription>, DisplayError> {
         Ok(self
             .monitor_layout()?
             .into_iter()
-            .map(|info| MonitorDescription { info, label: None })
+            .map(|info| MonitorDescription {
+                info,
+                label: None,
+                physical_size: None,
+            })
             .collect())
     }
 
@@ -324,8 +379,8 @@ mod tests {
     }
 
     /// A backend that names nothing describes nothing — but it never loses
-    /// or reorders a monitor doing so. An absent label is `None` on a
-    /// present entry, exactly as an absent id is.
+    /// or reorders a monitor doing so. An absent label or size is `None` on
+    /// a present entry, exactly as an absent id is.
     #[test]
     fn the_default_description_query_labels_nothing_and_drops_nothing() {
         let display = GeometryOnly;
@@ -343,6 +398,11 @@ mod tests {
             descriptions
                 .iter()
                 .all(|description| description.label.is_none())
+        );
+        assert!(
+            descriptions
+                .iter()
+                .all(|description| description.physical_size.is_none())
         );
         assert!(
             descriptions
@@ -386,6 +446,7 @@ mod tests {
         assert_eq!(descriptions.len(), 1);
         assert_eq!(descriptions[0].info.id.as_deref(), Some("SCREEN-1"));
         assert_eq!(descriptions[0].label, None);
+        assert_eq!(descriptions[0].physical_size, None);
     }
 
     /// An enumeration failure is still a failure: a defaulted method must
