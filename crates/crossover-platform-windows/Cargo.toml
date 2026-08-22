@@ -36,13 +36,21 @@ zip = { workspace = true }
 # stderr; the library itself installs no subscriber.
 [target.'cfg(windows)'.dev-dependencies]
 tracing-subscriber = { workspace = true }
+
 # Tests only, and deliberately not a real dependency: the display test
 # asserts that every `szDevice` this machine reports is a usable
-# `MonitorId` — ADR 0018's byte bound and printable-ASCII rule, imported
-# rather than restated so the two cannot drift. The platform crates stay
-# free of the layout model at build time; a platform trait that could only
-# report ids the model already accepts would have no way to say that a
-# machine's display configuration is unusable.
+# `MonitorId` — ADR 0018's byte bound and printable-ASCII rule — and the
+# EDID test asserts that this reader's plausibility range is the layout
+# model's own, both imported rather than restated so the two cannot drift.
+# The platform crates stay free of the layout model at build time; a
+# platform trait that could only report ids the model already accepts would
+# have no way to say that a machine's display configuration is unusable.
+#
+# Not Windows-gated, unlike the entry above it: `edid` is the one module
+# here that compiles on every OS (its bytes-in/size-out half is pure), so
+# the range it mirrors is pinned on every CI OS rather than only where the
+# bytes can be fetched.
+[dev-dependencies]
 crossover-topology = { workspace = true }
 
 # The workspace forbids unsafe_code (NFR-6). This crate is the designated
