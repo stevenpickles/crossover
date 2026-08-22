@@ -1546,6 +1546,39 @@ mod tests {
         assert!(peer.rect.width < 1920, "{peer:?}");
     }
 
+    /// A size the wire admits but no panel could have never reaches the
+    /// drawing. The peer is trusted to be *itself*, not to be correct, and
+    /// a 1 mm claim would otherwise seed a four-unit sliver sitting on a
+    /// real crossing seam — too small to take hold of, and unfixable until
+    /// the manual override lands.
+    #[test]
+    fn an_implausible_peer_size_is_drawn_as_an_estimate_not_as_a_sliver() {
+        let sized = |width_mm: u16, height_mm: u16| {
+            vec![LiveMonitor {
+                physical_size: Some(PhysicalSizeMm::new(width_mm, height_mm).unwrap()),
+                ..live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)
+            }]
+        };
+        let local = vec![LiveMonitor {
+            physical_size: Some(PhysicalSizeMm::new(597, 336).unwrap()),
+            ..live(r"\\.\DISPLAY1", 0, 2560, 1440, 100)
+        }];
+
+        for (width_mm, height_mm) in [(1, 1), (10_000, 10_000)] {
+            let scene = Model::from_state(&state(local.clone(), sized(width_mm, height_mm), None));
+            let drawn = &scene.peer.as_ref().unwrap().monitors[0];
+            assert!(drawn.size_estimated, "{width_mm}x{height_mm} mm was drawn");
+            // Sized from its pixels on the local machine's believable
+            // scale, so it is a rectangle of the same order as its
+            // neighbour rather than a sliver or a wall.
+            let neighbour = scene.local.monitors[0].rect.width;
+            assert!(
+                drawn.rect.width * 4 > neighbour && drawn.rect.width < neighbour * 4,
+                "{drawn:?} beside {neighbour}"
+            );
+        }
+    }
+
     /// A rectangle an authoritative arrangement placed is never badged:
     /// its size is what the user saved, whatever the panel behind it will
     /// or will not say about itself today.

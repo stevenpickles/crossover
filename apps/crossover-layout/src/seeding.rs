@@ -23,11 +23,14 @@
 //! For one machine, given each monitor's live pixel rectangle, its
 //! `scale_percent`, and its optional [`PhysicalSizeMm`]:
 //!
-//! - **A monitor that measured itself draws at its millimetres times
-//!   [`UNITS_PER_MM`]** — layout units are abstract (ADR 0018: "the model
-//!   neither knows nor needs to know what a unit is worth"), so the constant
-//!   only has to be *consistent*, and is chosen to keep drawn magnitudes in
-//!   the same ballpark as the DIP seeding it replaces.
+//! - **A monitor that measured itself believably draws at its millimetres
+//!   times [`UNITS_PER_MM`]** — layout units are abstract (ADR 0018: "the
+//!   model neither knows nor needs to know what a unit is worth"), so the
+//!   constant only has to be *consistent*, and is chosen to keep drawn
+//!   magnitudes in the same ballpark as the DIP seeding it replaces.
+//!   *Believably* is [`believable`]'s business: a size the wire admits but
+//!   no panel could have is treated as no size at all, because a
+//!   proportion drawn from a fiction misdraws the whole desk.
 //! - **A monitor that did not draws at its DIP size times the machine's
 //!   median millimetres-per-DIP**, so it stays in proportion with its
 //!   measured siblings instead of being drawn at a magnitude from a
@@ -36,12 +39,24 @@
 //! - **A machine with nothing measured at all** — no EDID anywhere, a desk
 //!   of virtual or remote displays — has no ratio to borrow from itself, so
 //!   it borrows the *other* machine's ([`MachineScale::of`]'s `fallback`).
-//!   Failing that the ratio is 1:1 by definition and the whole machine seeds
-//!   in DIPs, **exactly** as it did before sizes existed: same arithmetic,
-//!   same integers, no floating point in the path at all. That is a
+//!   Failing that the whole *scene* is unmeasured: every rectangle seeds in
+//!   DIPs, exactly as it did before sizes existed, and nothing is badged
+//!   because nothing is any less certain than anything beside it. That is a
 //!   deliberate literal third arm rather than the second arm with a ratio of
 //!   1.0, so "nothing measured anywhere draws what it always drew" is a
 //!   property of the code's shape rather than of an argument about rounding.
+//!
+//! # Sizes do not flicker
+//!
+//! A monitor's size can arrive later than the monitor — the worker's
+//! ~1 s sweep reads geometry and EDID separately — but it does not come and
+//! go: the worker keeps a per-monitor record of what it has learned and
+//! fills the two descriptive fields independently (ADR 0018's retention
+//! paragraph), so a sweep that fails to read one panel's EDID reports the
+//! last size it did read rather than none. This module therefore needs no
+//! state of its own to keep a rectangle from oscillating between arms, and
+//! [`crate::model`]'s transplant covers the one transition that remains: a
+//! size learned for the first time while the user is mid-edit.
 //!
 //! # Rotation
 //!
@@ -61,7 +76,9 @@
 //! that construction, and they survive this module changing the widths
 //! precisely because the packing derives each x from the widths it is given.
 
-use crossover_topology::{LiveMonitor, MAX_MONITOR_EXTENT, PhysicalSizeMm};
+use crossover_topology::{
+    LiveMonitor, MAX_MONITOR_EXTENT, PhysicalSizeMm, is_plausible_physical_size,
+};
 
 /// Layout units per millimetre — one unit is a quarter of a millimetre.
 ///
@@ -71,9 +88,11 @@ use crossover_topology::{LiveMonitor, MAX_MONITOR_EXTENT, PhysicalSizeMm};
 /// 2388 units, sitting in the same range as the 1920–2560 its DIP seeding
 /// produced, so an arrangement drawn before this rule and one drawn after
 /// zoom and snap identically. It is also small enough that the largest size
-/// the wire admits (`MAX_PHYSICAL_SIZE_MM`, 10 000 mm) seeds 40 000 units,
-/// inside [`MAX_MONITOR_EXTENT`] with room to spare — so no legal
-/// measurement can reach the clamp in [`to_extent`].
+/// this module will draw from (`MAX_PLAUSIBLE_PHYSICAL_MM`, 3000 mm) seeds
+/// 12 000 units — and even the largest the *wire* admits (10 000 mm, which
+/// [`believable`] refuses long before it gets here) would seed 40 000,
+/// inside [`MAX_MONITOR_EXTENT`]. So no measurement, believable or not, can
+/// reach the clamp in [`bound`].
 pub const UNITS_PER_MM: u32 = 4;
 
 /// A drawn size, and whether it is a measurement or an estimate.
@@ -84,9 +103,16 @@ pub struct SeededSize {
     /// Drawn height, in layout units. Always `1..=MAX_MONITOR_EXTENT`.
     pub height: u32,
     /// `true` when this size came from pixels rather than from the panel's
-    /// own millimetres — the editor's cue to badge the rectangle, since a
-    /// proportion nobody measured is a proportion the user may need to
-    /// correct.
+    /// own millimetres, **and some other screen in the scene did measure
+    /// itself** — the editor's cue to badge the rectangle.
+    ///
+    /// The second half is what makes the badge worth painting. It marks a
+    /// *difference* in fidelity between rectangles the user is looking at:
+    /// this one's proportions are inferred, that one's were measured. Where
+    /// nothing anywhere measured itself there is no difference to mark —
+    /// every rectangle is seeded from pixels, exactly as every rectangle
+    /// always was — and badging all of them would put a third caption line
+    /// on every screen on the desk to say nothing at all.
     pub estimated: bool,
 }
 
@@ -142,11 +168,11 @@ impl MachineScale {
     pub fn size_of(self, monitor: &LiveMonitor) -> SeededSize {
         let pixels = (monitor.rect.width, monitor.rect.height);
         let dips = dip_pair(monitor);
-        match (monitor.physical_size, self.units_per_dip) {
+        match (believable(monitor), self.units_per_dip) {
             // Measured: the panel's own millimetres, in the orientation the
             // OS is presenting it. Integer arithmetic throughout — a
-            // validated size is at most 10 000 mm, so the product is at most
-            // 40 000 and nothing here can overflow or round.
+            // believable size is at most 3000 mm, so the product is at most
+            // 12 000 and nothing here can overflow or round.
             (Some(size), _) => {
                 let (width_mm, height_mm) = oriented(size, pixels);
                 SeededSize {
@@ -158,20 +184,52 @@ impl MachineScale {
             // Unmeasured, on a machine (or a pair) that measured something:
             // DIPs carried onto the measured monitors' scale, so the
             // rectangle is at least the right size relative to its
-            // neighbours even though nothing measured it.
+            // neighbours even though nothing measured it. Badged, because
+            // there are measured rectangles beside it to be less certain
+            // than.
             (None, Some(units_per_dip)) => SeededSize {
                 width: to_extent(f64::from(dips.0) * units_per_dip),
                 height: to_extent(f64::from(dips.1) * units_per_dip),
                 estimated: true,
             },
-            // Nothing measured anywhere: the pre-sizes rule, literally.
+            // Nothing believable measured anywhere: the pre-sizes rule, and
+            // no badge, because every rectangle in the scene is in exactly
+            // this position and a mark that never varies marks nothing.
             (None, None) => SeededSize {
-                width: dips.0,
-                height: dips.1,
-                estimated: true,
+                width: bound(dips.0),
+                height: bound(dips.1),
+                estimated: false,
             },
         }
     }
+}
+
+/// The panel size to *draw from*, which is not simply the one the monitor
+/// reported: a size outside the shared plausible range
+/// (`crossover_topology::is_plausible_physical_size`) is treated exactly as
+/// a missing one.
+///
+/// The wire and the state file admit 1..=10 000 mm, because a decoder's job
+/// is arithmetic safety and refusing a peer's eccentric measurement is not
+/// worth a terminated session. Drawing is a different question with a
+/// different asymmetry. A size is a *proportion*, so one screen claiming
+/// 1 mm does not draw one wrong rectangle — it seeds a four-unit sliver on
+/// a real crossing seam, too small to grab, while every other rectangle
+/// keeps its own scale; and one claiming 10 m seeds 40 000 units and dwarfs
+/// the scene. Neither is repairable in the editor until the manual override
+/// lands (feature/161), and both are reachable from a peer this machine
+/// merely trusts to be *itself*, not to be correct. Falling back to the
+/// estimate the module already computes costs the improvement for that one
+/// screen and nothing else.
+///
+/// The range is `crossover-topology`'s rather than this module's precisely
+/// so that it is the same range the Windows EDID reader applies to local
+/// hardware: a size this machine would have refused to claim must not be
+/// one it will draw from because a peer sent it instead.
+fn believable(monitor: &LiveMonitor) -> Option<PhysicalSizeMm> {
+    monitor
+        .physical_size
+        .filter(|size| is_plausible_physical_size(*size))
 }
 
 /// The median millimetres-per-DIP over the monitors of `monitors` that
@@ -191,7 +249,11 @@ pub fn median_mm_per_dip(monitors: &[LiveMonitor]) -> Option<f64> {
     let mut ratios: Vec<f64> = monitors
         .iter()
         .filter_map(|monitor| {
-            let size = monitor.physical_size?;
+            // The same [`believable`] filter the sizes themselves go
+            // through: an implausible measurement must not steer the
+            // rectangles of the screens that *did* measure believably,
+            // which is precisely what letting it into this median would do.
+            let size = believable(monitor)?;
             let (width_mm, height_mm) = oriented(size, (monitor.rect.width, monitor.rect.height));
             let (width_dip, height_dip) = dip_pair(monitor);
             // Both denominators are at least 1 (`dip_size` floors there), so
@@ -243,11 +305,15 @@ fn dip_pair(monitor: &LiveMonitor) -> (u32, u32) {
 /// seed computation over already-validated numbers, not a boundary the way
 /// the decoder is.
 ///
-/// Deliberately **not** bounded by [`MAX_MONITOR_EXTENT`]: this is the arm
-/// that has to reproduce the pre-sizes seeding exactly, and the pre-sizes
-/// seeding did not bound it either. An input extreme enough to exceed the
-/// ceiling here (a maximal-extent monitor at 25 % scale) draws exactly as
-/// oversized as it always did, and the scene's own validation says so.
+/// Unbounded above *here*, and bounded by [`bound`] at every call site: an
+/// input extreme enough to exceed the layout model's ceiling (a
+/// maximal-extent monitor at 25 % scale seeds 262 140) is one the pre-sizes
+/// editor drew as an oversized rectangle that `Layout::new` then refused,
+/// leaving a disabled Save button and an empty offender list — a dead end
+/// with nothing to act on. Clamping is the only behavioural difference this
+/// module makes to an unmeasured desk, it is confined to arrangements that
+/// could not be saved at all, and it is what lets [`SeededSize`] promise a
+/// legal extent without an exception.
 pub(crate) fn dip_size(pixels: u32, scale_percent: u16) -> u32 {
     let scaled =
         (u64::from(pixels) * 100 + u64::from(scale_percent) / 2) / u64::from(scale_percent);
@@ -384,13 +450,15 @@ mod tests {
         assert!(drawn.height.abs_diff(reference.height) <= 2, "{drawn:?}");
     }
 
-    /// The median is a median: one panel lying by an order of magnitude
-    /// does not drag the unmeasured rectangles with it.
+    /// The median is a median: one panel lying *within* the believable
+    /// range does not drag the unmeasured rectangles with it. (A panel
+    /// lying outside it never reaches the median at all — see
+    /// [`an_unbelievable_size_is_drawn_as_no_size_at_all`].)
     #[test]
     fn a_single_absurd_measurement_does_not_move_the_median() {
         let honest = measured(2560, 1440, 100, 597, 336);
         let other = measured(1920, 1080, 100, 447, 252);
-        let liar = measured(1920, 1080, 100, 6000, 4000);
+        let liar = measured(1920, 1080, 100, 2400, 1600);
         let unmeasured = monitor(1920, 1080, 100);
 
         let with_liar = MachineScale::of(
@@ -404,13 +472,66 @@ mod tests {
         // Not bit-identical — three ratios take the middle one and two take
         // the midpoint of both — but moved by a unit, not by a multiple.
         // The same desk under a *mean* would seed the unmeasured screen
-        // around five times too wide, which is the failure this chooses the
+        // around twice too wide, which is the failure this chooses the
         // median to avoid.
         assert!(
             with_liar.width.abs_diff(without.width) <= 2,
             "{with_liar:?} vs {without:?}"
         );
-        assert!(with_liar.width < without.width * 2, "{with_liar:?}");
+        assert!(with_liar.width * 3 < without.width * 4, "{with_liar:?}");
+    }
+
+    /// The editor's own plausibility gate. A size the wire admits but no
+    /// panel could have is drawn as *no size*: a 1 mm screen would
+    /// otherwise seed a four-unit sliver sitting on a real crossing seam,
+    /// too small to take hold of, and a 10 m one would seed 40 000 units
+    /// and swallow the scene — neither repairable in the editor.
+    #[test]
+    fn an_unbelievable_size_is_drawn_as_no_size_at_all() {
+        // A believable screen on the same machine, so the estimated arm has
+        // a ratio to work from and the badge has something to contrast
+        // with.
+        let honest = measured(2560, 1440, 100, 597, 336);
+
+        for (width_mm, height_mm) in [(1, 1), (10_000, 10_000), (49, 300), (597, 3_001)] {
+            let absurd = measured(1920, 1080, 100, width_mm, height_mm);
+            let machine = [honest.clone(), absurd.clone()];
+            let scale = MachineScale::of(&machine, None);
+            let drawn = scale.size_of(&absurd);
+
+            assert!(
+                drawn.estimated,
+                "{width_mm}x{height_mm} mm was believed: {drawn:?}"
+            );
+            assert_ne!(drawn.width, u32::from(width_mm) * UNITS_PER_MM);
+            // And it did not reach the median either: the honest screen
+            // seeds exactly what it seeds on its own.
+            assert_eq!(
+                scale.size_of(&honest),
+                MachineScale::of(std::slice::from_ref(&honest), None).size_of(&honest)
+            );
+        }
+
+        // The boundaries themselves are believed, so the gate is a range
+        // and not an accident of the numbers above.
+        for (width_mm, height_mm) in [(50, 50), (3_000, 3_000)] {
+            let edge = measured(1920, 1080, 100, width_mm, height_mm);
+            let drawn = MachineScale::of(std::slice::from_ref(&edge), None).size_of(&edge);
+            assert!(!drawn.estimated, "{width_mm}x{height_mm} mm was refused");
+        }
+    }
+
+    /// A machine whose *only* size is unbelievable is a machine with no
+    /// sizes: it falls all the way through to the unmeasured scene, badge
+    /// included (which is to say, absent).
+    #[test]
+    fn a_lone_unbelievable_size_leaves_the_scene_wholly_unmeasured() {
+        let absurd = measured(3840, 2160, 200, 1, 1);
+        let scale = MachineScale::of(std::slice::from_ref(&absurd), None);
+        assert_eq!(scale, MachineScale::dips());
+        let drawn = scale.size_of(&absurd);
+        assert_eq!((drawn.width, drawn.height), (1920, 1080));
+        assert!(!drawn.estimated);
     }
 
     /// A machine that measured nothing borrows the *other* machine's ratio
@@ -443,14 +564,43 @@ mod tests {
     }
 
     /// The behaviour-unchanged guarantee, stated as an example beside the
-    /// property that proves it in general.
+    /// property that proves it in general — including the badge, which a
+    /// scene with nothing to contrast against does not paint.
     #[test]
     fn nothing_measured_anywhere_is_the_dip_seeding_exactly() {
         let scale = MachineScale::of(&[monitor(3840, 2160, 200)], None);
         let drawn = scale.size_of(&monitor(3840, 2160, 200));
         assert_eq!((drawn.width, drawn.height), (1920, 1080));
-        assert!(drawn.estimated, "a size nobody measured is still a guess");
+        assert!(
+            !drawn.estimated,
+            "a badge on every rectangle marks no difference"
+        );
         assert_eq!(scale, MachineScale::dips());
+    }
+
+    /// The same monitor, once beside a measured screen and once not: the
+    /// badge is a statement about the *scene*, not about the monitor.
+    #[test]
+    fn the_badge_marks_a_difference_in_fidelity_and_nothing_else() {
+        let unmeasured = monitor(2560, 1440, 100);
+        let alone = MachineScale::of(std::slice::from_ref(&unmeasured), None).size_of(&unmeasured);
+        assert!(!alone.estimated);
+
+        let beside_a_measured_screen = MachineScale::of(
+            &[unmeasured.clone(), measured(1920, 1080, 100, 527, 296)],
+            None,
+        )
+        .size_of(&unmeasured);
+        assert!(beside_a_measured_screen.estimated);
+
+        // Including when the measured screen is on the *other* machine,
+        // which is where the borrowed ratio comes from.
+        let borrowed = MachineScale::of(
+            std::slice::from_ref(&unmeasured),
+            median_mm_per_dip(&[measured(1920, 1080, 100, 527, 296)]),
+        )
+        .size_of(&unmeasured);
+        assert!(borrowed.estimated);
     }
 
     fn any_monitor() -> impl Strategy<Value = LiveMonitor> {
@@ -469,7 +619,9 @@ mod tests {
 
     proptest! {
         /// Totality: any live geometry the model can hold produces a size,
-        /// never a panic, and never one the layout model would refuse.
+        /// never a panic, and never one the layout model would refuse —
+        /// uniformly, on every arm, which is what [`SeededSize`]'s field
+        /// documentation promises.
         #[test]
         fn every_seeded_size_is_a_legal_extent(
             machine in proptest::collection::vec(any_monitor(), 1..=8),
@@ -477,14 +629,8 @@ mod tests {
             let scale = MachineScale::of(&machine, None);
             for monitor in &machine {
                 let drawn = scale.size_of(monitor);
-                // The DIP arm is deliberately unbounded above (see
-                // `dip_size`), and only reachable when nothing measured.
-                if monitor.physical_size.is_some() || scale != MachineScale::dips() {
-                    prop_assert!((1..=MAX_MONITOR_EXTENT).contains(&drawn.width));
-                    prop_assert!((1..=MAX_MONITOR_EXTENT).contains(&drawn.height));
-                } else {
-                    prop_assert!(drawn.width >= 1 && drawn.height >= 1);
-                }
+                prop_assert!((1..=MAX_MONITOR_EXTENT).contains(&drawn.width), "{drawn:?}");
+                prop_assert!((1..=MAX_MONITOR_EXTENT).contains(&drawn.height), "{drawn:?}");
             }
         }
 
@@ -504,10 +650,13 @@ mod tests {
             }
         }
 
-        /// The behaviour-unchanged guarantee: with no physical size
+        /// The behaviour-unchanged guarantee: with no believable size
         /// anywhere, every seeded size is the DIP size the editor drew
-        /// before panels could measure themselves — bit for bit, on inputs
-        /// generated rather than chosen.
+        /// before panels could measure themselves — on inputs generated
+        /// rather than chosen, and against the arithmetic **restated here**
+        /// rather than borrowed from production, since a test that calls
+        /// the function under test agrees with it by construction and
+        /// proves nothing.
         #[test]
         fn with_nothing_measured_every_size_is_the_old_dip_size(
             machine in proptest::collection::vec(any_monitor(), 1..=8),
@@ -519,15 +668,27 @@ mod tests {
             let scale = MachineScale::of(&machine, None);
             for monitor in &machine {
                 let drawn = scale.size_of(monitor);
-                prop_assert_eq!(drawn.width, dip_size(monitor.rect.width, monitor.scale_percent));
-                prop_assert_eq!(drawn.height, dip_size(monitor.rect.height, monitor.scale_percent));
-                prop_assert!(drawn.estimated);
+                let scale_percent = u64::from(monitor.scale_percent);
+                // Pixels ÷ scale, rounded to nearest, floored at one unit
+                // and held inside the layout model's ceiling.
+                let expected = |pixels: u32| {
+                    ((u64::from(pixels) * 100 + scale_percent / 2) / scale_percent)
+                        .clamp(1, u64::from(MAX_MONITOR_EXTENT))
+                };
+                prop_assert_eq!(u64::from(drawn.width), expected(monitor.rect.width));
+                prop_assert_eq!(u64::from(drawn.height), expected(monitor.rect.height));
+                prop_assert!(!drawn.estimated, "nothing to be less certain than");
             }
         }
 
         /// A measured monitor's drawn rectangle is its panel's proportion,
         /// to integer rounding — the property the crossing mapping cares
         /// about, since a seam's fraction is read off the drawn edge.
+        ///
+        /// Stated without restating `oriented`'s own condition: the drawn
+        /// rectangle carries the panel's two dimensions (in some order),
+        /// and it is oriented the way the *pixels* are. Together those pin
+        /// the rotation rule without borrowing its expression.
         #[test]
         fn a_measured_monitor_draws_at_its_panels_aspect(
             width_mm in 50u16..=3000,
@@ -537,14 +698,18 @@ mod tests {
         ) {
             let monitor = measured(width, height, 100, width_mm, height_mm);
             let drawn = MachineScale::of(std::slice::from_ref(&monitor), None).size_of(&monitor);
-            let landscape_alike = (width_mm >= height_mm) == (width >= height);
-            let (expected_w, expected_h) = if landscape_alike {
-                (width_mm, height_mm)
-            } else {
-                (height_mm, width_mm)
-            };
-            prop_assert_eq!(drawn.width, u32::from(expected_w) * UNITS_PER_MM);
-            prop_assert_eq!(drawn.height, u32::from(expected_h) * UNITS_PER_MM);
+
+            let mut panel = [u32::from(width_mm) * UNITS_PER_MM, u32::from(height_mm) * UNITS_PER_MM];
+            let mut sides = [drawn.width, drawn.height];
+            panel.sort_unstable();
+            sides.sort_unstable();
+            prop_assert_eq!(sides, panel, "the drawn sides are the panel's");
+            prop_assert_eq!(
+                drawn.width >= drawn.height,
+                width >= height,
+                "the drawing follows the pixels, not the panel: {:?}",
+                drawn
+            );
             prop_assert!(!drawn.estimated);
         }
     }

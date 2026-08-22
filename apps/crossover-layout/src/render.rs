@@ -841,9 +841,17 @@ mod tests {
             ..live_monitor(id)
         };
 
-        // Neither machine could measure anything: both rectangles are
-        // guesses, and both say so.
+        // Neither machine could measure anything: every rectangle is
+        // seeded from pixels, exactly as before sizes existed, and a badge
+        // on all of them would mark no difference at all.
         let state = document(Some(peer_state(true)), 0);
+        let painted = painted_text(&editing(Model::from_state(&state)));
+        assert!(!painted.contains("(size estimated)"), "{painted}");
+
+        // One machine measured and the other did not: now there *is* a
+        // difference between the rectangles, and the guesses say so.
+        let mut state = document(Some(peer_state(true)), 0);
+        state.peer.as_mut().unwrap().monitors = vec![measured(r"\\.\DISPLAY1")];
         let painted = painted_text(&editing(Model::from_state(&state)));
         assert!(painted.contains("(size estimated)"), "{painted}");
 
