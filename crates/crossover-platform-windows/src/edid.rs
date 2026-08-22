@@ -161,9 +161,14 @@ fn detailed_timing_size(block: &[u8]) -> Option<(u16, u16)> {
 ///
 /// Both bytes zero is the EDID way of saying "undefined" (a projector is
 /// the case the standard names), not a screen with no size.
+/// Indexed through `get` rather than directly, like its sibling above.
+/// Today the caller has already established that the block is long enough,
+/// so a raw index would be sound — but this module's contract is *total on
+/// arbitrary bytes*, and a contract that holds only because of what some
+/// other function checked first is one refactoring away from being false.
 fn max_image_size(block: &[u8]) -> Option<(u16, u16)> {
-    let width_cm = u16::from(block[21]);
-    let height_cm = u16::from(block[22]);
+    let width_cm = u16::from(*block.get(21)?);
+    let height_cm = u16::from(*block.get(22)?);
     if width_cm == 0 || height_cm == 0 {
         return None;
     }
