@@ -143,6 +143,14 @@ pub struct DrawnMonitor {
     /// an authoritative layout names a monitor this machine did not report
     /// as currently live (unplugged, or a stale saved arrangement).
     pub native_size: Option<(u32, u32)>,
+    /// Its live scale factor, from the same live report as
+    /// [`Self::native_size`] and `None` on the same absence.
+    ///
+    /// Kept beside the pixel size because the pair — not the pixels alone —
+    /// is what says whether a seeded extent still describes this screen: a
+    /// monitor whose DPI changed reports the same pixels at a new scale,
+    /// and seeds a different rectangle for it ([`transplant_group`]).
+    pub native_scale_percent: Option<u16>,
     /// `true` when `rect` is the saved arrangement's own position for this
     /// monitor. `false` when it is a seed: either the whole scene is seeded
     /// ([`Model::seeded`]), or this one monitor is live but the saved
@@ -150,12 +158,14 @@ pub struct DrawnMonitor {
     /// *unplaced* rather than hides.
     pub authoritative: bool,
     /// `true` when this rectangle's **size** is a guess rather than a
-    /// measurement: it was seeded, and the machine could not say how big
-    /// the panel physically is ([`crate::seeding::SeededSize::estimated`]).
+    /// measurement: it was seeded, the machine could not believably say how
+    /// big the panel physically is, and something else in the scene could
+    /// ([`crate::seeding::SeededSize::estimated`] states the whole rule).
     ///
     /// Always `false` for a rectangle an authoritative layout placed — that
     /// size is the saved arrangement's, which is not a guess whatever the
-    /// platform knows about the panel today.
+    /// platform knows about the panel today. That is an invariant of every
+    /// path that builds or updates a group, [`transplant_group`] included.
     pub size_estimated: bool,
 }
 
@@ -891,21 +901,29 @@ impl Model {
 
 /// Move `fresh`'s rectangles to where the user put them.
 ///
-/// A monitor the previous scene also drew takes that scene's **rectangle**
-/// — position and size both — for as long as the screen behind it is the
-/// screen it was. What decides "the same screen" is the live pixel size:
+/// A monitor the previous scene also drew always takes that scene's
+/// **position**. Whether it also keeps that scene's **extent** is one
+/// question with two halves, and both halves have to hold:
 ///
-/// - **Same pixels, so the same screen.** The whole rectangle is the
-///   previous scene's, including its extent. That extent may well be a
-///   *seed*, and a seed can change underneath a running editor for reasons
-///   that are no news at all to the user: the worker learns a panel's
-///   physical size a moment after it learns the panel exists, so a monitor
-///   seeded from the DIP fallback on one read is seeded from millimetres on
-///   the next. Re-seeding a rectangle the user is in the middle of
-///   arranging would resize it under their hand — the same wipe this
-///   transplant exists to prevent, in a form that is harder to see.
-/// - **Different pixels, so a resolution change.** That *is* news: the
-///   fresh extent wins, and only the position is carried over.
+/// - **Is the fresh rectangle a seed?** Only a seed's extent is this
+///   module's to hold on to. A rectangle a validated arrangement placed is
+///   the *user's saved size*, freshly read, and it wins outright — over a
+///   seed the previous scene had computed, and over that seed's badge,
+///   which is why an authoritative rectangle is never marked estimated
+///   (see [`DrawnMonitor::size_estimated`]).
+/// - **Is it still the same screen?** Pixels *and* scale, together. A seed
+///   can change underneath a running editor for reasons that are no news
+///   at all to the user — the worker learns a panel's physical size a
+///   moment after it learns the panel exists, so a monitor seeded from the
+///   DIP fallback on one read is seeded from millimetres on the next — and
+///   re-seeding a rectangle the user is in the middle of arranging would
+///   resize it under their hand, the same wipe this transplant exists to
+///   prevent in a form that is harder to see. But a **resolution or DPI
+///   change is news**: both change what the screen is, both change what the
+///   seed computes, and the pixel size alone would silently swallow the
+///   second (a 4K screen at 100 % and at 200 % reports the same pixels and
+///   seeds half the size). Either changing takes the fresh extent, keeping
+///   only the position.
 ///
 /// A monitor only the fresh scene has — a display docked while the editor
 /// was open — is offered at its seeded place plus the translation the user
@@ -927,11 +945,11 @@ fn transplant_group(fresh: &mut MachineGroup, previous: &MachineGroup) {
     };
     for monitor in &mut fresh.monitors {
         match previous.monitors.iter().find(|was| was.id == monitor.id) {
-            Some(was) if was.native_size == monitor.native_size => {
-                // The same screen at the same resolution: the user's
-                // rectangle stands whole, and the badge travels with the
-                // size it describes rather than with a size that is not on
-                // screen.
+            Some(was) if !monitor.authoritative && describes_the_same_screen(was, monitor) => {
+                // A seed, for a screen that has not changed: the rectangle
+                // the user is arranging stands whole, and the badge travels
+                // with the size it describes rather than with a size that
+                // is not on screen.
                 monitor.rect = was.rect;
                 monitor.size_estimated = was.size_estimated;
             }
@@ -945,6 +963,18 @@ fn transplant_group(fresh: &mut MachineGroup, previous: &MachineGroup) {
             None => monitor.rect = translated(monitor.rect, delta),
         }
     }
+}
+
+/// Whether two reads of one monitor id describe a screen that has not
+/// changed in any way the seed depends on — its pixel size and its scale
+/// factor, which are exactly [`crate::seeding`]'s two live inputs.
+///
+/// Not "are these the same monitor": the id already answered that. This
+/// asks the narrower question the transplant needs — *would seeding it
+/// again produce a different rectangle, for a reason the user would
+/// recognise as news about their hardware?*
+fn describes_the_same_screen(was: &DrawnMonitor, fresh: &DrawnMonitor) -> bool {
+    was.native_size == fresh.native_size && was.native_scale_percent == fresh.native_scale_percent
 }
 
 /// The blocking diagnostic for a scene that is not a layout, naming the
@@ -1157,6 +1187,7 @@ fn seed_monitors(
                 height: size.height,
             },
             native_size: Some((monitor.rect.width, monitor.rect.height)),
+            native_scale_percent: Some(monitor.scale_percent),
             authoritative: false,
             size_estimated: size.estimated,
         });
@@ -1225,6 +1256,7 @@ fn authoritative_group(
                 ordinal: index + 1,
                 rect: monitor.rect,
                 native_size: live.map(|candidate| (candidate.rect.width, candidate.rect.height)),
+                native_scale_percent: live.map(|candidate| candidate.scale_percent),
                 authoritative: true,
                 // A placed rectangle's size is the saved arrangement's, so
                 // nothing about it is estimated — not even when the panel
@@ -1942,12 +1974,15 @@ mod tests {
     /// screen is the user's work.
     #[test]
     fn a_physical_size_arriving_mid_edit_does_not_resize_the_users_rectangles() {
+        // The peer measured itself from the start, so the local machine's
+        // unmeasured rectangle is badged and has something to contrast
+        // with — the badge is a statement about the scene, not the screen.
+        let peer = vec![LiveMonitor {
+            physical_size: Some(PhysicalSizeMm::new(286, 179).unwrap()),
+            ..live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)
+        }];
         let unmeasured = live(r"\\.\DISPLAY1", 0, 2560, 1440, 100);
-        let mut edited = Model::from_state(&state(
-            vec![unmeasured.clone()],
-            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
-            None,
-        ));
+        let mut edited = Model::from_state(&state(vec![unmeasured.clone()], peer.clone(), None));
         drag_by(&mut edited, LOCAL, r"\\.\DISPLAY1", (0.0, 900.0));
         let drawn = edited.local.monitors[0].rect;
         assert!(edited.local.monitors[0].size_estimated);
@@ -1957,11 +1992,7 @@ mod tests {
             physical_size: Some(PhysicalSizeMm::new(597, 336).unwrap()),
             ..unmeasured.clone()
         };
-        let mut fresh = Model::from_state(&state(
-            vec![measured.clone()],
-            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
-            None,
-        ));
+        let mut fresh = Model::from_state(&state(vec![measured.clone()], peer.clone(), None));
         assert_ne!(
             fresh.local.monitors[0].rect.width, drawn.width,
             "the fixture must actually re-seed differently"
@@ -1979,21 +2010,87 @@ mod tests {
 
         // And the same in reverse: a size that goes away — a re-enumeration
         // that failed to read the EDID this time — does not resize it back.
-        let mut fresh = Model::from_state(&state(
-            vec![unmeasured],
-            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
-            None,
-        ));
-        let mut measured_edit = Model::from_state(&state(
-            vec![measured],
-            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
-            None,
-        ));
+        let mut fresh = Model::from_state(&state(vec![unmeasured], peer.clone(), None));
+        let mut measured_edit = Model::from_state(&state(vec![measured], peer, None));
         drag_by(&mut measured_edit, LOCAL, r"\\.\DISPLAY1", (0.0, 900.0));
         let measured_rect = measured_edit.local.monitors[0].rect;
         fresh.transplant_from(&measured_edit);
         assert_eq!(fresh.local.monitors[0].rect, measured_rect);
         assert!(!fresh.local.monitors[0].size_estimated);
+    }
+
+    /// A **DPI** change is news exactly as a resolution change is: the same
+    /// pixels at a new scale are a differently-sized screen and seed a
+    /// differently-sized rectangle, and a predicate that looked only at
+    /// pixels would swallow it — leaving the editor showing a rectangle
+    /// whose size describes a scale factor the machine no longer uses.
+    /// TESTING.md's E-1 is a DPI check for exactly this reason.
+    #[test]
+    fn a_scale_change_alone_still_resizes_a_rectangle_being_edited() {
+        let mut edited = Model::from_state(&state(
+            vec![live(r"\\.\DISPLAY1", 0, 3840, 2160, 100)],
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            None,
+        ));
+        drag_by(&mut edited, LOCAL, r"\\.\DISPLAY1", (0.0, 900.0));
+        assert_eq!(edited.local.monitors[0].rect.width, 3840);
+
+        // The same screen, the same pixels, now at 200 %.
+        let mut fresh = Model::from_state(&state(
+            vec![live(r"\\.\DISPLAY1", 0, 3840, 2160, 200)],
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            None,
+        ));
+        fresh.transplant_from(&edited);
+        assert_eq!(
+            (
+                fresh.local.monitors[0].rect.width,
+                fresh.local.monitors[0].rect.height
+            ),
+            (1920, 1080),
+            "the new scale is the OS's fact, not an edit to undo"
+        );
+        assert_eq!(fresh.local.monitors[0].rect.y, 900, "still the user's");
+    }
+
+    /// A rectangle the *fresh* document places authoritatively is the
+    /// user's own saved size, freshly read — so it wins over a seed the
+    /// previous scene had computed, and it is never left carrying that
+    /// seed's badge. Only the position transplants.
+    #[test]
+    fn an_authoritative_rectangle_keeps_its_saved_size_and_is_never_badged() {
+        // A seeded scene the user has dragged, with the local rectangle
+        // badged (the peer measured itself, so there is a contrast).
+        let peer = vec![LiveMonitor {
+            physical_size: Some(PhysicalSizeMm::new(286, 179).unwrap()),
+            ..live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)
+        }];
+        let mut edited = Model::from_state(&state(
+            vec![live(r"\\.\DISPLAY1", 0, 2560, 1440, 100)],
+            peer.clone(),
+            None,
+        ));
+        drag_by(&mut edited, LOCAL, r"\\.\DISPLAY1", (0.0, 900.0));
+        assert!(edited.local.monitors[0].size_estimated);
+        assert_ne!(edited.local.monitors[0].rect.width, 1920);
+
+        // The worker has since caught up with a saved arrangement, which
+        // places that monitor at 1920 wide.
+        let mut fresh = Model::from_state(&state(
+            vec![live(r"\\.\DISPLAY1", 0, 2560, 1440, 100)],
+            peer,
+            Some(side_by_side_layout()),
+        ));
+        fresh.transplant_from(&edited);
+
+        let drawn = &fresh.local.monitors[0];
+        assert!(drawn.authoritative);
+        assert_eq!(drawn.rect.width, 1920, "the saved size is the user's own");
+        assert!(
+            !drawn.size_estimated,
+            "and an authoritative size is no guess"
+        );
+        assert_eq!(drawn.rect.y, 900, "but where they dragged it stands");
     }
 
     /// The other half of the same rule, so the hold cannot quietly become
