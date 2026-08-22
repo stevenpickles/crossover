@@ -897,10 +897,21 @@ impl Model {
 
 /// Move `fresh`'s rectangles to where the user put them.
 ///
-/// A monitor the previous scene also drew takes that scene's **position**
-/// exactly — and keeps the *fresh* scene's size, because an extent is the
-/// OS's fact about the screen and a resolution change is news, not an edit
-/// to be undone.
+/// A monitor the previous scene also drew takes that scene's **rectangle**
+/// — position and size both — for as long as the screen behind it is the
+/// screen it was. What decides "the same screen" is the live pixel size:
+///
+/// - **Same pixels, so the same screen.** The whole rectangle is the
+///   previous scene's, including its extent. That extent may well be a
+///   *seed*, and a seed can change underneath a running editor for reasons
+///   that are no news at all to the user: the worker learns a panel's
+///   physical size a moment after it learns the panel exists, so a monitor
+///   seeded from the DIP fallback on one read is seeded from millimetres on
+///   the next. Re-seeding a rectangle the user is in the middle of
+///   arranging would resize it under their hand — the same wipe this
+///   transplant exists to prevent, in a form that is harder to see.
+/// - **Different pixels, so a resolution change.** That *is* news: the
+///   fresh extent wins, and only the position is carried over.
 ///
 /// A monitor only the fresh scene has — a display docked while the editor
 /// was open — is offered at its seeded place plus the translation the user
@@ -921,14 +932,24 @@ fn transplant_group(fresh: &mut MachineGroup, previous: &MachineGroup) {
         return;
     };
     for monitor in &mut fresh.monitors {
-        monitor.rect = match previous.monitors.iter().find(|was| was.id == monitor.id) {
-            Some(was) => LayoutRect {
-                x: was.rect.x,
-                y: was.rect.y,
-                ..monitor.rect
-            },
-            None => translated(monitor.rect, delta),
-        };
+        match previous.monitors.iter().find(|was| was.id == monitor.id) {
+            Some(was) if was.native_size == monitor.native_size => {
+                // The same screen at the same resolution: the user's
+                // rectangle stands whole, and the badge travels with the
+                // size it describes rather than with a size that is not on
+                // screen.
+                monitor.rect = was.rect;
+                monitor.size_estimated = was.size_estimated;
+            }
+            Some(was) => {
+                monitor.rect = LayoutRect {
+                    x: was.rect.x,
+                    y: was.rect.y,
+                    ..monitor.rect
+                };
+            }
+            None => monitor.rect = translated(monitor.rect, delta),
+        }
     }
 }
 
@@ -1881,8 +1902,9 @@ mod tests {
 
     /// The transplant's direction, stated as a unit: the **fresh** scene is
     /// what everything else comes from, and only the user's work moves onto
-    /// it. So a monitor's *size* is the fresh scene's (a resolution change
-    /// is news, not an edit to undo) while its *position* is the user's.
+    /// it. A monitor whose *resolution* changed takes the fresh extent —
+    /// that is news, not an edit to undo — while its position stays the
+    /// user's.
     #[test]
     fn a_transplant_takes_positions_from_the_edit_and_everything_else_from_the_fresh_scene() {
         let mut edited = two_and_one();
@@ -1917,6 +1939,95 @@ mod tests {
             "but the position is still the user's"
         );
         assert!(fresh.is_dirty(), "and it is still unsaved");
+    }
+
+    /// A panel that measures itself *while the editor is open* — the
+    /// worker learns a size a moment after it learns the monitor — must not
+    /// resize the rectangle the user is arranging. Nothing about the screen
+    /// changed; only what the worker knows about it did, and the drawing on
+    /// screen is the user's work.
+    #[test]
+    fn a_physical_size_arriving_mid_edit_does_not_resize_the_users_rectangles() {
+        let unmeasured = live(r"\\.\DISPLAY1", 0, 2560, 1440, 100);
+        let mut edited = Model::from_state(&state(
+            vec![unmeasured.clone()],
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            None,
+        ));
+        drag_by(&mut edited, LOCAL, r"\\.\DISPLAY1", (0.0, 900.0));
+        let drawn = edited.local.monitors[0].rect;
+        assert!(edited.local.monitors[0].size_estimated);
+
+        // The next read of the state file, with the EDID now read.
+        let measured = LiveMonitor {
+            physical_size: Some(PhysicalSizeMm::new(597, 336).unwrap()),
+            ..unmeasured.clone()
+        };
+        let mut fresh = Model::from_state(&state(
+            vec![measured.clone()],
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            None,
+        ));
+        assert_ne!(
+            fresh.local.monitors[0].rect.width, drawn.width,
+            "the fixture must actually re-seed differently"
+        );
+        fresh.transplant_from(&edited);
+
+        assert_eq!(
+            fresh.local.monitors[0].rect, drawn,
+            "the rectangle the user is arranging is theirs"
+        );
+        assert!(
+            fresh.local.monitors[0].size_estimated,
+            "and the badge describes the size actually drawn"
+        );
+
+        // And the same in reverse: a size that goes away — a re-enumeration
+        // that failed to read the EDID this time — does not resize it back.
+        let mut fresh = Model::from_state(&state(
+            vec![unmeasured],
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            None,
+        ));
+        let mut measured_edit = Model::from_state(&state(
+            vec![measured],
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            None,
+        ));
+        drag_by(&mut measured_edit, LOCAL, r"\\.\DISPLAY1", (0.0, 900.0));
+        let measured_rect = measured_edit.local.monitors[0].rect;
+        fresh.transplant_from(&measured_edit);
+        assert_eq!(fresh.local.monitors[0].rect, measured_rect);
+        assert!(!fresh.local.monitors[0].size_estimated);
+    }
+
+    /// The other half of the same rule, so the hold cannot quietly become
+    /// "the size never changes": a screen that really did change
+    /// resolution takes the fresh extent, mid-edit or not.
+    #[test]
+    fn a_resolution_change_still_resizes_a_rectangle_being_edited() {
+        let mut edited = Model::from_state(&state(
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            None,
+        ));
+        drag_by(&mut edited, LOCAL, r"\\.\DISPLAY1", (0.0, 900.0));
+
+        let mut fresh = Model::from_state(&state(
+            vec![live(r"\\.\DISPLAY1", 0, 2560, 1440, 100)],
+            vec![live(r"\\.\DISPLAY1", 0, 1920, 1080, 100)],
+            None,
+        ));
+        fresh.transplant_from(&edited);
+        assert_eq!(
+            (
+                fresh.local.monitors[0].rect.width,
+                fresh.local.monitors[0].rect.height
+            ),
+            (2560, 1440)
+        );
+        assert_eq!(fresh.local.monitors[0].rect.y, 900, "still the user's");
     }
 
     /// A monitor the edit never saw arrives with the machine it belongs to,
