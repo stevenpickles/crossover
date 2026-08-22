@@ -105,11 +105,13 @@ use crossover_protocol::RawFrame;
 use crossover_protocol::hello::MessageType;
 use crossover_protocol::layout::{LayoutSync, MonitorReport, MonitorTopology};
 use crossover_topology::{
-    DeviceId, DevicePair, Layout, LayoutError, LayoutState, LiveMonitor, PersistError,
+    DeviceId, DevicePair, Layout, LayoutError, LayoutState, LiveMonitor, MonitorId, PersistError,
     persist_layout,
 };
 
-use crate::topology_state::{LiveMonitorsError, TopologyStateWriter, live_monitors};
+use crate::topology_state::{
+    LiveMonitorsError, TopologyStateWriter, live_monitor_ids, live_monitors,
+};
 
 /// How often adoption may rewrite `config.toml` (ADR 0018,
 /// docs/SECURITY.md T23).
@@ -531,7 +533,7 @@ impl TopologySync {
         if self.sessions.is_empty() {
             return;
         }
-        let monitors = match live_monitors(&*self.display) {
+        let mut monitors = match live_monitors(&*self.display) {
             Ok(monitors) => monitors,
             Err(LiveMonitorsError::Unavailable(error)) => {
                 tracing::warn!(
@@ -558,6 +560,17 @@ impl TopologySync {
                 "layout sync: no nameable monitors to report; MonitorTopology not sent"
             );
             return;
+        }
+        // Captions the display would not repeat this instant, filled in
+        // from what the state writer last saw. Geometry is always this
+        // query's own; only the labels come from memory, and only where
+        // this query had none — see `TopologyStateWriter::set_monitors`
+        // for why a caption is remembered rather than re-read. Without
+        // this the state file and the wire would describe the same desk
+        // differently whenever a label sweep failed to coincide with a
+        // real display change.
+        if let Some(writer) = &self.state {
+            writer.fill_remembered_labels(&mut monitors);
         }
         let message = MonitorTopology {
             monitors: monitors.iter().map(report_of).collect(),
@@ -1175,11 +1188,17 @@ impl TopologySync {
     /// Only when this machine actually has screens to match against: a
     /// display that will not enumerate is a different fault, and one
     /// `live_monitors` has already reported.
+    ///
+    /// Asks [`live_monitor_ids`] rather than `live_monitors`, because ids
+    /// are the entire question here and the fuller query would drag a
+    /// `QueryDisplayConfig` sweep along behind a log line — breaking ADR
+    /// 0018's promise that only the ~1 s topology cadence pays for reading
+    /// product names.
     fn warn_if_inert_here(&self) {
         let Some(adopted) = &self.layout else {
             return;
         };
-        let Ok(live) = live_monitors(&*self.display) else {
+        let Ok(live) = live_monitor_ids(&*self.display) else {
             return;
         };
         if live.is_empty() {
@@ -1187,7 +1206,7 @@ impl TopologySync {
         }
         if adopted
             .monitors_for(self.local)
-            .any(|drawn| live.iter().any(|screen| screen.id == drawn.id))
+            .any(|drawn| live.contains(&drawn.id))
         {
             return;
         }
@@ -1195,7 +1214,7 @@ impl TopologySync {
             .monitors_for(self.local)
             .map(|monitor| monitor.id.as_str())
             .collect();
-        let attached: Vec<&str> = live.iter().map(|monitor| monitor.id.as_str()).collect();
+        let attached: Vec<&str> = live.iter().map(MonitorId::as_str).collect();
         tracing::warn!(
             revision = adopted.revision(),
             drawn = ?drawn,
