@@ -190,6 +190,18 @@ because the two facts pull in opposite directions: the label is
 but the byte is on the wire regardless, and it is the byte that forces the
 bump.
 
+And once more for v5 → **v6** ([ADR 0018](adr/0018-drawn-display-topology.md)'s
+2026-08-22 amendment): the same per-monitor entry gains an optional
+`physical_size`, the panel's real width and height in millimetres, so the
+peer's editor can draw a 27" screen and a 13" one in proportion to each
+other rather than by pixel count (§6.2). The rule decides it exactly as it
+decided v5 — same message, still gated by no bit, so the `Option`
+discriminant byte rides every monitor of every report and a v5 peer would
+read it as trailing data and fail the payload (§7, fatal). Both ends of the
+range move to 6. The same two facts pull the same two ways: a size is
+**proportion-only and never identity**, so nothing about crossing changes,
+and the byte is on the wire regardless.
+
 ## 4. Message classes
 
 Four logical classes, initially multiplexed over the single TLS connection:
@@ -523,7 +535,8 @@ messages carry it, both added at v4 and both base protocol — no feature bit
 
 ```
 MonitorTopology   { monitors: [ { id, x, y, width, height,         // type 17
-                                  scale_percent, label? } ] }
+                                  scale_percent, label?,
+                                  physical_size? } ] }
 LayoutSync        { revision, origin,                              // type 18
                     monitors: [ { device, id, x, y, width, height } ] }
 ```
@@ -577,6 +590,30 @@ LayoutSync        { revision, origin,                              // type 18
     acceptable because a label is never an identity — the worst a novel
     invisible character buys is an ambiguous caption, never a
     mis-crossing.
+- **`physical_size` is optional, and is a proportion rather than a
+  measurement of anything the protocol acts on** (added at v6). It is the
+  panel's real width and height in millimetres, so the receiver's editor
+  can draw a 27" screen and a 13" one at the sizes they actually are: a
+  cursor leaving one desk a third of the way up a bezel should arrive a
+  third of the way up the other's, and pixel counts alone cannot say that.
+  It carries the same three properties the label does, for the same
+  reasons:
+  - **Proportion-only, never identity.** Nothing keys off it. A peer that
+    lies about a size draws a rectangle at the wrong scale at the other
+    desk; it cannot move a crossing, which stays proportional through the
+    *drawn* geometry rather than through anything reported here.
+  - **Not unique.** Two identical screens measure identically, so a
+    repeated size is a valid message where a repeated `id` is malformed.
+  - **Bounded and refused, not repaired.** Each axis is
+    `1..=MAX_PHYSICAL_SIZE_MM`, validated on encode and decode alike; zero
+    or over is malformed and fatal (§7). That cap is deliberately looser
+    than what a *sending* platform will claim: a decoder's business is
+    arithmetic and allocation safety, so it refuses the impossible, while
+    an acquiring backend refuses the merely implausible — the Windows EDID
+    reader admits only 50–3000 mm, because projectors, TVs, and virtual
+    displays report sizes that are fiction and a wrong size drawn
+    confidently is worse than none. Splitting it that way means the
+    plausibility policy can move without moving the protocol.
 - **`LayoutSync` states the arrangement**, which describes *both* machines:
   a `u64` revision, `origin` (the editing device's identity), and the
   placed monitors. It is sent after `Hello` when the sender holds an
@@ -594,14 +631,16 @@ Invariants, all of them checked before anything is adopted:
   `MAX_MONITOR_ID_BYTES` printable-ASCII bytes, unique within a machine; a
   monitor label of at most `MAX_MONITOR_LABEL_BYTES` UTF-8 bytes with no
   control, bidirectional, or invisible format characters, *not* required
-  to be unique; `1 ≤ width, height ≤
-  MAX_MONITOR_EXTENT`; `|x|, |y| ≤ MAX_LAYOUT_COORDINATE`. Every
+  to be unique; a physical size of `1 ≤ width_mm, height_mm ≤
+  MAX_PHYSICAL_SIZE_MM`, likewise not required to be unique; `1 ≤ width,
+  height ≤ MAX_MONITOR_EXTENT`; `|x|, |y| ≤ MAX_LAYOUT_COORDINATE`. Every
   derivation runs in `i64`, where those bounds make overflow impossible
   rather than merely unlikely.
 - **Malformed is fatal** (§7): a count past its cap, a zero or oversized
   dimension, an out-of-range coordinate, a non-ASCII or overlong id, an
   overlong label or one carrying a control, bidirectional, or invisible
-  format character — the session terminates, fail closed.
+  format character, a physical size that is zero or over its cap on either
+  axis — the session terminates, fail closed.
 - **Well-formed but semantically impossible is rejected, never adopted**: a
   layout naming a device that is not this session's pair, or rectangles
   that overlap. It is logged and charged as a protocol violation on §7's
@@ -669,6 +708,7 @@ Invariants, all of them checked before anything is adopted:
 | Max monitors in a layout | 32, `MAX_LAYOUT_MONITORS` (ADR 0018) — a layout describes exactly two machines |
 | Max monitor id | 64 bytes, `MAX_MONITOR_ID_BYTES` (ADR 0018), printable ASCII — the platform's device string (`szDevice` on Windows), which survives a restart where an enumeration index does not |
 | Max monitor label | 64 bytes, `MAX_MONITOR_LABEL_BYTES` (ADR 0018 as amended 2026-08-21), UTF-8 with no control, bidirectional, or invisible format characters (`FORMAT_CHARACTERS`) — the human-readable monitor name the editor captions with, from EDID where the platform has one. Optional, non-unique, display-only: never an identity, so nothing matches or derives on it |
+| Max physical size | 10 000 mm per axis, `MAX_PHYSICAL_SIZE_MM` (ADR 0018 as amended 2026-08-22); minimum 1 — the panel's real millimetres, so the editor can draw two desks in proportion. Optional, non-unique, proportion-only: never an identity, so nothing matches or derives on it. Deliberately looser than the 50–3000 mm plausibility gate a sending platform applies — the wire refuses the impossible, the acquiring backend refuses the implausible |
 | Max monitor extent | 65 535, `MAX_MONITOR_EXTENT` (ADR 0018); minimum 1 — a zero-sized monitor has no edge to cross |
 | Max layout coordinate | 2^24, `MAX_LAYOUT_COORDINATE` (ADR 0018) — with the extent cap this keeps every derivation under 2^42 in `i64`, so overflow is impossible rather than improbable |
 | Monitor scale bounds | 25–500 percent, `MIN_SCALE_PERCENT` / `MAX_SCALE_PERCENT` (ADR 0018) — seeds the editor's to-scale drawing only; never enters crossing mapping |

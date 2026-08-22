@@ -45,15 +45,29 @@ use crate::ProtocolError;
 /// per docs/PROTOCOL.md §7 — so the bump turns that into a refusal at
 /// `Hello`. The label itself is display-only and never identity; the
 /// bump is about the byte, not about what it means.
-pub const PROTOCOL_VERSION: u16 = 5;
+///
+/// v6 (Phase 8, ADR 0018's 2026-08-22 amendment): the same per-monitor
+/// entry gains an optional `physical_size` — the panel's real width and
+/// height in millimetres, so the peer's editor can draw a 27" screen and a
+/// 13" one in proportion rather than by pixel count, which is what makes a
+/// crossing physically continuous across the seam between two desks
+/// (docs/PROTOCOL.md §6.2). ADR 0017's rule for the third time in this
+/// message: `MonitorTopology` travels between every pair of v5 peers and
+/// carries no feature bit, so the extra `Option` byte on every monitor of
+/// every report is on the wire whatever either side wants. A v5 peer would
+/// read it as trailing data and fail the payload — fatal per
+/// docs/PROTOCOL.md §7 — so the bump turns that into a refusal at `Hello`.
+/// Like the label before it the size is display-only and never identity;
+/// the bump is about the byte, not about what it means.
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// The lowest protocol version this build accepts. Each bump has been an
 /// incompatible layout change (v1's control messages cannot be decoded by
 /// v2; v2's offers cannot be decoded by v3; v3's `entry` cannot be decoded
-/// by v4; v4's `MonitorTopology` cannot be decoded by v5), and peers are
-/// deployed in lockstep, so the floor tracks the ceiling rather than
-/// carrying compatibility code for a version nobody runs.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 5;
+/// by v4; v4's `MonitorTopology` cannot be decoded by v5, nor v5's by v6),
+/// and peers are deployed in lockstep, so the floor tracks the ceiling
+/// rather than carrying compatibility code for a version nobody runs.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 6;
 
 /// An inclusive range of supported protocol versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
