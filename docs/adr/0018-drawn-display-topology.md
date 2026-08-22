@@ -705,7 +705,9 @@ acquisition end means it can be tightened for a newly-discovered class of
 lying display with no protocol change and no peer to coordinate with.
 
 **Acquisition and retention.** The size comes from the monitor's EDID,
-which Windows caches under the monitor's own driver key; the
+which Windows caches under the monitor's own hardware key (its
+`Device Parameters` subkey, which is what `DIREG_DEV` opens — the driver
+key holds no EDID); the
 `QueryDisplayConfig` sweep that already reads product names hands back the
 device interface path that key sits behind, so it costs one SetupAPI open
 and one bounded registry read per monitor on the same ~1 s cadence and

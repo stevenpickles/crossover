@@ -160,7 +160,7 @@ windows = { version = "0.62", features = [
     # the edge detector's hot path — see crossover-platform's `display`
     # module.
     # SetupDi*: the walk from a monitor's device interface path to its own
-    # driver key, where Windows caches the EDID the panel's physical size is
+    # hardware key, where Windows caches the EDID the panel's physical size is
     # read out of. Paired with Win32_System_Registry below; see
     # crossover-platform-windows' `edid` module for the parsing and the
     # plausibility rule.
@@ -197,7 +197,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     # RegQueryValueExW: reading the cached `EDID` value out of the monitor
-    # driver key SetupDi* above opens. Read-only, bounded before it
+    # hardware key SetupDi* above opens. Read-only, bounded before it
     # allocates, and never on the edge path.
     "Win32_System_Registry",
     "Win32_System_RemoteDesktop",

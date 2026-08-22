@@ -616,8 +616,12 @@ fn friendly_name_of(target: &DISPLAYCONFIG_TARGET_DEVICE_NAME) -> Option<String>
 ///
 /// `monitorDevicePath` is a device *interface* path — the
 /// `\\?\DISPLAY#DEL41A1#...` string Device Manager knows the monitor by —
-/// and it is the handle onto the monitor's own driver key, under which
-/// Windows caches the EDID it read off the cable. Every step is best effort
+/// and it is the handle onto the monitor's own **hardware** key
+/// (`...\Enum\DISPLAY\<id>\<instance>\Device Parameters`), under which
+/// Windows caches the EDID it read off the cable. The hardware key, not
+/// the driver one: `DIREG_DRV` opens the class/driver key, which has no
+/// `EDID` value at all, so naming the wrong hive here would send a
+/// debugger looking in a place the value can never be. Every step is best effort
 /// and every failure is `None`, because a caption-and-proportion feature has
 /// no failure worth propagating: a screen with no readable EDID draws the
 /// way every screen drew before sizes existed.
@@ -653,7 +657,9 @@ const MAX_EDID_BYTES: u32 = 1024;
 /// The route is the documented one: an empty device information list, the
 /// interface opened *by path* onto it (which adds exactly that one device),
 /// the device information for the single member that produces, and then the
-/// device's own driver key, where the `EDID` value lives.
+/// device's own hardware key — `DIREG_DEV`, which is the
+/// `Device Parameters` subkey where the `EDID` value lives, and not
+/// `DIREG_DRV`'s driver key, which has none.
 ///
 /// Every failure is `None` rather than an error, per [`panel_size_of`]. The
 /// list is destroyed on every exit, including the early ones — a leaked
@@ -721,7 +727,7 @@ fn read_edid_from(devices: HDEVINFO, path: &[u16]) -> Option<Vec<u8>> {
     edid
 }
 
-/// The `EDID` value under an already-open monitor driver key.
+/// The `EDID` value under an already-open monitor hardware key.
 ///
 /// The length is asked for first and **checked before anything is
 /// allocated**, so a value claiming to be enormous costs a comparison
