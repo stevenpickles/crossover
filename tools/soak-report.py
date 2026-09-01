@@ -79,10 +79,13 @@ def summarize(path: Path) -> None:
         # contended attempt (ADR 0005, addendum 2026-09-01).
         elif "parking the install" in line:
             parked += 1
-        # The stretch marker, not the per-copy debug line: one of these
-        # per gap in the pairing, however many copies the gap held
-        # (ADR 0006, addendum 2026-09-01).
-        elif "no peer connected" in line:
+        # The stretch marker only: one of these per gap in the pairing,
+        # however many copies the gap held (ADR 0006, addendum
+        # 2026-09-01). Matched on the marker's own tail rather than on
+        # "no peer connected", which the two per-copy debug lines also
+        # carry — under RUST_LOG=debug, which docs/SOAK.md sanctions,
+        # the looser match counted copies and called them stretches.
+        elif "will be offered when one connects" in line:
             offline += 1
         elif "busy" in line.lower() and "clipboard" in line.lower():
             contention += 1
