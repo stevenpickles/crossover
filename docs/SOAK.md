@@ -213,6 +213,77 @@ If clipboard tests fail this way, check `Set-Clipboard` in PowerShell
 first — if that also fails, the machine is wedged and the test results
 mean nothing until the service is restarted.
 
+### Reading the holder from the log line (feature/162)
+
+Hardware evidence (2026-09-01, machine A) found the ordinary, briefer
+cousin of the above: at 5 of 8 peer reconnects, `OpenClipboard` failed for
+about a second with the same "Access is denied", but recovered on its own
+— routine contention (R-5), not a wedged service, and every such failure
+now names its holder in the reason string.
+
+That reason surfaces at two different log levels, and it matters which
+one an operator is reading:
+
+- **Where it actually appears at `RUST_LOG=info`** (this soak's own
+  documented setting, above, and the worker's default filter when
+  `RUST_LOG` is unset): `crates/crossover-core/src/clipboard_driver.rs`
+  logs the *first* `Busy` for a given clipboard item at `warn!` —
+  `write busy` / `offer busy`, with `clipboard_id` and the holder-naming
+  `error` field — and every retry after that (every 200 ms, up to the
+  retry budget) at `debug!`, so a sustained contention episode produces
+  exactly one visible line per item, not a flood. A line that never
+  clears eventually meets the engine's own give-up line in
+  `crates/crossover-core/src/clipboard.rs` (`clipboard item could not be
+  installed`, also `warn!`), which the `clipboard_id` field ties back to
+  this one.
+- **The reason string itself**, produced in
+  `crates/crossover-platform-windows/src/clipboard.rs`, is what both of
+  those log lines' `error` field carries:
+  - `OpenClipboard failed (clipboard held elsewhere?): Access is denied.
+    (0x80070005); held by pid 1234 "SomeApp.exe" (window class "Foo")` —
+    an external application (Clipboard History, a password manager, an
+    RDP client are the usual suspects); nothing to fix in Crossover. A
+    class name Win32 could not read prints as `(window class unreadable)`
+    — unquoted, on purpose, so it can never be mistaken for a window
+    genuinely classed that word.
+  - `…; held by this process (our own clipboard guard on thread T, site
+    "read"/"write"/"ole")` — the contention is **internal**: this
+    process's own `OpenGuard` (the ordinary text/image path) collided
+    with itself, most often against the OLE virtual-file apartment thread
+    (`crossover-platform-windows::virtual_file`, site `"ole"`). Worth a
+    closer look if it recurs, since nothing external explains it. This is
+    the shape that needed its own tracking (`OWN_HOLD` in `clipboard.rs`):
+    every call site here opens with a `NULL` window handle, which
+    `GetOpenClipboardWindow` cannot see at all — without it, this exact
+    case would misreport as the "unidentified" bucket below.
+  - `…; held by this process (pid N, thread T, window class "...")` — the
+    same internal-contention finding, reached instead through a real
+    window `GetOpenClipboardWindow` could see (some other in-process
+    clipboard use we do not control, rather than one of our own marked
+    call sites).
+  - `…; held by an unidentified owner (no window)` — two distinct causes
+    read identically here, and neither one alone warrants chasing the
+    service restart below:
+    1. **Benign and transient.** The holder released the clipboard in the
+       gap between our failed open and this lookup — inherent to asking
+       *afterwards*, and the ordinary shape of routine contention that
+       clears on its own.
+    2. **Some other process opened with a `NULL` window handle**, the same
+       way this codebase's own call sites do, so it is invisible to
+       `GetOpenClipboardWindow` for the same reason ours would be (were
+       `OWN_HOLD` not there to catch it first).
+
+    Only if this line **persists** — recurring well past a few retries,
+    or turning up as the wholesale "every process" failure the top of
+    this section describes — does it become worth suspecting the wedged
+    Clipboard User Service and reaching for `Restart-Service cbdhsvc*`.
+    A handful of transient occurrences during a reconnect burst is not
+    that; it is R-5 working as designed.
+
+The prefix (`OpenClipboard failed (clipboard held elsewhere?)` /
+`OleSetClipboard failed (clipboard held elsewhere?)`) is unchanged and
+still what to `grep` for; the holder clause is appended after it.
+
 ## Phase 3 soak: remote mouse (two machines)
 
 This is the Phase 3 exit criterion that no single machine can show:

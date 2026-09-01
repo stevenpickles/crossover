@@ -260,6 +260,41 @@ Guidelines:
     than reaching Win32. Type is judged before size, so an oversized JPEG
     is refused for being a JPEG: the durable answer, where "too big"
     invites a smaller retry that must also fail.
+  - **A contention failure names its holder** (FR-7.3; feature/162, from
+    2026-09-01 hardware evidence of `OpenClipboard` failing across ~1 s of
+    peer reconnects with no way to tell who held it). `Busy`'s `reason`
+    resolves the holder two ways, checked in order:
+    - **This process's own opens first**, via a process-global marker
+      (`OWN_HOLD`) `OpenGuard::open` and the OLE virtual-file placement
+      (`crossover-platform-windows::virtual_file`) set the instant their
+      open succeeds and clear the instant it ends, tagged with a `site`
+      (`"read"`/`"write"`/`"ole"`). This exists because every open here
+      uses a `NULL` window handle, which the second method below cannot
+      see at all — without it, Crossover contending with *itself* (the
+      OLE apartment thread against the ordinary text/image path, say)
+      would misreport as unidentified rather than naming the real cause.
+    - **Falling back to `GetOpenClipboardWindow` → `GetWindowThreadProcessId`**
+      for a holder that *does* associate a real window — an external
+      application, or in-process use this crate does not mark. The
+      window's class name (`GetClassNameW`, escaped per SECURITY.md F11
+      before it can reach a log line — a class name is attacker-influenced
+      text) and, for an external holder, the process's own executable
+      file name (`QueryFullProcessImageNameW`) are named; never a window
+      title or full path, both of which can carry document or user
+      content (FR-7.4). Whether the pid is this process's own
+      (`GetCurrentProcessId`) is the one bit that matters most here too.
+      A class name Win32 could not read prints unquoted
+      (`window class unreadable`) rather than a placeholder word, so it
+      can never be confused with a window genuinely classed that way.
+
+    Every lookup degrades to "unidentified" on failure rather than
+    blocking or panicking, the same discipline `LinkStateProbe` below
+    holds to. The reason reaching a live log at all is a separate concern
+    the driver owns: `crossover-core::clipboard_driver` logs a busy
+    write's or file offer's *first* attempt for a given item at `warn!`
+    and every retry after that (every 200 ms, up to the retry budget) at
+    `debug!` — so the holder is visible at this project's default log
+    level without a retry storm drowning it out.
 - `LinkStateProbe` is a **diagnostic** capability, not an operational one: it
   is read on a failure path to label a log line and never gates, delays, or
   reorders anything (see §10). Its contract is therefore unusually strict —

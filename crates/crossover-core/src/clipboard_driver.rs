@@ -27,8 +27,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crossover_platform::{
-    ClipboardError, ClipboardProvider, FileBlob, FileBlobBuilder, FileBlobRefusal, SpoolError,
-    SpoolStorage, VirtualFile, VirtualFileClipboard,
+    ClipboardContent, ClipboardError, ClipboardProvider, FileBlob, FileBlobBuilder,
+    FileBlobRefusal, SpoolError, SpoolStorage, VirtualFile, VirtualFileClipboard,
 };
 use crossover_protocol::RawFrame;
 use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
@@ -150,6 +150,38 @@ pub enum SyncEvent {
     },
 }
 
+/// Tracks whether the *first* `Busy` for a given item has already been
+/// escalated to `warn!` (feature/162). A write (or file offer) is retried
+/// every [`crate::clipboard::RetryPolicy::delay`] (200 ms by default) up
+/// to [`crate::clipboard::RetryPolicy::max_attempts`] times; at `info` —
+/// the worker's default filter — logging every retry at `warn!` would
+/// spam the log for exactly the contention this exists to make visible
+/// *without* noise, so only the first attempt for each item warns and the
+/// rest stay at `debug!`.
+///
+/// Pure and side-effect-free beyond its own state, deliberately split out
+/// from the `tracing::warn!`/`debug!` call sites that use it so the
+/// once-per-item decision is unit-testable without a live driver, a
+/// clipboard provider, or `tracing`'s dispatch machinery.
+#[derive(Default)]
+struct BusyWarnOnce(Option<Uuid>);
+
+impl BusyWarnOnce {
+    /// `true` the first time this is called for `id` — warn. `false` for
+    /// every following call with the *same* `id` — a retry, stay at
+    /// `debug!`. A different `id` (a new item) warns again: holding only
+    /// the last id seen is enough, since each item carries a fresh one,
+    /// so this never needs an explicit reset.
+    fn should_warn(&mut self, id: Uuid) -> bool {
+        if self.0 == Some(id) {
+            false
+        } else {
+            self.0 = Some(id);
+            true
+        }
+    }
+}
+
 /// The clipboard sync driver. Create with [`clipboard_sync`], then spawn
 /// [`ClipboardSyncDriver::run`].
 pub struct ClipboardSyncDriver {
@@ -199,6 +231,11 @@ pub struct ClipboardSyncDriver {
     /// (sent, applied, superseded, latency) are recorded inside the engine
     /// itself, which owns those decisions.
     metrics: Option<Arc<Metrics>>,
+    /// See [`BusyWarnOnce`] — tracks the write path's own busy item.
+    write_busy_warned: BusyWarnOnce,
+    /// As `write_busy_warned`, for the file-offer path
+    /// ([`Self::offer_file`]) — a separate id space, so a separate marker.
+    offer_busy_warned: BusyWarnOnce,
 }
 
 /// Build a driver for `provider`, returning the handles the app uses:
@@ -266,6 +303,8 @@ pub fn clipboard_sync(
         busy_reads: 0,
         settle_generation: 0,
         metrics,
+        write_busy_warned: BusyWarnOnce::default(),
+        offer_busy_warned: BusyWarnOnce::default(),
     };
     Ok((driver, events_tx, commands_rx))
 }
@@ -624,6 +663,36 @@ impl ClipboardSyncDriver {
         }
     }
 
+    /// Write `content` to the provider and feed the result back into the
+    /// engine.
+    fn write_clipboard(&mut self, id: Uuid, content: &ClipboardContent) -> Vec<Action> {
+        let result = match self.provider.write(content) {
+            Ok(()) => Ok(()),
+            Err(ClipboardError::Busy { reason }) => {
+                if self.write_busy_warned.should_warn(id) {
+                    tracing::warn!(clipboard_id = %id, error = %reason, "write busy");
+                } else {
+                    tracing::debug!(clipboard_id = %id, error = %reason, "write busy");
+                }
+                self.record(Metrics::record_clipboard_contention);
+                Err(WriteFailure::Busy)
+            }
+            Err(error @ ClipboardError::Unsupported { .. }) => {
+                tracing::warn!(
+                    clipboard_id = %id,
+                    error = %error,
+                    "clipboard content type not supported by this platform"
+                );
+                Err(WriteFailure::UnsupportedType)
+            }
+            Err(error) => {
+                tracing::warn!(clipboard_id = %id, error = %error, "write failed");
+                Err(WriteFailure::Unavailable)
+            }
+        };
+        self.engine.on_write_result(id, result)
+    }
+
     /// Hand one engine message to the send path.
     ///
     /// One chunk per command, on purpose: a chunk is ADR 0013's preemption
@@ -715,7 +784,14 @@ impl ClipboardSyncDriver {
         let result = match files.offer(&offer) {
             Ok(()) => Ok(()),
             Err(ClipboardError::Busy { reason }) => {
-                tracing::debug!(clipboard_id = %id, error = %reason, "offer busy");
+                // Same once-per-item shape as the write path above: this
+                // retries on the same 200 ms timer, and only the first
+                // attempt's holder is worth a `warn!`.
+                if self.offer_busy_warned.should_warn(id) {
+                    tracing::warn!(clipboard_id = %id, error = %reason, "offer busy");
+                } else {
+                    tracing::debug!(clipboard_id = %id, error = %reason, "offer busy");
+                }
                 self.record(Metrics::record_clipboard_contention);
                 Err(WriteFailure::Busy)
             }
@@ -1036,27 +1112,7 @@ impl ClipboardSyncDriver {
                 self.pending.extend(more);
             }
             Action::WriteClipboard { id, content } => {
-                let result = match self.provider.write(&content) {
-                    Ok(()) => Ok(()),
-                    Err(ClipboardError::Busy { reason }) => {
-                        tracing::debug!(clipboard_id = %id, error = %reason, "write busy");
-                        self.record(Metrics::record_clipboard_contention);
-                        Err(WriteFailure::Busy)
-                    }
-                    Err(error @ ClipboardError::Unsupported { .. }) => {
-                        tracing::warn!(
-                            clipboard_id = %id,
-                            error = %error,
-                            "clipboard content type not supported by this platform"
-                        );
-                        Err(WriteFailure::UnsupportedType)
-                    }
-                    Err(error) => {
-                        tracing::warn!(clipboard_id = %id, error = %error, "write failed");
-                        Err(WriteFailure::Unavailable)
-                    }
-                };
-                let more = self.engine.on_write_result(id, result);
+                let more = self.write_clipboard(id, &content);
                 self.pending.extend(more);
             }
             Action::Send(message) => match self.send_message(message).await {
@@ -1155,7 +1211,8 @@ mod tests {
     use crossover_protocol::hello::MessageType;
 
     use super::{
-        EVENT_CHANNEL_CAPACITY, MAX_DEFERRED_EVENTS, SessionCommand, SyncEvent, clipboard_sync,
+        BusyWarnOnce, EVENT_CHANNEL_CAPACITY, MAX_DEFERRED_EVENTS, SessionCommand, SyncEvent,
+        clipboard_sync,
     };
     use crossover_platform::SpoolError;
 
@@ -1228,6 +1285,43 @@ mod tests {
             message_id: 42,
             payload,
         })
+    }
+
+    /// feature/162's reason the write/offer paths use [`BusyWarnOnce`]:
+    /// the busy reason (which, on Windows, now names the holder) must
+    /// reach an operator running at the worker's default filter
+    /// (`RUST_LOG=info`) — but only once per item, not once per 200 ms
+    /// retry, which would spam the log for exactly the contention this
+    /// is meant to make visible without noise. Pure and synchronous, so
+    /// this is deterministic where a test asserting on captured log text
+    /// across a spawned task would not be: `tracing`'s per-callsite
+    /// interest cache is process-global even though the default
+    /// subscriber is thread-local, so two log-capturing tests on
+    /// different threads can transiently steal each other's events —
+    /// reproduced directly while developing this fix. The decision this
+    /// type makes is what actually matters; the `warn!`/`debug!` call
+    /// sites that consult it are a one-line `if` each, reviewable by
+    /// inspection.
+    #[test]
+    fn busy_warn_once_warns_for_the_first_attempt_and_stays_quiet_after() {
+        let mut warned = BusyWarnOnce::default();
+        let item_a = Uuid::from_bytes([0xAA; 16]);
+        let item_b = Uuid::from_bytes([0xBB; 16]);
+
+        assert!(
+            warned.should_warn(item_a),
+            "the first Busy for a new item must warn"
+        );
+        assert!(
+            !warned.should_warn(item_a),
+            "a retry of the same item must not warn again"
+        );
+        assert!(!warned.should_warn(item_a), "nor any retry after that one");
+        assert!(
+            warned.should_warn(item_b),
+            "a different item is a fresh item and warns again"
+        );
+        assert!(!warned.should_warn(item_b));
     }
 
     #[tokio::test]
