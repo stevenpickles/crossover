@@ -16,10 +16,11 @@
         cargo build --release -p crossover -p crossover-svc -p crossover-layout
 
 .PARAMETER Version
-    Package version. Defaults to the version in apps\crossover\Cargo.toml.
+    Package version. Defaults to [workspace.package] version in the root
+    Cargo.toml, which every crate inherits.
     Must be a version NuGet accepts: dots are not allowed in the pre-release
-    label, so scripts\build.ps1 passes 0.1.0-dev-319-gabc1234 rather than the
-    binaries' own 0.1.0-dev.319.gabc1234.
+    label, so scripts\build.ps1 passes 0.2.0-dev-319-gabc1234 rather than the
+    binaries' own 0.2.0-dev.319.gabc1234.
 
 .PARAMETER BinariesDirectory
     Where to find the executables. Defaults to target\release.
@@ -64,9 +65,14 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\THIRD-PARTY-NOTICES.txt')
     -Destination $toolsDir -Force
 
 if (-not $Version) {
-    $cargoToml = Get-Content (Join-Path $repoRoot 'apps\crossover\Cargo.toml') -Raw
+    # The version lives once, in [workspace.package] of the root manifest;
+    # every crate inherits it with `version.workspace = true`. Reading a
+    # member manifest finds no `version = "..."` line at all, so this
+    # default silently became "always throw" the day the workspace took
+    # ownership of the version.
+    $cargoToml = Get-Content (Join-Path $repoRoot 'Cargo.toml') -Raw
     if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') { $Version = $Matches[1] }
-    else { throw 'Could not read the version from apps\crossover\Cargo.toml; pass -Version.' }
+    else { throw 'Could not read the version from the workspace Cargo.toml; pass -Version.' }
 }
 # NuGet's pre-release label is alphanumerics and hyphens only. Catching it
 # here keeps the failure legible instead of surfacing as a choco parse error.

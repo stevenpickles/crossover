@@ -4,7 +4,17 @@
 
 Crossover is pre-1.0 software under active development. Only the most
 recent release is supported: fixes land on `main` and ship in the next tag,
-and earlier tags are not patched. `0.1.0` is the first release.
+and earlier tags are not patched.
+
+| Version | Supported |
+|---------|-----------|
+| 0.2.0   | ✅ |
+| 0.1.0   | ❌ (the first release) |
+
+Because the wire protocol's minimum accepted version moves with its maximum
+before 1.0, **both machines must run the same release**. A mixed pair
+refuses at the handshake rather than establishing a session that fails
+later.
 
 Binaries are **not code-signed** yet, so Windows SmartScreen will warn about
 them; verify the SHA-256 published with each release rather than trusting
@@ -24,3 +34,8 @@ disclosure once a fix is available.
 
 Crossover's threat model, trust model, pairing design, and security
 invariants are documented in [docs/SECURITY.md](docs/SECURITY.md).
+
+Since 0.2.0 a paired peer can, **with an explicit per-peer grant that is off
+by default**, cause files to be written into a protected spool directory;
+[docs/SECURITY.md](docs/SECURITY.md) §7 documents that surface and its
+invariants.

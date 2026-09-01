@@ -1,9 +1,10 @@
 # Crossover Wire Protocol
 
-The application protocol between authenticated peers. This document is a
-skeleton: it fixes the invariants and message semantics; exact encodings are
-settled when the serialization format ADR is accepted
-([adr/README.md](adr/README.md), deferred decision 1).
+The application protocol between authenticated peers. This document specifies
+the protocol as implemented: invariants, message semantics, and encodings.
+The serialization format is fixed by
+[ADR 0001](adr/0001-wire-serialization-format.md) (postcard); the encodings
+below are pinned by golden tests in `crossover-protocol`.
 
 The protocol crate (`crossover-protocol`) implements everything here and is
 testable without sockets ([ARCHITECTURE.md](ARCHITECTURE.md) §3).

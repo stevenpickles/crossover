@@ -73,9 +73,9 @@ crossover/
                                     #   privileged process links no network code.
         crossover-layout/           # the display layout editor (ADR 0019): an
                                     #   egui/eframe window the user opens on
-                                    #   demand. Today it depends on the GUI
-                                    #   stack alone; the canvas branch adds
-                                    #   crossover-topology, and nothing else of
+                                    #   demand. Depends on the GUI stack and
+                                    #   crossover-topology (config feature),
+                                    #   and nothing else of
                                     #   ours ever — so the GUI graph stays out
                                     #   of the worker, and the worker's out of
                                     #   it.
@@ -104,13 +104,14 @@ crossover/
     docs/
 ```
 
-> **Phase 8 adds two members**, both in the tree above.
+> **`crossover-topology` and `apps/crossover-layout` joined the tree in
+> Phase 8**, both shown above.
 > `crates/crossover-topology` ([ADR 0018](adr/0018-drawn-display-topology.md))
 > is the drawn-layout model, its validation, the config `[layout]` types and
 > writer, and the state-file schema. `apps/crossover-layout`
-> ([ADR 0019](adr/0019-layout-editor-toolkit.md)) is the editor binary; today
-> it depends on the GUI stack alone, and the canvas branch adds
-> `crossover-topology`.
+> ([ADR 0019](adr/0019-layout-editor-toolkit.md)) is the editor binary; it
+> depends on the GUI stack and `crossover-topology` (with its `config`
+> feature), and nothing else of ours.
 >
 > The crate exists so the editor shares the model and writer with the worker
 > without linking core's protocol/security/platform graph, which is why its
@@ -119,7 +120,9 @@ crossover/
 > `[layout]` writer) and `serde_json` (the state-file schema) — the ADR's
 > dated amendment records the second. **`crossover-protocol` and
 > `crossover-core` both depend on the default graph** — protocol carries the
-> model types on the v4 wire, and core derives crossing spans from a layout
+> model types on the v6 wire (v4 introduced the model types; v5 and v6 added
+> the monitor label and its physical size), and core derives crossing spans
+> from a layout
 > (`core::crossing`, ADR 0018) — and neither enables the feature, so neither
 > the TOML writer nor the JSON schema enters their trees.
 
@@ -135,7 +138,7 @@ only when a boundary proves real:
 | `crossover-network` | `crossover-core::net` (+ app wiring) | A second transport (e.g., QUIC) or reuse outside the app appears |
 | `crossover-config` | `apps/crossover` | Config is needed by tools/test-peer independently |
 | `crossover-telemetry` | `tracing` usage throughout | Local metrics grow beyond counters and spans |
-| `crossover-platform-macos` / `-linux` | not created | The corresponding port begins (Phase 7) |
+| `crossover-platform-macos` / `-linux` | not created | The corresponding port begins (Phase 9) |
 
 Creating or dissolving a crate is an ADR-level decision. The compile-time
 firewall that matters from day one is the **platform boundary** and the
@@ -146,7 +149,7 @@ from Phase 0.
 > anticipate: not one of the candidates above, but a new boundary created by
 > [ADR 0018](adr/0018-drawn-display-topology.md) so the editor binary and the
 > worker share one layout model and one config writer. `crossover-protocol`
-> will gain a dependency edge on it for the wire shapes when those land, with
+> carries the model types on the wire and depends on the default graph, with
 > the TOML writer and the JSON state schema both behind a non-default
 > `config` cargo feature so the protocol crate stays as dependency-light and
 > socket-free as this section requires.
