@@ -65,9 +65,10 @@ Each installation generates a persistent identity at first run (FR-1.1):
 
 - device UUID (random)
 - human-readable device name
-- asymmetric keypair; credential form (raw public key vs. self-signed
-  certificate) and its binding into TLS 1.3 mutual authentication are fixed
-  by ADR (deferred decision 3)
+- asymmetric keypair; the credential form and its binding into TLS 1.3
+  mutual authentication are fixed by
+  [ADR 0003](adr/0003-device-identity-credential.md) — an Ed25519 key
+  pinned by the SHA-256 of its SPKI
 - creation timestamp
 
 Storage: private key material goes through the `SecureStorage` platform
@@ -96,11 +97,12 @@ connections authenticate automatically; identities not in the trust store
 are rejected (FR-1.3).
 
 **MITM requirement:** the ceremony must defeat an active man-in-the-middle
-on first contact. The verification mechanism — short authentication string
-(SAS) derived from the key exchange vs. a PAKE (e.g., SPAKE2 over a short
-code) — is deferred decision 2. Whichever is chosen, the security argument
-(what the human comparison/entry actually proves, and the probability an
-active attacker survives it) must be written into the ADR.
+on first contact. The verification mechanism is fixed by
+[ADR 0002](adr/0002-pairing-verification-mechanism.md): a PAKE — SPAKE2 over
+a typed one-time code — chosen over a short authentication string derived
+from the key exchange. The security argument (what the human entry actually
+proves, and the probability an active attacker survives it) is written into
+that ADR.
 
 ## 4. Trusted peer store
 
@@ -208,32 +210,37 @@ system's paste mechanism, executing the user's own gesture, copies them out of
 a completed spool entry — Crossover advertises a virtual file list and the
 shell performs that write.
 
-**Implemented so far** (feature/126–132): the protected spool and its
+**Implemented and released in 0.2.0:** the protected spool and its
 handle-only boundary (F15), the `file_receive` grant (F1), the receiving
 path from offer to verified entry (F3, F5, F6, F7, F8), the virtual file
 list and its render bound (F4's descriptor construction, F10, F13, F14,
-F16), and the whole of F12 — byte and entry budgets, the clipboard
-lifetime rule, and the age backstop behind it. The sending half's lower
-two slices are built as well (feature/133–134): a local `CF_HDROP` copy is
-observed, and a selection is packed into one blob under the refusals ADR
-0015 requires — count, depth and cumulative bytes judged during the walk,
-and a symlink, junction, or other reparse point refusing the **whole**
-item rather than being followed or silently skipped, so a copied shortcut
-cannot pack out-of-tree content into something the user believes they
-selected. The engine transaction over that blob is built too
-(feature/135): the peer's negotiated file support and its `clipboard_send`
-grant are judged **before** anything is walked or packed, F13's third
-guard — no path inside the spool root is ever a send source — is
-enforced, and every path that ends the transaction drops the blob, whose
-delete-on-close handle is what removes the artifact. **`FILE_CLIPBOARD` is
-now advertised** (feature/136): the application computes `FileSend` the
-same way it computes `file_receive`'s policy — negotiated feature set,
-then trust-store grant, re-published on the same revocation poll — so a
-conforming peer can actually reach both halves. `clipboard_send` is the
-first permission this codebase enforces anywhere; text and images still
-travel without checking it (§4). The path is exercised only by the test
-suites so far — no two-machine hardware validation of file transfer has
-run yet.
+F16), the whole of F12 — byte and entry budgets, the clipboard lifetime
+rule, and the age backstop behind it — and the sending half: a local
+`CF_HDROP` copy is observed, and a selection is packed into one blob under
+the refusals ADR 0015 requires — count, depth and cumulative bytes judged
+during the walk, and a symlink, junction, or other reparse point refusing
+the **whole** item rather than being followed or silently skipped, so a
+copied shortcut cannot pack out-of-tree content into something the user
+believes they selected. The engine transaction over that blob judges the
+peer's negotiated file support and its `clipboard_send` grant **before**
+anything is walked or packed, enforces F13's third guard — no path inside
+the spool root is ever a send source — and drops the blob on every path
+that ends the transaction, its delete-on-close handle being what removes
+the artifact. `FILE_CLIPBOARD` is advertised: the application computes
+`FileSend` the same way it computes `file_receive`'s policy — negotiated
+feature set, then trust-store grant, re-published on the same revocation
+poll — so a conforming peer can actually reach both halves.
+`clipboard_send` is the first permission this codebase enforces anywhere;
+text and images still travel without checking it (§4).
+
+The whole path — offer, blob build, chunked send, spool, verify,
+virtual-file paste — was validated on two machines over a direct wired link
+on 2026-08-19: single-file and folder/multi-selection transfers arrived
+byte-identical in both directions, the `TooLarge` refusal and `AlreadyHave`
+dedup were observed live, loop prevention suppressed a deliberate
+spool-path copy, and F16 was confirmed on wire-crossed hardware — a
+received offer does not appear in Win+V history and does not cloud-sync
+([SOAK.md](SOAK.md)).
 
 1. **F1 — Consent before bytes.** No file transfer is accepted from a peer
    whose trust-store record does not carry `file_receive` (§4). The check runs
