@@ -49,6 +49,11 @@ fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFl
             retry: ClipboardRetryPolicy {
                 max_attempts: 3,
                 delay: Duration::from_millis(20),
+                // The parked phase is real here, only shrunk: the
+                // proportions (a slower cadence, a budget an order of
+                // magnitude past it) are what the test exercises.
+                park_delay: Duration::from_millis(20),
+                park_budget: Duration::from_millis(200),
             },
             transmit_debounce: Duration::from_millis(5),
             ..ClipboardConfig::new()

@@ -59,6 +59,11 @@ fn side(origin: u8) -> Side {
             retry: ClipboardRetryPolicy {
                 max_attempts: 5,
                 delay: Duration::from_millis(1),
+                // Compressed like the fast phase above, for the same
+                // reason: the gate measures throughput, and the parked
+                // phase is only reached under injected contention.
+                park_delay: Duration::from_millis(1),
+                park_budget: Duration::from_millis(50),
             },
             // The gate measures transaction throughput, not the debounce
             // (ADR 0006 has its own tests). Zero means transmit eagerly:
@@ -155,11 +160,21 @@ async fn sustained_contention_still_delivers_every_item() {
     b.events.send(SyncEvent::SessionEstablished).await.unwrap();
 
     let mut applied = 0;
+    let mut parked = 0;
     for i in 0..updates {
-        // Every third item meets a busy clipboard twice before landing.
+        // Every third item meets a busy clipboard twice before landing —
+        // absorbed by the fast phase, as the blip it stands for is.
         if i.is_multiple_of(3) {
             b.clipboard
                 .fail_next(ClipboardOp::Write, ClipboardFailure::Busy, 2);
+        }
+        // Every seventh meets a hold that outlives the whole fast budget,
+        // which is the 2026-09-01 fault: five attempts is not always
+        // enough, and the item must survive anyway (ADR 0005, addendum).
+        if i.is_multiple_of(7) {
+            b.clipboard
+                .fail_next(ClipboardOp::Write, ClipboardFailure::Busy, 8);
+            parked += 1;
         }
         let text = format!("contended item {i}");
         a.clipboard.set_text_locally(&text);
@@ -203,7 +218,14 @@ async fn sustained_contention_still_delivers_every_item() {
             .unwrap();
     }
     assert_eq!(applied, updates);
-    println!("contention stress: {applied} items delivered through injected contention");
+    assert!(
+        parked > 0,
+        "the run never exercised the parked phase; the injection is not doing its job"
+    );
+    println!(
+        "contention stress: {applied} items delivered through injected contention \
+         ({parked} of them past the fast retry budget)"
+    );
 }
 
 /// One update: copy on `source`, deliver, apply on `sink`, acknowledge,
