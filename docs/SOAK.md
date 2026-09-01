@@ -545,15 +545,17 @@ they compose into the seamless illusion (ADR 0009).
 ### Setup
 
 Pair and connect exactly as for the earlier soaks (same binary, firewall
-rule, pairing ceremony). Then run each machine with its **side of the
-pair**, arranged physically as `A | B` — A on the left, B on the right:
+rule, pairing ceremony). Draw the arrangement once with `crossover layout`
+before the run — physically `A | B`, A on the left, B on the right.
+`--left`/`--right` still work and log a deprecation warning, but they
+cannot express a per-monitor seam. Then:
 
 ```
 # Machine A (left screen), listening:
-crossover --name machine-a run --listen --left  > soak-a.log 2>&1
+crossover --name machine-a run --listen > soak-a.log 2>&1
 
 # Machine B (right screen), dialing A:
-crossover --name machine-b run --connect <A-address>:27677 --right > soak-b.log 2>&1
+crossover --name machine-b run --connect <A-address>:27677 > soak-b.log 2>&1
 ```
 
 Each side prints its whole-desktop geometry and edge at startup — check it:
@@ -700,33 +702,34 @@ the security boundary. So it happens once, up front, and its trust persists:
 
 ### Configuration (the service reads config.toml, not flags)
 
-The service starts `crossover run` with no arguments, so each machine's role and
-side come from `~/.crossover/config.toml` (not CLI flags). Arranged
+The service starts `crossover run` with no arguments, so each machine's role
+comes from `~/.crossover/config.toml` (not CLI flags). Arranged
 `A | B` — A left, B right:
 
 Machine A (left screen, listens):
 
 ```toml
-schema_version = 1
+schema_version = 2
 [device]
 name = "machine-a"
 [network]
 listen = "0.0.0.0:27677"
-[seamless]
-side = "left"
 ```
 
 Machine B (right screen, dials A at its LAN address):
 
 ```toml
-schema_version = 1
+schema_version = 2
 [device]
 name = "machine-b"
 [network]
 connect = "192.168.1.151:27677"
-[seamless]
-side = "right"
 ```
+
+The `[layout]` section that says how the screens sit is written by
+`crossover layout`, not by hand; run it once on either machine and both
+workers pick the arrangement up. A v1 file, or a lingering `[seamless]
+side`, still loads as an implicit layout.
 
 The dialing side (B) owns the reconnect supervisor, so pointing B at A means a
 reboot of either machine recovers on its own: B retries until A is back;
@@ -880,7 +883,8 @@ Findings feeding follow-up work:
   not corner cases. Known residual: when Windows itself keeps a sleeping
   monitor in the layout (common over HDMI), the desktop genuinely still
   extends there and Crossover follows Windows — nothing to detect. The
-  two-machine unplug/replug check joins the Phase 7 soak procedure.
+  two-machine unplug/replug check joins the Phase 8 topology soak
+  procedure, which is where runtime display change is exercised (Pass 2).
 - **Silent worker exit (diagnosability).** During the 08-11 relaunch loop
   the worker logged `starting` and nothing else — it exited before reaching
   its run loop without recording why. The window is consistent with a
@@ -1325,10 +1329,10 @@ count entry-point warnings.
 Five things to do before starting, each of which has cost time when
 skipped:
 
-1. **Build both machines from the same commit.** Protocol v4 raises the
-   floor as well as the ceiling (ADR 0018, ADR 0017's rule), so a v3 peer
-   is refused at `Hello` with a version-range mismatch and the session
-   never establishes. A mixed pair does not connect at all — that is the
+1. **Build both machines from the same commit.** Protocol v6 raises the
+   floor as well as the ceiling (ADR 0018, ADR 0017's rule), so any peer
+   below v6 — including v0.1.0 — is refused at `Hello` with a
+   version-range mismatch and the session never establishes. A mixed pair does not connect at all — that is the
    designed behaviour, not a fault to debug.
 2. **Install all three binaries.** `crossover.exe`, `crossover-svc.exe`
    and now `crossover-layout.exe`, which must sit **beside**
