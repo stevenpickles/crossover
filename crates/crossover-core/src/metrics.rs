@@ -218,6 +218,11 @@ pub struct Metrics {
     // by grep, not by the run report (FR-7.3).
     clipboard_installs_parked: AtomicU64,
     clipboard_installs_failed: AtomicU64,
+    // Local copies made while no peer was connected (ADR 0006, addendum
+    // 2026-09-01). Named for the situation rather than for "deferred",
+    // which `clipboard_deferred_peak` below already spends on the
+    // driver's event queue.
+    clipboard_offline_changes: AtomicU64,
     clipboard_deferred_peak: AtomicU64,
     // Files (ADR 0015) are counted apart from clipboard items generally,
     // because they are the one content type that reaches disk: how many a
@@ -391,6 +396,23 @@ impl Metrics {
     /// no combination of the other counters could show.
     pub fn record_clipboard_install_failed(&self) {
         self.clipboard_installs_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A local clipboard change was recorded but not transmitted, because
+    /// no session was live to transmit it to (ADR 0006, addendum
+    /// 2026-09-01).
+    ///
+    /// The counterpart to [`Self::record_clipboard_sent`] for the hours a
+    /// pair spends apart, and the number that keeps
+    /// [`Self::record_clipboard_abandoned`] meaning what it says: before
+    /// this rule, every offline copy minted a transaction that nobody
+    /// could answer and expired sixty seconds later as an `abandoned`, so
+    /// a night with a sleeping peer read exactly like a night of a peer
+    /// that stopped replying. This counts those copies as what they are —
+    /// held, and offered whole on the next connect.
+    pub fn record_clipboard_offline_change(&self) {
+        self.clipboard_offline_changes
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -632,6 +654,7 @@ impl Metrics {
             clipboard_abandoned: load(&self.clipboard_abandoned),
             clipboard_installs_parked: load(&self.clipboard_installs_parked),
             clipboard_installs_failed: load(&self.clipboard_installs_failed),
+            clipboard_offline_changes: load(&self.clipboard_offline_changes),
             clipboard_deferred_peak: load(&self.clipboard_deferred_peak),
             clipboard_files_stored: load(&self.clipboard_files_stored),
             clipboard_files_declined: load(&self.clipboard_files_declined),
@@ -758,6 +781,10 @@ pub struct Report {
     /// Inbound items the destination clipboard never took, after every
     /// retry: content that was lost.
     pub clipboard_installs_failed: u64,
+    /// Local copies recorded while no peer was connected, and therefore
+    /// never offered (ADR 0006, addendum 2026-09-01). Not a failure: the
+    /// current item is offered whole when a session next establishes.
+    pub clipboard_offline_changes: u64,
     /// Deepest the driver's deferred-event queue got while parked on bulk
     /// backpressure; `0` if it never had to defer.
     pub clipboard_deferred_peak: u64,
@@ -874,6 +901,7 @@ impl Report {
             clipboard_loop_suppressed = self.clipboard_loop_suppressed,
             clipboard_installs_parked = self.clipboard_installs_parked,
             clipboard_installs_failed = self.clipboard_installs_failed,
+            clipboard_offline_changes = self.clipboard_offline_changes,
             clipboard_latency_dropped = self.clipboard_latency_dropped,
             clipboard_deferred_peak = self.clipboard_deferred_peak,
             clipboard_files_stored = self.clipboard_files_stored,
@@ -1009,6 +1037,19 @@ impl Report {
                 f,
                 "                {} installs parked past the fast retry budget",
                 self.clipboard_installs_parked,
+            )?;
+        }
+        // Only when it happened, and phrased so it is not read as a loss:
+        // these copies are on this machine's clipboard and the next
+        // session establishment offers whatever is current (ADR 0006
+        // trigger 3). The line exists so a run whose `sent` count is low
+        // says *why* — a peer that was away, rather than a clipboard that
+        // stopped working.
+        if self.clipboard_offline_changes > 0 {
+            writeln!(
+                f,
+                "                {} local copies made with no peer connected (held, not lost)",
+                self.clipboard_offline_changes,
             )?;
         }
         // Files are rare by design (ADR 0015), so a run that saw none
@@ -1211,6 +1252,7 @@ mod tests {
         metrics.record_clipboard_loop_suppressed();
         metrics.record_clipboard_install_parked();
         metrics.record_clipboard_install_failed();
+        metrics.record_clipboard_offline_change();
         metrics.record_deferred_depth(7);
         metrics.record_file_stored(2 * 1024 * 1024);
         metrics.record_file_declined();
@@ -1227,6 +1269,7 @@ mod tests {
             "1 conflicts",
             "1 own-write loops suppressed",
             "1 installs parked",
+            "1 local copies made with no peer connected",
             "deferred peak 7",
             "1 stored (2.0 MiB)",
             "1 refused",
