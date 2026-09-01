@@ -208,6 +208,16 @@ pub struct Metrics {
     clipboard_loop_suppressed: AtomicU64,
     clipboard_conflicts: AtomicU64,
     clipboard_abandoned: AtomicU64,
+    // Two counters about the *install* half specifically, which nothing
+    // above could distinguish. `clipboard_applied` says how many peer
+    // items reached this machine's clipboard; until these existed nothing
+    // said how many did not, and nothing at all said how often the fast
+    // retry budget was not enough. On 2026-09-01 five of eight reconnects
+    // lost their re-announced item to about a second of external
+    // contention, and the only trace was a warn line per item — countable
+    // by grep, not by the run report (FR-7.3).
+    clipboard_installs_parked: AtomicU64,
+    clipboard_installs_failed: AtomicU64,
     clipboard_deferred_peak: AtomicU64,
     // Files (ADR 0015) are counted apart from clipboard items generally,
     // because they are the one content type that reaches disk: how many a
@@ -358,6 +368,30 @@ impl Metrics {
     /// transaction simply is not there any more (NFR-3, FR-7.3).
     pub fn record_clipboard_abandoned(&self) {
         self.clipboard_abandoned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An inbound install exhausted its fast retry budget and entered the
+    /// parked phase (ADR 0005's 2026-09-01 addendum).
+    ///
+    /// Not a failure: a parked install usually lands. It is the signal
+    /// that something on this machine held the clipboard for longer than
+    /// the fast schedule covers, which is a property of the *machine*
+    /// rather than of the peer, and the only number that separates "the
+    /// clipboard is contended here" from "the peer is sending a lot".
+    pub fn record_clipboard_install_parked(&self) {
+        self.clipboard_installs_parked
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// An inbound item was permanently dropped: the destination clipboard
+    /// never took it, and the origin was told `ClipboardUnavailable`.
+    ///
+    /// The counterpart to [`Self::record_clipboard_applied`], and the one
+    /// clipboard-reliability number a run report was missing (priority #2,
+    /// FR-7.3): a run with a non-zero value here lost user content, which
+    /// no combination of the other counters could show.
+    pub fn record_clipboard_install_failed(&self) {
+        self.clipboard_installs_failed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record how deep the clipboard driver's deferred-event queue got
@@ -596,6 +630,8 @@ impl Metrics {
             clipboard_loop_suppressed: load(&self.clipboard_loop_suppressed),
             clipboard_conflicts: load(&self.clipboard_conflicts),
             clipboard_abandoned: load(&self.clipboard_abandoned),
+            clipboard_installs_parked: load(&self.clipboard_installs_parked),
+            clipboard_installs_failed: load(&self.clipboard_installs_failed),
             clipboard_deferred_peak: load(&self.clipboard_deferred_peak),
             clipboard_files_stored: load(&self.clipboard_files_stored),
             clipboard_files_declined: load(&self.clipboard_files_declined),
@@ -716,6 +752,12 @@ pub struct Report {
     pub clipboard_loop_suppressed: u64,
     /// Clipboard conflicts resolved.
     pub clipboard_conflicts: u64,
+    /// Inbound installs that outlived the fast retry budget and were
+    /// parked (ADR 0005's 2026-09-01 addendum). Most of them still land.
+    pub clipboard_installs_parked: u64,
+    /// Inbound items the destination clipboard never took, after every
+    /// retry: content that was lost.
+    pub clipboard_installs_failed: u64,
     /// Deepest the driver's deferred-event queue got while parked on bulk
     /// backpressure; `0` if it never had to defer.
     pub clipboard_deferred_peak: u64,
@@ -830,6 +872,8 @@ impl Report {
             clipboard_contention = self.clipboard_contention,
             clipboard_conflicts = self.clipboard_conflicts,
             clipboard_loop_suppressed = self.clipboard_loop_suppressed,
+            clipboard_installs_parked = self.clipboard_installs_parked,
+            clipboard_installs_failed = self.clipboard_installs_failed,
             clipboard_latency_dropped = self.clipboard_latency_dropped,
             clipboard_deferred_peak = self.clipboard_deferred_peak,
             clipboard_files_stored = self.clipboard_files_stored,
@@ -937,9 +981,10 @@ impl Report {
     fn write_clipboard(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "  clipboard:  {} sent, {} applied, {} superseded, {} abandoned",
+            "  clipboard:  {} sent, {} applied, {} failed, {} superseded, {} abandoned",
             self.clipboard_sent,
             self.clipboard_applied,
+            self.clipboard_installs_failed,
             self.clipboard_superseded,
             self.clipboard_abandoned,
         )?;
@@ -955,6 +1000,17 @@ impl Report {
             self.clipboard_conflicts,
             self.clipboard_loop_suppressed,
         )?;
+        // Only when it happened: a run where the fast retry budget always
+        // sufficed has nothing to say, and the line exists to make the
+        // rarer case legible — how many installs had to be parked, against
+        // how many of them were nonetheless lost.
+        if self.clipboard_installs_parked > 0 {
+            writeln!(
+                f,
+                "                {} installs parked past the fast retry budget",
+                self.clipboard_installs_parked,
+            )?;
+        }
         // Files are rare by design (ADR 0015), so a run that saw none
         // says nothing rather than printing three zeroes. A run that saw
         // any prints all three counts even where some are zero: "4 stored,
@@ -1153,6 +1209,8 @@ mod tests {
         metrics.record_clipboard_contention();
         metrics.record_clipboard_conflict();
         metrics.record_clipboard_loop_suppressed();
+        metrics.record_clipboard_install_parked();
+        metrics.record_clipboard_install_failed();
         metrics.record_deferred_depth(7);
         metrics.record_file_stored(2 * 1024 * 1024);
         metrics.record_file_declined();
@@ -1168,6 +1226,7 @@ mod tests {
             "1 contention",
             "1 conflicts",
             "1 own-write loops suppressed",
+            "1 installs parked",
             "deferred peak 7",
             "1 stored (2.0 MiB)",
             "1 refused",
