@@ -545,10 +545,10 @@ they compose into the seamless illusion (ADR 0009).
 ### Setup
 
 Pair and connect exactly as for the earlier soaks (same binary, firewall
-rule, pairing ceremony). Draw the arrangement once with `crossover layout`
-before the run — physically `A | B`, A on the left, B on the right.
-`--left`/`--right` still work and log a deprecation warning, but they
-cannot express a per-monitor seam. Then:
+rule, pairing ceremony). Start both workers **first** — the editor draws
+from what the worker publishes to `~/.crossover/state/topology.json`, so it
+has nothing to show until this machine's worker is running, and it cannot
+show the *peer's* monitors until the session is established:
 
 ```
 # Machine A (left screen), listening:
@@ -557,6 +557,19 @@ crossover --name machine-a run --listen > soak-a.log 2>&1
 # Machine B (right screen), dialing A:
 crossover --name machine-b run --connect <A-address>:27677 > soak-b.log 2>&1
 ```
+
+With both connected, draw the arrangement once, on either machine —
+physically `A | B`, A on the left, B on the right:
+
+```
+crossover layout
+```
+
+The editor says which of the two it is waiting on if it cannot draw yet
+("the worker is not running", "waiting for the peer"). Saving takes effect
+without restarting anything on a machine that already holds a drawn
+arrangement. `--left`/`--right` still work and log a deprecation warning,
+but they cannot express a per-monitor seam.
 
 Each side prints its whole-desktop geometry and edge at startup — check it:
 
