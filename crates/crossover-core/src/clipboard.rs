@@ -1221,7 +1221,12 @@ impl ClipboardEngine {
     ///   installing a peer item over it would destroy what they just made,
     ///   so the parked install is superseded;
     /// - nothing readable — no evidence either way, so the parked install
-    ///   is left to its own timer.
+    ///   is left to its own timer. **Known residual** (ADR 0005, addendum
+    ///   2026-09-01): a copy in a format this build cannot render answers
+    ///   `None` too, and is indistinguishable from an empty clipboard
+    ///   here, so the parked install can still overwrite it. Fixing it
+    ///   means the provider separating `Empty` from `Unreadable`, which is
+    ///   a platform-trait change and its own branch.
     pub fn on_local_read(&mut self, content: Option<ClipboardContent>) -> Vec<Action> {
         // Consumed whatever the read shows: the re-announcement had its
         // chance, and a flag left set would make the next ordinary read
@@ -1231,19 +1236,7 @@ impl ClipboardEngine {
             return Vec::new(); // empty, or a format this build cannot read
         };
         if let ClipboardContent::FileList(selection) = content {
-            // A selection has no hash until it is packed, so "new" cannot
-            // be tested here — but the driver filters our own offer out
-            // before the read (F13), so anything reaching this is a
-            // selection the user made. A re-announcement after a reconnect
-            // is the one case that is not, and it must not cost a parked
-            // install.
-            let mut actions = if reannouncing {
-                Vec::new()
-            } else {
-                self.supersede_parked_write("a local copy")
-            };
-            actions.extend(self.on_local_file_list(selection));
-            return actions;
+            return self.on_local_file_list(selection, reannouncing);
         }
         let Some((content_type, bytes)) = into_wire(content) else {
             return Vec::new(); // never reached; see `into_wire`
@@ -1368,7 +1361,7 @@ impl ClipboardEngine {
     /// something in the spool, which must never travel back); may files be
     /// sent to this peer; is the selection within the entry cap that can
     /// be judged without walking anything. Only then does a build start.
-    fn on_local_file_list(&mut self, selection: Vec<PathBuf>) -> Vec<Action> {
+    fn on_local_file_list(&mut self, selection: Vec<PathBuf>, reannouncing: bool) -> Vec<Action> {
         if selection.is_empty() {
             tracing::debug!("empty local file selection; nothing to stage");
             return Vec::new();
@@ -1388,6 +1381,31 @@ impl ClipboardEngine {
             );
             return Vec::new();
         }
+        // Only now is this known to be the *user's* selection, which is
+        // the whole basis for it outranking a parked install (ADR 0005,
+        // addendum 2026-09-01). Deciding it above the loop guard meant our
+        // own spool selection coming back — the case layer 2 exists for —
+        // would kill the peer's parked item and then be discarded as a
+        // loop, costing the item to catch a mistake of our own.
+        //
+        // Below the guard but *above* the permission gates, because a
+        // selection this build refuses to send is still on the clipboard
+        // and still the user's: a refusal is a statement about us, not
+        // about what they copied.
+        let mut actions = if reannouncing {
+            // A reconnect re-read is not somebody copying (see
+            // `on_local_read`); it must not cost the peer's item either.
+            Vec::new()
+        } else {
+            self.supersede_parked_write("a local copy")
+        };
+        actions.extend(self.stage_local_file_list(selection));
+        actions
+    }
+
+    /// The gates and the build, once the selection is known to be the
+    /// user's own (see [`Self::on_local_file_list`]).
+    fn stage_local_file_list(&mut self, selection: Vec<PathBuf>) -> Vec<Action> {
         match self.file_send {
             FileSend::Allowed => {}
             FileSend::Unsupported => {
@@ -2136,6 +2154,30 @@ impl ClipboardEngine {
             return self.supersede_pending_write(by);
         }
         Vec::new()
+    }
+
+    /// [`Self::supersede_pending_write`], but only when the install being
+    /// replaced belongs to a *different* transaction than `incoming`.
+    ///
+    /// A peer that repeats a `ClipboardData` frame — a retransmit, a
+    /// duplicate delivery — arrives bearing the id already installing.
+    /// That is not a newer item, and answering it `Superseded` would draw
+    /// **two verdicts for one transaction**: the supersession now and the
+    /// install's own verdict later, for the same id. One transaction, one
+    /// verdict is what the origin's state machine is built on (ADR 0005).
+    fn supersede_pending_write_for(&mut self, incoming: Uuid, by: &str) -> Vec<Action> {
+        if self
+            .pending_write
+            .as_ref()
+            .is_some_and(|pending| pending.meta.id == incoming)
+        {
+            tracing::debug!(
+                clipboard_id = %incoming,
+                "a repeat of the item already installing; not superseding it with itself"
+            );
+            return Vec::new();
+        }
+        self.supersede_pending_write(by)
     }
 
     fn supersede_pending_write(&mut self, by: &str) -> Vec<Action> {
@@ -3141,8 +3183,12 @@ impl ClipboardEngine {
         // notices. Both machines would believe they show this item while
         // one shows the other.
         if self.current_local_hash == Some(meta.content_hash) {
-            actions
-                .extend(self.supersede_pending_write("an inbound item already on the clipboard"));
+            actions.extend(
+                self.supersede_pending_write_for(
+                    meta.id,
+                    "an inbound item already on the clipboard",
+                ),
+            );
             actions.push(Action::Send(OutboundMessage::Applied(ClipboardApplied {
                 id: meta.id,
                 result: ApplyResult::Applied,
@@ -3159,7 +3205,7 @@ impl ClipboardEngine {
             return actions;
         };
 
-        actions.extend(self.supersede_pending_write("a newer inbound item"));
+        actions.extend(self.supersede_pending_write_for(meta.id, "a newer inbound item"));
         let content = Arc::new(content);
         self.pending_write = Some(PendingWrite {
             meta,
@@ -4379,6 +4425,103 @@ mod tests {
         let report = metrics.snapshot();
         assert_eq!(report.clipboard_installs_failed, 0, "counted as a loss");
         assert_eq!(report.clipboard_superseded, 0, "counted as a supersession");
+    }
+
+    /// A repeat of the frame already installing is the same transaction,
+    /// not a newer item. Answering it `Superseded` would draw **two
+    /// verdicts for one id** — the supersession now and the install's own
+    /// verdict later — and one transaction, one verdict is what the
+    /// origin's state machine is built on.
+    #[test]
+    fn a_repeated_data_frame_does_not_draw_a_second_verdict() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        let id = Uuid::new_v4();
+        let deliver = || {
+            ClipboardData::from_content(
+                id,
+                Uuid::from_bytes([0xAA; 16]),
+                0,
+                ContentType::Utf8Text,
+                b"delivered twice".to_vec(),
+            )
+        };
+        assert!(matches!(
+            e.on_peer_message(InboundMessage::Data(deliver()))
+                .as_slice(),
+            [Action::WriteClipboard { .. }]
+        ));
+        park_the_install(&mut e, id);
+
+        // The peer repeats it — a retransmit, a duplicate delivery.
+        let again = e.on_peer_message(InboundMessage::Data(deliver()));
+        assert!(
+            sent(&again).is_empty(),
+            "a repeat drew a verdict for an install still running: {again:?}"
+        );
+        assert!(matches!(
+            again.as_slice(),
+            [Action::WriteClipboard { id: writing, .. }] if *writing == id
+        ));
+
+        // Exactly one verdict, when it finally lands.
+        assert_eq!(
+            verdict(&e.on_write_result(id, Ok(()))),
+            ApplyResult::Applied
+        );
+        assert_eq!(metrics.snapshot().clipboard_superseded, 0);
+    }
+
+    /// The parked install must not pay for a mistake of ours. Layer 2's
+    /// whole reason to exist is layer 1 missing, so the selection reaching
+    /// it may be our own delivered file coming back — and superseding on
+    /// that would kill the peer's item and then discard the selection as a
+    /// loop, losing the item to catch our own error.
+    ///
+    /// A refusal is different: a selection this build will not send is
+    /// still on the clipboard and still the user's, so it still wins.
+    #[test]
+    fn only_a_selection_that_is_really_the_users_costs_a_parked_install() {
+        let root = spool_root();
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        e.set_file_send(FileSend::Allowed);
+        e.set_spool_root(Some(root.clone()));
+
+        let parked = inbound_text(&mut e, 0, "the peer's item");
+        park_the_install(&mut e, parked);
+
+        // Layer 1 missed and our own spool selection came back.
+        let ours = e.on_local_read(Some(ClipboardContent::FileList(vec![
+            root.join("3f2a.bin"),
+        ])));
+        assert!(ours.is_empty(), "our own selection produced work: {ours:?}");
+        assert!(
+            matches!(
+                e.on_retry_due(parked).as_slice(),
+                [Action::WriteClipboard { id, .. }] if *id == parked
+            ),
+            "our own selection coming back cost the peer's parked item"
+        );
+        assert_eq!(metrics.snapshot().clipboard_superseded, 0);
+
+        // A selection that is genuinely theirs still outranks it, even one
+        // this build refuses to send: the refusal is about us, not about
+        // what they copied.
+        e.set_file_send(FileSend::Denied);
+        let theirs = e.on_local_read(Some(ClipboardContent::FileList(vec![elsewhere(
+            "report.pdf",
+        )])));
+        assert!(
+            matches!(
+                sent(&theirs).as_slice(),
+                [OutboundMessage::Applied(ClipboardApplied {
+                    id,
+                    result: ApplyResult::Superseded,
+                })] if *id == parked
+            ),
+            "a refused-but-real local copy should still win: {theirs:?}"
+        );
     }
 
     #[test]

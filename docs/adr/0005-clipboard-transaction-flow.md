@@ -255,3 +255,31 @@ read.
   against an unchanged peer.
 - **It does not identify the holder.** Naming what has the clipboard is a
   platform-layer concern and is handled separately (feature/162).
+- **It does not protect a copy this build cannot read.** This is the one
+  known residual of the rule above, and it is the same fault the
+  notification-versus-read ordering fixes, narrowed to a case the engine
+  cannot currently see.
+
+  The failure shape: the user copies something in a format Crossover does
+  not sync — an application's private format, RTF-only content, anything
+  the provider will not render — so the read answers `Ok(None)`. The
+  engine cannot tell that from *the clipboard is empty*, and an empty
+  clipboard is not content worth protecting, so it treats `None` as no
+  evidence either way and leaves the parked install to its timer. That
+  timer fires within a second and installs the peer's item over the user's
+  copy. It is narrower than the original defect — it needs an unsyncable
+  copy during a parked window rather than any copy at all — but the outcome
+  is the same, and it is equally silent.
+
+  A related consequence of the same blindness: `current_local_hash` is
+  **not** cleared on `None`, so after an unreadable copy the engine still
+  believes the last content it could read is on the clipboard. A later read
+  of that same content therefore looks unchanged rather than new — correct
+  for dedup, and one more reason the engine cannot infer the truth here.
+
+  The fix direction is a provider-level change and belongs to its own
+  branch: `ClipboardProvider::read` distinguishes **`Empty`** from
+  **`Unreadable`**, and `Unreadable` joins "genuinely new content" as a
+  local copy that supersedes a parked install. Deliberately not done here,
+  because it widens a platform trait that three backends implement, which
+  is not a change to make inside a retry fix.
