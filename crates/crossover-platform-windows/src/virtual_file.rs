@@ -1007,10 +1007,17 @@ fn place(
     }
     .into();
 
+    // Marked around the call itself, not held any longer: unlike
+    // `OpenGuard`, `OleSetClipboard` has no separate close, so this is the
+    // whole window in which a `Busy` failure elsewhere in this process
+    // could name this site (feature/162's `OWN_HOLD`, `clipboard.rs`).
+    crate::clipboard::mark_own_hold("ole");
     // SAFETY: called on this thread's STA with a live object; OLE takes
     // its own reference, and the local one is kept below so the object
     // outlives the placement.
-    unsafe { OleSetClipboard(Some(&object)) }.map_err(|e| ClipboardError::Busy {
+    let placed = unsafe { OleSetClipboard(Some(&object)) };
+    crate::clipboard::clear_own_hold();
+    placed.map_err(|e| ClipboardError::Busy {
         reason: format!(
             "OleSetClipboard failed (clipboard held elsewhere?): {e}; {}",
             crate::clipboard::describe_clipboard_holder()
