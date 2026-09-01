@@ -1076,10 +1076,30 @@ fn le_i32(blob: &[u8], at: usize) -> Option<i32> {
 /// apartment thread against the ordinary text/image path, say) would
 /// misreport as "unidentified" rather than naming the real cause.
 ///
-/// Set by [`mark_own_hold`] the instant an open succeeds, cleared by
-/// [`clear_own_hold`] the instant it ends — both called only from this
-/// crate's own clipboard code, never from a `Busy` path (nothing here
-/// blocks).
+/// This is confirmed to matter for that OLE-vs-`OpenGuard` case
+/// specifically, not for two `OpenGuard` opens against each other:
+/// `OpenClipboard(NULL)` associates the open with "the current task"
+/// (MSDN), and empirically (feature/162's own test development) a second
+/// same-process thread calling `OpenClipboard(NULL)` while the first
+/// still holds it is *admitted* rather than blocked — Windows does not
+/// contend two null-hwnd opens from the same process against each other,
+/// so `OpenGuard` racing `OpenGuard` never reaches this marker's `Busy`
+/// path at all, on this machine, at least. The marker is still correct
+/// and still cheap to keep for that case (a future Windows version or
+/// configuration could contend it, and the reverse read is still exactly
+/// right if it ever does), but its practical value today is the OLE site,
+/// whose underlying apartment window is a real, distinct resource from
+/// `OpenGuard`'s.
+///
+/// Set by [`mark_own_hold`] (`OpenGuard` the instant its open succeeds;
+/// the OLE placement just before the call that might contend, since it
+/// has no separate open step) and cleared by [`clear_own_hold`] — both
+/// called only from this crate's own clipboard code, never from a `Busy`
+/// path (nothing here blocks). At most one hold is tracked at a time, on
+/// the honest assumption that this process opens the clipboard from one
+/// thread at a time in the ordinary case; see the two functions for how
+/// a genuine overlap between our own call sites is kept from corrupting
+/// it.
 static OWN_HOLD: Mutex<Option<OwnHold>> = Mutex::new(None);
 
 /// One of this process's own clipboard-holding call sites, recorded in
@@ -1098,16 +1118,49 @@ struct OwnHold {
 /// Record that `site` now holds the clipboard open, on this thread. Pair
 /// with [`clear_own_hold`] — every caller must clear on every exit path,
 /// success or failure, or a stale marker would misname a later holder.
+///
+/// Deliberately marked *before* the call it describes, not after it
+/// succeeds — `crate::virtual_file`'s OLE placement is a single call with
+/// no separate open/close, and by the time it returns success the
+/// clipboard is already released again, so marking only on success would
+/// describe a hold that no longer exists by the time anyone could read
+/// it. The cost of marking early is that two of our own call sites can
+/// genuinely be mid-mark at once — an `OpenGuard` racing the OLE
+/// placement is exactly the contention this marker exists to describe —
+/// so this never overwrites a hold another thread already recorded:
+/// whichever thread holds the *real* Win32 lock is the one whose mark
+/// must survive, and an overwrite would rename that live hold to
+/// whichever thread called this last, only for that thread's own (often
+/// much shorter) [`clear_own_hold`] to then erase it while the first
+/// thread is still genuinely holding the clipboard.
 pub(crate) fn mark_own_hold(site: &'static str) {
     // SAFETY: a bare read of the calling thread's own id.
     let thread = unsafe { GetCurrentThreadId() };
-    *OWN_HOLD.lock().unwrap_or_else(PoisonError::into_inner) = Some(OwnHold { thread, site });
+    let mut hold = OWN_HOLD.lock().unwrap_or_else(PoisonError::into_inner);
+    let overwrite = match *hold {
+        None => true,
+        // Already ours (not expected to happen — no call site here nests
+        // — but harmless and correct if it ever did).
+        Some(existing) => existing.thread == thread,
+    };
+    if overwrite {
+        *hold = Some(OwnHold { thread, site });
+    }
 }
 
-/// Clear whatever [`mark_own_hold`] set. Always safe to call, including
-/// when nothing is held.
+/// Clear whatever [`mark_own_hold`] set — but only if *this thread* set
+/// it. [`mark_own_hold`] may have declined to overwrite another thread's
+/// still-live hold; an unconditional clear here would then wipe that
+/// thread's marker out from under it while it is still genuinely holding
+/// the clipboard. Always safe to call, including when nothing is held or
+/// when the live hold belongs to some other thread.
 pub(crate) fn clear_own_hold() {
-    *OWN_HOLD.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    let mut hold = OWN_HOLD.lock().unwrap_or_else(PoisonError::into_inner);
+    // SAFETY: a bare read of the calling thread's own id.
+    let current = unsafe { GetCurrentThreadId() };
+    if matches!(*hold, Some(existing) if existing.thread == current) {
+        *hold = None;
+    }
 }
 
 /// If [`OWN_HOLD`] names a hold on some *other* thread than the caller's
@@ -1898,74 +1951,6 @@ mod tests {
         holder.join().unwrap();
 
         with_retry(|| clipboard.write_text("after named contention")).unwrap();
-    }
-
-    /// The gap the test above cannot reach: every real call site in this
-    /// codebase opens with `OpenClipboard(None)` — a `NULL` hwnd — which
-    /// `GetOpenClipboardWindow` cannot see at all. Without `OWN_HOLD`
-    /// (feature/162), that shape would misreport as "unidentified owner
-    /// (no window)" even though it is Crossover contending with itself.
-    /// Stages exactly that: a second thread holds the clipboard open via
-    /// `OpenGuard::open` itself, the same call the production read/write
-    /// paths make.
-    #[test]
-    fn contention_reason_names_this_process_via_our_own_open_guard() {
-        let _serial = clipboard_lock();
-        let clipboard = WindowsClipboard::new().unwrap();
-        with_retry(|| clipboard.write_text("before guard contention")).unwrap();
-
-        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            let mut guard = None;
-            for _ in 0..20 {
-                match super::OpenGuard::open("write") {
-                    Ok(open) => {
-                        guard = Some(open);
-                        break;
-                    }
-                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
-                }
-            }
-            holding_tx.send(guard.is_some()).ok();
-            if guard.is_some() {
-                let _ = release_rx.recv();
-            }
-            // `guard` drops here either way, releasing the open if one
-            // was ever taken.
-        });
-
-        let held = holding_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("holder thread did not report");
-        if !held {
-            release_tx.send(()).ok();
-            holder.join().unwrap();
-            eprintln!("skipped: could not stage guard-owned contention");
-            return;
-        }
-
-        // Same honest limitation the other contention tests carry: Win32
-        // may admit another thread of this same process anyway.
-        match clipboard.write_text("during guard contention") {
-            Err(ClipboardError::Busy { reason }) => {
-                assert!(
-                    reason.contains("held by this process")
-                        && reason.contains("our own clipboard guard")
-                        && reason.contains("site \"write\""),
-                    "reason must name this process's own guard and its site: {reason}"
-                );
-            }
-            Ok(()) => {
-                eprintln!("skipped: this thread's guarded open admitted us, nothing to inspect");
-            }
-            Err(other) => panic!("contention must classify as Busy, got {other:?}"),
-        }
-
-        release_tx.send(()).ok();
-        holder.join().unwrap();
-
-        with_retry(|| clipboard.write_text("after guard contention")).unwrap();
     }
 
     /// Rapid replacement (FR-6.1): a burst of writes must leave the last
