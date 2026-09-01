@@ -85,20 +85,22 @@ The first useful implementation supports exactly:
 - seamless screen-edge control transfer
 - structured logging and command-line operation (foreground/debug execution)
 
-No GUI is required initially (the one exception arrives in Phase 8 — the
-topology editor; see the §3.3 note).
+No GUI is required for operation; the one exception — the topology editor —
+shipped in Phase 8 (see the §3.3 note).
 
 ### 3.2 Long-term scope
 
 Eventually: macOS and Linux; more than two peers, including arbitrary
 display topology across them; background/tray operation; peer discovery; rich
-clipboard types (HTML, images, file lists); drag-and-drop; auto-update;
+clipboard types not yet carried (HTML); drag-and-drop; auto-update;
 secure WAN operation; diagnostics UI.
 
-> **Re-scoped:** clipboard **images** left this list on 2026-08-11 and are
-> being built in Phase 7 ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md));
-> file lists are designed for a later, deliberately minimal spool-and-paste
-> capability ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)). ADR 0014's
+> **Re-scoped:** clipboard **images** left this list on 2026-08-11 and
+> shipped in Phase 7 ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md));
+> file lists followed in the same phase as a deliberately minimal
+> spool-and-paste capability
+> ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)), hardware-validated
+> 2026-08-19. ADR 0014's
 > platform slice has since landed, so §3.1's "UTF-8 **text**" now understates
 > what a build synchronizes: images travel too, in the source clipboard's own
 > raster format, between peers that both advertise `CHUNKED_CLIPBOARD`
@@ -108,7 +110,7 @@ secure WAN operation; diagnostics UI.
 
 > **Re-scoped (2026-08-20):** **multiple monitors per peer with arbitrary
 > topology** left this list for the two-peer case, which is why the entry
-> above now scopes it to "more than two peers". Phase 8 places both machines'
+> above now scopes it to "more than two peers". Phase 8 placed both machines'
 > monitors in one drawn coordinate space and derives crossing edges from
 > adjacency, so a seam between two monitors of the same machine, an
 > over/under arrangement, and a three-monitor corner are all expressible
@@ -123,13 +125,19 @@ assumptions).
 
 ### 3.3 Non-goals (initial development)
 
-Graphical configuration, tray application, service installation, peer
-discovery, >2 computers, macOS/Linux implementations, non-text clipboard,
-drag-and-drop, screen streaming or remote video/audio, NAT traversal, cloud
-services, user accounts, centralized authentication, mobile platforms.
+Graphical configuration, tray application, peer discovery, >2 computers,
+macOS/Linux implementations, drag-and-drop, screen streaming or remote
+video/audio, NAT traversal, cloud services, user accounts, centralized
+authentication, mobile platforms.
+
+> **No longer non-goals:** *service installation* (Phase 6,
+> [ADR 0011](adr/0011-background-service-launcher.md)) and *non-text
+> clipboard* (Phase 7 — images
+> [ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md), files
+> [ADR 0015](adr/0015-spooled-virtual-file-paste.md)).
 
 > **No longer a non-goal (2026-08-20):** graphical configuration, in one
-> specific form. Phase 8 ships a **topology editor** — the project's first
+> specific form. Phase 8 shipped a **topology editor** — the project's first
 > GUI — because an arrangement the user draws is the deliverable, and a
 > drawn arrangement has no command-line form worth having. It is a separate
 > user-session surface rather than a mode of the headless, service-launched
@@ -211,7 +219,10 @@ are binding; "should" requirements are strong defaults changeable by ADR.
   *(Discharged as designed: raster images were added in Phase 7
   ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md)) as a new content
   type on the existing model — negotiated, chunked, and carried verbatim —
-  with no protocol version bump.)*
+  with no protocol version bump. The *file* content type that followed did
+  bump it: a descriptor byte on every offer moved both the version and its
+  floor to 3 ([ADR 0017](adr/0017-protocol-version-3.md)), and the drawn
+  topology later took them to 6.)*
 
 ### 4.4 Input forwarding
 
