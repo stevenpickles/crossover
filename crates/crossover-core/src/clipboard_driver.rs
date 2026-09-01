@@ -48,21 +48,58 @@ use crate::outbound::{CommandReceiver, CommandSender, command_lanes};
 /// looks again shortly (the next change notification would also do it).
 const READ_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// How long between read attempts once [`MAX_CONSECUTIVE_BUSY_READS`] has
+/// been passed.
+///
+/// The fast nudge and this are the read side's version of the install's
+/// two phases (ADR 0005, addendum 2026-09-01), and for the same reasons:
+/// hard polling suits a blip, once a second suits a holder that is doing
+/// something, and re-taking the machine-global lock five times a second
+/// for twenty seconds is how Crossover made other applications' clipboard
+/// calls fail in the two-machine soak.
+const READ_REVIVAL_DELAY: Duration = Duration::from_secs(1);
+
+/// How many slow revivals follow the fast nudges before the driver stops
+/// looking and waits for a notification.
+///
+/// The bound that was missing. Before it, a read parked "until the next
+/// change notification" was revived by a real notification, a settle
+/// timer, or session establishment — and by nothing else, so a clipboard
+/// that never changed again never got read. That is not hypothetical: the
+/// re-announce on reconnect *is* a read, and on machine A (2026-09-01)
+/// items copied while the peer was away were never offered when it came
+/// back, because the establish-time read met about a second of contention
+/// and then waited for a change that never came.
+///
+/// Twenty seconds of revivals, matching the install's parked budget, so
+/// the two halves of "wait out a contended clipboard" have one number
+/// between them.
+const MAX_READ_REVIVALS: u32 = 20;
+
 /// Upper bound on events drained in one coalescing pass, so a flood
 /// cannot stall the loop (NFR-1).
 const MAX_COALESCE_BATCH: usize = 512;
 
-/// How many consecutive `Busy` reads before the driver stops re-nudging
-/// itself and waits for the next real change notification.
+/// How many consecutive `Busy` reads before the driver drops to the
+/// slower [`READ_REVIVAL_DELAY`] cadence.
 ///
 /// Found in the two-machine soak (docs/SOAK.md): with the local
 /// clipboard under sustained contention, an unbounded nudge cycle
 /// re-enqueues itself indefinitely, and because inbound frames share
 /// this one serial event queue, a peer's acknowledgement can sit
 /// unprocessed behind the churn — 27 seconds of it, in the run that
-/// exposed this. Bounding the cycle costs nothing real: the clipboard
-/// listener will notify us again for any change we miss, so giving up
-/// here loses no content, only a redundant look.
+/// exposed this. Slowing the cycle keeps that cure and drops its cost:
+/// the churn was the *rate*, not the retrying.
+///
+/// The counter is consecutive in the honest sense — it resets on a
+/// successful read, on session establishment, and on a genuine change
+/// notification. It did not, until 2026-09-01: the fast nudge re-enqueued
+/// `LocalChanged`, indistinguishable from the listener's own signal, so
+/// nothing but a successful read could ever clear it, and one contended
+/// episode left every later `Busy` read past the cap with no nudge
+/// scheduled at all. The nudge has its own event now
+/// ([`SyncEvent::ReadRetryDue`]), which is what makes resetting on a
+/// notification safe rather than a way back to the unbounded cycle.
 const MAX_CONSECUTIVE_BUSY_READS: u32 = 5;
 
 /// How many events the driver may hold aside while it is parked on send
@@ -106,7 +143,20 @@ pub enum SyncEvent {
     /// ignored here).
     Frame(RawFrame),
     /// The local clipboard may have changed (listener bridge; coalesced).
+    ///
+    /// The listener's signal *only*. The driver's own "look again" nudge
+    /// used to arrive as this too, which made a genuine change
+    /// indistinguishable from the driver talking to itself — see
+    /// [`SyncEvent::ReadRetryDue`], which it now uses instead.
     LocalChanged,
+    /// A contended read is due for another attempt (driver-internal).
+    ///
+    /// Distinct from [`SyncEvent::LocalChanged`] on purpose, and the
+    /// distinction is load-bearing twice over: a nudge must not restart
+    /// the settle window (ADR 0006) that a real change starts, and it must
+    /// not reset the consecutive-busy counter it is itself the product of
+    /// ([`MAX_CONSECUTIVE_BUSY_READS`]).
+    ReadRetryDue,
     /// A scheduled write retry came due.
     RetryDue(Uuid),
     /// The settle window elapsed (ADR 0006): time to read.
@@ -213,8 +263,12 @@ pub struct ClipboardSyncDriver {
     events_rx: mpsc::Receiver<SyncEvent>,
     events_tx: mpsc::Sender<SyncEvent>,
     commands_tx: CommandSender,
-    /// Consecutive `Busy` reads; reset by any successful read.
+    /// Consecutive `Busy` reads; reset by a successful read, by session
+    /// establishment, and by a genuine change notification.
     busy_reads: u32,
+    /// Slow revival attempts made since the fast nudges were exhausted,
+    /// bounded by [`MAX_READ_REVIVALS`]. Reset with `busy_reads`.
+    read_revivals: u32,
     /// Actions still to perform, carried across turns of the event loop
     /// so a long chunk stream cannot monopolize the driver (see `run`).
     pending: VecDeque<Action>,
@@ -301,6 +355,7 @@ pub fn clipboard_sync(
         pending: VecDeque::new(),
         deferred: VecDeque::new(),
         busy_reads: 0,
+        read_revivals: 0,
         settle_generation: 0,
         metrics,
         write_busy_warned: BusyWarnOnce::default(),
@@ -382,9 +437,27 @@ impl ClipboardSyncDriver {
     /// Feed one event to the engine and return what it wants done.
     async fn dispatch(&mut self, event: SyncEvent) -> Vec<Action> {
         match event {
-            SyncEvent::SessionEstablished => self.engine.on_session_established(),
+            SyncEvent::SessionEstablished => {
+                self.reset_read_backoff();
+                self.engine.on_session_established()
+            }
             SyncEvent::SessionLost => self.engine.on_session_lost(),
-            SyncEvent::LocalChanged => self.on_local_change(),
+            SyncEvent::LocalChanged => {
+                self.reset_read_backoff();
+                self.on_local_change()
+            }
+            SyncEvent::ReadRetryDue => {
+                if self.clipboard_holds_our_file_offer() {
+                    // Nothing to look for, and looking would be the F13
+                    // loop: the retry chain ends here rather than
+                    // rendering our own offer back into the engine. A real
+                    // change re-arms everything.
+                    tracing::debug!("read retry skipped; the clipboard holds our own file list");
+                    Vec::new()
+                } else {
+                    vec![Action::ReadClipboard]
+                }
+            }
             SyncEvent::SpoolSweepDue => self.engine.on_spool_sweep_due(),
             SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
             SyncEvent::TransferTimeout { scope, generation } => {
@@ -626,33 +699,54 @@ impl ClipboardSyncDriver {
     fn read_clipboard(&mut self) -> Vec<Action> {
         match self.provider.read() {
             Ok(content) => {
-                self.busy_reads = 0;
+                self.reset_read_backoff();
                 self.engine.on_local_read(content)
             }
             Err(ClipboardError::Busy { reason }) => {
                 self.busy_reads += 1;
                 self.record(Metrics::record_clipboard_contention);
-                if self.busy_reads > MAX_CONSECUTIVE_BUSY_READS {
-                    // Stop nudging: the change listener will wake us for
-                    // anything that actually changes, and continuing would
-                    // starve inbound frames on this same queue.
-                    tracing::warn!(
-                        error = %reason,
-                        attempt_count = self.busy_reads,
-                        "clipboard read still busy; waiting for the next change \
-                         notification instead of re-checking"
-                    );
-                } else {
+                if self.busy_reads <= MAX_CONSECUTIVE_BUSY_READS {
                     tracing::debug!(
                         error = %reason,
                         attempt_count = self.busy_reads,
                         "clipboard read busy; will look again"
                     );
-                    let notify = self.events_tx.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(READ_RETRY_DELAY).await;
-                        let _ = notify.try_send(SyncEvent::LocalChanged);
-                    });
+                    self.schedule(READ_RETRY_DELAY, SyncEvent::ReadRetryDue);
+                } else if self.read_revivals < MAX_READ_REVIVALS {
+                    self.read_revivals += 1;
+                    // The transition, once. The revivals themselves are at
+                    // debug: twenty warn lines for one contended episode
+                    // would bury the outcome.
+                    if self.read_revivals == 1 {
+                        tracing::warn!(
+                            error = %reason,
+                            attempt_count = self.busy_reads,
+                            revival_limit = MAX_READ_REVIVALS,
+                            revival_delay_ms = READ_REVIVAL_DELAY.as_millis(),
+                            "clipboard read still busy after the fast nudges; slowing to the \
+                             revival cadence rather than waiting on a change that may not come"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %reason,
+                            attempt_count = self.busy_reads,
+                            revival_count = self.read_revivals,
+                            "clipboard read still busy; revival rescheduled"
+                        );
+                    }
+                    self.schedule(READ_REVIVAL_DELAY, SyncEvent::ReadRetryDue);
+                } else {
+                    // Now, and only now, give up looking: the change
+                    // listener will wake us for anything that actually
+                    // changes, and continuing would starve inbound frames
+                    // on this same queue.
+                    tracing::warn!(
+                        error = %reason,
+                        attempt_count = self.busy_reads,
+                        revival_count = self.read_revivals,
+                        "clipboard read still busy; waiting for the next change \
+                         notification instead of re-checking"
+                    );
                 }
                 Vec::new()
             }
@@ -691,6 +785,18 @@ impl ClipboardSyncDriver {
             }
         };
         self.engine.on_write_result(id, result)
+    }
+
+    /// Forget a contended episode, so the next one gets the full budget.
+    ///
+    /// Called wherever the reason to look again is *new* rather than a
+    /// continuation: a successful read, a session establishing (whose
+    /// re-announce read must not inherit an earlier episode's exhausted
+    /// counter — that inheritance is exactly the 2026-09-01 defect), and a
+    /// genuine change notification.
+    fn reset_read_backoff(&mut self) {
+        self.busy_reads = 0;
+        self.read_revivals = 0;
     }
 
     /// Hand one engine message to the send path.
@@ -752,11 +858,7 @@ impl ClipboardSyncDriver {
     ///   the clipboard has moved on, so the entry behind the item it was
     ///   offering can no longer be pasted and is collected.
     fn on_local_change(&mut self) -> Vec<Action> {
-        if self
-            .virtual_files
-            .as_ref()
-            .is_some_and(|files| files.is_current())
-        {
+        if self.clipboard_holds_our_file_offer() {
             self.record(Metrics::record_clipboard_loop_suppressed);
             tracing::debug!("clipboard change is our own virtual file list; not staging it");
             return Vec::new();
@@ -764,6 +866,21 @@ impl ClipboardSyncDriver {
         let mut actions = self.engine.on_clipboard_moved_on();
         actions.extend(self.engine.on_local_change());
         actions
+    }
+
+    /// Whether the clipboard still holds the virtual file list *we* put
+    /// there (F13).
+    ///
+    /// Its own function because the guard has to hold on **every** path
+    /// that reaches a read, not only the notification path.
+    /// [`SyncEvent::ReadRetryDue`] is the second one, and it went straight
+    /// to the provider — which would render our own offer back into the
+    /// engine, the very loop the guard exists to prevent, reachable
+    /// whenever a contended read overlapped an outgoing file.
+    fn clipboard_holds_our_file_offer(&self) -> bool {
+        self.virtual_files
+            .as_ref()
+            .is_some_and(|files| files.is_current())
     }
 
     /// Offer a verified entry for paste, and report what the clipboard
@@ -1247,6 +1364,11 @@ mod tests {
             retry: RetryPolicy {
                 max_attempts: 3,
                 delay: Duration::from_millis(20),
+                // Scaled down, not switched off: the parked phase must
+                // be exercised by the driver suite, and at production
+                // budgets one test would take twenty seconds.
+                park_delay: Duration::from_millis(20),
+                park_budget: Duration::from_millis(100),
             },
             // Tests drive the trigger's *behaviour*, not the wait.
             transmit_debounce: Duration::from_millis(5),
@@ -1414,18 +1536,63 @@ mod tests {
         assert_eq!(rig.clipboard.peek().as_deref(), Some("contended"));
 
         // Two Busy writes were two contention events and two retries; the
-        // third write applied the item once.
+        // third write applied the item once, all inside the fast phase.
         let report = rig.metrics.snapshot();
         assert_eq!(report.clipboard_contention, 2);
         assert_eq!(report.clipboard_retries, 2);
         assert_eq!(report.clipboard_applied, 1);
+        assert_eq!(report.clipboard_installs_parked, 0);
+        assert_eq!(report.clipboard_installs_failed, 0);
+    }
+
+    /// The 2026-09-01 hardware defect, driven through real timers:
+    /// contention that outlives the *fast* budget must cost the item time,
+    /// not existence. Before the parked phase this ended in
+    /// `ClipboardUnavailable` and the content was gone.
+    #[tokio::test]
+    async fn contention_past_the_fast_budget_parks_the_install_and_it_still_lands() {
+        let mut rig = rig();
+        // One more failure than the fast phase's three attempts can
+        // absorb, so the install has to park to survive.
+        rig.clipboard
+            .fail_next(ClipboardOp::Write, ClipboardFailure::Busy, 4);
+
+        let item = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xBB; 16]),
+            0,
+            ContentType::Utf8Text,
+            b"survives the hold".to_vec(),
+        );
+        rig.events
+            .send(frame(
+                MessageType::ClipboardData,
+                item.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let SessionCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
+            panic!("expected SendFrame");
+        };
+        let applied = ClipboardApplied::decode_payload(&payload).unwrap();
+        assert_eq!(
+            applied.result,
+            ApplyResult::Applied,
+            "a hold past the fast budget still cost the item"
+        );
+        assert_eq!(rig.clipboard.peek().as_deref(), Some("survives the hold"));
+
+        let report = rig.metrics.snapshot();
+        assert_eq!(report.clipboard_installs_parked, 1);
+        assert_eq!(report.clipboard_installs_failed, 0);
     }
 
     #[tokio::test]
     async fn exhausted_retries_report_clipboard_unavailable() {
         let mut rig = rig();
         rig.clipboard
-            .fail_next(ClipboardOp::Write, ClipboardFailure::Busy, 99);
+            .fail_next(ClipboardOp::Write, ClipboardFailure::Busy, 999);
 
         let item = ClipboardData::from_content(
             Uuid::new_v4(),
@@ -1448,6 +1615,13 @@ mod tests {
         let applied = ClipboardApplied::decode_payload(&payload).unwrap();
         assert_eq!(applied.result, ApplyResult::ClipboardUnavailable);
         assert_eq!(rig.clipboard.peek(), None);
+
+        // Both halves of the outcome are counted: the install was parked,
+        // and it was nonetheless lost. A run report that showed only the
+        // first would read like a success.
+        let report = rig.metrics.snapshot();
+        assert_eq!(report.clipboard_installs_parked, 1);
+        assert_eq!(report.clipboard_installs_failed, 1);
     }
 
     #[tokio::test]
@@ -1907,6 +2081,85 @@ mod tests {
         };
         let data = ClipboardData::decode_payload(&payload).unwrap();
         assert_eq!(data.content, b"survives the gap");
+    }
+
+    /// The other half of the 2026-09-01 defect, and the harder half to
+    /// see: the re-announce on reconnect is a *read*, and a contended read
+    /// used to be parked "until the next change notification" — which,
+    /// with the clipboard holding content copied while the peer was away,
+    /// is a change that never comes. The item was simply never offered.
+    ///
+    /// Contention here spans well past the fast nudges (5 × 100 ms), so
+    /// only the slow revival can recover it.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_re_announce_survives_a_contended_clipboard() {
+        let mut rig = rig();
+        rig.clipboard.set_text_locally("copied while away");
+        // Drain the announcement the copy itself produced.
+        let _ = next_command(&mut rig).await;
+
+        rig.events.send(SyncEvent::SessionLost).await.unwrap();
+        // Six failures: five exhaust the fast nudges, the sixth is met by
+        // the first slow revival a second later. Nothing else can revive
+        // this read — the clipboard never changes again.
+        rig.clipboard
+            .fail_next(ClipboardOp::Read, ClipboardFailure::Busy, 6);
+        rig.events
+            .send(SyncEvent::SessionEstablished)
+            .await
+            .unwrap();
+
+        let SessionCommand::SendFrame { payload, .. } =
+            timeout(Duration::from_secs(10), rig.commands.recv())
+                .await
+                .expect("the re-announce never happened: a contended read was never revived")
+                .expect("command channel closed")
+        else {
+            panic!("expected SendFrame");
+        };
+        let data = ClipboardData::decode_payload(&payload).unwrap();
+        assert_eq!(data.content, b"copied while away");
+    }
+
+    /// A contended episode must not poison the next one.
+    ///
+    /// `busy_reads` used to reset on a successful read and nothing else,
+    /// and the driver's own nudge arrived as `LocalChanged` — so after one
+    /// episode passed the cap, a *genuine* copy was read once, and if that
+    /// read was contended it inherited an already-exhausted counter. Here
+    /// the second episode is three ordinary busy reads: with the counter
+    /// reset they are three fast nudges (~300 ms), and without it they are
+    /// three attempts on the one-second revival cadence, which is what the
+    /// deadline separates.
+    /// Paused time, so the deadline is a statement about the *cadence*
+    /// rather than about the runner: the clock advances only when every
+    /// task is idle, so "within 1200 ms" means three 100 ms nudges
+    /// happened and three 1 s revivals did not, on any machine.
+    #[tokio::test(start_paused = true)]
+    async fn a_contended_episode_does_not_poison_the_next_read() {
+        let mut rig = rig();
+        // Burn the fast nudges on an episode of its own. Six failures,
+        // one more than the cap, so the counter is genuinely past it.
+        rig.clipboard
+            .fail_next(ClipboardOp::Read, ClipboardFailure::Busy, 6);
+        rig.events.send(SyncEvent::LocalChanged).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        // A fresh episode, and a real copy behind it.
+        rig.clipboard
+            .fail_next(ClipboardOp::Read, ClipboardFailure::Busy, 3);
+        rig.clipboard.set_text_locally("after the episode");
+
+        let SessionCommand::SendFrame { payload, .. } =
+            timeout(Duration::from_millis(1200), rig.commands.recv())
+                .await
+                .expect("the second episode read on the slow cadence: did the counter reset?")
+                .expect("command channel closed")
+        else {
+            panic!("expected SendFrame");
+        };
+        let data = ClipboardData::decode_payload(&payload).unwrap();
+        assert_eq!(data.content, b"after the episode");
     }
 
     /// `MAX_DEFERRED_EVENTS` is the *bound* on the deferred queue, and the
