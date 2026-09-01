@@ -1343,18 +1343,28 @@ mod tests {
         metrics: Arc<Metrics>,
     }
 
-    fn rig() -> Rig {
-        rig_with(None, None, None)
+    async fn rig() -> Rig {
+        rig_with(None, None, None).await
     }
 
-    fn rig_with_spool(
+    async fn rig_with_spool(
         spool: Option<Arc<dyn crossover_platform::SpoolStorage>>,
         virtual_files: Option<Arc<dyn VirtualFileClipboard>>,
     ) -> Rig {
-        rig_with(spool, virtual_files, None)
+        rig_with(spool, virtual_files, None).await
     }
 
-    fn rig_with(
+    /// A running driver **with a peer connected**, which is the situation
+    /// every test here describes.
+    ///
+    /// Since the 2026-09-01 addendum to ADR 0006 a local change with no
+    /// live session is recorded and never transmitted, so a rig that
+    /// never connected would emit no frames at all. The session is
+    /// brought up here, before the caller can touch the clipboard, and
+    /// the driver is then let run until its establishment read has been
+    /// taken — otherwise that read lands on content the test set
+    /// afterwards, and the test sees an extra observation it never made.
+    async fn rig_with(
         spool: Option<Arc<dyn crossover_platform::SpoolStorage>>,
         virtual_files: Option<Arc<dyn VirtualFileClipboard>>,
         blob_builder: Option<Arc<dyn crossover_platform::FileBlobBuilder>>,
@@ -1375,7 +1385,7 @@ mod tests {
             ..ClipboardConfig::new()
         };
         let metrics = Arc::new(Metrics::new());
-        let (driver, events, commands) = clipboard_sync(
+        let (driver, events, mut commands) = clipboard_sync(
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
             spool,
             virtual_files,
@@ -1386,6 +1396,36 @@ mod tests {
         )
         .unwrap();
         tokio::spawn(driver.run());
+        events
+            .try_send(SyncEvent::SessionEstablished)
+            .expect("a fresh event channel cannot be full");
+        // Wait on the condition, not on a fixed number of polls: the
+        // driver must have *taken* the event before the caller touches
+        // the clipboard, or the establishment read lands on content the
+        // test set afterwards and the test sees an observation it never
+        // made. A restored capacity is what says it was taken.
+        for _ in 0..1_000 {
+            if events.capacity() == events.max_capacity() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            events.capacity(),
+            events.max_capacity(),
+            "the driver never took the session event"
+        );
+        // And what it scheduled produced nothing, which is what lets this
+        // rig hand the caller a clean command channel: the clipboard is
+        // still empty here. Asserted rather than assumed, so an
+        // establishment path that grows an `Action::Send` fails loudly
+        // once instead of turning every test in this suite into a flake.
+        assert!(
+            timeout(Duration::from_millis(50), commands.recv())
+                .await
+                .is_err(),
+            "session establishment emitted a command against an empty clipboard;              this rig's guarantee that the channel starts clean no longer holds"
+        );
         Rig {
             clipboard,
             events,
@@ -1448,7 +1488,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_copy_flows_out_as_a_data_frame() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         // The listener bridge is installed: a local copy alone drives the
         // whole pipeline, no manual events.
         rig.clipboard.set_text_locally("copied text");
@@ -1466,9 +1506,60 @@ mod tests {
         assert_eq!(data.content, b"copied text");
     }
 
+    /// Session liveness reaches the engine through the driver, and a
+    /// disconnected pair produces no traffic at all (ADR 0006 addendum).
+    ///
+    /// Built without the rig's `SessionEstablished`, because the whole
+    /// subject is a driver that never had one. On machine A the copies
+    /// this covers each became a broadcast nobody received and an
+    /// `abandoned` warning a minute later.
+    #[tokio::test]
+    async fn a_disconnected_driver_emits_nothing_and_then_offers_on_connect() {
+        let clipboard = Arc::new(InMemoryClipboard::new());
+        let (driver, events, mut commands) = clipboard_sync(
+            Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
+            None,
+            None,
+            None,
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig {
+                transmit_debounce: Duration::from_millis(5),
+                ..ClipboardConfig::new()
+            },
+            None,
+        )
+        .unwrap();
+        tokio::spawn(driver.run());
+
+        clipboard.set_text_locally("copied while alone");
+        // Long enough for the settle, the read and any frame the old
+        // behaviour would have produced.
+        assert!(
+            timeout(Duration::from_millis(200), commands.recv())
+                .await
+                .is_err(),
+            "a driver with no session sent something"
+        );
+
+        // The peer arrives: the item is offered without the user copying
+        // it again (ADR 0006 trigger 3).
+        events.send(SyncEvent::SessionEstablished).await.unwrap();
+        let command = timeout(Duration::from_secs(5), commands.recv())
+            .await
+            .expect("the held item was never offered on connect")
+            .expect("command channel closed");
+        let SessionCommand::SendFrame { payload, .. } = command else {
+            panic!("expected SendFrame");
+        };
+        assert_eq!(
+            ClipboardData::decode_payload(&payload).unwrap().content,
+            b"copied while alone"
+        );
+    }
+
     #[tokio::test]
     async fn inbound_data_is_applied_acked_and_not_echoed() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         let item = ClipboardData::from_content(
             Uuid::new_v4(),
             Uuid::from_bytes([0xBB; 16]),
@@ -1507,7 +1598,7 @@ mod tests {
 
     #[tokio::test]
     async fn busy_writes_retry_through_real_timers_then_succeed() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         rig.clipboard
             .fail_next(ClipboardOp::Write, ClipboardFailure::Busy, 2);
 
@@ -1551,7 +1642,7 @@ mod tests {
     /// `ClipboardUnavailable` and the content was gone.
     #[tokio::test]
     async fn contention_past_the_fast_budget_parks_the_install_and_it_still_lands() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         // One more failure than the fast phase's three attempts can
         // absorb, so the install has to park to survive.
         rig.clipboard
@@ -1590,7 +1681,7 @@ mod tests {
 
     #[tokio::test]
     async fn exhausted_retries_report_clipboard_unavailable() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         rig.clipboard
             .fail_next(ClipboardOp::Write, ClipboardFailure::Busy, 999);
 
@@ -1626,7 +1717,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_clipboard_payload_terminates_the_session() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         rig.events
             .send(frame(MessageType::ClipboardData, vec![0xFF; 40]))
             .await
@@ -1643,7 +1734,7 @@ mod tests {
     /// it (27 seconds, on real hardware).
     #[tokio::test]
     async fn sustained_read_contention_does_not_starve_inbound_items() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         // Far more busy reads than the bound allows.
         rig.clipboard
             .fail_next(ClipboardOp::Read, ClipboardFailure::Busy, 1000);
@@ -1688,7 +1779,7 @@ mod tests {
     /// silently dropped.
     #[tokio::test]
     async fn a_backlog_of_items_applies_only_the_newest() {
-        let mut rig = rig();
+        let mut rig = rig().await;
 
         let mut ids = Vec::new();
         for i in 0..20 {
@@ -1743,7 +1834,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_clipboard_frames_are_ignored() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         rig.events
             .send(SyncEvent::Frame(RawFrame {
                 message_type: 0x7777,
@@ -1766,7 +1857,7 @@ mod tests {
             ClipboardAccept, ClipboardChunk, ClipboardOffer, MAX_CHUNK_BYTES,
         };
 
-        let mut rig = rig();
+        let mut rig = rig().await;
         let bytes: Vec<u8> = (0..MAX_CHUNK_BYTES * 2 + 9)
             .map(|i| u8::try_from(i % 256).unwrap_or(0))
             .collect();
@@ -1829,7 +1920,7 @@ mod tests {
             content_hash,
         };
 
-        let mut rig = rig();
+        let mut rig = rig().await;
         // Deliberately hostile bytes for anything that assumes text.
         let bytes: Vec<u8> = (0..=MAX_CHUNK_BYTES)
             .map(|i| if i % 3 == 0 { 0xFF } else { 0x00 })
@@ -1920,7 +2011,7 @@ mod tests {
         // the driver is genuinely parked partway through.
         const CHUNKS: usize = 200;
 
-        let mut rig = rig();
+        let mut rig = rig().await;
         rig.clipboard.set_image_locally(
             ClipboardImageFormat::Dib,
             vec![0xAB; MAX_CHUNK_BYTES * CHUNKS],
@@ -2065,7 +2156,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_re_announces_current_content() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         rig.clipboard.set_text_locally("survives the gap");
         // Drain the initial announcement.
         let _ = next_command(&mut rig).await;
@@ -2093,7 +2184,7 @@ mod tests {
     /// only the slow revival can recover it.
     #[tokio::test(start_paused = true)]
     async fn a_reconnect_re_announce_survives_a_contended_clipboard() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         rig.clipboard.set_text_locally("copied while away");
         // Drain the announcement the copy itself produced.
         let _ = next_command(&mut rig).await;
@@ -2137,7 +2228,7 @@ mod tests {
     /// happened and three 1 s revivals did not, on any machine.
     #[tokio::test(start_paused = true)]
     async fn a_contended_episode_does_not_poison_the_next_read() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         // Burn the fast nudges on an episode of its own. Six failures,
         // one more than the cap, so the counter is genuinely past it.
         rig.clipboard
@@ -2195,7 +2286,7 @@ mod tests {
         // inside `send_command`, the only place deferring happens — and,
         // crucially, it stops *without* having drained the event channel,
         // which is what makes the count below mean something.
-        let mut rig = rig();
+        let mut rig = rig().await;
         rig.clipboard
             .set_image_locally(ClipboardImageFormat::Dib, vec![0xAB; MAX_CHUNK_BYTES * 200]);
         let SessionCommand::SendFrame { payload, .. } = next_command(&mut rig).await else {
@@ -2389,7 +2480,8 @@ mod tests {
         let mut rig = rig_with_spool(
             Some(Arc::clone(&spool) as Arc<dyn crossover_platform::SpoolStorage>),
             Some(Arc::clone(&files) as Arc<dyn VirtualFileClipboard>),
-        );
+        )
+        .await;
         rig.events
             .send(SyncEvent::FileReceivePolicy(FileReceive::Allowed))
             .await
@@ -2488,7 +2580,7 @@ mod tests {
     /// file to go, so it is not a matter of permission.
     #[tokio::test]
     async fn a_driver_without_a_spool_refuses_files_however_it_is_configured() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         rig.events
             .send(SyncEvent::FileReceivePolicy(FileReceive::Allowed))
             .await
@@ -2534,7 +2626,8 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&builder) as Arc<dyn crossover_platform::FileBlobBuilder>),
-        );
+        )
+        .await;
         rig.events
             .send(SyncEvent::FileSendPolicy(FileSend::Allowed))
             .await
@@ -2608,7 +2701,8 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&builder) as Arc<dyn crossover_platform::FileBlobBuilder>),
-        );
+        )
+        .await;
         rig.events
             .send(SyncEvent::FileSendPolicy(FileSend::Allowed))
             .await
@@ -2633,7 +2727,7 @@ mod tests {
     /// clamp the receiving side has, in the other direction.
     #[tokio::test]
     async fn a_driver_without_a_builder_never_packs_a_selection() {
-        let mut rig = rig();
+        let mut rig = rig().await;
         rig.events
             .send(SyncEvent::FileSendPolicy(FileSend::Allowed))
             .await

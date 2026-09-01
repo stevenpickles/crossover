@@ -1106,6 +1106,41 @@ pub struct ClipboardEngine {
     /// [`ClipboardEngine::on_session_established`], so the budget is per
     /// session rather than per process.
     violations: u32,
+    /// How many sessions are currently live (ADR 0006, addendum
+    /// 2026-09-01). Nothing is transmitted while this is zero.
+    ///
+    /// A **count**, not a flag, because this process can hold more than
+    /// one session at once: the inbound listener and the outbound
+    /// supervisor run independently, so a machine can be serving one peer
+    /// while dialling another — and both fan `SessionEstablished` /
+    /// `SessionLost` into this one engine. A flag would be cleared by the
+    /// first of two peers to drop, and every copy after that would be
+    /// silently held from the peer that was still there: a clipboard that
+    /// stops working with no fault visible anywhere, which is the
+    /// priority-#2 failure this rule exists to avoid causing.
+    ///
+    /// **What the count buys is scoped to new copies.** It keeps
+    /// *transmission* alive for a surviving session; it does not make
+    /// [`Self::on_session_lost`] session-aware, and that method still
+    /// tears down the in-flight state unconditionally. See the note there.
+    ///
+    /// The two events are strictly paired at every call site, so the
+    /// count tracks reality; `saturating_sub` keeps an unpaired loss from
+    /// wrapping. It does not *correct* one: an unpaired loss leaves the
+    /// count permanently one low, so the last real session to drop would
+    /// find it already at zero. What the next
+    /// [`Self::on_session_established`] restores is transmission, not the
+    /// count — the stall lifts, the skew stays — which is why reaching
+    /// `saturating_sub` at zero is warned about rather than absorbed.
+    live_sessions: u32,
+    /// Whether the current offline stretch has already announced itself.
+    ///
+    /// A pair can be apart for hours (docs/SOAK.md), and one `info` line
+    /// per copy for eight hours is noise that buries the lines a soak is
+    /// read for. The first copy of a stretch says it at `info`, the rest
+    /// at `debug`, and [`Self::on_session_established`] arms it again for
+    /// the next stretch.
+    offline_announced: bool,
     /// Optional metrics sink. Recorded alongside the `tracing` side
     /// effects the engine already emits at each decision point, so the
     /// semantic outcomes only this engine can see — sent, applied,
@@ -1153,6 +1188,8 @@ impl ClipboardEngine {
             build_generation: 0,
             pending_write: None,
             violations: 0,
+            live_sessions: 0,
+            offline_announced: false,
             metrics,
         }
     }
@@ -1162,6 +1199,43 @@ impl ClipboardEngine {
         if let Some(metrics) = &self.metrics {
             f(metrics);
         }
+    }
+
+    /// Is there a peer for an item to travel to at all?
+    ///
+    /// The one question that separates "this copy is going nowhere" from
+    /// "this copy is going nowhere *yet*", and the whole basis of the
+    /// 2026-09-01 addendum to ADR 0006: with no session live, minting a
+    /// deadline-bound transaction produces one broadcast frame that the
+    /// application drops for want of a sink, and one `abandoned` warning
+    /// sixty seconds later for a fault that never happened.
+    fn has_live_session(&self) -> bool {
+        self.live_sessions > 0
+    }
+
+    /// Count a local change that was recorded but not transmitted, and
+    /// say so at most once per offline stretch.
+    ///
+    /// The counter takes every copy, because the run report's job is to
+    /// account for all of them; the `info` line takes only the first,
+    /// because the log's job is to be readable after eight hours with a
+    /// peer that is asleep. Each caller has already emitted its own
+    /// `debug` line with the fields particular to its content type.
+    fn note_offline_change(&mut self) {
+        self.record(Metrics::record_clipboard_offline_change);
+        if self.offline_announced {
+            return;
+        }
+        self.offline_announced = true;
+        // `tools/soak-report.py` counts offline *stretches* by matching
+        // the tail of this line — "will be offered when one connects" —
+        // precisely because the two per-copy `debug` lines share its
+        // opening and would otherwise be counted as stretches under
+        // `RUST_LOG=debug`. Reword the tail and the tool stops counting;
+        // reword either debug line into it and the tool over-counts.
+        tracing::info!(
+            "clipboard: no peer connected; the current item will be offered when one connects"
+        );
     }
 
     /// The provider signaled a change.
@@ -1287,6 +1361,34 @@ impl ClipboardEngine {
             self.supersede_parked_write("a local copy")
         };
 
+        // Nobody to offer it to (ADR 0006, addendum 2026-09-01). The
+        // observation above stands in full — the hash is updated, dedup
+        // and loop suppression are untouched, a parked install has had
+        // its answer — and nothing is minted: no outbound slot, no
+        // deadline, no frame.
+        //
+        // Placed *after* the supersession and returning what it built,
+        // not `Vec::new()`. A `Superseded` verdict is constructed
+        // immediately above, and swallowing one here would leave the
+        // origin waiting out its own 60 s deadline for an answer this
+        // machine had already reached — the exact failure ADR 0005's
+        // "every transaction ends in a typed verdict" invariant forbids.
+        // On today's code that vector is always empty on this path: a
+        // parked install belongs to a session, and `on_session_lost`
+        // drops the pending write before the count can reach zero, so
+        // there is nothing to supersede once there is nobody to tell.
+        // The ordering is written to be safe rather than to happen to
+        // be, because what makes it unreachable lives in another method.
+        if !self.has_live_session() {
+            tracing::debug!(
+                byte_count = bytes.len(),
+                content_type = ?content_type,
+                "no peer connected; the current item is held, not transmitted"
+            );
+            self.note_offline_change();
+            return superseded;
+        }
+
         let sequence = self.next_sequence;
         self.next_sequence += 1;
         let meta = ClipboardMeta {
@@ -1399,6 +1501,9 @@ impl ClipboardEngine {
         } else {
             self.supersede_parked_write("a local copy")
         };
+        // Whatever the staging decides — including the no-peer case just
+        // below, which stages nothing — the verdict built above still
+        // travels, because it is already in `actions`.
         actions.extend(self.stage_local_file_list(selection));
         actions
     }
@@ -1406,6 +1511,26 @@ impl ClipboardEngine {
     /// The gates and the build, once the selection is known to be the
     /// user's own (see [`Self::on_local_file_list`]).
     fn stage_local_file_list(&mut self, selection: Vec<PathBuf>) -> Vec<Action> {
+        // Before every permission gate, because "no peer" is not a
+        // refusal (ADR 0006, addendum 2026-09-01). The application's
+        // policy does already close to `Denied` with nothing live, so the
+        // expensive build was never at risk here — but reporting an empty
+        // desk as "this peer holds no clipboard-send grant" names a peer
+        // that does not exist, and charges `files_send_refused` for it.
+        //
+        // Below the caller's supersession rather than above it, for the
+        // reason `on_local_read` returns what it built: a verdict this
+        // machine has already decided must reach the origin even on a
+        // path that stages nothing. Here the caller's `extend` preserves
+        // it by shape, so this can return an honest empty.
+        if !self.has_live_session() {
+            tracing::debug!(
+                entry_count = selection.len(),
+                "no peer connected; nothing is packed for a selection that cannot travel"
+            );
+            self.note_offline_change();
+            return Vec::new();
+        }
         match self.file_send {
             FileSend::Allowed => {}
             FileSend::Unsupported => {
@@ -2200,7 +2325,15 @@ impl ClipboardEngine {
     /// A session (re)connected: re-announce our current item so the peers
     /// converge after any gap (reconnect-safe behavior; receiver-side
     /// dedup makes re-announcement cheap).
+    ///
+    /// Since 2026-09-01 this is also the delivery mechanism for every
+    /// copy made while the pair was apart (ADR 0006 trigger 3, and its
+    /// addendum): those copies minted no transaction, so the re-read
+    /// below is the only thing that offers them — one item, the current
+    /// one, however many copies the offline stretch contained.
     pub fn on_session_established(&mut self) -> Vec<Action> {
+        self.live_sessions = self.live_sessions.saturating_add(1);
+        self.offline_announced = false;
         self.outbound = None;
         self.expecting_data = None;
         self.reassembly = None;
@@ -2249,6 +2382,41 @@ impl ClipboardEngine {
     /// sent: the peer is gone, and the deadline that would have answered
     /// it becomes moot with the session.
     pub fn on_session_lost(&mut self) -> Vec<Action> {
+        // One session of possibly several. Only the last one out turns
+        // transmission off (ADR 0006, addendum 2026-09-01), so a machine
+        // serving one peer while dialling another goes on offering *new*
+        // copies to the one that stayed.
+        //
+        // That is the whole of what the count buys, and the rest of this
+        // method is deliberately unchanged and deliberately unconditional:
+        // the outbound transaction, the accepted offer, the pending
+        // install, the reassembly and the build are torn down by **any**
+        // loss, whichever session it was, and whatever the count now
+        // reads. So a transfer in flight to a surviving peer still dies
+        // here — and a file one still counts a `file_send_failed`.
+        // Scoping this teardown to the session that actually dropped
+        // means the engine tracking which session each transfer belongs
+        // to, which is a change to the transaction model rather than to
+        // the offline rule; it has its own branch (ADR 0006 addendum,
+        // "Named follow-up").
+        //
+        // The count is therefore read and warned about *before* any of
+        // it, and never gates it: an install that has not landed must be
+        // dropped on a session loss even when the count is already wrong.
+        if self.live_sessions == 0 {
+            // Not merely absorbed: reaching here means a `SessionLost`
+            // arrived that no `SessionEstablished` paired with, and the
+            // count is now skewed against every session still up. The
+            // symptom is a clipboard that stops offering while a peer is
+            // connected, and this line is the only thing that would say
+            // why (FR-7.3).
+            tracing::warn!(
+                "clipboard: session lost with none counted as live; the liveness \
+                 count is skewed and transmission may stop early until the next \
+                 connect"
+            );
+        }
+        self.live_sessions = self.live_sessions.saturating_sub(1);
         let mut released_outbound = None;
         if let Some(outbound) = self.outbound.take() {
             tracing::debug!(
@@ -3586,7 +3754,23 @@ mod tests {
     }
 
     fn engine(origin_fill: u8) -> ClipboardEngine {
-        ClipboardEngine::new(Uuid::from_bytes([origin_fill; 16]), ClipboardConfig::new())
+        connected(ClipboardEngine::new(
+            Uuid::from_bytes([origin_fill; 16]),
+            ClipboardConfig::new(),
+        ))
+    }
+
+    /// An engine with one live session — which is the situation almost
+    /// every test in this module is about: two connected peers.
+    ///
+    /// Since the 2026-09-01 addendum to ADR 0006 a local change with no
+    /// live session is recorded and not transmitted, so a test about
+    /// *transmission* has to say a peer is there first. Tests about the
+    /// offline rule itself build a bare engine instead and never call
+    /// this.
+    fn connected(mut engine: ClipboardEngine) -> ClipboardEngine {
+        engine.on_session_established();
+        engine
     }
 
     /// Image bytes that no text path could survive: non-UTF-8 lead bytes,
@@ -3967,14 +4151,14 @@ mod tests {
     }
 
     fn parking_engine(metrics: &Arc<Metrics>) -> ClipboardEngine {
-        ClipboardEngine::with_metrics(
+        connected(ClipboardEngine::with_metrics(
             Uuid::from_bytes([0xBB; 16]),
             ClipboardConfig {
                 retry: parking_policy(),
                 ..ClipboardConfig::new()
             },
             Some(Arc::clone(metrics)),
-        )
+        ))
     }
 
     /// Stage one inbound text item and return its id, having consumed the
@@ -4705,6 +4889,114 @@ mod tests {
         );
     }
 
+    /// The 2026-09-01 defect, at its source (ADR 0006 addendum).
+    ///
+    /// On machine A, with the peer asleep for eight hours, every local
+    /// copy minted a deadline-bound transaction, broadcast a frame the
+    /// application dropped for want of a sink, and produced a WARN and an
+    /// `abandoned` sixty seconds later — twenty times in one evening, for
+    /// a fault that never happened. Nothing at all may be minted with no
+    /// peer to answer it: no frame, no outbound slot, no deadline.
+    #[test]
+    fn a_local_copy_with_no_peer_mints_no_transaction() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig::new(),
+            Some(Arc::clone(&metrics)),
+        );
+
+        let actions = copy(&mut e, "copied while alone");
+        assert!(
+            actions.is_empty(),
+            "a copy with no peer asked for work: {actions:?}"
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.clipboard_offline_changes, 1);
+        // The two counters this defect polluted: nothing was sent, and —
+        // the point of the whole change — nothing can later be abandoned,
+        // because no deadline was ever armed.
+        assert_eq!(snap.clipboard_sent, 0);
+        assert_eq!(snap.clipboard_abandoned, 0);
+    }
+
+    /// The other half of the rule: a held copy is not a lost copy.
+    ///
+    /// `on_session_established` marks a re-announcement pending and
+    /// re-reads, which is ADR 0006's trigger 3 — and, since the addendum,
+    /// the *only* route by which an offline copy is ever offered. However
+    /// many
+    /// copies the gap contained, the peer is offered the one that is
+    /// current, which is the only one anybody can paste.
+    #[test]
+    fn the_item_copied_while_alone_is_offered_when_a_peer_arrives() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig::new(),
+            Some(Arc::clone(&metrics)),
+        );
+
+        assert!(copy(&mut e, "first while alone").is_empty());
+        assert!(copy(&mut e, "last while alone").is_empty());
+        assert_eq!(metrics.snapshot().clipboard_offline_changes, 2);
+
+        // Establishing asks for the re-read, and the re-read offers the
+        // current item — once, not twice.
+        assert_eq!(e.on_session_established(), vec![Action::ReadClipboard]);
+        let actions = e.on_local_read(Some(ClipboardContent::Text("last while alone".to_owned())));
+        let msgs = sent(&actions);
+        assert_eq!(msgs.len(), 1, "expected one offer, got {msgs:?}");
+        let OutboundMessage::Data(data) = msgs[0] else {
+            panic!("expected inline data");
+        };
+        assert_eq!(data.content, b"last while alone");
+        assert_eq!(metrics.snapshot().clipboard_sent, 1);
+    }
+
+    /// Losing the session mid-transaction is unchanged by the new rule:
+    /// the in-flight state is released, nothing is sent to a peer that is
+    /// gone, and the next copy is simply held instead of minting another
+    /// transaction into the void.
+    #[test]
+    fn a_session_lost_mid_transaction_still_releases_and_then_holds() {
+        let mut e = engine(0xAA);
+        let actions = copy(&mut e, "in flight");
+        assert_eq!(sent(&actions).len(), 1);
+
+        // As today: the transaction is dropped, and no verdict travels.
+        let lost = e.on_session_lost();
+        assert!(lost.is_empty(), "session loss sent something: {lost:?}");
+
+        // And now there is no peer, so the next copy is held.
+        assert!(copy(&mut e, "after the loss").is_empty());
+    }
+
+    /// A count, not a flag (ADR 0006 addendum): this process can hold an
+    /// inbound and an outbound session at once, and both fan their
+    /// lifecycle into this one engine. If losing either one stopped
+    /// transmission, a copy would silently stop reaching the peer that
+    /// was still connected — a clipboard that quietly stops working,
+    /// which is the priority-#2 fault this rule exists to avoid causing.
+    #[test]
+    fn losing_one_of_two_sessions_does_not_stop_offering() {
+        let mut e = engine(0xAA); // one session live
+        e.on_session_established(); // and a second
+
+        e.on_session_lost();
+        let actions = copy(&mut e, "still one peer left");
+        assert_eq!(
+            sent(&actions).len(),
+            1,
+            "the surviving session stopped receiving offers: {actions:?}"
+        );
+
+        // Only the last one out turns transmission off.
+        e.on_session_lost();
+        assert!(copy(&mut e, "now nobody").is_empty());
+    }
+
     /// ADR 0006: a burst of notifications costs one clipboard *read*,
     /// not one per notification. Reading takes the machine-global lock,
     /// so reacting to every notification is itself the contention the
@@ -4735,13 +5027,13 @@ mod tests {
 
     #[test]
     fn zero_debounce_reads_eagerly() {
-        let mut e = ClipboardEngine::new(
+        let mut e = connected(ClipboardEngine::new(
             Uuid::from_bytes([0xAA; 16]),
             ClipboardConfig {
                 transmit_debounce: Duration::ZERO,
                 ..ClipboardConfig::new()
             },
-        );
+        ));
         // The escape hatch for callers who want no wait at all.
         assert_eq!(e.on_local_change(), vec![Action::ReadClipboard]);
         assert_eq!(
@@ -4757,11 +5049,11 @@ mod tests {
         use crate::metrics::Metrics;
 
         let metrics = Arc::new(Metrics::new());
-        let mut e = ClipboardEngine::with_metrics(
+        let mut e = connected(ClipboardEngine::with_metrics(
             Uuid::from_bytes([0xAA; 16]),
             ClipboardConfig::new(),
             Some(Arc::clone(&metrics)),
-        );
+        ));
 
         // A local copy is one item sent.
         let actions = copy(&mut e, "hello");
@@ -4809,11 +5101,11 @@ mod tests {
         use crate::metrics::Metrics;
 
         let metrics = Arc::new(Metrics::new());
-        let mut e = ClipboardEngine::with_metrics(
+        let mut e = connected(ClipboardEngine::with_metrics(
             Uuid::from_bytes([0xAA; 16]),
             ClipboardConfig::new(),
             Some(Arc::clone(&metrics)),
-        );
+        ));
 
         // Our item is in flight when a higher-origin inbound item arrives:
         // the deterministic order makes theirs win, and it counts as one
@@ -5323,11 +5615,11 @@ mod tests {
         use crate::metrics::Metrics;
 
         let metrics = Arc::new(Metrics::new());
-        let mut e = ClipboardEngine::with_metrics(
+        let mut e = connected(ClipboardEngine::with_metrics(
             Uuid::from_bytes([0xAA; 16]),
             ClipboardConfig::new(),
             Some(Arc::clone(&metrics)),
-        );
+        ));
         let actions = copy(&mut e, "sent into silence");
         assert!(
             actions.iter().any(|a| matches!(
@@ -6926,11 +7218,11 @@ mod tests {
     #[test]
     fn the_sending_half_counts_what_it_refused_and_what_it_sent() {
         let metrics = Arc::new(Metrics::new());
-        let mut engine = ClipboardEngine::with_metrics(
+        let mut engine = connected(ClipboardEngine::with_metrics(
             Uuid::from_bytes([0xAA; 16]),
             ClipboardConfig::new(),
             Some(Arc::clone(&metrics)),
-        );
+        ));
 
         // Gated off: refused, not silent.
         engine.set_file_send(FileSend::NotNegotiated);
@@ -6951,5 +7243,38 @@ mod tests {
             reason: DeclineReason::NotPermitted,
         }));
         assert_eq!(metrics.snapshot().clipboard_files_send_failed, 1);
+    }
+
+    /// No peer is not a refusal (ADR 0006 addendum), and a selection
+    /// copied alone must not be walked or packed.
+    ///
+    /// The application's own policy already closes to `Denied` with
+    /// nothing live, so the expensive build was never at risk — but
+    /// answering an empty desk with "this peer holds no clipboard-send
+    /// grant" names a peer that does not exist, and charges
+    /// `files_send_refused` for a permission nobody was asked for. The
+    /// gate is judged before the policy so the diagnostic is true.
+    #[test]
+    fn a_file_selection_copied_with_no_peer_is_held_not_refused() {
+        let metrics = Arc::new(Metrics::new());
+        let mut engine = ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig::new(),
+            Some(Arc::clone(&metrics)),
+        );
+        // Even fully permitted, there is nobody to offer it to.
+        engine.set_file_send(FileSend::Allowed);
+
+        let actions = copy_files(&mut engine, &[r"C:\work\a.pdf"]);
+        assert!(
+            actions.is_empty(),
+            "a file copy with no peer asked for work: {actions:?}"
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.clipboard_offline_changes, 1);
+        assert_eq!(
+            snapshot.clipboard_files_send_refused, 0,
+            "an absent peer was reported as a refused one"
+        );
     }
 }
