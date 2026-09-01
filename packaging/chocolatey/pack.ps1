@@ -18,8 +18,8 @@
 .PARAMETER Version
     Package version. Defaults to the version in apps\crossover\Cargo.toml.
     Must be a version NuGet accepts: dots are not allowed in the pre-release
-    label, so scripts\build.ps1 passes 0.1.0-dev-319-gabc1234 rather than the
-    binaries' own 0.1.0-dev.319.gabc1234.
+    label, so scripts\build.ps1 passes 0.2.0-dev-319-gabc1234 rather than the
+    binaries' own 0.2.0-dev.319.gabc1234.
 
 .PARAMETER BinariesDirectory
     Where to find the executables. Defaults to target\release.

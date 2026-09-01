@@ -38,11 +38,11 @@ each artifact's hash. `-SkipChecks` skips the gate; `-SkipChocolatey` stops
 after the archive.
 
 The version is derived from the source state rather than typed in: a tagged
-commit produces `0.1.0`, anything else produces something that names its
-origin, such as `0.1.0-dev.7.gabc1234.dirty`. Run `crossover version` (or
+commit produces `0.2.0`, anything else produces something that names its
+origin, such as `0.2.0-dev.7.gabc1234.dirty`. Run `crossover version` (or
 `crossover-svc.exe --version`) to see the full identity of any binary you
 find on a machine. NuGet rejects dots in a pre-release label, so the
-Chocolatey package for that build is versioned `0.1.0-dev-7-gabc1234-dirty`;
+Chocolatey package for that build is versioned `0.2.0-dev-7-gabc1234-dirty`;
 `artifacts.json` carries both forms.
 
 To compile without packaging:
@@ -81,7 +81,7 @@ To build only the package, from binaries you already have:
 
 ```powershell
 .\chocolatey\pack.ps1                                   # target\release, Cargo version
-.\chocolatey\pack.ps1 -Version 0.1.0 -OutputDirectory ..\dist
+.\chocolatey\pack.ps1 -Version 0.2.0 -OutputDirectory ..\dist
 ```
 
 This produces `crossover.<version>.nupkg` in the output directory
@@ -97,7 +97,7 @@ choco uninstall crossover -y
 > **`--pre` is required for anything but a tagged release.** Chocolatey
 > filters pre-release versions out unless asked for them, and every
 > untagged build carries a pre-release label
-> (`0.1.0-dev-7-gabc1234`). Without it the install fails with
+> (`0.2.0-dev-7-gabc1234`). Without it the install fails with
 >
 > ```
 > crossover was not found with the source(s) listed.
@@ -128,18 +128,18 @@ not bookkeeping — leaving it alone breaks upgrades, silently:
 
 A development build names itself `<version>-dev.N.g<commit>`, and SemVer
 ranks a pre-release *below* the release it prefixes. So while the workspace
-still says `0.1.0` after `v0.1.0` ships, every build made is
-`0.1.0-dev.N` — a pre-release of the version already installed. Chocolatey
+still says `0.2.0` after `v0.2.0` ships, every build made is
+`0.2.0-dev.N` — a pre-release of the version already installed. Chocolatey
 correctly refuses it as a downgrade, `choco upgrade` reports the machine is
 already current, and testing the next build means `--force` or an uninstall.
 
-Bumping to `0.2.0` right after the release makes those builds `0.2.0-dev.N`,
-which sorts above `0.1.0` and below the eventual `0.2.0`. Both channels then
-behave:
+Bumping to the next minor (`0.3.0` after `v0.2.0`) right after the release
+makes those builds `0.3.0-dev.N`, which sorts above `0.2.0` and below the
+eventual `0.3.0`. Both channels then behave:
 
 ```powershell
-choco upgrade crossover -y -s <source>          # stays on 0.1.0
-choco upgrade crossover -y --pre -s <source>    # takes 0.2.0-dev.N
+choco upgrade crossover -y -s <source>          # stays on the released 0.2.0
+choco upgrade crossover -y --pre -s <source>    # takes 0.3.0-dev.N
 ```
 
 The version lives in one place — `[workspace.package]` in the root
@@ -174,6 +174,9 @@ SmartScreen does not warn. Neither is needed for personal or internal use.
 
 The service starts the worker, but the worker needs a role. Create
 `~/.crossover/config.toml` (see `crossover config` for an example) with a
-`[network]` role and, for seamless mode, a `[seamless] side`. (Config and logs
+`[network]` role, then run `crossover layout` on either machine to draw how
+the screens sit — that writes the `[layout]` section both workers cross by.
+(`[seamless] side`, and the `--left`/`--right` flags, still load as an
+implicit layout but are deprecated.) (Config and logs
 live under `~/.crossover`; identity and the trust store stay under
 `%LOCALAPPDATA%\Crossover`.)
