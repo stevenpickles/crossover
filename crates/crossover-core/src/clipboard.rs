@@ -238,15 +238,71 @@ pub const TRANSMIT_DEBOUNCE: Duration = Duration::from_millis(300);
 /// the state machine session state it otherwise has no reason to know.
 pub const TRANSFER_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// How long a parked install waits between attempts (ADR 0005, addendum
+/// 2026-09-01).
+///
+/// A second rather than the fast schedule's 200 ms because the parked
+/// phase is answering a different question. The fast phase covers a
+/// *blip* — another application between `OpenClipboard` and
+/// `CloseClipboard` — and polling hard is right for something that
+/// resolves in milliseconds. Past that budget the holder is doing
+/// something, and re-taking the machine-global lock five times a second
+/// while it does is how Crossover made other applications' clipboard
+/// calls fail in the two-machine soak (docs/SOAK.md). Once a second is
+/// cheap enough to be a good neighbour and frequent enough that a
+/// clipboard freed at any moment is re-tried almost immediately — and the
+/// change notification, which is the *primary* revival, usually gets
+/// there first.
+pub const PARK_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// How long an install may stay parked before it is finally reported
+/// `ClipboardUnavailable` (ADR 0005, addendum 2026-09-01).
+///
+/// The arithmetic that fixes it is the origin's, not ours. An outbound
+/// transaction is abandoned after [`TRANSFER_TIMEOUT`] — 60 s — so a
+/// receiver that keeps trying past that point is answering a transaction
+/// nobody is listening to any more, and the origin would count an
+/// `abandoned` where a verdict was on its way. The whole install budget
+/// must therefore finish comfortably *inside* 60 s: the fast phase is
+/// 5 attempts × 200 ms ≈ 0.8 s, this adds 20 s, and the last parked
+/// attempt can be scheduled up to [`PARK_RETRY_DELAY`] after the budget
+/// is checked, so the worst case is ≈ 22 s — roughly a third of the
+/// origin's patience, with the remaining two thirds absorbing the network
+/// and any queueing on either side.
+///
+/// Twenty seconds is also chosen against the observed fault: on machine A
+/// (2026-09-01) an external holder kept the clipboard for about a second
+/// at five of eight reconnects, which the fast budget missed by a hair.
+/// A budget an order of magnitude past the observed hold is what makes
+/// the fix about the *class* of fault rather than about one second.
+pub const PARK_BUDGET: Duration = Duration::from_secs(20);
+
 /// Retry policy for `Busy` clipboard writes (FR-3.4): centrally defined,
 /// bounded attempts, bounded total time (ADR 0005 requires exactly this
 /// shape).
+///
+/// Two phases, not one (ADR 0005, addendum 2026-09-01). The fast phase is
+/// the original bounded schedule and covers the common blip. When it is
+/// exhausted and the clipboard is still `Busy` the install is **parked**
+/// rather than failed: it keeps being retried, on the slower
+/// [`Self::park_delay`] cadence and on every local change notification,
+/// until [`Self::park_budget`] elapses. Both phases together are still a
+/// hard bound, which is what ADR 0005 requires — losing a user's clipboard
+/// item to a second of contention was the defect, not the bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
-    /// Total write attempts before giving up (first try included).
+    /// Fast-phase write attempts before the install parks (first try
+    /// included).
     pub max_attempts: u32,
-    /// Delay between attempts.
+    /// Delay between fast-phase attempts.
     pub delay: Duration,
+    /// Delay between parked attempts.
+    pub park_delay: Duration,
+    /// How long an install may stay parked before it is reported
+    /// `ClipboardUnavailable`. [`Duration::ZERO`] configures the parked
+    /// phase off entirely, which only a test that is about the fast cap
+    /// itself has any reason to do.
+    pub park_budget: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -254,6 +310,8 @@ impl Default for RetryPolicy {
         Self {
             max_attempts: 5,
             delay: Duration::from_millis(200),
+            park_delay: PARK_RETRY_DELAY,
+            park_budget: PARK_BUDGET,
         }
     }
 }
@@ -941,6 +999,20 @@ struct PendingWrite {
     meta: ClipboardMeta,
     content: Arc<ClipboardContent>,
     attempts_made: u32,
+    /// When the fast retry budget ran out and the install parked, or
+    /// `None` while it is still in the fast phase (ADR 0005, addendum
+    /// 2026-09-01). The instant, not a flag, because the parked budget is
+    /// measured from here.
+    parked_since: Option<Instant>,
+    /// Whether a retry timer is outstanding and still entitled to fire.
+    ///
+    /// The parked phase has two revival paths — the slow timer and a local
+    /// change notification — and without this they would race into two
+    /// concurrent write attempts for one transaction, each scheduling its
+    /// own successor. Whichever gets there first consumes the entitlement;
+    /// the other fires into a no-op, exactly as a stale generation-tagged
+    /// timer does elsewhere, so nothing has to be cancelled.
+    retry_armed: bool,
 }
 
 /// The sans-io clipboard engine. One instance per peer session scope.
@@ -1086,12 +1158,19 @@ impl ClipboardEngine {
     /// which during a burst is true many times per second. Wait for quiet
     /// (ADR 0006), then read once.
     pub fn on_local_change(&mut self) -> Vec<Action> {
+        // A parked install goes first, and does not wait for the settle
+        // window: the notification is the evidence that the clipboard is
+        // free again, and the whole point of parking is to take that
+        // moment (ADR 0005, addendum 2026-09-01).
+        let mut actions = self.revive_parked_write();
         if self.config.transmit_debounce.is_zero() {
-            return vec![Action::ReadClipboard];
+            actions.push(Action::ReadClipboard);
+        } else {
+            actions.push(Action::ScheduleSettle {
+                delay: self.config.transmit_debounce,
+            });
         }
-        vec![Action::ScheduleSettle {
-            delay: self.config.transmit_debounce,
-        }]
+        actions
     }
 
     /// The settle window elapsed: now read the clipboard, once.
@@ -1774,7 +1853,7 @@ impl ClipboardEngine {
     /// The driver finished (or failed) a clipboard write.
     pub fn on_write_result(&mut self, id: Uuid, result: Result<(), WriteFailure>) -> Vec<Action> {
         // Take-then-restore: no panic path exists (NFR-1 discipline).
-        let Some(pending) = self.pending_write.take() else {
+        let Some(mut pending) = self.pending_write.take() else {
             tracing::debug!(clipboard_id = %id, "write result for no pending write; ignoring");
             return Vec::new();
         };
@@ -1794,6 +1873,11 @@ impl ClipboardEngine {
                     origin_peer = %pending.meta.origin,
                     byte_count = pending.meta.content_length,
                     attempt_count = pending.attempts_made,
+                    // Zero on the overwhelmingly common path. Non-zero is
+                    // the parked phase reporting that it earned its keep:
+                    // an item this long under contention is one the old
+                    // fixed budget would have dropped.
+                    parked_ms = pending.parked_since.map_or(0, elapsed_ms),
                     result = "applied",
                     "clipboard item installed"
                 );
@@ -1804,16 +1888,10 @@ impl ClipboardEngine {
             }
             Err(failure) => {
                 if failure == WriteFailure::Busy
-                    && pending.attempts_made < self.config.retry.max_attempts
+                    && let Some(retry) = self.schedule_install_retry(id, &mut pending)
                 {
-                    let delay = self.config.retry.delay;
-                    tracing::debug!(
-                        clipboard_id = %id,
-                        attempt_count = pending.attempts_made,
-                        "clipboard busy; retry scheduled"
-                    );
                     self.pending_write = Some(pending);
-                    return vec![Action::ScheduleRetry { id, delay }];
+                    return vec![retry];
                 }
                 // A type this destination cannot represent is a statement
                 // about the *content*, not about the clipboard's
@@ -1823,6 +1901,7 @@ impl ClipboardEngine {
                 let verdict = match failure {
                     WriteFailure::UnsupportedType => ApplyResult::ContentRejected,
                     WriteFailure::Busy | WriteFailure::Unavailable => {
+                        self.record(Metrics::record_clipboard_install_failed);
                         ApplyResult::ClipboardUnavailable
                     }
                 };
@@ -1831,6 +1910,7 @@ impl ClipboardEngine {
                     origin_peer = %pending.meta.origin,
                     content_type = ?pending.meta.content_type,
                     attempt_count = pending.attempts_made,
+                    parked_ms = pending.parked_since.map_or(0, elapsed_ms),
                     result = ?verdict,
                     "clipboard item could not be installed"
                 );
@@ -1860,11 +1940,137 @@ impl ClipboardEngine {
         if pending.meta.id != id {
             return Vec::new();
         }
+        if !pending.retry_armed {
+            // A local change notification already revived this install; the
+            // timer that armed it has nothing left to do (see
+            // `PendingWrite::retry_armed`).
+            return Vec::new();
+        }
+        pending.retry_armed = false;
         pending.attempts_made += 1;
         vec![Action::WriteClipboard {
             id,
             content: Arc::clone(&pending.content),
         }]
+    }
+
+    /// Decide what a `Busy` install does next: retry fast, park, keep
+    /// trying while parked, or finally give up (`None`).
+    ///
+    /// The whole two-phase policy of ADR 0005's 2026-09-01 addendum is
+    /// here, and it is a pure decision — the driver owns every clock.
+    fn schedule_install_retry(&self, id: Uuid, pending: &mut PendingWrite) -> Option<Action> {
+        let policy = &self.config.retry;
+        let Some(parked_since) = pending.parked_since else {
+            if pending.attempts_made < policy.max_attempts {
+                tracing::debug!(
+                    clipboard_id = %id,
+                    attempt_count = pending.attempts_made,
+                    "clipboard busy; retry scheduled"
+                );
+                pending.retry_armed = true;
+                return Some(Action::ScheduleRetry {
+                    id,
+                    delay: policy.delay,
+                });
+            }
+            if policy.park_budget.is_zero() {
+                return None; // parked phase configured off (tests)
+            }
+            // The transition, logged exactly once. Everything after this
+            // is at debug, because a parked install that logged per
+            // attempt would turn one contended second into twenty lines
+            // and bury the outcome the operator actually wants.
+            pending.parked_since = Some(Instant::now());
+            pending.retry_armed = true;
+            self.record(Metrics::record_clipboard_install_parked);
+            tracing::warn!(
+                clipboard_id = %id,
+                origin_peer = %pending.meta.origin,
+                attempt_count = pending.attempts_made,
+                park_budget_ms = duration_ms(policy.park_budget),
+                park_delay_ms = duration_ms(policy.park_delay),
+                "clipboard still busy after the fast retry budget; parking the install \
+                 and retrying on every change notification until the budget runs out"
+            );
+            return Some(Action::ScheduleRetry {
+                id,
+                delay: policy.park_delay,
+            });
+        };
+        if parked_since.elapsed() >= policy.park_budget {
+            return None; // bounded, as ADR 0005 requires: the verdict travels
+        }
+        tracing::debug!(
+            clipboard_id = %id,
+            attempt_count = pending.attempts_made,
+            parked_ms = elapsed_ms(parked_since),
+            "clipboard still busy; parked install rescheduled"
+        );
+        pending.retry_armed = true;
+        Some(Action::ScheduleRetry {
+            id,
+            delay: policy.park_delay,
+        })
+    }
+
+    /// A local change notification is the parked phase's primary revival:
+    /// the clipboard demonstrably just moved, which is the best evidence
+    /// available that whoever was holding it has let go.
+    ///
+    /// Only a *parked* install is revived this way. One inside the fast
+    /// budget already has a 200 ms timer running, and a notification
+    /// arriving in that window would only take a turn the timer was about
+    /// to take.
+    fn revive_parked_write(&mut self) -> Vec<Action> {
+        let Some(pending) = self.pending_write.as_mut() else {
+            return Vec::new();
+        };
+        let Some(parked_since) = pending.parked_since else {
+            return Vec::new();
+        };
+        if !pending.retry_armed {
+            return Vec::new(); // an attempt is already outstanding
+        }
+        pending.retry_armed = false;
+        pending.attempts_made += 1;
+        tracing::debug!(
+            clipboard_id = %pending.meta.id,
+            attempt_count = pending.attempts_made,
+            parked_ms = elapsed_ms(parked_since),
+            "the clipboard changed; retrying the parked install now"
+        );
+        vec![Action::WriteClipboard {
+            id: pending.meta.id,
+            content: Arc::clone(&pending.content),
+        }]
+    }
+
+    /// Close a pending install that something newer has replaced, telling
+    /// the origin the truth.
+    ///
+    /// `Superseded` is the verdict the coalescing driver and the conflict
+    /// rule already use for "a newer item won", reused rather than
+    /// invented. Sending it at all is new: this path used to drop the
+    /// write with a debug line and no verdict, which was survivable while
+    /// the write lived for 800 ms and is not once it can live for twenty
+    /// seconds — ADR 0005 requires every transaction to end in a typed
+    /// verdict within a bounded time.
+    fn supersede_pending_write(&mut self, by: &str) -> Vec<Action> {
+        let Some(superseded) = self.pending_write.take() else {
+            return Vec::new();
+        };
+        self.record(Metrics::record_clipboard_superseded);
+        tracing::debug!(
+            clipboard_id = %superseded.meta.id,
+            parked_ms = superseded.parked_since.map_or(0, elapsed_ms),
+            superseded_by = by,
+            "pending clipboard install superseded before it landed"
+        );
+        vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
+            id: superseded.meta.id,
+            result: ApplyResult::Superseded,
+        }))]
     }
 
     /// A session (re)connected: re-announce our current item so the peers
@@ -2119,7 +2325,22 @@ impl ClipboardEngine {
         body: OutboundBody,
         descriptor: Option<FileDescriptor>,
     ) -> Vec<Action> {
-        let mut superseded = Vec::new();
+        // A *parked* install loses to a local copy, and only a parked one
+        // does (ADR 0005, addendum 2026-09-01). Reaching here means this
+        // machine's user put something on this machine's clipboard that is
+        // neither a duplicate nor our own write, so installing a peer item
+        // over it — possibly many seconds later — would destroy content the
+        // user just made. Inside the fast budget the question does not
+        // arise: 800 ms is not a window a user copies into and then waits.
+        let mut superseded = if self
+            .pending_write
+            .as_ref()
+            .is_some_and(|pending| pending.parked_since.is_some())
+        {
+            self.supersede_pending_write("a local copy")
+        } else {
+            Vec::new()
+        };
         if let Some(previous) = self.outbound.take() {
             tracing::debug!(
                 clipboard_id = %previous.meta().id,
@@ -2826,17 +3047,14 @@ impl ClipboardEngine {
             return actions;
         };
 
-        if let Some(superseded) = self.pending_write.take() {
-            tracing::debug!(
-                clipboard_id = %superseded.meta.id,
-                "pending write superseded by newer inbound item"
-            );
-        }
+        actions.extend(self.supersede_pending_write("a newer inbound item"));
         let content = Arc::new(content);
         self.pending_write = Some(PendingWrite {
             meta,
             content: Arc::clone(&content),
             attempts_made: 1,
+            parked_since: None,
+            retry_armed: false,
         });
         actions.push(Action::WriteClipboard {
             id: meta.id,
@@ -3159,6 +3377,12 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// A configured duration as milliseconds, for log fields that report a
+/// budget rather than a measurement.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Narrow a millisecond duration to the `u32` the latency histogram
 /// keeps, saturating rather than wrapping (a clipboard round trip past 49
 /// days is a broken clock, not a real sample).
@@ -3356,6 +3580,30 @@ mod tests {
         assert!(!ClipboardConfig::default().transfer_timeout.is_zero());
     }
 
+    /// The arithmetic ADR 0005's 2026-09-01 addendum turns on, pinned so
+    /// that raising either budget without the other is a test failure
+    /// rather than a class of silent stall.
+    ///
+    /// A receiver that keeps retrying past the *origin's* transfer
+    /// deadline is answering a transaction nobody is listening to: the
+    /// origin has already abandoned it and counted it, and the verdict
+    /// that eventually arrives lands on nothing. The whole install budget
+    /// must therefore finish comfortably inside `TRANSFER_TIMEOUT`, with
+    /// room left over for the network and for queueing on either side.
+    #[test]
+    fn the_whole_install_budget_fits_inside_the_origins_patience() {
+        let retry = RetryPolicy::default();
+        let fast = retry.delay * retry.max_attempts;
+        // The last parked attempt can be scheduled up to one `park_delay`
+        // after the budget was last checked, so it counts too.
+        let worst_case = fast + retry.park_budget + retry.park_delay;
+        assert!(
+            worst_case * 2 < super::TRANSFER_TIMEOUT,
+            "the install budget ({worst_case:?}) leaves the origin ({:?}) too little margin",
+            super::TRANSFER_TIMEOUT
+        );
+    }
+
     #[test]
     fn small_copy_goes_inline_large_copy_gets_offered() {
         let mut e = engine(0xAA);
@@ -3476,6 +3724,11 @@ mod tests {
         let policy = RetryPolicy {
             max_attempts: 3,
             delay: std::time::Duration::from_millis(50),
+            // Zero parked budget: this test is about the *fast* phase's
+            // cap and the verdict past it, so the parked phase is
+            // configured out of the way rather than reasoned around.
+            park_delay: std::time::Duration::from_millis(50),
+            park_budget: Duration::ZERO,
         };
         let mut e = ClipboardEngine::new(
             Uuid::from_bytes([0xBB; 16]),
@@ -3541,6 +3794,278 @@ mod tests {
                 ..
             })]
         ));
+    }
+
+    /// A retry policy whose two phases are small enough for a unit test
+    /// but still shaped like the production one: a fast phase of a few
+    /// attempts, then a parked phase on a slower cadence.
+    fn parking_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 2,
+            delay: Duration::from_millis(1),
+            park_delay: Duration::from_millis(1),
+            park_budget: Duration::from_secs(30),
+        }
+    }
+
+    fn parking_engine(metrics: &Arc<Metrics>) -> ClipboardEngine {
+        ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xBB; 16]),
+            ClipboardConfig {
+                retry: parking_policy(),
+                ..ClipboardConfig::new()
+            },
+            Some(Arc::clone(metrics)),
+        )
+    }
+
+    /// Stage one inbound text item and return its id, having consumed the
+    /// first write attempt the engine asks for.
+    fn inbound_text(engine: &mut ClipboardEngine, sequence: u64, text: &str) -> Uuid {
+        let item = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xAA; 16]),
+            sequence,
+            ContentType::Utf8Text,
+            text.as_bytes().to_vec(),
+        );
+        let id = item.meta.id;
+        assert!(
+            matches!(
+                engine
+                    .on_peer_message(InboundMessage::Data(item))
+                    .as_slice(),
+                [Action::WriteClipboard { .. }]
+            ),
+            "staging an inbound item should ask for a write"
+        );
+        id
+    }
+
+    /// Burn the fast retry budget on `Busy`, leaving the install parked
+    /// with its slow timer armed.
+    fn park_the_install(engine: &mut ClipboardEngine, id: Uuid) {
+        for _ in 1..parking_policy().max_attempts {
+            assert!(matches!(
+                engine
+                    .on_write_result(id, Err(WriteFailure::Busy))
+                    .as_slice(),
+                [Action::ScheduleRetry { .. }]
+            ));
+            assert!(matches!(
+                engine.on_retry_due(id).as_slice(),
+                [Action::WriteClipboard { .. }]
+            ));
+        }
+        // The attempt that used to end the transaction: it parks instead.
+        let parked = engine.on_write_result(id, Err(WriteFailure::Busy));
+        assert!(
+            matches!(parked.as_slice(), [Action::ScheduleRetry { .. }]),
+            "the fast budget should park the install, not close it: {parked:?}"
+        );
+        assert!(
+            sent(&parked).is_empty(),
+            "the origin heard a verdict while the install was still viable"
+        );
+    }
+
+    /// The 2026-09-01 defect, at the engine level: about a second of
+    /// external contention outlives the fast retry budget, and used to
+    /// cost the item permanently. It must cost only time.
+    #[test]
+    fn a_contended_clipboard_parks_the_install_rather_than_dropping_it() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        let id = inbound_text(&mut e, 0, "must not be lost");
+        park_the_install(&mut e, id);
+        assert_eq!(metrics.snapshot().clipboard_installs_parked, 1);
+
+        // Parked attempts keep going on the slow cadence, with nothing
+        // said to the origin, until one of them lands.
+        for _ in 0..5 {
+            assert!(matches!(
+                e.on_retry_due(id).as_slice(),
+                [Action::WriteClipboard { .. }]
+            ));
+            assert!(matches!(
+                e.on_write_result(id, Err(WriteFailure::Busy)).as_slice(),
+                [Action::ScheduleRetry { .. }]
+            ));
+        }
+        assert!(matches!(
+            e.on_retry_due(id).as_slice(),
+            [Action::WriteClipboard { .. }]
+        ));
+        let applied = e.on_write_result(id, Ok(()));
+        assert_eq!(verdict(&applied), ApplyResult::Applied);
+
+        let report = metrics.snapshot();
+        assert_eq!(report.clipboard_applied, 1);
+        assert_eq!(report.clipboard_installs_failed, 0);
+    }
+
+    /// Parking is not waiting forever. ADR 0005 requires every
+    /// transaction to end in a typed verdict within a bounded time, and
+    /// the parked budget is that bound — a budget of zero makes the
+    /// boundary observable without a twenty-second test.
+    #[test]
+    fn a_parked_install_still_ends_in_a_verdict_when_its_budget_runs_out() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xBB; 16]),
+            ClipboardConfig {
+                retry: RetryPolicy {
+                    park_budget: Duration::from_nanos(1),
+                    ..parking_policy()
+                },
+                ..ClipboardConfig::new()
+            },
+            Some(Arc::clone(&metrics)),
+        );
+        let id = inbound_text(&mut e, 0, "outlives the budget");
+        park_the_install(&mut e, id);
+
+        assert!(matches!(
+            e.on_retry_due(id).as_slice(),
+            [Action::WriteClipboard { .. }]
+        ));
+        let closed = e.on_write_result(id, Err(WriteFailure::Busy));
+        assert_eq!(closed.len(), 1, "the budget must close the transaction");
+        assert_eq!(verdict(&closed), ApplyResult::ClipboardUnavailable);
+
+        let report = metrics.snapshot();
+        assert_eq!(report.clipboard_installs_parked, 1);
+        assert_eq!(report.clipboard_installs_failed, 1);
+        assert_eq!(report.clipboard_applied, 0);
+    }
+
+    /// The parked phase's primary revival: a change notification is the
+    /// best evidence available that whoever held the clipboard has let go,
+    /// and waiting out the slow cadence after it would be waiting for
+    /// nothing.
+    #[test]
+    fn a_change_notification_retries_a_parked_install_immediately() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        let id = inbound_text(&mut e, 0, "revived by a notification");
+        park_the_install(&mut e, id);
+
+        let revived = e.on_local_change();
+        assert!(
+            matches!(
+                revived.as_slice(),
+                [
+                    Action::WriteClipboard { id: retried, .. },
+                    Action::ScheduleSettle { .. }
+                ] if *retried == id
+            ),
+            "a notification should retry the parked install and still settle: {revived:?}"
+        );
+        assert_eq!(
+            verdict(&e.on_write_result(id, Ok(()))),
+            ApplyResult::Applied
+        );
+
+        // The slow timer that was armed when the install parked fires
+        // afterwards into nothing: the notification took its turn, so
+        // there is never a second write in flight for one transaction.
+        assert!(e.on_retry_due(id).is_empty());
+    }
+
+    /// A notification arriving while the install is still inside its fast
+    /// budget changes nothing: the 200 ms timer is already about to take
+    /// that turn, and two writes for one transaction is the bug the
+    /// entitlement flag exists to prevent.
+    #[test]
+    fn a_change_notification_leaves_an_unparked_install_alone() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        let id = inbound_text(&mut e, 0, "still in the fast phase");
+        assert!(matches!(
+            e.on_write_result(id, Err(WriteFailure::Busy)).as_slice(),
+            [Action::ScheduleRetry { .. }]
+        ));
+        assert!(matches!(
+            e.on_local_change().as_slice(),
+            [Action::ScheduleSettle { .. }]
+        ));
+    }
+
+    /// A parked install lives long enough that the two things which can
+    /// legitimately outrank it must both close it — with the verdict the
+    /// rest of the engine already uses for "something newer won", and
+    /// never in silence.
+    #[test]
+    fn a_newer_item_supersedes_a_parked_install_with_a_verdict() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        let parked = inbound_text(&mut e, 0, "the older item");
+        park_the_install(&mut e, parked);
+
+        let newer = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xAA; 16]),
+            1,
+            ContentType::Utf8Text,
+            b"the newer item".to_vec(),
+        );
+        let newer_id = newer.meta.id;
+        let actions = e.on_peer_message(InboundMessage::Data(newer));
+        assert!(matches!(
+            sent(&actions).as_slice(),
+            [OutboundMessage::Applied(ClipboardApplied {
+                id,
+                result: ApplyResult::Superseded,
+            })] if *id == parked
+        ));
+        assert!(matches!(
+            actions.as_slice(),
+            [_, Action::WriteClipboard { id, .. }] if *id == newer_id
+        ));
+        assert!(e.on_retry_due(parked).is_empty(), "a ghost install retried");
+    }
+
+    /// The other one that outranks it, and the reason the parked budget is
+    /// not simply "forever": a local copy is this machine's user putting
+    /// something on this machine's clipboard, and installing a peer item
+    /// over it seconds later would destroy what they just made.
+    #[test]
+    fn a_local_copy_supersedes_a_parked_install() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        let parked = inbound_text(&mut e, 0, "the peer's item");
+        park_the_install(&mut e, parked);
+
+        // The notification revives it once; the write is still contended.
+        let revived = e.on_local_change();
+        assert!(matches!(
+            revived.first(),
+            Some(Action::WriteClipboard { .. })
+        ));
+        assert!(matches!(
+            e.on_write_result(parked, Err(WriteFailure::Busy))
+                .as_slice(),
+            [Action::ScheduleRetry { .. }]
+        ));
+
+        // Then the settle window closes on genuinely new local content.
+        assert_eq!(e.on_settle_due(), vec![Action::ReadClipboard]);
+        let actions = e.on_local_read(Some(ClipboardContent::Text("mine".to_owned())));
+        let messages = sent(&actions);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [
+                    OutboundMessage::Applied(ClipboardApplied {
+                        id,
+                        result: ApplyResult::Superseded,
+                    }),
+                    OutboundMessage::Data(_),
+                ] if *id == parked
+            ),
+            "the local copy should close the parked install and travel: {messages:?}"
+        );
+        assert!(e.on_retry_due(parked).is_empty(), "a ghost install retried");
     }
 
     #[test]
