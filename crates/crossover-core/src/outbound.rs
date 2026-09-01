@@ -110,6 +110,13 @@ impl SendPriority {
     /// A message type this build does not know is Background: it cannot be
     /// interactive traffic *we* emit, and the High lane is reserved for
     /// frames whose latency budget we can vouch for.
+    /// This is a priority partition, not a class one — `MessageType::class`
+    /// exists for the §4 class fact and is used where that fact alone is
+    /// what a caller needs (`crossover-core::metrics`); this match groups
+    /// by latency budget instead, which is a different question with the
+    /// same answer for most types and a different one for a few (INPUT
+    /// class's `InputBatch` rides High for the reason above, alongside
+    /// every CONTROL-class type).
     #[must_use]
     pub fn of(message_type: u16) -> Self {
         match MessageType::from_wire(message_type) {
@@ -119,6 +126,12 @@ impl SendPriority {
                 | MessageType::ControlRequest
                 | MessageType::ControlResponse
                 | MessageType::ControlRelease
+                // Display topology (ADR 0018) is CONTROL class
+                // (docs/PROTOCOL.md §4): a stale arrangement degrades
+                // crossing placement (never control correctness), but it
+                // is still interactive-sized negotiation traffic, not bulk.
+                | MessageType::MonitorTopology
+                | MessageType::LayoutSync
                 | MessageType::Ping
                 | MessageType::Pong
                 | MessageType::Hello

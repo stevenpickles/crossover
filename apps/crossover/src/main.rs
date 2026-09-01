@@ -13,6 +13,8 @@ mod console;
 mod logging;
 mod paths;
 mod storage;
+mod topology_state;
+mod topology_sync;
 
 // Shared with `crossover-svc` so both binaries of one install report the same
 // identity (apps/build_identity.rs explains why it is an include, not a crate).
@@ -47,6 +49,15 @@ struct Cli {
     command: Command,
 }
 
+// Two of these verbs are also spelled out in another binary: the layout
+// editor's empty state tells the user to run `crossover run` or `crossover
+// service install` (apps/crossover-layout/src/render.rs's
+// `draw_worker_never_run`, which carries the matching note). Renaming either
+// here without changing that text leaves the editor naming a command that no
+// longer exists. Sharing the strings would mean a crate between the two
+// binaries for four words, which ADR 0019's dependency rule makes a poor
+// trade — so the coupling is deliberately held by these two comments and the
+// editor's test.
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run Crossover in the foreground (clipboard sync arrives in Phase 2).
@@ -74,6 +85,9 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Open the display layout editor: arrange both machines' monitors and
+    /// save the arrangement (ADR 0018, ADR 0019).
+    Layout,
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
@@ -105,14 +119,18 @@ struct RunArgs {
     #[arg(long)]
     connect: Option<String>,
 
-    /// Seamless mode: this machine is the LEFT screen of a left–right
-    /// pair, so its right edge crosses to the peer (ADR 0009). The cursor
-    /// follows across the edge with no manual switch.
+    /// Deprecated: seamless mode, this machine is the LEFT screen of a
+    /// left–right pair, so its right edge crosses to the peer (ADR 0009).
+    /// The cursor follows across the edge with no manual switch. Draw an
+    /// arrangement with `crossover layout` instead (ADR 0018); an explicit
+    /// layout in the config wins over this flag.
     #[arg(long, conflicts_with = "right")]
     left: bool,
 
-    /// Seamless mode: this machine is the RIGHT screen, so its left edge
-    /// crosses to the peer.
+    /// Deprecated: seamless mode, this machine is the RIGHT screen, so its
+    /// left edge crosses to the peer. Draw an arrangement with `crossover
+    /// layout` instead (ADR 0018); an explicit layout in the config wins
+    /// over this flag.
     #[arg(long)]
     right: bool,
 
@@ -139,10 +157,21 @@ struct PairArgs {
     bind: Option<String>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, PartialEq, Eq, Subcommand)]
 enum PeersAction {
     /// Revoke a trusted peer by device id (`crossover peers` lists them).
     Remove {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+    },
+    /// Let a trusted peer send you files. Off for every peer until you run
+    /// this: pairing does not grant it (ADR 0015).
+    AllowFiles {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+    },
+    /// Withdraw a peer's permission to send you files.
+    DenyFiles {
         /// The peer's device id (UUID).
         device_id: Uuid,
     },
@@ -244,10 +273,25 @@ fn protocol_fields() -> [(&'static str, build_info::Value); 2] {
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Run(args) => {
+            // Captured *before* the read below, not lazily inside
+            // `commands::apply_config_changes` once its task first polls —
+            // which can be well after this point, since identity, trust
+            // store, clipboard and input-control setup, and an outbound
+            // connection attempt all run between here and the foreground
+            // select starting. Seeding that task's baseline from this
+            // early reading is what lets an edit landing in that window
+            // reach the topology state file on the very first re-read
+            // tick rather than needing a second edit to be noticed
+            // (ADR 0018).
+            let initial_config_signature =
+                config::config_signature_at(paths::config_path().as_deref());
             // Merge CLI flags over the startup config file: a flag present on
             // the command line wins; otherwise the file supplies the value
             // (Phase 6). `--name` is global, so it rides in from `cli`.
-            let effective = config::load_run_config()?.merge(config::CliRun {
+            // `load_run_config` is the one place `[layout]` is validated
+            // (ADR 0018); `merge` consumes that already-validated result and
+            // returns every warning it decided as data, rendered here, once.
+            let (effective, notices) = config::load_run_config()?.merge(config::CliRun {
                 name: cli.name,
                 listen: args.listen,
                 bind: args.bind,
@@ -256,13 +300,23 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 right: args.right,
                 no_cursor_mask: args.no_cursor_mask,
             });
+            for notice in &notices {
+                render_config_notice(notice);
+            }
             // Log the resolved role up front so a headless worker's log shows
-            // what it is trying to do (listen/dial/side), not just that it
-            // started — the fastest read on a "not connecting" soak.
+            // what it is trying to do (listen/dial/layout), not just that it
+            // started — the fastest read on a "not connecting" soak. The
+            // layout summary is the discriminant and a revision, not the
+            // full monitor list: this line stays one line even with a large
+            // drawn arrangement configured.
+            let layout_summary = effective
+                .layout_source
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), config::LayoutSource::summary);
             tracing::info!(
                 listen = effective.listen,
                 connect = ?effective.connect,
-                side = ?effective.side,
+                layout = %layout_summary,
                 "run configuration",
             );
             if !effective.listen && effective.connect.is_none() {
@@ -281,17 +335,14 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     .clone()
                     .unwrap_or_else(|| format!("0.0.0.0:{}", crossover_protocol::DEFAULT_PORT))
             });
-            let side = effective.side.map(|side| match side {
-                config::Side::Left => crossover_core::LinkSide::Left,
-                config::Side::Right => crossover_core::LinkSide::Right,
-            });
             let device_name = storage::resolve_device_name(effective.name);
             let result = commands::run(
                 &device_name,
                 listen_bind,
                 effective.connect,
-                side,
+                effective.layout_source,
                 effective.no_cursor_mask,
+                initial_config_signature,
             )
             .await;
             // Seamless masking may have blanked the system cursor; restore it
@@ -311,6 +362,12 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Peers { action } => match action {
             None => commands::peers_list(),
             Some(PeersAction::Remove { device_id }) => commands::peers_remove(device_id),
+            Some(PeersAction::AllowFiles { device_id }) => {
+                commands::peers_set_file_receive(device_id, true)
+            }
+            Some(PeersAction::DenyFiles { device_id }) => {
+                commands::peers_set_file_receive(device_id, false)
+            }
         },
         Command::Status => commands::status(&storage::resolve_device_name(cli.name)),
         Command::Config => commands::config_show(),
@@ -323,14 +380,99 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             ServiceAction::Uninstall => commands::service_uninstall(),
             ServiceAction::Status => commands::service_status(),
         },
+        Command::Layout => commands::layout(),
+    }
+}
+
+/// Render one [`config::ConfigNotice`] into the log and stderr — the single
+/// place `crossover run` warns about a deprecated flag or key, an
+/// override, or a `[layout]` that failed validation. `config::merge`
+/// returns notices as data specifically so this is the only place that
+/// does it, rather than every decision point inside `merge` emitting its
+/// own near-identical `tracing::warn!`/`eprintln!` pair.
+///
+/// **The wording lives in [`notice_log_message`] and
+/// [`notice_console_message`], not here.** This function only supplies the
+/// structured fields and emits. The split is deliberate and was bought the
+/// hard way: with the text inline, nothing could assert it, and the
+/// `ExplicitLayoutWins` arm went on telling users for a whole branch that
+/// this build could not drive a drawn layout — and advising them to delete
+/// it — after the branch that made it drive one. Text a test can read is
+/// text that cannot rot silently (NFR-3).
+fn render_config_notice(notice: &config::ConfigNotice) {
+    let message = notice_log_message(notice);
+    match notice {
+        config::ConfigNotice::DeprecatedFlag { flag } => tracing::warn!(flag, "{message}"),
+        config::ConfigNotice::DeprecatedSideKey => tracing::warn!("{message}"),
+        config::ConfigNotice::ExplicitLayoutWins { overridden } => {
+            tracing::warn!(overridden, "{message}");
+        }
+        config::ConfigNotice::InvalidLayout { error } => {
+            tracing::warn!(error = %error, "{message}");
+        }
+    }
+    eprintln!("{}", notice_console_message(notice));
+}
+
+/// The log wording for one notice, without its structured fields.
+///
+/// Lowercase and free of the values the fields already carry — house
+/// style for a tracing message.
+fn notice_log_message(notice: &config::ConfigNotice) -> String {
+    match notice {
+        config::ConfigNotice::DeprecatedFlag { .. } => {
+            "deprecated: draw an arrangement with `crossover layout` instead (ADR 0018)".to_owned()
+        }
+        config::ConfigNotice::DeprecatedSideKey => {
+            "deprecated: [seamless] side is retired by ADR 0018; draw an arrangement with \
+             `crossover layout` instead"
+                .to_owned()
+        }
+        config::ConfigNotice::ExplicitLayoutWins { .. } => {
+            "ignored: the config holds an explicit [layout], which wins over it and drives \
+             this run's crossings (ADR 0018)"
+                .to_owned()
+        }
+        config::ConfigNotice::InvalidLayout { .. } => {
+            "the [layout] section is invalid; treating this run as having no layout (seamless \
+             off, explicit control intact)"
+                .to_owned()
+        }
+    }
+}
+
+/// The console sentence for one notice — independently capitalized and
+/// punctuated, the house convention for a log/console pair, and carrying
+/// the values a reader at a terminal has no structured fields to read.
+fn notice_console_message(notice: &config::ConfigNotice) -> String {
+    match notice {
+        config::ConfigNotice::DeprecatedFlag { flag } => format!(
+            "Warning: {flag} is deprecated; draw an arrangement with `crossover layout` \
+             instead (ADR 0018)."
+        ),
+        config::ConfigNotice::DeprecatedSideKey => "Warning: [seamless] side is deprecated; draw \
+             an arrangement with `crossover layout` instead (ADR 0018)."
+            .to_owned(),
+        config::ConfigNotice::ExplicitLayoutWins { overridden } => format!(
+            "Warning: {overridden} is ignored — the config already holds an explicit [layout], \
+             which takes precedence (ADR 0018). The drawn arrangement is what this run crosses \
+             on; edit it with `crossover layout`."
+        ),
+        config::ConfigNotice::InvalidLayout { error } => format!(
+            "Warning: the [layout] section in the config is invalid and is being ignored for \
+             this run — seamless transfer is off, but explicit control still works: \
+             {error}\nRun `crossover config` to see this diagnosis again, or fix it with \
+             `crossover layout`."
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use uuid::Uuid;
 
-    use super::{Cli, Command, PeersAction, ServiceAction};
+    use super::{Cli, Command, PeersAction, ServiceAction, config};
 
     // Catches invalid clap derive configurations (conflicting flags,
     // ambiguous subcommands) at test time instead of first invocation.
@@ -338,6 +480,29 @@ mod tests {
     fn cli_definition_is_internally_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// `--left`/`--right` are deprecated (ADR 0018), but still parse — a
+    /// script or a service registration that still names one keeps working
+    /// (`config::RunConfig::merge` is what actually retires them, by
+    /// turning an explicit `[layout]` into the winner).
+    #[test]
+    fn run_still_parses_the_deprecated_left_and_right_flags() {
+        let cli = Cli::try_parse_from(["crossover", "run", "--left"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run");
+        };
+        assert!(args.left);
+        assert!(!args.right);
+
+        let cli = Cli::try_parse_from(["crossover", "run", "--right"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run");
+        };
+        assert!(args.right);
+
+        // Still mutually exclusive.
+        assert!(Cli::try_parse_from(["crossover", "run", "--left", "--right"]).is_err());
     }
 
     #[test]
@@ -384,6 +549,47 @@ mod tests {
     }
 
     #[test]
+    fn file_permission_is_granted_and_withdrawn_by_dedicated_verbs() {
+        let id: Uuid = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8".parse().unwrap();
+        for (args, expected) in [
+            (
+                ["crossover", "peers", "allow-files", &id.to_string()],
+                PeersAction::AllowFiles { device_id: id },
+            ),
+            (
+                ["crossover", "peers", "deny-files", &id.to_string()],
+                PeersAction::DenyFiles { device_id: id },
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Peers {
+                action: Some(action),
+            } = cli.command
+            else {
+                panic!("expected peers action for {args:?}");
+            };
+            assert_eq!(action, expected);
+        }
+
+        // Each verb names exactly one peer: no bare form that could act on
+        // every peer at once, and no id that is not a device id (ADR 0015 —
+        // the grant is explicit and per peer).
+        assert!(Cli::try_parse_from(["crossover", "peers", "allow-files"]).is_err());
+        assert!(Cli::try_parse_from(["crossover", "peers", "deny-files"]).is_err());
+        assert!(Cli::try_parse_from(["crossover", "peers", "allow-files", "all"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "crossover",
+                "peers",
+                "allow-files",
+                &id.to_string(),
+                &id.to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn global_name_flag_applies_across_subcommands() {
         let cli = Cli::try_parse_from(["crossover", "--name", "left", "status"]).unwrap();
         assert_eq!(cli.name.as_deref(), Some("left"));
@@ -412,9 +618,91 @@ mod tests {
     }
 
     #[test]
+    fn layout_is_a_bare_verb_that_takes_no_arguments() {
+        let cli = Cli::try_parse_from(["crossover", "layout"]).unwrap();
+        assert!(matches!(cli.command, Command::Layout));
+        // The editor takes its input from the state file and the config, not
+        // from this command line (ADR 0018) — so anything here is a mistake
+        // worth reporting rather than an argument to forward.
+        assert!(Cli::try_parse_from(["crossover", "layout", "--edit"]).is_err());
+        assert!(Cli::try_parse_from(["crossover", "layout", "topology.json"]).is_err());
+    }
+
+    #[test]
     fn bare_invocation_is_rejected_with_usage() {
         // No default subcommand: running `crossover` bare must show usage,
         // not silently pick a behavior.
         assert!(Cli::try_parse_from(["crossover"]).is_err());
+    }
+
+    // ---- what the config notices actually say ----
+
+    /// The override notice must say the drawn layout **wins and drives**.
+    ///
+    /// This exists because the text it replaces said the opposite. While
+    /// the crossing engine really did predate the layout model, the arm
+    /// told the user seamless was off regardless and advised removing
+    /// `[layout]` to fall back to the side model. Once the layout drove
+    /// crossings, that advice became both false and destructive — delete
+    /// your arrangement to fix a thing that is not broken — and nothing
+    /// caught it, because no test read the words.
+    #[test]
+    fn the_override_notice_says_the_drawn_layout_drives_this_run() {
+        let notice = config::ConfigNotice::ExplicitLayoutWins {
+            overridden: "--right",
+        };
+        let log = super::notice_log_message(&notice);
+        let console = super::notice_console_message(&notice);
+
+        assert!(
+            log.contains("drives"),
+            "the log must say the layout drives the run: {log}"
+        );
+        assert!(
+            console.contains("--right") && console.contains("takes precedence"),
+            "the console line must name what was overridden and why: {console}"
+        );
+        for text in [&log, &console] {
+            assert!(
+                !text.contains("predates") && !text.contains("stays off") && !text.contains("OFF"),
+                "the notice still claims seamless is off: {text}"
+            );
+            assert!(
+                !text.contains("remove [layout]") && !text.contains("fall back"),
+                "the notice still advises deleting the user's arrangement: {text}"
+            );
+        }
+    }
+
+    /// Every notice renders something in both places, and the two follow
+    /// the house convention: a lowercase tracing message, a capitalized
+    /// console sentence. A missing arm would otherwise be an empty warning.
+    #[test]
+    fn every_config_notice_renders_in_both_places() {
+        use crossover_topology::LayoutError;
+
+        let notices = [
+            config::ConfigNotice::DeprecatedFlag { flag: "--left" },
+            config::ConfigNotice::DeprecatedSideKey,
+            config::ConfigNotice::ExplicitLayoutWins {
+                overridden: "[seamless] side",
+            },
+            config::ConfigNotice::InvalidLayout {
+                error: LayoutError::NoMonitors,
+            },
+        ];
+        for notice in &notices {
+            let log = super::notice_log_message(notice);
+            let console = super::notice_console_message(notice);
+            assert!(!log.is_empty() && !console.is_empty(), "{notice:?}");
+            assert!(
+                log.starts_with(|c: char| c.is_lowercase() || c == '['),
+                "a tracing message should not be capitalized: {log}"
+            );
+            assert!(
+                console.starts_with("Warning: "),
+                "a console notice should announce itself: {console}"
+            );
+        }
     }
 }

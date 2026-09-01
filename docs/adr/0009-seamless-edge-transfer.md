@@ -1,7 +1,17 @@
 # 0009. Seamless control transfer: cross a screen edge, control follows
 
-Status: Accepted
+Status: Accepted — topology superseded by [0018](0018-drawn-display-topology.md) (2026-08-20)
 Date: 2026-08-09
+
+What 0018 replaces is the topology only: the "one linked edge pair,
+left–right" side model, the 2026-08-09 refinement's "edge monitor =
+outermost in the linked direction", and desktop-bounds-decides-the-edge —
+all superseded by a drawn layout in one shared coordinate space. The
+crossing *mechanism* below is retained: the edge as a trigger on the
+negotiated engine, local symmetric detection on the real cursor, the
+crossing position as a fraction, reclaim to neutral, the Schmitt-trigger
+re-arm (now per-span), the generation-stamped mode, and the cursor mask all
+stand as written and are restated in 0018.
 
 ## Context
 
@@ -297,3 +307,137 @@ restoring the defaults on every exit from control and on shutdown, **and** by
 restoring them when a mask is created, so the next launch of Crossover
 self-heals a crash's blanking. Masking is a display nicety: a failure to hide
 or restore is logged and never disturbs control.
+
+## Addendum (2026-08-19): a re-arm margin on the crossing trigger
+
+The risk this ADR accepted — "immediate crossing can fire on an accidental
+brush against the linked edge ... revisited in the soak" — materialized on
+hardware, and worse than an occasional stray transfer: it *oscillated*.
+
+Crossing onto the controlled machine places its cursor **exactly on** the
+linked column (the deliberate entry placement above), and that same column
+means *return* while the peer is in control. The detector's re-arm condition
+was a single observation one pixel off the column, sampled at 125 Hz — so a
+two-pixel wobble at the seam, over 16 ms, read as a fresh arrival and fired a
+complete reverse transfer. Each reversal re-parked *both* cursors on their own
+trigger columns, leaving both machines primed to do it again: ten take/revoke
+cycles in five seconds, with periods down to ~150 ms. It is a self-sustaining
+loop, not a brush.
+
+**The trigger is now a Schmitt trigger.** A touch of the linked edge fires
+only while the detector is *armed*, and only travel more than
+`REARM_MARGIN` pixels (24) back inside the screen re-arms it. Entry
+placement, and priming when detection restarts, leave the detector disarmed.
+
+This is deliberately **neither** of the two mitigations this ADR rejected:
+
+- **Not the entry inset.** The cursor still enters *on* the edge column, so
+  cursor continuity across the seam is unchanged — placing it a few pixels
+  inside was rejected above for making the forward crossing a hair-trigger,
+  and it stays rejected. The hysteresis lives in the *detector's* state, not
+  in where the pointer is put.
+- **Not a dwell.** Nothing waits and nothing is timed, so a deliberate
+  crossing gains exactly zero latency: a cursor travelling toward the edge is
+  far more than 24 px clear of it on the way, so it is armed, and the first
+  observation that reaches the column fires as before. Only a cursor that
+  never left the edge's neighbourhood is inert.
+
+The margin also closes a race the immediate trigger left open: the entry
+placement runs inline on the control loop while the detector primes on its
+own task after a channel hop, so injected motion could land in between and
+arm the detector before it was primed. A few pixels of injected motion are
+nowhere near the margin, so they no longer can.
+
+**Crossings are also generation-stamped.** A crossing carries a `kind`
+(leave/return) frozen at detection time and reaches the control loop through
+a bounded queue. If the control state changed on the way, acting on it
+applies a decision about a state that no longer exists — a stale `Return` can
+revoke a *fresh* grant. Every edge-mode publication carries a generation; the
+detector stamps it onto the crossings it emits under that mode, and the
+control driver drops any crossing whose stamp is not the one it last
+published. That is a correctness fix independent of the margin, and it stays
+correct however the polling and queueing are later retimed.
+
+**The mode itself is a level, on a `watch`.** It says what this machine is
+watching for *right now*, so latest-wins is the correct semantics and
+publishing must never block. It used to ride a bounded `mpsc` that closed a
+cycle back onto the control loop — mode → detector → crossings → control
+events → the control loop, which is the only thing that drains them — so any
+slowness there fed back into itself and cleared only in `MAX_DRAIN_BATCH`
+bursts. That is why the generation is *carried inside the published value*
+rather than counted at each end: counting was only ever correct over a
+lossless FIFO, and a coalescing channel would drift the two counts apart on
+the first collapsed burst. Carried, it cannot.
+
+**A cursor placement re-primes the detector, whatever the mode did.** Entry
+placement parks the pointer *on* the linked column, which is also the trigger
+column; priming there is what stops it firing. A first grant re-primed for
+free, because taking it changed the mode — but a **refreshed** grant (below)
+does not change `is_controlled`, so nothing was published, and with the
+trigger armed the refresh's own placement fired a return that revoked the
+grant it had just re-issued. The re-prime is therefore tied to the
+`PlaceCursor` that causes it: every placement republishes the mode, unchanged
+value and all, under a new generation. The detector primes on the placed
+cursor, and the new generation invalidates any crossing detected before the
+refresh.
+
+## Addendum (2026-08-19): late answers are self-correcting
+
+"In any transitional state a timeout or disconnect falls back to `LOCAL`"
+turned out to be only half a rule. Falling back is what the *requester*
+does; it said nothing to the peer, and the peer's slow answer then arrived
+into a world that had moved on. Correlated two-machine logs from a burst of
+rapid grant/edge-revoke cycles caught the consequence: one answer arrived
+4.7 s late and the two state machines locked each other out for seven
+seconds.
+
+The sequence, every step matched to code. B's crossing requested control and
+timed out, so B reverted to local — silently. B crossed again and requested
+a second time. Only then did A work through its inbound backlog: it granted
+the *first* request, and answered the second with
+`Denied(AlreadyControlled)` — denying the very session that held its grant.
+B, meanwhile, received the grant it had stopped waiting for and released it.
+The user saw a denial and could not cross until another push.
+
+Three rules now make a late answer converge on its own:
+
+- **A re-request from the grant holder refreshes the grant.** The holder
+  only asks again because it believes it holds nothing, so a denial strands
+  both machines. The refresh drains everything the old grant left held — a
+  refreshed grant must no more inherit a latched key than a hand-back may
+  leave one (FR-4.4) — and restarts the applied-input sequence, because the
+  controller restarts its send sequence with every grant it is given.
+  `AlreadyControlled` still denies a request from any *other* session: one
+  peer drives this desktop at a time, and *which* peer is the security
+  boundary (FR-2.3). Refreshing is security-neutral — same principal, same
+  authenticated session, complete mediation unchanged.
+- **A timed-out request cancels on the wire**, not just locally, so a grant
+  in flight toward a requester that has given up does not stand with nobody
+  believing they hold it.
+- **The stray-grant undo yields to our own retry.** A late grant for an
+  earlier request, arriving while a newer request to that same session is in
+  flight, is left alone: releasing it would tear down the grant the newer
+  request is being given. Every other stray grant is still undone, so no
+  peer is ever left controlled by a driver that will never drive.
+
+Each rule is idempotent with the others — a release from a session that
+holds nothing, and that we do not control, is already a silent no-op — and
+together they give the property the incident violated, now pinned by a
+deterministic two-engine test that scripts the hardware timeline message by
+message: **with no further user input, both engines converge on one belief
+about who controls whom, and the requester ends able to cross.** Nothing
+here waits on a clock or a heuristic; convergence follows from the message
+order alone.
+
+The head-of-line delay on the answering side that opened the window is a
+separate matter, settled in
+[ADR 0013](0013-interactive-over-bulk-prioritization.md)'s 2026-08-19
+addendum: inbound frames are now routed by message type, so a control
+request no longer waits on the clipboard driver's queue to discard it.
+
+The `RETURNING` state this ADR promised above (between `REMOTE` and `LOCAL`)
+was never built and is not needed: the reverse crossing is detected on the
+controlled side, which revokes, so the controller returns to `LOCAL` on the
+resulting release with no transitional state of its own. ARCHITECTURE §5.1's
+diagram is corrected to the `LOCAL / REQUESTING / REMOTE` the code has always
+had.

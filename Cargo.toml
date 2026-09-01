@@ -1,12 +1,14 @@
 [workspace]
 members = [
     "apps/crossover",
+    "apps/crossover-layout",
     "apps/crossover-svc",
     "crates/crossover-core",
     "crates/crossover-platform",
     "crates/crossover-platform-windows",
     "crates/crossover-protocol",
     "crates/crossover-security",
+    "crates/crossover-topology",
     "tools/test-peer",
 ]
 # cargo-fuzz convention: the fuzz crate lives outside the workspace (own
@@ -15,6 +17,19 @@ exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
+# One version for every crate, bumped once per release. Kept here rather
+# than repeated in eight manifests because `build_identity.rs` reads each
+# crate's own CARGO_PKG_VERSION: if the two binaries ever disagreed, they
+# would report different versions and the packaging script's consistency
+# check would reject the build — a drift that is easy to create and
+# tedious to diagnose.
+#
+# Bumped immediately *after* a release, not before the next one. A build
+# made after v0.1.0 shipped is `0.2.0-dev.N`, which sorts above 0.1.0, so it
+# installs as an upgrade; leaving it at 0.1.0 would make every development
+# build a *pre-release of the version already installed* and therefore
+# un-upgradeable.
+version = "0.2.0"
 # Nothing here is published to crates.io: this is one application in one
 # repository, and the crate split exists for internal boundaries
 # (docs/ARCHITECTURE.md §3), not distribution. Declaring it prevents an
@@ -32,6 +47,7 @@ crossover-platform = { path = "crates/crossover-platform" }
 crossover-platform-windows = { path = "crates/crossover-platform-windows" }
 crossover-protocol = { path = "crates/crossover-protocol" }
 crossover-security = { path = "crates/crossover-security" }
+crossover-topology = { path = "crates/crossover-topology" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -39,6 +55,23 @@ clap = { version = "4", features = ["derive"] }
 # the DER *encode* traits (which produce the SPKI bytes our identity is
 # pinned to, ADR 0003) live behind it.
 ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
+# The layout editor's GUI toolkit: egui, driven by its eframe shell (ADR
+# 0019). default-features = false is load-bearing rather than tidy — the
+# defaults pull the whole wgpu stack, accesskit, and the web backends, none of
+# which an editor that draws flat rectangles needs. What is left is the
+# minimum that opens a window and paints one: `glow` (the OpenGL renderer),
+# plus `x11` and `wayland` (the two Linux display servers, inert on Windows
+# and macOS, and both required by the Phase 9 ports).
+#
+# `default_fonts` is deliberately *off*. It would bundle faces under
+# OFL-1.1 and Ubuntu-font-1.0, neither of which this MIT-only tree allows
+# (deny.toml); the editor embeds the BSD-3-Clause Go fonts from
+# `assets/fonts/` instead, which is a license the policy already accepts.
+eframe = { version = "0.36", default-features = false, features = [
+    "glow",
+    "wayland",
+    "x11",
+] }
 getrandom = "0.4"
 hmac = "0.13"
 # default-features = false drops postcard's heapless-cas default, which
@@ -51,6 +84,14 @@ proptest = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
+# The worker→editor state file is versioned JSON (ADR 0018): a document a
+# human reads while diagnosing a crossing, and one an editor written in a
+# different language could still parse. It is a *report*, never a source of
+# truth, and it is read only from this machine's own profile — so a
+# self-describing text format is the right trade against the postcard blobs
+# the trust store and device identity use, which are at-rest secrets in
+# `SecureStorage` rather than documents.
+serde_json = "1"
 sha2 = "0.11"
 # RustCrypto PAKEs implementation (ADR 0002 dependency evaluation: active
 # org maintenance, MIT/Apache-2.0, pure Rust, transitive deps already in
@@ -58,11 +99,30 @@ sha2 = "0.11"
 spake2 = "0.4"
 thiserror = "2"
 # Human-editable startup configuration file (Phase 6). default-features off
-# drops the `display` half — the config is read, never written. `serde` is
-# explicit because 1.0 stopped implying it from `parse`, and `toml::from_str`
-# lives behind it. Held at 1.x so it stays the single TOML implementation in
-# the tree: winresource's build script pulls 1.x regardless.
+# drops the `display` half, which stays dropped: this is the crate that
+# *reads* the config, and reading is all it does. Phase 8 makes the file
+# writable too (ADR 0018), but through `toml_edit` below rather than by
+# turning serialization on here — a serialize-and-truncate writer would
+# discard the user's comments and ordering, which is exactly what a second
+# writer must not do. `serde` is explicit because 1.0 stopped implying it
+# from `parse`, and `toml::from_str` lives behind it. Held at 1.x so it stays
+# the single TOML *parser* in the tree: winresource's build script pulls 1.x
+# regardless, and toml_edit 0.25 shares the same `toml_parser`/`toml_writer`
+# 1.1 backends, so the two are one implementation with two front ends.
 toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
+# The format-preserving TOML front end, and the only thing in the tree that
+# writes a config file (ADR 0018). It exists because `[layout]` gains a
+# second writer — the layout editor, alongside the worker adopting a peer's
+# arrangement — and a write neither of them made by hand must leave the
+# user's comments, key order, and unrelated sections exactly as they were.
+# default-features off is spelled out rather than inherited: `parse` and
+# `display` are precisely what a read-modify-write needs, `serde` is not
+# (the document is edited as a document, not round-tripped through a
+# struct), and `unbounded` stays off so a hostile or corrupt file meets
+# toml_edit's recursion limit instead of the stack. Reached only through
+# `crossover-topology`'s non-default `config` feature, so the protocol crate
+# never links it.
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 tokio = { version = "1", features = [
     "io-std",
     "io-util",
@@ -79,27 +139,88 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 x509-parser = "0.18"
+# The COM plumbing behind `#[implement]`: the macro emits absolute
+# `::windows_core` paths, so the crate the `windows` façade already pulls in
+# has to be named directly. Same version, same source, no new tree.
+windows-core = "0.62"
 windows = { version = "0.62", features = [
+    # Wdk_*: NtCreateFile plus OBJECT_ATTRIBUTES, the only Win32 way to
+    # open a file *relative to an already-open directory handle*. The spool
+    # (ADR 0015, SECURITY.md F15) must never re-resolve its root by path,
+    # and CreateFileW has no relative form, so the NT call is not a
+    # preference here — it is what makes the invariant expressible.
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    # FILE_FS_FULL_SIZE_INFORMATION: the spool's free-space check, asked of
+    # the volume behind the open root handle rather than of a path (F15).
+    "Wdk_System_SystemServices",
+    # QueryDisplayConfig + DisplayConfigGetDeviceInfo: the only Win32 route
+    # to a monitor's EDID product name ("DELL U2720Q"), which the layout
+    # editor captions rectangles with. Display-only, and deliberately off
+    # the edge detector's hot path — see crossover-platform's `display`
+    # module.
+    # SetupDi*: the walk from a monitor's device interface path to its own
+    # hardware key, where Windows caches the EDID the panel's physical size is
+    # read out of. Paired with Win32_System_Registry below; see
+    # crossover-platform-windows' `edid` module for the parsing and the
+    # plausibility rule.
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Display",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    # GetBestInterfaceEx + GetIfEntry2: which local interface carries a
+    # given peer, and is its media connected. Two kernel-table reads on the
+    # disconnect path, so a NIC that drops its link is not misreported as
+    # the peer closing the connection (docs/ARCHITECTURE.md §10).
+    "Win32_NetworkManagement_IpHelper",
+    # IF_OPER_STATUS / NET_IF_MEDIA_CONNECT_STATE, the two status fields of
+    # the interface row above.
+    "Win32_NetworkManagement_Ndis",
+    # SOCKADDR_IN/SOCKADDR_IN6: how a route lookup names its destination.
+    "Win32_Networking_WinSock",
     "Win32_Security",
+    # SDDL and SetSecurityInfo: the spool root's explicit DACL and
+    # mandatory integrity label (F15).
+    "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    # IDataObject, IStream, FORMATETC/STGMEDIUM: the virtual file list the
+    # shell pastes from (ADR 0015).
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
     "Win32_System_Console",
     "Win32_System_Environment",
+    # IO_STATUS_BLOCK, NtCreateFile's out-parameter.
+    "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    # RegQueryValueExW: reading the cached `EDID` value out of the monitor
+    # hardware key SetupDi* above opens. Read-only, bounded before it
+    # allocates, and never on the edge path.
+    "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
+    # FILEGROUPDESCRIPTORW and the CFSTR_* format names files paste through.
+    "Win32_UI_Shell",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
 zeroize = "1"
+# Write-only zip support for the sender's one-blob-per-item rule (ADR
+# 0015). default-features = false is load-bearing rather than tidy: the
+# defaults pull aes, bzip2, deflate/zopfli, lzma, ppmd, xz and zstd, and
+# the archive is written with Stored entries only, so every one of those
+# codecs would be supply-chain surface for a compression this design does
+# not perform. Nothing in the workspace reads an archive — F9's guarantee
+# is that no archive parser ever meets untrusted input — which the reader
+# ban in clippy.toml holds mechanically.
+zip = { version = "8", default-features = false }
 
 # `unsafe_code = "forbid"` enforces NFR-6 (docs/SPECIFICATION.md). Platform
 # crates may later relax it locally with documented justification.

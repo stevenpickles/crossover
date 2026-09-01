@@ -60,6 +60,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "clipboard_file_offer"
+path = "fuzz_targets/clipboard_file_offer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "clipboard_control"
 path = "fuzz_targets/clipboard_control.rs"
 test = false
@@ -69,6 +76,27 @@ bench = false
 [[bin]]
 name = "input"
 path = "fuzz_targets/input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control"
+path = "fuzz_targets/control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "monitor_topology"
+path = "fuzz_targets/monitor_topology.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layout_sync"
+path = "fuzz_targets/layout_sync.rs"
 test = false
 doc = false
 bench = false

@@ -47,6 +47,23 @@ impl Default for WorkerSupervisorConfig {
     }
 }
 
+/// Why the driver is being told to stop the running worker. Carried on
+/// [`WorkerAction::StopWorker`] purely for observability — it does not change
+/// the state machine's behavior — so a supervision log can tell a
+/// service-initiated stop apart from a session change without guessing from
+/// timing (the 2026-08-19 silent-death incident: no exit code, no reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The service itself is stopping or shutting down (`SERVICE_CONTROL_STOP`
+    /// / `SERVICE_CONTROL_SHUTDOWN`).
+    ServiceStopping,
+    /// No user is logged on to the console (logoff, or no console session).
+    Logoff,
+    /// The active console session changed while the worker was running in the
+    /// previous one (fast user switch).
+    SessionChanged,
+}
+
 /// What the driver should do next. Exactly one action per [`WorkerSupervisor::poll`];
 /// the driver executes it, which produces the next event (or waits until
 /// [`WorkerSupervisor::wake_deadline`]).
@@ -56,9 +73,9 @@ pub enum WorkerAction {
     /// it running as of the `now_ms` passed to `poll`; if the launch fails, the
     /// driver must call [`WorkerSupervisor::note_launch_failed`].
     Launch(SessionId),
-    /// Terminate the running worker (wrong session, logoff, or stopping). The
+    /// Terminate the running worker, for the carried [`StopReason`]. The
     /// driver reports the resulting exit via [`WorkerSupervisor::note_worker_exited`].
-    StopWorker,
+    StopWorker(StopReason),
     /// Nothing to do now. If [`WorkerSupervisor::wake_deadline`] is `Some`, call
     /// `poll` again at that time (a pending backoff relaunch).
     Idle,
@@ -188,7 +205,7 @@ impl WorkerSupervisor {
     pub fn poll(&mut self, now_ms: u64) -> WorkerAction {
         if self.stopping {
             return if matches!(self.worker, Worker::Running { .. }) {
-                WorkerAction::StopWorker
+                WorkerAction::StopWorker(StopReason::ServiceStopping)
             } else {
                 WorkerAction::Stopped
             };
@@ -198,7 +215,7 @@ impl WorkerSupervisor {
             // No user logged on: ensure nothing is running.
             return if matches!(self.worker, Worker::Running { .. }) {
                 self.stop_worker_pending = true;
-                WorkerAction::StopWorker
+                WorkerAction::StopWorker(StopReason::Logoff)
             } else {
                 WorkerAction::Idle
             };
@@ -213,7 +230,7 @@ impl WorkerSupervisor {
             // under it) must be stopped before relaunching in the new one.
             Worker::Running { .. } => {
                 self.stop_worker_pending = true;
-                WorkerAction::StopWorker
+                WorkerAction::StopWorker(StopReason::SessionChanged)
             }
             Worker::Idle => {
                 self.worker = Worker::Running {
@@ -263,7 +280,7 @@ impl WorkerSupervisor {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionId, WorkerAction, WorkerSupervisor, WorkerSupervisorConfig};
+    use super::{SessionId, StopReason, WorkerAction, WorkerSupervisor, WorkerSupervisorConfig};
 
     const SESSION: SessionId = 1;
     const OTHER_SESSION: SessionId = 2;
@@ -366,7 +383,10 @@ mod tests {
 
         // Logoff: stop the running worker.
         sup.note_active_session(None);
-        assert_eq!(sup.poll(1_000), WorkerAction::StopWorker);
+        assert_eq!(
+            sup.poll(1_000),
+            WorkerAction::StopWorker(StopReason::Logoff)
+        );
         sup.note_worker_exited(false, 1_000);
         assert_eq!(sup.poll(1_100), WorkerAction::Idle);
 
@@ -383,7 +403,10 @@ mod tests {
 
         // Fast user switch: the console is now a different session.
         sup.note_active_session(Some(OTHER_SESSION));
-        assert_eq!(sup.poll(1_000), WorkerAction::StopWorker);
+        assert_eq!(
+            sup.poll(1_000),
+            WorkerAction::StopWorker(StopReason::SessionChanged)
+        );
         sup.note_worker_exited(false, 1_000);
         assert_eq!(sup.poll(1_100), WorkerAction::Launch(OTHER_SESSION));
     }
@@ -408,7 +431,10 @@ mod tests {
         assert_eq!(sup.poll(0), WorkerAction::Launch(SESSION));
 
         sup.request_stop();
-        assert_eq!(sup.poll(1_000), WorkerAction::StopWorker);
+        assert_eq!(
+            sup.poll(1_000),
+            WorkerAction::StopWorker(StopReason::ServiceStopping)
+        );
         sup.note_worker_exited(false, 1_000);
         assert_eq!(sup.poll(1_100), WorkerAction::Stopped);
     }

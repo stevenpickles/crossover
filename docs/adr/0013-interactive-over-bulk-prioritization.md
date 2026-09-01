@@ -136,3 +136,104 @@ change of decision.
   queue and the socket and asserts structurally — arrival positions and frame
   counts, not elapsed time ([TESTING.md](../TESTING.md) §1.5). Numeric
   latency remains a measurement (TESTING.md §4), not a gate.
+
+## Addendum (2026-08-19): the classes exist inbound too
+
+This ADR split the **send** path and said nothing about the receive one,
+because "the receive side already dispatches per-frame, so interleaved input
+frames are applied as they arrive while chunks route to reassembly." That was
+true of the *session* layer and false one hop later. The application fanned
+every decoded frame out to **both** the clipboard driver and the control
+driver and awaited both, from a strictly serial per-session frame pump. Each
+driver discarded whatever was not its traffic — so the fan-out of a
+`ControlRequest` completed only once a saturated clipboard queue had accepted
+a frame it was going to throw away, and the pump could not move on until it
+did.
+
+Every class of frame paid it. Bulk clipboard chunks were cloned once for a
+driver that dropped the clone; the 125 Hz input stream queued behind clipboard
+backpressure; and on 2026-08-19 an inbound `ControlRequest` was answered
+**4.7 s late**, which cost the requester a timeout and left the two machines
+locked out of each other for seven seconds
+([ADR 0009](0009-seamless-edge-transfer.md)'s convergence addendum covers the
+lockout; this covers the delay that opened it).
+
+**Inbound frames are now routed by message type, to exactly one driver** —
+the same partition as `SendPriority::of`, read the other way round: clipboard
+traffic to the sync driver, input and control traffic to the control driver.
+No frame waits on a driver that will discard it, and no bulk payload is
+cloned for one.
+
+Three properties the routing has to keep, and does:
+
+- **Total.** A message type this build does not recognize keeps its historical
+  delivery to *both* drivers. Ignoring an unknown frame is a driver's decision
+  to make; a classifier that predates the type must not turn it into a silent
+  drop. (Nothing else lands there: the session layer answers `Ping`, accepts
+  `Pong`, and fails the session on `Hello` or a pairing message, so those
+  never become application frames at all.)
+- **Order-preserving within a driver.** One frame is delivered before the next
+  is classified, so each driver still sees its own traffic in exactly arrival
+  order — which ADR 0005's transaction state machine and the applied-input
+  sequence both depend on.
+- **Bounded.** Routing adds no queue and no buffering; it removes a wait.
+
+What it deliberately does **not** claim is preemption. Backpressure from a
+genuinely saturated clipboard path still reaches the peer, and on one ordered
+TCP stream that necessarily delays whatever the peer sent behind it —
+priority #2 (clipboard reliability) outranks #5 (input latency), so bulk may
+never be dropped to clear the way. The guarantee here is narrower and exactly
+the one that was violated: an interactive frame is never delayed by a queue
+belonging to a driver with no interest in it.
+
+## Addendum (2026-08-20): the chunk size, measured on the link it was costed for
+
+This ADR's chunk-size arithmetic — 64 KiB is "0.21 ms of 2.5 GbE, so one
+chunk of worst-case input delay stays sub-millisecond" — was an assertion
+about a wired LAN that had never been read on one. A 2026-08-16 hardware
+measurement over **WiFi** broke it badly (input queue-to-wire mean 1.94 ms,
+max 309.8 ms), and the maintainer held the size at 64 KiB rather than tune
+it against a link this ADR never contemplated, pending a wired re-run. That
+re-run has happened.
+
+**The measurement.** 2026-08-21T00:19:07Z, both machines on `dev` at
+`f69afc8`, over a direct wired link negotiated at 2.5 Gbps full duplex — the
+design target exactly. The contended case was driven as this ADR describes
+it, with **one writer carrying both classes**: the sending machine was
+simultaneously controlling the other (continuous mouse and keyboard) and
+streaming bulk file data to it over the same connection. Ten distinct
+200 MiB random-content files went across back-to-back in 39 s (~1 s per
+delivery), with input running throughout; 4,558 input frames were timed.
+
+| | avg | max |
+|---|---|---|
+| socket accepting the bytes | **0.019 ms** | **0.147 ms** |
+| waiting for the writer | 0.41 ms | 72.2 ms |
+| queue-to-wire, total | 0.43 ms | 72.2 ms |
+
+**Decision: 64 KiB stands** (maintainer, 2026-08-20). The worst socket write
+under full saturation, 0.147 ms, is smaller than the 0.21 ms this ADR costs a
+single 64 KiB chunk at 2.5 GbE — so the unpreemptable unit behaves as the
+arithmetic said it would, and shrinking it would buy latency nobody is
+paying. The WiFi failure is attributed to the physical link rather than to
+the chunking design: the same chunk that is a fifth of a millisecond here was
+a tenth of a second there. Nothing in the decision changes; what changes is
+that the number behind it is now evidence instead of arithmetic.
+
+The corollary matters as much: **the writer-task redesign this measurement
+was meant to price is not warranted.** [ARCHITECTURE.md](../ARCHITECTURE.md)
+§5.4 already corrected the claim that moving the writer to its own task would
+remove the wait — it would still write serially into one TLS stream — and the
+socket figures now leave it nothing to recover. Genuine mid-frame preemption
+still means separate streams or a second connection, both considered and
+rejected above, and this measurement gives no reason to revisit them.
+
+**One observation the numbers carry honestly.** A single ~72 ms tail event
+appeared in the interactive *lane* while socket writes stayed at or below
+0.147 ms — so a frame waited before the writer, not behind bulk bytes in the
+socket. That is not the head-of-line blocking this ADR exists to prevent; it
+is one outlier among 4,558 samples against lane and total averages of
+0.41 ms and 0.43 ms, and the operator noticed nothing. It is recorded as a
+future investigation in the roadmap's Phase 7 follow-ups, not as a defect in
+this decision. The full session record is docs/SOAK.md's Phase 7
+input-latency section.

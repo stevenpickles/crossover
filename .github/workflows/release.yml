@@ -46,7 +46,7 @@ jobs:
         run: rustup show
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: cargo-deny
 

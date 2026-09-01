@@ -85,25 +85,38 @@ The first useful implementation supports exactly:
 - seamless screen-edge control transfer
 - structured logging and command-line operation (foreground/debug execution)
 
-No GUI is required initially.
+No GUI is required for operation; the one exception — the topology editor —
+shipped in Phase 8 (see the §3.3 note).
 
 ### 3.2 Long-term scope
 
-Eventually: macOS and Linux; more than two peers; multiple monitors per peer
-with arbitrary topology; background/tray operation; peer discovery; rich
-clipboard types (HTML, images, file lists); drag-and-drop; auto-update;
+Eventually: macOS and Linux; more than two peers, including arbitrary
+display topology across them; background/tray operation; peer discovery; rich
+clipboard types not yet carried (HTML); drag-and-drop; auto-update;
 secure WAN operation; diagnostics UI.
 
-> **Re-scoped:** clipboard **images** left this list on 2026-08-11 and are
-> being built in Phase 7 ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md));
-> file lists are designed for a later, deliberately minimal spool-and-paste
-> capability ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)). ADR 0014's
+> **Re-scoped:** clipboard **images** left this list on 2026-08-11 and
+> shipped in Phase 7 ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md));
+> file lists followed in the same phase as a deliberately minimal
+> spool-and-paste capability
+> ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)), hardware-validated
+> 2026-08-19. ADR 0014's
 > platform slice has since landed, so §3.1's "UTF-8 **text**" now understates
 > what a build synchronizes: images travel too, in the source clipboard's own
 > raster format, between peers that both advertise `CHUNKED_CLIPBOARD`
 > (PROTOCOL.md §3.1). Text remains the only type every peer can take,
 > because the capability is negotiated and a peer without the bit is sent
 > nothing new.
+
+> **Re-scoped (2026-08-20):** **multiple monitors per peer with arbitrary
+> topology** left this list for the two-peer case, which is why the entry
+> above now scopes it to "more than two peers". Phase 8 placed both machines'
+> monitors in one drawn coordinate space and derives crossing edges from
+> adjacency, so a seam between two monitors of the same machine, an
+> over/under arrangement, and a three-monitor corner are all expressible
+> ([ADR 0018](adr/0018-drawn-display-topology.md)). The same capability
+> across *more* than two peers stays long-term: the layout model admits it,
+> and this phase does not build it.
 
 Long-term capabilities must not complicate the initial implementation except
 where required to preserve a clean architecture (chiefly: the protocol and
@@ -112,10 +125,26 @@ assumptions).
 
 ### 3.3 Non-goals (initial development)
 
-Graphical configuration, tray application, service installation, peer
-discovery, >2 computers, macOS/Linux implementations, non-text clipboard,
-drag-and-drop, screen streaming or remote video/audio, NAT traversal, cloud
-services, user accounts, centralized authentication, mobile platforms.
+Graphical configuration, tray application, peer discovery, >2 computers,
+macOS/Linux implementations, drag-and-drop, screen streaming or remote
+video/audio, NAT traversal, cloud services, user accounts, centralized
+authentication, mobile platforms.
+
+> **No longer non-goals:** *service installation* (Phase 6,
+> [ADR 0011](adr/0011-background-service-launcher.md)) and *non-text
+> clipboard* (Phase 7 — images
+> [ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md), files
+> [ADR 0015](adr/0015-spooled-virtual-file-paste.md)).
+
+> **No longer a non-goal (2026-08-20):** graphical configuration, in one
+> specific form. Phase 8 shipped a **topology editor** — the project's first
+> GUI — because an arrangement the user draws is the deliverable, and a
+> drawn arrangement has no command-line form worth having. It is a separate
+> user-session surface rather than a mode of the headless, service-launched
+> worker ([ADR 0011](adr/0011-background-service-launcher.md),
+> [ADR 0018](adr/0018-drawn-display-topology.md); the UI toolkit decision
+> follows as ADR 0019). Graphical configuration of everything *else* remains
+> out of initial scope and stays in Phase 10.
 
 ## 4. Functional requirements
 
@@ -165,6 +194,15 @@ are binding; "should" requirements are strong defaults changeable by ADR.
 - **FR-3.2** A synchronization operation succeeds only when the destination
   operating-system clipboard has been updated — not when bytes were written
   to a socket. Success must be acknowledged end to end.
+  **Files read this one step earlier, and deliberately**
+  ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)): a file item
+  succeeds (`ApplyResult::Stored`) when the receiver has verified it and
+  registered it in its spool, because what reaches the destination
+  clipboard is a *promise* of the bytes rather than the bytes, and what
+  follows — whether the user ever pastes, and where — is the user's
+  gesture, not a synchronization outcome. The requirement's substance is
+  unchanged: the acknowledgement still states a fact about the
+  destination, and still never about a socket write.
 - **FR-3.3** Synchronization must not loop: a peer applying a remote clipboard
   item must recognize the resulting local clipboard change as that item and
   must not re-send it.
@@ -181,7 +219,10 @@ are binding; "should" requirements are strong defaults changeable by ADR.
   *(Discharged as designed: raster images were added in Phase 7
   ([ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md)) as a new content
   type on the existing model — negotiated, chunked, and carried verbatim —
-  with no protocol version bump.)*
+  with no protocol version bump. The *file* content type that followed did
+  bump it: a descriptor byte on every offer moved both the version and its
+  floor to 3 ([ADR 0017](adr/0017-protocol-version-3.md)), and the drawn
+  topology later took them to 6.)*
 
 ### 4.4 Input forwarding
 
@@ -294,10 +335,13 @@ that touch them:
   conflict with hooks. Initial scope may exclude these; the limitation must
   be documented.
 
-macOS (accessibility permissions, pasteboard semantics) and Linux
-(X11/Wayland split, clipboard ownership model) risks are catalogued when
-those phases begin ([ROADMAP.md](ROADMAP.md) Phase 8 — Cross-Platform
-Validation).
+macOS and Linux risks are now catalogued, ahead of the ports as Phase 9
+requires: [platform-risks-macos.md](platform-risks-macos.md) and
+[platform-risks-linux.md](platform-risks-linux.md). They are written from
+documented platform behaviour rather than measurement, so each risk carries
+what to verify; anything that survives contact with hardware belongs here in
+§6 alongside the Windows risks, and anything falsified should be struck with
+a note saying so.
 
 ## 7. Process requirements
 

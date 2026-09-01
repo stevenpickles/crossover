@@ -58,31 +58,48 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0006](0006-clipboard-transmission-triggers.md) | Clipboard transmission is trigger-driven, not change-driven | Accepted |
 | [0007](0007-windows-input-capture.md) | Windows input: hooks to suppress, Raw Input for motion, SendInput to inject | Accepted |
 | [0008](0008-keyboard-key-representation.md) | Keyboard key representation: physical key by USB HID usage, text carried, inject by scan code | Accepted |
-| [0009](0009-seamless-edge-transfer.md) | Seamless control transfer: edge crossing triggers the negotiated engine, position as a fraction | Accepted |
+| [0009](0009-seamless-edge-transfer.md) | Seamless control transfer: edge crossing triggers the negotiated engine, position as a fraction | Accepted; topology superseded by [0018](0018-drawn-display-topology.md) (mechanism retained) |
 | [0010](0010-active-session-revocation.md) | Revocation terminates active sessions via a trust-store poll, not just new connections | Accepted |
 | [0011](0011-background-service-launcher.md) | Background operation: a minimal LocalSystem service launches the worker into the user session, behind a `ServiceManager` boundary | Accepted (amended by 0012) |
 | [0012](0012-elevated-worker-integrity.md) | Worker runs at high integrity, launched with the user's elevated linked token, so it can drive elevated windows | Accepted |
 | [0013](0013-interactive-over-bulk-prioritization.md) | Interactive input takes wire priority over bulk transfers (Phase 7) | Accepted |
 | [0014](0014-chunked-rich-clipboard-transfer.md) | Chunked rich-clipboard transfer: images first, native format verbatim (Phase 7) | Accepted |
-| [0015](0015-spooled-virtual-file-paste.md) | Files/folders transfer: eager transfer to a bounded internal spool, pasted as a virtual file list, sender-zipped archives, per-peer permission (Phase 7) | Proposed |
+| [0015](0015-spooled-virtual-file-paste.md) | Files/folders transfer: eager transfer to a bounded internal spool, pasted as a virtual file list, sender-zipped archives, per-peer permission (Phase 7) | Accepted |
+| [0017](0017-protocol-version-3.md) | Protocol v3: the file descriptor changes every offer's layout, so the version and its floor both move; no back-compatibility with v2 | Accepted |
+| [0016](0016-image-interchange-format.md) | Image interchange: the receiver names the format, the sender produces it; PNG is the baseline and receivers never decode (cross-platform) | Proposed |
+| [0018](0018-drawn-display-topology.md) | Display topology is a drawn layout in one shared coordinate space; edges derived from adjacency, protocol v4 (v5 and v6 by amendment), a `crossover-topology` crate (Phase 8) | Accepted (supersedes 0009's topology) |
+| [0019](0019-layout-editor-toolkit.md) | The layout editor is an egui/eframe application in its own on-demand, user-session binary, `apps/crossover-layout` (Phase 8) | Accepted |
 
 ## Known decisions awaiting an ADR
 
-None outstanding. The files/folders **filesystem-write surface** sketched in
-0014 is now designed in [0015](0015-spooled-virtual-file-paste.md) (Proposed) —
-eager verified transfer into a bounded internal spool, disposed of by pasting a
-virtual file list, superseding the drop-folder model 0014 sketched and 0015's
-own first draft carried — with the matching threat-model additions in
-[SECURITY.md](../SECURITY.md) §7 (invariants F1–F15, threats T12–T21) — the
-precondition 0014 set for any implementation.
+None outstanding. One drafted decision is still open:
+[0016](0016-image-interchange-format.md) (image interchange format) is
+**Proposed**, and is a precondition for the Phase 9 ports.
+
+The layout editor's **UI toolkit** — the entry this section
+carried while Phase 8 was being designed — is decided in
+[0019](0019-layout-editor-toolkit.md) (Accepted): egui through eframe, in a
+separate user-session binary whose dependency graph excludes every core,
+protocol, security, and platform crate.
+
+The files/folders **filesystem-write surface** sketched in
+0014 is designed in [0015](0015-spooled-virtual-file-paste.md) and shipped in
+0.2.0 — eager verified transfer into a bounded internal spool, disposed of by
+pasting a virtual file list, superseding the drop-folder model 0014 sketched
+and 0015's own first draft carried — with the matching threat-model additions
+in [SECURITY.md](../SECURITY.md) §7 (invariants F1–F16, threats T12–T22) — the
+precondition 0014 set for any implementation. T23, the peer-supplied layout,
+belongs to [0018](0018-drawn-display-topology.md).
 
 The deferred *specification* decisions are all recorded — wire format (0001),
 pairing mechanism (0002), identity credential (0003), default port (0004),
 clipboard transaction flow (0005), Windows input capture (0007), and keyboard
 key representation (0008); 0006 was raised by evidence rather than deferred.
 ADRs 0013 and 0014 are **Accepted** — the Phase 7 rich-clipboard direction is
-ratified after a drift-check against the current code. ADR 0015 is **Proposed**
-— files/folders transfer stays gated on its ratification.
+ratified after a drift-check against the current code. ADR 0015 was
+**Accepted** 2026-08-17 and implemented in full for 0.2.0; its design forks
+are settled and recorded in its implementation-decisions and addendum
+sections.
 
 New entries belong here when a decision is identified but not yet made,
 so that the gap is visible rather than implicit.

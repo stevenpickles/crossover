@@ -6,18 +6,24 @@
 //! crate's own tests.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::clipboard::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
 };
 use crate::cursor::{CursorMask, CursorMaskError};
-use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
+use crate::display::{
+    CursorPoint, DisplayError, DisplayInfo, MonitorDescription, MonitorInfo, MonitorRect, Screen,
+};
+use crate::file_blob::{BlobNaming, FileBlob, FileBlobBuilder, FileBlobRefusal};
 use crate::input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerEvent,
 };
+use crate::link::{LinkState, LinkStateProbe};
 use crate::secure_storage::{SecureStorage, SecureStorageError};
 use crate::service::{ServiceError, ServiceManager, ServiceStatus};
+use crate::virtual_file::{VirtualFile, VirtualFileClipboard};
 
 /// In-memory [`SecureStorage`] with scriptable fault injection.
 #[derive(Debug, Default)]
@@ -125,6 +131,12 @@ impl InMemoryClipboard {
     /// Simulate a local snip: set image content and notify (ADR 0014).
     pub fn set_image_locally(&self, format: ClipboardImageFormat, bytes: Vec<u8>) {
         self.set_locally(ClipboardContent::Image { format, bytes });
+    }
+
+    /// Simulate a local Explorer file/folder copy: set a file-list
+    /// observation and notify (ADR 0015, feature/133).
+    pub fn set_file_list_locally(&self, paths: Vec<std::path::PathBuf>) {
+        self.set_locally(ClipboardContent::FileList(paths));
     }
 
     /// Simulate any local copy: set content and notify the listener.
@@ -357,6 +369,10 @@ pub struct FakeInputInjector {
     /// set to script a secure desktop. Stored inverted so the derived default
     /// (`false`) means "injectable".
     blocked: Mutex<bool>,
+    /// A display whose cursor follows this injector's placements, when one
+    /// is linked (see [`FakeInputInjector::follow`]). Unlinked by default,
+    /// so placements are only recorded.
+    display: Mutex<Option<Arc<FakeDisplay>>>,
 }
 
 impl FakeInputInjector {
@@ -408,6 +424,15 @@ impl FakeInputInjector {
     pub fn set_can_inject(&self, available: bool) {
         *lock(&self.blocked) = !available;
     }
+
+    /// Make `display`'s cursor follow this injector's placements, the way a
+    /// real absolute move is immediately visible to the display query that
+    /// edge detection polls. Without this link a placement is only recorded,
+    /// which hides feedback loops between placing the cursor and detecting
+    /// where it now is.
+    pub fn follow(&self, display: Arc<FakeDisplay>) {
+        *lock(&self.display) = Some(display);
+    }
 }
 
 impl InputInjector for FakeInputInjector {
@@ -421,6 +446,13 @@ impl InputInjector for FakeInputInjector {
 
     fn place_cursor(&self, position: CursorPoint) -> Result<(), InputError> {
         lock(&self.placements).push(position);
+        // A real placement moves the pointer the display then reports; a
+        // linked display models that, so tests see the same feedback the
+        // machine does.
+        let display = lock(&self.display).clone();
+        if let Some(display) = display {
+            display.set_cursor(position);
+        }
         Ok(())
     }
 
@@ -429,14 +461,34 @@ impl InputInjector for FakeInputInjector {
     }
 }
 
+/// The device string [`FakeDisplay`] mints for a monitor a test scripted
+/// by geometry alone.
+///
+/// Deliberately **not** spelled `\\.\DISPLAYn`. A fake that produced real
+/// Windows device strings would let a test pass here for a reason that
+/// exists only on Windows — an assertion accidentally matching the shape
+/// of one platform's names is exactly the coupling the platform boundary
+/// exists to prevent. `FAKE-DISPLAY-1` is obviously synthetic, is valid
+/// printable ASCII inside ADR 0018's byte bound, and is predictable, so a
+/// test that cares can name it without setting it.
+#[must_use]
+pub fn fake_monitor_id(index: usize) -> String {
+    format!("FAKE-DISPLAY-{}", index + 1)
+}
+
 /// In-memory [`DisplayInfo`] with a scriptable screen size and cursor, so
 /// edge-detection logic is exercisable with no real display.
 pub struct FakeDisplay {
     screen: Mutex<Screen>,
     cursor: Mutex<CursorPoint>,
-    /// The monitor layout. Defaults to a single monitor covering the whole
-    /// screen; multi-monitor tests override it via [`Self::set_monitors`].
-    monitors: Mutex<Vec<MonitorRect>>,
+    /// The monitor layout, ids and labels and panel sizes and all — one
+    /// list, projected three ways by the three queries, so they cannot
+    /// disagree about which monitors exist. Defaults to a single
+    /// undescribed monitor covering the whole screen; tests override it via
+    /// [`Self::set_monitors`] (geometry only, ids synthesized),
+    /// [`Self::set_monitor_layout`] (geometry and ids), or
+    /// [`Self::set_monitor_descriptions`] (everything).
+    monitors: Mutex<Vec<MonitorDescription>>,
     /// When set, both queries fail with this reason — the platform
     /// refusing to report geometry.
     fail: Mutex<Option<String>>,
@@ -450,11 +502,21 @@ impl FakeDisplay {
         Self {
             screen: Mutex::new(screen),
             cursor: Mutex::new(CursorPoint { x: 0, y: 0 }),
-            monitors: Mutex::new(vec![MonitorRect {
-                left: 0,
-                top: 0,
-                width: screen.width,
-                height: screen.height,
+            monitors: Mutex::new(vec![MonitorDescription {
+                info: MonitorInfo {
+                    id: Some(fake_monitor_id(0)),
+                    rect: MonitorRect {
+                        left: 0,
+                        top: 0,
+                        width: screen.width,
+                        height: screen.height,
+                    },
+                },
+                // Undescribed by default: the ordinary backend is the one
+                // that cannot read a product name or measure a panel, and a
+                // test that cares about either says so.
+                label: None,
+                physical_size: None,
             }]),
             fail: Mutex::new(None),
         }
@@ -471,8 +533,90 @@ impl FakeDisplay {
         *lock(&self.screen) = screen;
     }
 
-    /// Replace the monitor layout, for multi-monitor edge-mapping tests.
+    /// Replace the monitor layout by geometry alone, for multi-monitor
+    /// edge-mapping tests. Tests written before monitors had identities
+    /// keep working unchanged.
+    ///
+    /// **A monitor that survives the change keeps its id** — and its label
+    /// and its measured size, for the same reason. A rectangle
+    /// present before and after is the same screen, and relabelling it
+    /// would model the one thing ADR 0018 chose device strings to avoid: a
+    /// screen whose identity silently moves when the list around it
+    /// changes. So surviving rectangles carry their description across
+    /// (each matched once, so duplicates stay distinct), and only genuinely
+    /// new ones are named — with the lowest [`fake_monitor_id`] index not
+    /// already in use, so a new monitor can never inherit a live
+    /// neighbour's name either.
     pub fn set_monitors(&self, monitors: Vec<MonitorRect>) {
+        let mut previous = lock(&self.monitors);
+        let mut unclaimed: Vec<MonitorDescription> = previous.clone();
+        let mut next: Vec<MonitorDescription> = monitors
+            .into_iter()
+            .map(|rect| {
+                // Same rectangle as one we had? Same screen, same id, same
+                // description.
+                match unclaimed.iter().position(|held| held.info.rect == rect) {
+                    Some(index) => unclaimed.remove(index),
+                    None => MonitorDescription {
+                        info: MonitorInfo { id: None, rect },
+                        label: None,
+                        physical_size: None,
+                    },
+                }
+            })
+            .collect();
+
+        // Name the newcomers from the lowest index nothing else holds.
+        for index in 0.. {
+            if next.iter().all(|monitor| monitor.info.id.is_some()) {
+                break;
+            }
+            let candidate = fake_monitor_id(index);
+            if next
+                .iter()
+                .any(|monitor| monitor.info.id.as_deref() == Some(candidate.as_str()))
+            {
+                continue;
+            }
+            if let Some(unnamed) = next.iter_mut().find(|monitor| monitor.info.id.is_none()) {
+                unnamed.info.id = Some(candidate);
+            }
+        }
+        *previous = next;
+    }
+
+    /// Replace the monitor layout, ids and all — for a test that is about
+    /// identity: an id that changes across a re-enumeration, a monitor the
+    /// platform declines to name (`id: None`), a layout naming a monitor
+    /// this machine does not have, or an id the layout model will refuse.
+    ///
+    /// Whatever is given is stored verbatim, including `None` and including
+    /// ids [`Self::set_monitors`] would never mint — that is the point of
+    /// having both setters. Every monitor comes out **undescribed** — no
+    /// label, no measured size: this is the identity setter, and a test
+    /// that wants either uses [`Self::set_monitor_descriptions`].
+    pub fn set_monitor_layout(&self, monitors: Vec<MonitorInfo>) {
+        *lock(&self.monitors) = monitors
+            .into_iter()
+            .map(|info| MonitorDescription {
+                info,
+                label: None,
+                physical_size: None,
+            })
+            .collect();
+    }
+
+    /// Replace the monitor layout including everything the description
+    /// query adds — each monitor's human-readable label and its physical
+    /// panel size. For a test about captions (a labelled screen, an
+    /// unlabelled one, two screens sharing a label, a label the layout
+    /// model will refuse) or about proportion (a measured panel, an
+    /// unmeasured one, a size the model will refuse).
+    ///
+    /// Stored verbatim, like [`Self::set_monitor_layout`] — which is what
+    /// lets a test model the case retention exists for: a description sweep
+    /// that keeps the geometry and drops what it says *about* it.
+    pub fn set_monitor_descriptions(&self, monitors: Vec<MonitorDescription>) {
         *lock(&self.monitors) = monitors;
     }
 
@@ -480,6 +624,14 @@ impl FakeDisplay {
     /// cannot report geometry.
     pub fn fail_with(&self, reason: &str) {
         *lock(&self.fail) = Some(reason.to_owned());
+    }
+
+    /// Start answering again — the other half of [`Self::fail_with`], for a
+    /// test about *recovery* rather than about failure. A test that only
+    /// ever fails a display cannot tell a component that survived an outage
+    /// from one that quietly wedged itself during it.
+    pub fn clear_failure(&self) {
+        *lock(&self.fail) = None;
     }
 
     fn guard(&self) -> Result<(), DisplayError> {
@@ -497,6 +649,24 @@ impl DisplayInfo for FakeDisplay {
     }
 
     fn monitors(&self) -> Result<Vec<MonitorRect>, DisplayError> {
+        self.guard()?;
+        // Geometry is never withheld for want of an id, exactly as the
+        // real backend must not withhold it.
+        Ok(lock(&self.monitors)
+            .iter()
+            .map(|monitor| monitor.info.rect)
+            .collect())
+    }
+
+    fn monitor_layout(&self) -> Result<Vec<MonitorInfo>, DisplayError> {
+        self.guard()?;
+        Ok(lock(&self.monitors)
+            .iter()
+            .map(|monitor| monitor.info.clone())
+            .collect())
+    }
+
+    fn monitor_descriptions(&self) -> Result<Vec<MonitorDescription>, DisplayError> {
         self.guard()?;
         Ok(lock(&self.monitors).clone())
     }
@@ -638,6 +808,48 @@ impl ServiceManager for FakeServiceManager {
         } else {
             Ok(ServiceStatus::NotInstalled)
         }
+    }
+}
+
+/// Scriptable [`LinkStateProbe`]: answers whatever a test set, and records
+/// which peer it was asked about.
+///
+/// The recorded peer is half the point. The trait's contract is *per peer* —
+/// the interface carrying this session, not "some interface somewhere" — so
+/// a test that only checked the answer would not notice a caller asking the
+/// wrong question.
+#[derive(Debug, Default)]
+pub struct FakeLinkStateProbe {
+    answer: Mutex<LinkState>,
+    asked_about: Mutex<Vec<SocketAddr>>,
+}
+
+impl FakeLinkStateProbe {
+    /// A probe that answers `answer` for every peer.
+    #[must_use]
+    pub fn answering(answer: LinkState) -> Self {
+        Self {
+            answer: Mutex::new(answer),
+            asked_about: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Change what the next queries answer.
+    pub fn set_answer(&self, answer: LinkState) {
+        *lock(&self.answer) = answer;
+    }
+
+    /// Every peer address the probe was asked about, in order.
+    #[must_use]
+    pub fn asked_about(&self) -> Vec<SocketAddr> {
+        lock(&self.asked_about).clone()
+    }
+}
+
+impl LinkStateProbe for FakeLinkStateProbe {
+    fn link_state(&self, peer: SocketAddr) -> LinkState {
+        lock(&self.asked_about).push(peer);
+        *lock(&self.answer)
     }
 }
 
@@ -926,6 +1138,32 @@ mod clipboard_tests {
             })
         );
     }
+
+    /// A file-list observation (ADR 0015, feature/133) round-trips like any
+    /// other typed content and is not text — the same shape the image test
+    /// above asserts, so core tests can script a local Explorer copy with
+    /// no OS clipboard.
+    #[test]
+    fn file_list_content_round_trips_and_is_not_text() {
+        use crate::clipboard::ClipboardContent;
+        use std::path::PathBuf;
+
+        let clipboard = InMemoryClipboard::new();
+        let notifications = counting_listener(&clipboard);
+        let paths = vec![
+            PathBuf::from(r"C:\Users\test\report.pdf"),
+            PathBuf::from(r"C:\Users\test\photos"),
+        ];
+
+        clipboard.set_file_list_locally(paths.clone());
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            clipboard.read().unwrap(),
+            Some(ClipboardContent::FileList(paths))
+        );
+        assert_eq!(clipboard.read_text().unwrap(), None);
+        assert_eq!(clipboard.peek(), None);
+    }
 }
 
 #[cfg(test)]
@@ -969,7 +1207,7 @@ mod tests {
 
 #[cfg(test)]
 mod display_tests {
-    use super::FakeDisplay;
+    use super::{FakeDisplay, fake_monitor_id};
     use crate::display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
 
     #[test]
@@ -1058,5 +1296,490 @@ mod display_tests {
             display.monitors(),
             Err(DisplayError::Unavailable { .. })
         ));
+    }
+
+    /// The identity half (ADR 0018): geometry-only scripting mints
+    /// synthetic ids, `monitors()` reports the same rectangles either way,
+    /// and a test that cares can name the ids itself — `None` included.
+    #[test]
+    fn monitor_identities_are_synthesized_or_scripted_and_never_gate_geometry() {
+        use crate::display::MonitorInfo;
+
+        let display = FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        });
+        assert_eq!(
+            display.monitor_layout().unwrap()[0].id.as_deref(),
+            Some("FAKE-DISPLAY-1")
+        );
+
+        let laptop = MonitorRect {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1200,
+        };
+        let external = MonitorRect {
+            left: 1920,
+            top: 0,
+            width: 2560,
+            height: 1440,
+        };
+        display.set_monitors(vec![laptop, external]);
+        let identified = display.monitor_layout().unwrap();
+        assert_eq!(
+            identified
+                .iter()
+                .map(|m| m.id.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec![fake_monitor_id(0), fake_monitor_id(1)]
+        );
+        // Geometry reports exactly the same monitors, so the two views
+        // cannot disagree about what exists.
+        assert_eq!(
+            display.monitors().unwrap(),
+            identified.iter().map(|m| m.rect).collect::<Vec<_>>()
+        );
+
+        // Scripted ids survive verbatim — including an id the layout model
+        // will refuse, and `None`, because "the platform would not name
+        // this screen" is a state the model above has to be able to see.
+        display.set_monitor_layout(vec![
+            MonitorInfo {
+                id: Some("DP-2".to_owned()),
+                rect: laptop,
+            },
+            MonitorInfo {
+                id: None,
+                rect: external,
+            },
+        ]);
+        let identified = display.monitor_layout().unwrap();
+        assert_eq!(identified[0].id.as_deref(), Some("DP-2"));
+        assert_eq!(identified[1].id, None);
+        // The unnamed monitor is still in the geometry list. This is the
+        // property that keeps an identity failure from moving the
+        // desktop's outer edge inward.
+        assert_eq!(display.monitors().unwrap(), vec![laptop, external]);
+
+        // A scripted failure surfaces on both queries.
+        display.fail_with("no display attached");
+        assert!(matches!(
+            display.monitor_layout(),
+            Err(DisplayError::Unavailable { .. })
+        ));
+        assert!(matches!(
+            display.monitors(),
+            Err(DisplayError::Unavailable { .. })
+        ));
+    }
+
+    /// The description half: labels and panel sizes are scriptable
+    /// independently of each other and of identity, they reach only the
+    /// description query, and neither ever gates geometry.
+    ///
+    /// Independently is the point. A real sweep can hand back a name with
+    /// no size (a panel whose EDID is unreadable but which Windows names
+    /// anyway) or a size with no name (an EDID with measurements and no
+    /// product string), so a fake that could only supply both or neither
+    /// would make the retention rules above it untestable.
+    #[test]
+    fn monitor_descriptions_carry_labels_and_sizes_independently() {
+        use crate::display::{MonitorDescription, MonitorInfo, PhysicalSizeMm};
+
+        let display = FakeDisplay::new(Screen {
+            width: 3840,
+            height: 1080,
+        });
+        let described = |index: usize,
+                         left: i32,
+                         label: Option<&str>,
+                         size: Option<PhysicalSizeMm>| MonitorDescription {
+            info: MonitorInfo {
+                id: Some(fake_monitor_id(index)),
+                rect: MonitorRect {
+                    left,
+                    top: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            label: label.map(str::to_owned),
+            physical_size: size,
+        };
+        let panel = PhysicalSizeMm {
+            width_mm: 597,
+            height_mm: 336,
+        };
+
+        display.set_monitor_descriptions(vec![
+            described(0, 0, Some("DELL U2720Q"), Some(panel)),
+            described(1, 1920, Some("LG ULTRAGEAR"), None),
+            described(2, 3840, None, Some(panel)),
+        ]);
+
+        let descriptions = display.monitor_descriptions().unwrap();
+        assert_eq!(descriptions[0].physical_size, Some(panel));
+        assert_eq!(descriptions[1].physical_size, None);
+        assert_eq!(descriptions[2].label, None);
+        assert_eq!(descriptions[2].physical_size, Some(panel));
+
+        // Neither reaches the two cheaper queries, and neither can lose a
+        // monitor: all three lists describe the same three screens.
+        assert_eq!(display.monitors().unwrap().len(), 3);
+        assert_eq!(
+            display.monitor_layout().unwrap(),
+            descriptions
+                .iter()
+                .map(|description| description.info.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // The identity setter clears both, so a test about ids is never
+        // accidentally also a test about descriptions.
+        display.set_monitor_layout(
+            descriptions
+                .into_iter()
+                .map(|description| description.info)
+                .collect(),
+        );
+        assert!(
+            display
+                .monitor_descriptions()
+                .unwrap()
+                .iter()
+                .all(|d| d.label.is_none() && d.physical_size.is_none())
+        );
+    }
+
+    /// A rectangle that survives a `set_monitors` keeps the id it had.
+    ///
+    /// Relabelling a surviving screen is the failure mode ADR 0018 chose
+    /// device strings to avoid, so the fake must not model it by accident:
+    /// a test that unplugs a monitor would otherwise see every *remaining*
+    /// screen silently renamed.
+    #[test]
+    fn a_surviving_monitor_keeps_its_id_across_a_geometry_change() {
+        let display = FakeDisplay::new(Screen {
+            width: 3840,
+            height: 1080,
+        });
+        let left = MonitorRect {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let middle = MonitorRect {
+            left: 1920,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let right = MonitorRect {
+            left: 3840,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+
+        display.set_monitors(vec![left, middle, right]);
+        let ids = |display: &FakeDisplay| -> Vec<Option<String>> {
+            display
+                .monitor_layout()
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect()
+        };
+        let before = ids(&display);
+        assert_eq!(
+            before,
+            vec![
+                Some(fake_monitor_id(0)),
+                Some(fake_monitor_id(1)),
+                Some(fake_monitor_id(2)),
+            ]
+        );
+
+        // Unplug the middle one: the survivors keep their names, and the
+        // list does not shuffle them down.
+        display.set_monitors(vec![left, right]);
+        assert_eq!(
+            ids(&display),
+            vec![before[0].clone(), before[2].clone()],
+            "unplugging a monitor renamed the ones that stayed"
+        );
+
+        // Plug a new one in: it gets the lowest free name — the one the
+        // departed monitor gave up — and never a live neighbour's.
+        display.set_monitors(vec![left, middle, right]);
+        let after = ids(&display);
+        assert_eq!(after[0], before[0]);
+        assert_eq!(after[2], before[2]);
+        assert_eq!(after[1], Some(fake_monitor_id(1)));
+
+        // Reordering the same rectangles moves the ids with them rather
+        // than reassigning by position.
+        display.set_monitors(vec![right, left, middle]);
+        assert_eq!(
+            ids(&display),
+            vec![after[2].clone(), after[0].clone(), after[1].clone()]
+        );
+
+        // Two identical rectangles are matched once each, so a duplicate
+        // cannot claim the same name twice.
+        display.set_monitors(vec![left, left]);
+        let duplicated = ids(&display);
+        assert_eq!(duplicated.len(), 2);
+        assert_ne!(duplicated[0], duplicated[1]);
+        assert!(duplicated.iter().all(Option::is_some));
+    }
+}
+
+/// In-memory [`VirtualFileClipboard`]: records what was offered, and lets
+/// a test say whether the clipboard has since moved on.
+///
+/// The two questions this fake answers are the two the real object exists
+/// to answer — *did the offer land* and *is it still ours* — so the
+/// engine's lifetime rule and loop guard are exercisable with no OS
+/// clipboard and no apartment thread.
+#[derive(Debug, Default)]
+pub struct FakeVirtualFiles {
+    offers: Mutex<Vec<VirtualFile>>,
+    current: Mutex<bool>,
+    withdrawals: Mutex<u32>,
+    /// When set, the next offer fails with this error (then clears).
+    fail_next: Mutex<Option<ClipboardError>>,
+}
+
+impl FakeVirtualFiles {
+    /// A fake holding nothing, offering nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything offered so far, oldest first.
+    #[must_use]
+    pub fn offers(&self) -> Vec<VirtualFile> {
+        self.offers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many times the offer has been withdrawn.
+    #[must_use]
+    pub fn withdrawals(&self) -> u32 {
+        *self
+            .withdrawals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Somebody else copied: the clipboard has moved on from our item.
+    pub fn moved_on(&self) {
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    }
+
+    /// Fail the next offer with `error`.
+    pub fn fail_next(&self, error: ClipboardError) {
+        *self
+            .fail_next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(error);
+    }
+}
+
+impl VirtualFileClipboard for FakeVirtualFiles {
+    fn offer(&self, file: &VirtualFile) -> Result<(), ClipboardError> {
+        if let Some(error) = self
+            .fail_next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            return Err(error);
+        }
+        self.offers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(file.clone());
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        Ok(())
+    }
+
+    fn is_current(&self) -> bool {
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn withdraw(&self) -> Result<(), ClipboardError> {
+        *self
+            .withdrawals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        Ok(())
+    }
+}
+
+/// What a [`FakeFileBlobBuilder`] should produce for the next selection.
+///
+/// The packing itself is the Windows builder's business (the walk, the
+/// reparse-point rule, the archive); this stands in for its *answer*, so
+/// the engine transaction above it can be driven over every shape of
+/// result without a filesystem to arrange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeBlob {
+    /// The name the builder derived, before any validation.
+    pub proposed_name: String,
+    /// Where that name came from.
+    pub naming: BlobNaming,
+    /// Whether the blob stands for an archive.
+    pub archived: bool,
+    /// How many entries it packs.
+    pub entry_count: u32,
+    /// Uncompressed total of those entries.
+    pub original_bytes: u64,
+    /// The blob's bytes.
+    pub content: Vec<u8>,
+}
+
+impl FakeBlob {
+    /// One file's bytes, travelling verbatim under `name`.
+    #[must_use]
+    pub fn verbatim(name: &str, content: Vec<u8>) -> Self {
+        Self {
+            proposed_name: name.to_owned(),
+            naming: BlobNaming::Own,
+            archived: false,
+            entry_count: 1,
+            original_bytes: content.len() as u64,
+            content,
+        }
+    }
+}
+
+/// A scriptable [`FileBlobBuilder`].
+///
+/// The one place it diverges from the real contract is stated rather than
+/// hidden: a real builder never lets a caller name the artifact, and this
+/// one writes into a directory of its own under the process temp
+/// directory so a test can run without a platform builder. It matches the
+/// contract where it counts — the returned handle is positioned at the
+/// start, and the file is unlinked as soon as it is open, so the bytes
+/// live exactly as long as the [`FileBlob`] does.
+#[derive(Debug)]
+pub struct FakeFileBlobBuilder {
+    plan: Mutex<FakeBlob>,
+    refuse_next: Mutex<Option<FileBlobRefusal>>,
+    selections: Mutex<Vec<Vec<std::path::PathBuf>>>,
+    dir: std::path::PathBuf,
+}
+
+impl FakeFileBlobBuilder {
+    /// A builder that packs every selection into `content`, under `name`.
+    ///
+    /// # Panics
+    ///
+    /// If its working directory cannot be created — a fake with nowhere
+    /// to write is a broken test rig, not a condition to model.
+    #[must_use]
+    pub fn new(name: &str, content: Vec<u8>) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "crossover-fake-blob-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("fake blob builder working directory");
+        Self {
+            plan: Mutex::new(FakeBlob::verbatim(name, content)),
+            refuse_next: Mutex::new(None),
+            selections: Mutex::new(Vec::new()),
+            dir,
+        }
+    }
+
+    /// Produce `blob` for every following selection.
+    pub fn produce(&self, blob: FakeBlob) {
+        *self.plan.lock().unwrap_or_else(PoisonError::into_inner) = blob;
+    }
+
+    /// Refuse the next selection with `refusal`, then resume producing.
+    pub fn refuse_next(&self, refusal: FileBlobRefusal) {
+        *self
+            .refuse_next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(refusal);
+    }
+
+    /// Every selection handed to this builder, oldest first.
+    #[must_use]
+    pub fn selections(&self) -> Vec<Vec<std::path::PathBuf>> {
+        self.selections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for FakeFileBlobBuilder {
+    fn drop(&mut self) {
+        // Best effort: the artifacts are already unlinked, so this only
+        // removes the directory itself.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl FileBlobBuilder for FakeFileBlobBuilder {
+    fn build(&self, selection: &[std::path::PathBuf]) -> Result<FileBlob, FileBlobRefusal> {
+        use sha2::Digest as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        self.selections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(selection.to_vec());
+        if let Some(refusal) = self
+            .refuse_next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            return Err(refusal);
+        }
+        let plan = self
+            .plan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let path = self
+            .dir
+            .join(format!("{}.blob", NEXT.fetch_add(1, Ordering::Relaxed)));
+        let backend = |error: std::io::Error| FileBlobRefusal::Backend {
+            reason: error.to_string(),
+        };
+        std::fs::write(&path, &plan.content).map_err(backend)?;
+        let content = std::fs::File::open(&path).map_err(backend)?;
+        // Unlinked while open, so the bytes outlive the name and die with
+        // the handle — the property the real builder gets from
+        // `FILE_FLAG_DELETE_ON_CLOSE`.
+        let _ = std::fs::remove_file(&path);
+        Ok(FileBlob {
+            proposed_name: plan.proposed_name,
+            naming: plan.naming,
+            archived: plan.archived,
+            entry_count: plan.entry_count,
+            original_bytes: plan.original_bytes,
+            content_length: plan.content.len() as u64,
+            content_hash: sha2::Sha256::digest(&plan.content).into(),
+            content,
+        })
     }
 }

@@ -84,29 +84,64 @@
 //! refused permanently rather than guessed at. No format is transcoded
 //! into another (ADR 0014); this build's Windows sender emits `Dib`, so the
 //! other two arise only from a future non-Windows peer.
+//!
+//! # Files (ADR 0015's sender-side observation, feature/133)
+//!
+//! **`CF_HDROP`, read as a list of local paths.** A file/folder selection
+//! copied in Explorer publishes `CF_HDROP`: a shell structure naming the
+//! selected paths on *this* machine, read through `DragQueryFileW` rather
+//! than `GlobalLock`ed and copied like the other two formats. Bounded to
+//! [`MAX_CLIPBOARD_FILE_ENTRIES`] entries, checked from the structure's own
+//! count before a single path is read, so an oversized selection costs
+//! nothing to refuse (NFR-1). This is an *observation* only — what the
+//! engine does with it (walking the selection, building an archive,
+//! offering it to a peer) is `crossover-core`'s job, staged for feature/135
+//! and deliberately a no-op until then.
+//!
+//! **This build's own virtual file list never round-trips through here.**
+//! What Crossover places on the clipboard for a *received* file
+//! ([`crate::virtual_file`]) advertises `CFSTR_FILEDESCRIPTORW` and
+//! `CFSTR_FILECONTENTS`, never `CF_HDROP` — so a probe here finds nothing
+//! to read while our own object is current, which is ADR 0015's loop
+//! prevention layer 2 ("no `CF_HDROP`, no send") holding structurally,
+//! independent of the ownership check `crossover_core::clipboard_driver`
+//! performs before a read is ever attempted (layer 1). A virtual file list
+//! from another application — Outlook's attachment promise is the usual
+//! example — is the same story for the same reason: it has no `CF_HDROP`
+//! representation either, so it was already invisible to this probe before
+//! this feature existed, and stays that way.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use std::path::{Path, PathBuf};
+
 use crossover_platform::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
-    MAX_CLIPBOARD_IMAGE_BYTES,
+    MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
 };
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::GlobalFree;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
     RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
-use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE, MSG, PostMessageW,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE,
+use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows::core::w;
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, DispatchMessageW, GetClassNameW, GetMessageW,
+    GetWindowThreadProcessId, HWND_MESSAGE, MSG, PostMessageW, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE,
+};
+use windows::core::{PWSTR, w};
 
 /// Private message asking the pump thread to shut down.
 const WM_APP_SHUTDOWN: u32 = WM_APP + 1;
@@ -193,28 +228,42 @@ impl Drop for WindowsClipboard {
 }
 
 impl ClipboardProvider for WindowsClipboard {
-    /// Reads `CF_UNICODETEXT`, else `CF_DIB` (ADR 0014).
+    /// Reads `CF_UNICODETEXT`, else `CF_HDROP`, else `CF_DIB` (ADR 0014,
+    /// ADR 0015).
     ///
     /// Text first, deliberately: a clipboard holding both is holding a
     /// rendering of its own text, and the transaction carries one type.
-    /// The reasoning is on the module.
+    /// The reasoning is on the module. A file/folder selection is checked
+    /// next, ahead of the image: like text, it is exactly what the user
+    /// selected rather than a rendering of something else, and in
+    /// practice the two never coexist — Explorer's file copy publishes no
+    /// `CF_UNICODETEXT` or `CF_DIB` alongside its `CF_HDROP`.
     ///
     /// **Non-empty** text, precisely. A source may publish a zero-length
     /// `CF_UNICODETEXT` beside a picture, and letting that win would
     /// propagate `""` — blanking the peer's clipboard instead of sending
     /// the image, which is worse than either content type. So an empty
-    /// text representation steps aside for an image, and only for an
-    /// image: an empty clipboard with no picture behind it still reads
-    /// exactly as it always has.
+    /// text representation steps aside for a file list or an image, and
+    /// only for those: an empty clipboard with neither behind it still
+    /// reads exactly as it always has.
     ///
-    /// An image past [`MAX_CLIPBOARD_IMAGE_BYTES`] reads as *absent* —
-    /// the trait's meaning for "nothing this backend represents" — and is
-    /// refused before its bytes are copied, never truncated (FR-3.6).
+    /// An image past [`MAX_CLIPBOARD_IMAGE_BYTES`], or a selection past
+    /// [`MAX_CLIPBOARD_FILE_ENTRIES`], reads as *absent* — the trait's
+    /// meaning for "nothing this backend represents" — refused before its
+    /// bytes (or its paths) are copied, never truncated (FR-3.6).
     ///
-    /// Both probes happen inside one open, so the precedence above is
+    /// A virtual file list this process itself placed (ADR 0015) never
+    /// reaches here as `CF_HDROP` at all: the object we offer serves
+    /// `CFSTR_FILEDESCRIPTORW`/`CFSTR_FILECONTENTS`, not `CF_HDROP`, so
+    /// there is no format for this probe to find (ADR 0015's loop
+    /// prevention, layer 2 — see `crossover_core::clipboard_driver`, whose
+    /// layer 1 ownership check already stops a change notification from
+    /// reaching a read at all while our object is current).
+    ///
+    /// All three probes happen inside one open, so the precedence above is
     /// decided from a single clipboard state ([`read_current`]).
     fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
-        read_current(MAX_CLIPBOARD_IMAGE_BYTES)
+        read_current(MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_FILE_ENTRIES)
     }
 
     /// Writes `CF_UNICODETEXT`, `CF_DIB`, or the registered `"PNG"`
@@ -225,12 +274,27 @@ impl ClipboardProvider for WindowsClipboard {
     /// from a clipboard that is merely busy or broken (FR-3.2, NFR-3). An
     /// image past [`MAX_CLIPBOARD_IMAGE_BYTES`] is refused the same way,
     /// mirroring the ceiling the read path enforces.
+    ///
+    /// `FileList` is refused the same way, permanently: a file list is
+    /// placed on the clipboard through [`VirtualFileClipboard`], a
+    /// separate mechanism with its own apartment thread (ADR 0015), not
+    /// through this trait. Nothing in this build ever constructs a
+    /// `FileList` to write — it is a local *observation* the engine does
+    /// not yet stage for transmission (feature/133) — so this arm is a
+    /// defensive statement of the contract, not a path production takes.
+    ///
+    /// [`VirtualFileClipboard`]: crossover_platform::VirtualFileClipboard
     fn write(&self, content: &ClipboardContent) -> Result<(), ClipboardError> {
         match content {
             ClipboardContent::Text(text) => write_unicode_text(text),
             ClipboardContent::Image { format, bytes } => {
                 write_image(*format, bytes, MAX_CLIPBOARD_IMAGE_BYTES)
             }
+            ClipboardContent::FileList(_) => Err(ClipboardError::Unsupported {
+                reason: "a file list is placed via VirtualFileClipboard, not \
+                         ClipboardProvider::write (ADR 0015)"
+                    .to_owned(),
+            }),
         }
     }
 
@@ -243,49 +307,78 @@ impl ClipboardProvider for WindowsClipboard {
     }
 }
 
-/// Decide text-versus-image from **one** clipboard state.
+/// Decide text-versus-file-list-versus-image from **one** clipboard state.
 ///
-/// Both probes run under a single `OpenClipboard`, deliberately. Opening
-/// twice would let the clipboard change in between, and the precedence
-/// rule would then be applied to a pair of states that never existed
-/// together: text read as absent from the old contents, an image found in
-/// the new ones, and an image synchronized while the source's clipboard
-/// actually held text. That window is exactly what a user creates by
-/// copying twice in quick succession, and mixed-content precedence is the
+/// All three probes run under a single `OpenClipboard`, deliberately.
+/// Opening more than once would let the clipboard change in between, and
+/// the precedence rule would then be applied to a pair of states that never
+/// existed together: text read as absent from the old contents, an image
+/// found in the new ones, and an image synchronized while the source's
+/// clipboard actually held text. That window is exactly what a user creates
+/// by copying twice in quick succession, and mixed-content precedence is the
 /// part of this backend a human is asked to confirm by eye
 /// (docs/SOAK.md, Phase 7 hardware validation), so it should not be
 /// deciding across two different clipboards.
 ///
 /// It costs nothing in lock time for the common case: non-empty text
-/// returns without ever probing `CF_DIB`, so only a clipboard that is
-/// image-or-empty is examined twice under the one open.
-fn read_current(max_image_bytes: usize) -> Result<Option<ClipboardContent>, ClipboardError> {
+/// returns without ever probing `CF_HDROP` or `CF_DIB`, so only a clipboard
+/// that is file-list-or-image-or-empty is examined further under the one
+/// open.
+fn read_current(
+    max_image_bytes: usize,
+    max_file_entries: u32,
+) -> Result<Option<ClipboardContent>, ClipboardError> {
     let mut raw_image = None;
-    let mut oversized = None;
+    let mut oversized_image = None;
+    let mut file_list = None;
+    let mut oversized_file_list = None;
     // Held to the probes and the copies. The UTF-16 decode, the
-    // canonicalization, and the refusal log all run below, once this
+    // canonicalization, and the refusal logs all run below, once this
     // guard has dropped and the machine-global lock is free.
     let units = {
-        let open = OpenGuard::open()?;
+        let open = OpenGuard::open("read")?;
         match probe_unicode_text(&open)? {
             Some(units) if !units.is_empty() => Some(units),
             empty_or_absent => {
-                match probe_dib(&open, max_image_bytes)? {
-                    DibProbe::Raw(blob) => raw_image = Some(blob),
-                    DibProbe::TooLarge { byte_count } => oversized = Some(byte_count),
-                    DibProbe::Absent => {}
+                match probe_hdrop(&open, max_file_entries)? {
+                    HdropProbe::Raw(paths) => file_list = Some(paths),
+                    HdropProbe::TooManyEntries { entry_count } => {
+                        oversized_file_list = Some(entry_count);
+                    }
+                    HdropProbe::Absent => {}
+                }
+                // A file list, once found, wins outright: skip the image
+                // probe rather than pay for it. An oversized selection is
+                // *absent* for precedence purposes, exactly like an
+                // oversized image below, so it still falls through here.
+                if file_list.is_none() {
+                    match probe_dib(&open, max_image_bytes)? {
+                        DibProbe::Raw(blob) => raw_image = Some(blob),
+                        DibProbe::TooLarge { byte_count } => oversized_image = Some(byte_count),
+                        DibProbe::Absent => {}
+                    }
                 }
                 empty_or_absent
             }
         }
     };
 
-    if let Some(byte_count) = oversized {
+    if let Some(entry_count) = oversized_file_list {
+        tracing::warn!(
+            entry_count,
+            max_entries = max_file_entries,
+            "clipboard file selection exceeds the maximum entry count; not synchronized"
+        );
+    }
+    if let Some(byte_count) = oversized_image {
         tracing::warn!(
             byte_count,
             max_bytes = max_image_bytes,
             "clipboard image exceeds the maximum; not synchronized"
         );
+    }
+    if let Some(paths) = file_list {
+        return Ok(Some(ClipboardContent::FileList(paths)));
     }
     if let Some(blob) = raw_image {
         return Ok(Some(ClipboardContent::Image {
@@ -293,8 +386,8 @@ fn read_current(max_image_bytes: usize) -> Result<Option<ClipboardContent>, Clip
             bytes: canonical_dib(blob),
         }));
     }
-    // An oversized image is *absent*, which leaves an empty text
-    // representation beside it reading as it always has.
+    // An oversized file list or image is *absent*, which leaves an empty
+    // text representation beside it reading as it always has.
     Ok(units.map(|units| ClipboardContent::Text(String::from_utf16_lossy(&units))))
 }
 
@@ -513,6 +606,121 @@ fn probe_dib(_open: &OpenGuard, max_bytes: usize) -> Result<DibProbe, ClipboardE
     Ok(DibProbe::Raw(blob))
 }
 
+/// One `DragQueryFileW` name's own length bound, independent of
+/// [`MAX_CLIPBOARD_FILE_ENTRIES`] (which bounds the *list*, not one name).
+///
+/// This is not `crossover_protocol`'s `MAX_FILE_NAME_*` — those bound the
+/// *sanitized* name that later travels the wire, and applying them here
+/// would be validating a source path as though it were already the
+/// network input it is not yet (ADR 0015 leaves that to the sender-side
+/// selection walk, feature/135). This bound exists purely so a length
+/// `DragQueryFileW` reports cannot drive an unbounded allocation (NFR-1);
+/// it is Windows' own long-path ceiling (`\\?\`-prefixed paths run to
+/// about 32K UTF-16 units), far past anything a real path needs.
+const MAX_HDROP_PATH_UNITS: u32 = 32_767;
+
+/// What a `CF_HDROP` probe found.
+///
+/// "Too many entries" is a variant rather than a log line inside the probe
+/// for the same reason [`DibProbe::TooLarge`] is: the probe runs with the
+/// clipboard open, and `tracing` under the machine-global lock can block on
+/// a subscriber's I/O. The caller reports it once the guard has dropped.
+enum HdropProbe {
+    /// No `CF_HDROP` representation, an empty one, or one this probe could
+    /// not safely enumerate (a name past [`MAX_HDROP_PATH_UNITS`], or a
+    /// `DragQueryFileW` call that failed mid-list) — refused whole rather
+    /// than reported as a partial selection.
+    Absent,
+    /// Present, but past [`MAX_CLIPBOARD_FILE_ENTRIES`] — refused whole,
+    /// never truncated.
+    TooManyEntries { entry_count: u32 },
+    /// Present, within the ceiling, and every path successfully read.
+    Raw(Vec<PathBuf>),
+}
+
+/// Probe `CF_HDROP` on the already-open clipboard (ADR 0015).
+///
+/// Takes the open guard rather than opening, so this and
+/// [`probe_unicode_text`]/[`probe_dib`] see one clipboard state — see
+/// [`read_current`].
+///
+/// Unlike `CF_UNICODETEXT`/`CF_DIB`, there is no raw block to `GlobalLock`
+/// and copy out before parsing: an `HDROP` is an opaque shell structure,
+/// and `DragQueryFileW` is the only sanctioned way to read it. So, unlike
+/// [`probe_dib`], the UTF-16-to-`PathBuf` conversion happens *inside* the
+/// critical section here — there is no separable "copy now, decode later"
+/// step to defer. This is bounded work regardless: at most
+/// [`MAX_CLIPBOARD_FILE_ENTRIES`] calls, each against a length already
+/// capped by [`MAX_HDROP_PATH_UNITS`], nothing like the multi-megabyte
+/// image case the deferred-decode discipline exists for.
+///
+/// The entry count is read from `DragQueryFileW(hdrop, u32::MAX, None)` —
+/// documented Win32 behaviour for "how many files" — and checked against
+/// `max_entries` **before** a single name is queried (NFR-1): a selection
+/// past the ceiling is refused without touching its paths at all.
+fn probe_hdrop(_open: &OpenGuard, max_entries: u32) -> Result<HdropProbe, ClipboardError> {
+    // SAFETY: no arguments; checks format availability only.
+    if unsafe { IsClipboardFormatAvailable(u32::from(CF_HDROP.0)) }.is_err() {
+        return Ok(HdropProbe::Absent); // empty clipboard, or no file-list representation
+    }
+
+    // SAFETY: the clipboard is open (caller's guard); the returned handle
+    // stays owned by the clipboard, never by us. Ownership can churn
+    // between our open and this call, which surfaces as an error here and
+    // is retryable contention, not a fault (R-5).
+    let handle =
+        unsafe { GetClipboardData(u32::from(CF_HDROP.0)) }.map_err(|e| ClipboardError::Busy {
+            reason: format!("GetClipboardData(CF_HDROP) failed (ownership churn?): {e}"),
+        })?;
+    if handle.is_invalid() {
+        return Ok(HdropProbe::Absent);
+    }
+    let hdrop = HDROP(handle.0);
+
+    // SAFETY: `hdrop` came from GetClipboardData while the clipboard is
+    // open. `ifile = u32::MAX` with no buffer is the documented
+    // "how many files" query — it reads the structure's own count, not a
+    // name, so nothing is copied yet.
+    let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
+    if count == 0 {
+        return Ok(HdropProbe::Absent);
+    }
+    if count > max_entries {
+        // Reported, not logged here, so the caller can close the
+        // clipboard first — see the module note on `HdropProbe`.
+        return Ok(HdropProbe::TooManyEntries { entry_count: count });
+    }
+
+    let mut paths = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        // SAFETY: `hdrop` is a live HDROP from the open clipboard; a
+        // `None` buffer with a real index is documented to report the
+        // name's length (in UTF-16 units, excluding the terminator)
+        // rather than copy anything.
+        let needed = unsafe { DragQueryFileW(hdrop, index, None) };
+        if needed == 0 || needed > MAX_HDROP_PATH_UNITS {
+            // A name this probe cannot safely size is refused as part of
+            // the whole selection, never as a silently shorter list
+            // (the same "never truncated" discipline the length ceiling
+            // above already keeps at the list level).
+            return Ok(HdropProbe::Absent);
+        }
+        let mut buffer = vec![0u16; needed as usize + 1]; // +1 for the terminator DragQueryFileW writes
+        // SAFETY: `buffer` has room for `needed` units plus the
+        // terminator; `hdrop` and `index` are unchanged from the sizing
+        // call above.
+        let written = unsafe { DragQueryFileW(hdrop, index, Some(&mut buffer)) };
+        if written == 0 {
+            return Ok(HdropProbe::Absent);
+        }
+        // `written` excludes the terminator (documented behaviour),
+        // matching `probe_unicode_text`'s own terminator handling.
+        buffer.truncate(written as usize);
+        paths.push(PathBuf::from(String::from_utf16_lossy(&buffer)));
+    }
+    Ok(HdropProbe::Raw(paths))
+}
+
 /// Replace the clipboard with `text` as `CF_UNICODETEXT`.
 fn write_unicode_text(text: &str) -> Result<(), ClipboardError> {
     // UTF-16LE with the terminator `CF_UNICODETEXT` requires, built
@@ -629,7 +837,7 @@ fn install_formats(items: &[(u32, &[u8])]) -> Result<(), ClipboardError> {
     }
 
     // The critical section starts here and holds only the clipboard calls.
-    let _open = match OpenGuard::open() {
+    let _open = match OpenGuard::open("write") {
         Ok(guard) => guard,
         Err(error) => {
             free_blocks(&blocks);
@@ -858,24 +1066,336 @@ fn le_i32(blob: &[u8], at: usize) -> Option<i32> {
         .map(i32::from_le_bytes)
 }
 
+/// Which of our own call sites currently holds the clipboard open, if
+/// any — feature/162's answer to a gap the window-based lookup below
+/// cannot close on its own: every in-process open here uses a `NULL`
+/// hwnd (`OpenClipboard(None)`, `OleSetClipboard`), which
+/// `GetOpenClipboardWindow` cannot see at all (the same invisibility
+/// docs/SOAK.md's wedged-service note describes) — so without this
+/// marker, Crossover contending with *itself* (the OLE virtual-file
+/// apartment thread against the ordinary text/image path, say) would
+/// misreport as "unidentified" rather than naming the real cause.
+///
+/// This is confirmed to matter for that OLE-vs-`OpenGuard` case
+/// specifically, not for two `OpenGuard` opens against each other:
+/// `OpenClipboard(NULL)` associates the open with "the current task"
+/// (MSDN), and empirically (feature/162's own test development) a second
+/// same-process thread calling `OpenClipboard(NULL)` while the first
+/// still holds it is *admitted* rather than blocked — Windows does not
+/// contend two null-hwnd opens from the same process against each other,
+/// so `OpenGuard` racing `OpenGuard` never reaches this marker's `Busy`
+/// path at all, on this machine, at least. The marker is still correct
+/// and still cheap to keep for that case (a future Windows version or
+/// configuration could contend it, and the reverse read is still exactly
+/// right if it ever does), but its practical value today is the OLE site,
+/// whose underlying apartment window is a real, distinct resource from
+/// `OpenGuard`'s.
+///
+/// Set by [`mark_own_hold`] (`OpenGuard` the instant its open succeeds;
+/// the OLE placement just before the call that might contend, since it
+/// has no separate open step) and cleared by [`clear_own_hold`] — both
+/// called only from this crate's own clipboard code, never from a `Busy`
+/// path (nothing here blocks). At most one hold is tracked at a time, on
+/// the honest assumption that this process opens the clipboard from one
+/// thread at a time in the ordinary case; see the two functions for how
+/// a genuine overlap between our own call sites is kept from corrupting
+/// it.
+static OWN_HOLD: Mutex<Option<OwnHold>> = Mutex::new(None);
+
+/// One of this process's own clipboard-holding call sites, recorded in
+/// [`OWN_HOLD`] while it is live.
+#[derive(Clone, Copy)]
+struct OwnHold {
+    /// The OS thread id holding it (`GetCurrentThreadId`) — the same unit
+    /// [`ClipboardHolder::thread`] is in, so the two read the same way.
+    thread: u32,
+    /// Which call site, printed verbatim in the diagnostic: `"read"` and
+    /// `"write"` from [`OpenGuard::open`]'s callers in this file, `"ole"`
+    /// from `crate::virtual_file`'s placement.
+    site: &'static str,
+}
+
+/// Record that `site` now holds the clipboard open, on this thread. Pair
+/// with [`clear_own_hold`] — every caller must clear on every exit path,
+/// success or failure, or a stale marker would misname a later holder.
+///
+/// Deliberately marked *before* the call it describes, not after it
+/// succeeds — `crate::virtual_file`'s OLE placement is a single call with
+/// no separate open/close, and by the time it returns success the
+/// clipboard is already released again, so marking only on success would
+/// describe a hold that no longer exists by the time anyone could read
+/// it. The cost of marking early is that two of our own call sites can
+/// genuinely be mid-mark at once — an `OpenGuard` racing the OLE
+/// placement is exactly the contention this marker exists to describe —
+/// so this never overwrites a hold another thread already recorded:
+/// whichever thread holds the *real* Win32 lock is the one whose mark
+/// must survive, and an overwrite would rename that live hold to
+/// whichever thread called this last, only for that thread's own (often
+/// much shorter) [`clear_own_hold`] to then erase it while the first
+/// thread is still genuinely holding the clipboard.
+pub(crate) fn mark_own_hold(site: &'static str) {
+    // SAFETY: a bare read of the calling thread's own id.
+    let thread = unsafe { GetCurrentThreadId() };
+    let mut hold = OWN_HOLD.lock().unwrap_or_else(PoisonError::into_inner);
+    let overwrite = match *hold {
+        None => true,
+        // Already ours (not expected to happen — no call site here nests
+        // — but harmless and correct if it ever did).
+        Some(existing) => existing.thread == thread,
+    };
+    if overwrite {
+        *hold = Some(OwnHold { thread, site });
+    }
+}
+
+/// Clear whatever [`mark_own_hold`] set — but only if *this thread* set
+/// it. [`mark_own_hold`] may have declined to overwrite another thread's
+/// still-live hold; an unconditional clear here would then wipe that
+/// thread's marker out from under it while it is still genuinely holding
+/// the clipboard. Always safe to call, including when nothing is held or
+/// when the live hold belongs to some other thread.
+pub(crate) fn clear_own_hold() {
+    let mut hold = OWN_HOLD.lock().unwrap_or_else(PoisonError::into_inner);
+    // SAFETY: a bare read of the calling thread's own id.
+    let current = unsafe { GetCurrentThreadId() };
+    if matches!(*hold, Some(existing) if existing.thread == current) {
+        *hold = None;
+    }
+}
+
+/// If [`OWN_HOLD`] names a hold on some *other* thread than the caller's
+/// own, render it — this is checked before the window-based lookup below,
+/// since it is the only thing that can see a `NULL`-hwnd open. A hold
+/// recorded on the caller's own thread is not a meaningful "other holder"
+/// (reentrant opens do not happen in this codebase, but reporting
+/// ourselves as our own blocker would be a strange line to log), so that
+/// case falls through instead.
+fn describe_own_hold() -> Option<String> {
+    let hold = (*OWN_HOLD.lock().unwrap_or_else(PoisonError::into_inner))?;
+    // SAFETY: a bare read of the calling thread's own id.
+    if hold.thread == unsafe { GetCurrentThreadId() } {
+        return None;
+    }
+    Some(format!(
+        "held by this process (our own clipboard guard on thread {}, site \"{}\")",
+        hold.thread, hold.site
+    ))
+}
+
+/// A clipboard holder identified well enough to name — the Win32 lookups
+/// in [`find_clipboard_holder`] populate this; [`format_holder`] renders
+/// it, kept separate so the rendering is unit-testable without a live
+/// window or process.
+struct ClipboardHolder {
+    pid: u32,
+    thread: u32,
+    /// `None` when `GetClassNameW` failed — kept distinct from "resolved
+    /// to some string" (rather than defaulting to a placeholder word) so
+    /// the diagnostic can never be confused with a window genuinely
+    /// classed that word. Never the window title (FR-7.4): a title can
+    /// carry document content, a class name cannot — though a class name
+    /// is still attacker-influenced text (any same-user process can
+    /// register one), so it travels escaped (SECURITY.md F11's
+    /// precedent).
+    window_class: Option<String>,
+    is_this_process: bool,
+    /// Never the full path (FR-7.4): a path can carry a username.
+    image_file_name: Option<String>,
+}
+
+/// Identify who currently holds the clipboard open, for the `Busy`
+/// diagnostic (FR-7.3) — hardware evidence (2026-09-01) showed a bare
+/// "held elsewhere?" leaves no way to tell an external holder (Clipboard
+/// History, a password manager, an RDP client) from contention inside this
+/// process (e.g. the OLE virtual-file apartment thread in
+/// `crate::virtual_file`).
+///
+/// Checks [`describe_own_hold`] first — the only thing that can identify
+/// a `NULL`-hwnd open, which is what every call site in this codebase
+/// uses — and falls back to the window-based lookup, which also covers a
+/// same-process holder that (unlike ours) does associate a real window.
+///
+/// Every lookup here is best-effort and degrades to "unidentified" on any
+/// failure — never panics, never blocks (no waits), and every buffer is
+/// fixed-size.
+pub(crate) fn describe_clipboard_holder() -> String {
+    if let Some(reason) = describe_own_hold() {
+        return reason;
+    }
+    format_holder(find_clipboard_holder())
+}
+
+/// The window-based half of [`describe_clipboard_holder`]: who, if anyone
+/// identifiable by an associated window, has the clipboard open right
+/// now.
+fn find_clipboard_holder() -> Option<ClipboardHolder> {
+    // SAFETY: a bare query of global clipboard state; touches no handle
+    // or buffer of our own.
+    let holder = match unsafe { GetOpenClipboardWindow() } {
+        Ok(hwnd) if !hwnd.is_invalid() => hwnd,
+        // No window is associated with the open. Two distinct causes
+        // read identically here: the holder released between our failed
+        // open and this lookup (benign — a race inherent to asking
+        // afterwards), or the holder opened with a `NULL` hwnd the way
+        // this codebase's own call sites do (which `describe_own_hold`
+        // already ruled out being *us*, so it is some other process
+        // doing the same thing, or the wedged-Clipboard-User-Service
+        // signature docs/SOAK.md documents if it does not clear).
+        _ => return None,
+    };
+
+    let mut pid = 0u32;
+    // SAFETY: `holder` was just returned live by `GetOpenClipboardWindow`;
+    // the out-pointer is valid for the duration of this call.
+    let thread = unsafe { GetWindowThreadProcessId(holder, Some(&raw mut pid)) };
+    if pid == 0 {
+        return None;
+    }
+
+    let window_class = window_class_name(holder);
+    // SAFETY: a bare read of the calling process's own id.
+    let is_this_process = pid == unsafe { GetCurrentProcessId() };
+    // The single most important bit is `is_this_process`: it separates
+    // in-process contention from an external holder. An image name for
+    // our own process would say nothing that pid doesn't already.
+    let image_file_name = if is_this_process {
+        None
+    } else {
+        process_image_file_name(pid)
+    };
+
+    Some(ClipboardHolder {
+        pid,
+        thread,
+        window_class,
+        is_this_process,
+        image_file_name,
+    })
+}
+
+/// Render a holder lookup into the `Busy` diagnostic's trailing clause.
+/// Pure formatting — no Win32 calls — so this shape is covered by a plain
+/// unit test.
+fn format_holder(holder: Option<ClipboardHolder>) -> String {
+    let Some(holder) = holder else {
+        return "held by an unidentified owner (no window)".to_owned();
+    };
+    let ClipboardHolder {
+        pid,
+        thread,
+        window_class,
+        is_this_process,
+        image_file_name,
+    } = holder;
+    // Unquoted on purpose: every *real* class name below is quoted, so
+    // this phrase can never be mistaken for one (a window really named
+    // "unreadable" would still print quoted).
+    let window_class = match window_class {
+        Some(name) => format!("window class \"{name}\""),
+        None => "window class unreadable".to_owned(),
+    };
+    if is_this_process {
+        return format!("held by this process (pid {pid}, thread {thread}, {window_class})");
+    }
+    match image_file_name {
+        Some(name) => format!("held by pid {pid} \"{name}\" ({window_class})"),
+        None => format!("held by pid {pid} ({window_class})"),
+    }
+}
+
+/// A window's class name, bounded and best-effort — never the window
+/// title (FR-7.4). `None` on any Win32 failure, deliberately not a
+/// placeholder string: see [`ClipboardHolder::window_class`].
+fn window_class_name(hwnd: HWND) -> Option<String> {
+    let mut buffer = [0u16; WINDOW_CLASS_NAME_BUFFER_UNITS];
+    // SAFETY: `hwnd` is a live window handle from the caller; `buffer` is
+    // a real, fixed-size allocation for the duration of the call.
+    let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    let len = usize::try_from(len).ok().filter(|&len| len > 0)?;
+    let name = String::from_utf16_lossy(buffer.get(..len)?);
+    Some(escape_class_name(&name))
+}
+
+/// A window class name is attacker-influenced text — any same-user
+/// process may register one containing quotes or newlines — so it is
+/// escaped before it ever reaches a log line (SECURITY.md F11's escaping
+/// precedent). Split out from [`window_class_name`] so the escaping
+/// policy itself is unit-testable without a live window.
+fn escape_class_name(name: &str) -> String {
+    name.escape_debug().to_string()
+}
+
+/// Bound on [`window_class_name`]'s buffer. Generous for an ordinary
+/// class name; a longer one is simply not read (best-effort).
+const WINDOW_CLASS_NAME_BUFFER_UNITS: usize = 256;
+
+/// A process's own executable **file name** (never the full path — a path
+/// can carry a username, FR-7.4), best-effort: any failure anywhere in
+/// this chain — the process not opening, the query failing, a name this
+/// build cannot decode — is `None` rather than propagated.
+fn process_image_file_name(pid: u32) -> Option<String> {
+    // SAFETY: `PROCESS_QUERY_LIMITED_INFORMATION` is read-only and
+    // available even for a process we do not own; the handle is closed
+    // below on every path out of this function.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buffer = [0u16; PROCESS_IMAGE_NAME_BUFFER_UNITS];
+    let mut len = u32::try_from(PROCESS_IMAGE_NAME_BUFFER_UNITS)
+        .expect("a MAX_PATH-sized constant fits a u32");
+    // SAFETY: `process` is the handle opened above, live for this call;
+    // `buffer`/`len` describe a real, sized allocation the API writes
+    // into and reports the written length back through.
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &raw mut len,
+        )
+    };
+    // SAFETY: closes the handle opened above, exactly once, regardless of
+    // whether the query succeeded.
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    queried.ok()?;
+    let path = String::from_utf16_lossy(buffer.get(..len as usize)?);
+    Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// `MAX_PATH`. `QueryFullProcessImageNameW` does not truncate past this —
+/// it fails outright with `ERROR_INSUFFICIENT_BUFFER`, so a path that
+/// does not fit simply loses the lookup, the same as any other
+/// best-effort failure in [`process_image_file_name`].
+const PROCESS_IMAGE_NAME_BUFFER_UNITS: usize = 260;
+
 /// RAII for `OpenClipboard`/`CloseClipboard`. Open failure is `Busy`:
 /// another process holding the clipboard is routine contention (R-5).
 struct OpenGuard;
 
 impl OpenGuard {
-    fn open() -> Result<Self, ClipboardError> {
+    /// `site` names this open for [`OWN_HOLD`] — `"read"` or `"write"`
+    /// from this file's own callers — so a failure elsewhere in this
+    /// process can say which of our call sites it collided with.
+    fn open(site: &'static str) -> Result<Self, ClipboardError> {
         // SAFETY: opening with no owning window associates the open with
         // the calling thread; EmptyClipboard then assigns no owner, which
         // is correct for immediate (non-delayed) rendering.
         unsafe { OpenClipboard(None) }.map_err(|e| ClipboardError::Busy {
-            reason: format!("OpenClipboard failed (clipboard held elsewhere?): {e}"),
+            reason: format!(
+                "OpenClipboard failed (clipboard held elsewhere?): {e}; {}",
+                describe_clipboard_holder()
+            ),
         })?;
+        mark_own_hold(site);
         Ok(Self)
     }
 }
 
 impl Drop for OpenGuard {
     fn drop(&mut self) {
+        clear_own_hold();
         // SAFETY: balances the successful OpenClipboard in `open`.
         let _ = unsafe { CloseClipboard() };
     }
@@ -959,8 +1479,8 @@ fn pump_thread(listener: &SharedListener, init: &std::sync::mpsc::Sender<Result<
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     use crossover_platform::{ClipboardError, ClipboardProvider};
@@ -998,13 +1518,99 @@ mod tests {
     /// read reports for either, and what these tests assert against.
     fn probe_dib(max_bytes: usize) -> Result<Option<Vec<u8>>, ClipboardError> {
         let probe = {
-            let open = super::OpenGuard::open()?;
+            let open = super::OpenGuard::open("read")?;
             super::probe_dib(&open, max_bytes)?
         };
         Ok(match probe {
             super::DibProbe::Raw(blob) => Some(super::canonical_dib(blob)),
             super::DibProbe::Absent | super::DibProbe::TooLarge { .. } => None,
         })
+    }
+
+    /// The holder diagnostic's formatting, isolated from the Win32 lookups
+    /// that populate it (feature/162) — deterministic, no live clipboard
+    /// or window involved, covering every shape `format_holder` produces.
+    #[test]
+    fn format_holder_names_the_owner_or_says_unidentified() {
+        use super::{ClipboardHolder, format_holder};
+
+        assert_eq!(
+            format_holder(None),
+            "held by an unidentified owner (no window)"
+        );
+
+        assert_eq!(
+            format_holder(Some(ClipboardHolder {
+                pid: 4321,
+                thread: 9,
+                window_class: Some("Notepad".to_owned()),
+                is_this_process: false,
+                image_file_name: Some("notepad.exe".to_owned()),
+            })),
+            "held by pid 4321 \"notepad.exe\" (window class \"Notepad\")"
+        );
+
+        // A pid resolved but the image name lookup failed (protected
+        // process, race with exit, etc.) — degrades gracefully rather
+        // than dropping the pid it does have.
+        assert_eq!(
+            format_holder(Some(ClipboardHolder {
+                pid: 4321,
+                thread: 9,
+                window_class: Some("Notepad".to_owned()),
+                is_this_process: false,
+                image_file_name: None,
+            })),
+            "held by pid 4321 (window class \"Notepad\")"
+        );
+
+        // The class name lookup itself failed: the unreadable-class
+        // phrase is unquoted specifically so it can never be confused
+        // with a window genuinely classed that word (which would still
+        // print quoted).
+        assert_eq!(
+            format_holder(Some(ClipboardHolder {
+                pid: 4321,
+                thread: 9,
+                window_class: None,
+                is_this_process: false,
+                image_file_name: None,
+            })),
+            "held by pid 4321 (window class unreadable)"
+        );
+
+        // The case the feature exists for: our own process, not an
+        // external application.
+        assert_eq!(
+            format_holder(Some(ClipboardHolder {
+                pid: 1234,
+                thread: 42,
+                window_class: Some("CLIPBRDWNDCLASS".to_owned()),
+                is_this_process: true,
+                image_file_name: None,
+            })),
+            "held by this process (pid 1234, thread 42, window class \"CLIPBRDWNDCLASS\")"
+        );
+    }
+
+    /// A window class name is text another local process gets to choose
+    /// (SECURITY.md F11's escaping precedent) — a quote or a newline in it
+    /// must not corrupt the diagnostic line's shape. `window_class_name`
+    /// itself needs a live Win32 window to exercise (covered end to end by
+    /// the contention tests below, which read real class names back
+    /// through it); this covers the escaping policy it delegates to
+    /// directly.
+    #[test]
+    fn a_hostile_class_name_is_escaped_before_it_reaches_the_line() {
+        use super::escape_class_name;
+
+        assert_eq!(
+            escape_class_name("we\"ird\nclass"),
+            "we\\\"ird\\nclass",
+            "a quote or newline must not survive into the diagnostic unescaped"
+        );
+        // An ordinary class name round-trips unchanged.
+        assert_eq!(escape_class_name("Notepad"), "Notepad");
     }
 
     /// JPEG has no Windows clipboard convention, and ADR 0014 forbids
@@ -1112,14 +1718,10 @@ mod tests {
         }
     }
 
-    /// The Windows clipboard is machine-global: serialize every test that
-    /// touches it, across this whole test binary.
-    fn clipboard_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    /// The Windows clipboard is machine-global, and the virtual-file
+    /// object shares it, so the lock is crate-wide rather than per module
+    /// (see `test_support`).
+    use crate::test_support::clipboard_lock;
 
     #[test]
     fn write_then_read_round_trips_unicode() {
@@ -1242,6 +1844,113 @@ mod tests {
             with_retry(|| clipboard.read_text()).unwrap().as_deref(),
             Some("after contention")
         );
+    }
+
+    /// The diagnostic's most important bit (feature/162): when the holder
+    /// is identifiable at all, it must say *this process*, not merely
+    /// "held elsewhere" — distinguishing in-process contention (the OLE
+    /// virtual-file apartment thread's shape) from a genuinely external
+    /// application. Unlike the test above, the holder thread opens with a
+    /// **real window** rather than `OpenClipboard(None)`: Win32 makes a
+    /// NULL-owner open invisible to `GetOpenClipboardWindow` (the
+    /// wedged-service signature docs/SOAK.md documents), so naming the
+    /// holder needs a window to name.
+    #[test]
+    fn contention_reason_names_this_process_when_a_window_is_identifiable() {
+        use windows::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+        use windows::core::w;
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+        with_retry(|| clipboard.write_text("before named contention")).unwrap();
+
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            // SAFETY: a message-only window from the prebuilt STATIC
+            // class, destroyed before this thread exits.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("crossover-holder-test"),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            };
+            let Ok(hwnd) = hwnd else {
+                holding_tx.send(false).ok();
+                return;
+            };
+
+            let mut acquired = false;
+            for _ in 0..20 {
+                // SAFETY: `hwnd` is the live window just created, kept
+                // alive for the rest of this closure.
+                if unsafe { OpenClipboard(Some(hwnd)) }.is_ok() {
+                    acquired = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            holding_tx.send(acquired).ok();
+            if acquired {
+                let _ = release_rx.recv();
+                // SAFETY: balances the successful open above.
+                unsafe {
+                    let _ = CloseClipboard();
+                }
+            }
+            // SAFETY: destroys the window this thread created; nothing
+            // else references it once the clipboard is closed.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        });
+
+        let held = holding_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("holder thread did not report");
+        if !held {
+            release_tx.send(()).ok();
+            holder.join().unwrap();
+            eprintln!("skipped: could not stage window-owned contention");
+            return;
+        }
+
+        // Same honest limitation as the test above: Win32 may admit
+        // another thread of this same process anyway, in which case there
+        // is no Busy reason to inspect.
+        match clipboard.write_text("during named contention") {
+            Err(ClipboardError::Busy { reason }) => {
+                // `GetClassNameW` reports the predefined "STATIC" class
+                // back as "Static" — the window's own canonical casing,
+                // not the name it was created with.
+                assert!(
+                    reason.contains("held by this process") && reason.contains("Static"),
+                    "reason must name this process and the holder window's class: {reason}"
+                );
+            }
+            Ok(()) => eprintln!(
+                "skipped: this thread's window-owned open admitted us, nothing to inspect"
+            ),
+            Err(other) => panic!("contention must classify as Busy, got {other:?}"),
+        }
+
+        release_tx.send(()).ok();
+        holder.join().unwrap();
+
+        with_retry(|| clipboard.write_text("after named contention")).unwrap();
     }
 
     /// Rapid replacement (FR-6.1): a burst of writes must leave the last
@@ -1982,6 +2691,112 @@ mod tests {
             let out = super::canonical_dib(blob.clone());
             assert_eq!(out.as_slice(), &blob[..out.len()]);
         }
+    }
+
+    // ---- files: CF_HDROP observation (ADR 0015, feature/133) -------------
+
+    /// Bytes of a `CF_HDROP` block for `paths` — a `DROPFILES` header
+    /// (wide strings, no non-client drop) followed by a
+    /// double-null-terminated list of null-terminated wide names, exactly
+    /// what Explorer's own file/folder copy publishes.
+    ///
+    /// Built by hand rather than through the provider: production never
+    /// *writes* this format — `ClipboardContent::FileList` is refused by
+    /// `WindowsClipboard::write` by design, because a file list reaches
+    /// the clipboard through `VirtualFileClipboard`, not this trait — so
+    /// there is no production-shaped helper to stage a fixture with.
+    fn hdrop_bytes(paths: &[&str]) -> Vec<u8> {
+        use windows::Win32::UI::Shell::DROPFILES;
+
+        // The struct's own size, not a hardcoded number: `#[repr(C,
+        // packed(1))]` makes this exactly the byte offset DROPFILES.pFiles
+        // must name for the list to follow immediately.
+        let header_len =
+            u32::try_from(std::mem::size_of::<DROPFILES>()).expect("DROPFILES fits a u32");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&header_len.to_le_bytes()); // pFiles
+        bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+        bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+        bytes.extend_from_slice(&0i32.to_le_bytes()); // fNC = FALSE
+        bytes.extend_from_slice(&1i32.to_le_bytes()); // fWide = TRUE
+        debug_assert_eq!(u32::try_from(bytes.len()).unwrap_or(u32::MAX), header_len);
+        for path in paths {
+            for unit in path.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // per-name terminator
+        }
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // list terminator
+        bytes
+    }
+
+    /// Install `paths` on the real clipboard as `CF_HDROP`.
+    fn set_hdrop(paths: &[&str]) {
+        let bytes = hdrop_bytes(paths);
+        with_retry(|| super::install_formats(&[(u32::from(super::CF_HDROP.0), &bytes)])).unwrap();
+    }
+
+    /// The whole point of the slice: a local Explorer copy reads back as
+    /// the paths the shell reported, not as text and not as an image.
+    #[test]
+    fn a_local_file_selection_reads_back_as_absolute_paths() {
+        use crossover_platform::ClipboardContent;
+
+        let _serial = clipboard_lock();
+        let paths = [r"C:\Users\test\report.pdf", r"C:\Users\test\photos"];
+        set_hdrop(&paths);
+
+        let clipboard = WindowsClipboard::new().unwrap();
+        match with_retry(|| clipboard.read()).unwrap() {
+            Some(ClipboardContent::FileList(observed)) => {
+                assert_eq!(
+                    observed,
+                    paths
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>()
+                );
+            }
+            other => panic!("expected a file-list observation, got {other:?}"),
+        }
+        // The text convenience must not surface a file selection as text.
+        assert_eq!(with_retry(|| clipboard.read_text()).unwrap(), None);
+    }
+
+    /// A selection past [`crossover_platform::MAX_CLIPBOARD_FILE_ENTRIES`]
+    /// reads as absent — refused before a single path is queried, never
+    /// truncated to the first N (FR-3.6, NFR-1).
+    #[test]
+    fn a_selection_over_the_entry_ceiling_reads_as_absent() {
+        let _serial = clipboard_lock();
+        let too_many: Vec<String> = (0..=crossover_platform::MAX_CLIPBOARD_FILE_ENTRIES)
+            .map(|i| format!(r"C:\overflow\{i}.txt"))
+            .collect();
+        let refs: Vec<&str> = too_many.iter().map(String::as_str).collect();
+        set_hdrop(&refs);
+
+        let clipboard = WindowsClipboard::new().unwrap();
+        assert_eq!(with_retry(|| clipboard.read()).unwrap(), None);
+    }
+
+    /// `ClipboardContent::FileList` is a local observation, not something
+    /// this trait installs: a file list reaches the clipboard through
+    /// `VirtualFileClipboard`, a separate mechanism (ADR 0015). The
+    /// refusal must be permanent (`Unsupported`), matching every other
+    /// "this backend does not do that" answer on the write path.
+    #[test]
+    fn writing_a_file_list_through_the_provider_is_refused() {
+        use crossover_platform::ClipboardContent;
+
+        let clipboard = WindowsClipboard::new().unwrap();
+        let refusal = clipboard.write(&ClipboardContent::FileList(vec![std::path::PathBuf::from(
+            r"C:\a.txt",
+        )]));
+        assert!(
+            matches!(refusal, Err(ClipboardError::Unsupported { .. })),
+            "expected a permanent refusal, got {refusal:?}"
+        );
     }
 
     // ---- manual hardware validation (ADR 0014, docs/TESTING.md) ----------

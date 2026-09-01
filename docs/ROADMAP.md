@@ -1,6 +1,114 @@
 # Crossover Roadmap
 
-> **Current phase: 7 — Rich Clipboard (images and files)** (in progress.)
+> **Current phase: 8 — Dynamic Display Topology** (in progress.)
+>
+> **Phase 8 progress (2026-08-21):** both design decisions are recorded and
+> **Accepted** — [ADR 0018](adr/0018-drawn-display-topology.md) (the drawn
+> layout in one shared coordinate space, edges derived from exact
+> adjacency, protocol v4, config schema v2, the worker↔editor state file)
+> and, for deliverable 5, [ADR 0019](adr/0019-layout-editor-toolkit.md)
+> (egui through eframe, in its own on-demand user-session binary,
+> `apps/crossover-layout`, which the service never touches).
+>
+> Implementation is well past groundwork. **`PROTOCOL_VERSION` now stands
+> at 6, floor 6** — v4 brought the `EntryPoint` shape (feature/147), v5 the
+> per-monitor product name so the editor captions a rectangle `DELL U2720Q`
+> rather than `\\.\DISPLAY1` (feature/158), and v6 the panel's physical size
+> in millimetres so two desks can be drawn in proportion to each other
+> (feature/159). Each was ADR 0017's rule applied unchanged: a field
+> appended to `MonitorTopology`, which every pair of peers exchanges and no
+> feature bit gates, so the byte is on the wire regardless and the floor
+> moves with the ceiling. The size only *travels* so far — seeding the
+> editor's rectangles from it is feature/160 and the manual per-monitor
+> override is feature/161.
+>
+> Landed so far: the v4
+> `EntryPoint` protocol shape and `PROTOCOL_VERSION` 4 (feature/147); the
+> `crossover-topology` crate — the layout model, its validation, the
+> format-preserving config writer, and the state-file schema; the worker's
+> publication of `~/.crossover/state/topology.json` and its re-read of the
+> editor's edits (feature/153); crossing spans derived from the drawn
+> layout rather than a side (feature/148); and the editor itself — its
+> crate and window (feature/154), its screens and canvas (feature/155),
+> and the rigid-group drag, exact snapping, validation diagnostics and the
+> save that writes `[layout]` back to `config.toml` (feature/156).
+>
+> Deliverable 3's cross-machine half is the most recent to land
+> (feature/152): `MonitorTopology` and `LayoutSync` in both directions, the
+> `(revision, origin)` resolver with its SHA-256 tiebreak, adoption written
+> straight into `config.toml` under a rate bound, and publication to the
+> live crossing source — so an arrangement drawn at one desk reaches the
+> other, survives a restart, and takes effect without one. Two machines
+> that disagree converge on the newer arrangement, and the one that loses
+> says so.
+>
+> **Not yet done:** the exit criteria, which are hardware work on two desks
+> (docs/SOAK.md, and docs/TESTING.md §3.2's E-7 for the loop this phase
+> exists to close). One behaviour is worth knowing before that soak: a run
+> holding *no drawn arrangement* — a `--left`/`--right` run, or seamless
+> off — adopts and persists a layout the peer sends, but begins crossing by
+> it at the next start rather than mid-session (ADR 0018's 2026-08-21
+> amendment says why).
+>
+> Phase 7 (Rich Clipboard — images and files) closed 2026-08-20: the last
+> open exit criterion — **input latency bounded under a saturating
+> background transfer** — was measured on the wired link the decision had
+> been waiting for, and it passes. Images and files were already
+> delivery-proven on hardware (2026-08-16 and 2026-08-19, recorded below);
+> what remained was the number, and the number the 64 KiB hold was really
+> about is the socket write.
+>
+> **Measured on wire, 2026-08-21T00:19:07Z** (evening of 08-20 local).
+> Direct wired link, machine A (Intel I225-LMvP 2.5 GbE, dock-attached,
+> listener) ↔ machine B (10 GbE, dialer), negotiated 2.5 Gbps full duplex,
+> both machines on `dev` at `f69afc8`. B drove the contention ADR 0013 is
+> actually about — **one writer carrying both**: interactive input (B
+> controlling A, continuous mouse and keyboard) and bulk file data (B → A)
+> over the same connection. Ten distinct 200 MiB random-content files
+> (distinct so hash-dedup could not shortcut them) were pasted back-to-back
+> between 00:04:34 and 00:05:13 UTC — 39 s, ~1 s per delivery (file
+> delivery p50 906 ms / p95 1080 ms) — with input running the whole time,
+> then hands-off until the interim metrics line. B's counters over the
+> window: 4,558 input samples (4,561 input events), 36,732 frames sent,
+> 2,098,396,126 bytes sent, `clipboard_files_sent=10`
+> (`clipboard_file_sent_bytes=2,097,152,000`).
+>
+> | | avg | max |
+> |---|---|---|
+> | socket accepting the bytes (`input_write`) | **0.019 ms** | **0.147 ms** |
+> | waiting for the writer (`input_lane`) | 0.41 ms | 72.2 ms |
+> | queue-to-wire, total (`input_queue`) | 0.43 ms | 72.2 ms |
+>
+> **This is a pass, and it settles the 64 KiB question.** The socket-write
+> path — the thing the hold questioned — never exceeded **0.147 ms** under
+> full saturation, which is below even the **0.21 ms** ADR 0013 costs a
+> *single* 64 KiB chunk at 2.5 GbE, and against the WiFi run's mean 1.94 ms
+> / max 309.8 ms. The 2026-08-16 failure is therefore attributable to the
+> slow physical link, not to the chunking design. **Resolution
+> (maintainer, 2026-08-20): the 64 KiB chunk size stands** — recorded as
+> [ADR 0013](adr/0013-interactive-over-bulk-prioritization.md)'s 2026-08-20
+> addendum, with [ARCHITECTURE.md](ARCHITECTURE.md) §5.4's "held pending a
+> wired measurement" closed to match. The writer-task redesign §5.4 said
+> this measurement would price is **not warranted by this evidence**: §5.4
+> already records that a writer task still writes serially into one TLS
+> stream, and the socket figures leave it nothing to win.
+>
+> **The window is clean, which is what makes the maxima mean anything.**
+> B's service was restarted at 00:04:06 UTC for fresh counters (the
+> measurement start, T), and across T → T+15 A's log shows one unbroken
+> session while B reports `reconnect_attempts=0` — so every input sample
+> coexisted with genuine transfer traffic and nothing else. An earlier
+> attempt the same day *was* polluted, by an environmental NIC link drop,
+> and was discarded rather than reported.
+>
+> **One honest observation, recorded rather than buried.** A single tail
+> event of **~72 ms** appeared in the interactive lane while socket writes
+> stayed ≤ 0.147 ms — so it is a pre-writer scheduling/queueing stall, not
+> bulk head-of-line blocking at the socket, which is the failure mode this
+> criterion exists to catch. The averages (0.41 ms lane, 0.43 ms total)
+> place it as one outlier among 4,558 samples, and the operator perceived
+> nothing. Worth a future investigation, not a blocker; it is listed with
+> the phase's carried follow-ups under Phase 7's exit criteria below.
 >
 > **Images landed 2026-08-16.** The Windows CF_DIB backend carries real
 > images between two machines verbatim in both directions, and the feature
@@ -20,17 +128,197 @@
 > followed the decline onto the wire, which is the half the criterion is
 > about.
 >
-> **Input latency is now measurable** (feature/117): every input frame is
-> timed from the moment it is handed to the send path to the moment it
-> reaches the wire — queueing plus the writer's wait behind a bulk frame in
-> flight, which is what ADR 0013 and ADR 0014's chunking jointly bound. The
-> mean and maximum land in the shutdown block, and the hermetic suite
-> asserts the measurement happens *under saturation* without asserting a
-> bound a loaded CI runner could miss. **The criterion is met when the
-> number is taken on hardware**: docs/SOAK.md step 5 says how, and what good
-> looks like. Files/folders
-> ([ADR 0015](adr/0015-spooled-virtual-file-paste.md), still Proposed) is the
-> second sub-milestone and is not started.
+> **Input latency was measured, and it does not meet the criterion.**
+> Instrumented in feature/117 — every input frame timed from the moment it
+> is handed to the send path to the moment it reaches the wire — and read on
+> hardware 2026-08-16 during a saturating image transfer (~127 MiB sent,
+> 7,571 input frames timed):
+>
+> | | measured | expected |
+> |---|---|---|
+> | mean | **1.94 ms** | tens of µs |
+> | max | **309.8 ms** | single-digit ms |
+>
+> ADR 0013 costed a 64 KiB chunk at "0.21 ms of 2.5 GbE, so one chunk of
+> worst-case input delay stays sub-millisecond". The measured mean already
+> breaks that, and the maximum is three orders of magnitude past it.
+>
+> **Attributed on the second run** (feature/118 split the wait): of a
+> 124.3 ms worst case, **124.3 ms was the frame waiting for the writer and
+> 0.18 ms was the socket** accepting its own bytes. The input frame's bytes
+> leave quickly; it waits because the session loop is mid-write on a 64 KiB
+> bulk chunk. Head-of-line blocking behind one in-flight frame — the "a
+> frame in flight is unpreemptable" limit ADR 0013 names — not the lane
+> split failing and not the link refusing small writes.
+>
+> **Held at 64 KiB** (maintainer, 2026-08-16), to be revisited on a wired
+> link. The measurement was taken over **WiFi**, which ADR 0013's arithmetic
+> never contemplated: the same chunk is 0.21 ms of 2.5 GbE and ~124 ms of a
+> bad wireless moment. Chunk size is the only lever that acts on this
+> directly, and it is cheap to move — the receiver takes its plan from the
+> first chunk, so a smaller sender-side chunk needs no protocol change. Note
+> that **moving the writer to its own task would not help**: it still writes
+> serially into one stream (see ARCHITECTURE.md §5.4, corrected).
+> **Resolved 2026-08-20**: the wired re-run happened, the socket write
+> measured 0.147 ms worst case, and 64 KiB stands unchanged — see the
+> closure summary at the top of this marker.
+>
+> The mechanism is already documented rather than newly discovered:
+> [ARCHITECTURE.md](ARCHITECTURE.md) §5.4 records that the session loop
+> polls nothing while a write is pending, names "moving the writer to its
+> own task" as the fix that "would remove the freeze entirely", and defers
+> it as needing an ADR of its own. This measurement is the evidence that the
+> deferral now has a cost worth pricing. `clipboard_deferred_peak` also went
+> non-zero (1) for the first time, so the Background lane genuinely backed
+> up.
+>
+> Nothing here is unsafe or stuck; it is responsiveness under a saturating
+> bulk transfer, on a link that was never the design target. Files/folders
+> ([ADR 0015](adr/0015-spooled-virtual-file-paste.md), **Accepted**
+> 2026-08-17) is the second sub-milestone and is where the work is now.
+>
+> **The receiving half is built** (2026-08-17). A peer file is admitted
+> against permission, free space and the spool budget *before* the offer is
+> answered, streamed through to the spool a chunk at a time — memory stays
+> O(chunk), which is why a file may be 256 MiB where an image is capped at
+> 64 — verified against the offered hash and length, and promoted to an
+> entry only then. Every other outcome deletes the partial and registers
+> nothing. The engine stayed sans-io: it decides, and the driver performs
+> the four spool operations and reports back, so the guarantees are unit
+> tests over an action list rather than filesystem fixtures. The
+> `file_receive` grant reaches a running worker through the poll that
+> already re-reads the trust store for revocation.
+>
+> **The data object exists** (2026-08-17). A spooled entry can be offered
+> to Explorer as a virtual file list on an apartment thread of its own:
+> the descriptor carries the validated name and size, the contents are
+> served only as a read-only stream at index zero, and the file the shell
+> writes records where it came from (Local intranet — the internet zone
+> was built first and changed on a maintainer decision, ADR 0015).
+> Automated tests drive it through the real
+> clipboard as a consumer does and read the entry back byte for byte. Two
+> findings came out of building it, both recorded in ADR 0015:
+> `OleIsCurrentClipboard` alone reported "still ours" after a same-process
+> Win32 write, so ownership now also requires an unchanged clipboard
+> sequence number (SECURITY.md F13); and the OLE clipboard's own mediating
+> object answers out-of-enumeration requests before ours does, so the
+> typed refusal codes are asserted against the object directly.
+>
+> **The receiving half is complete** (2026-08-18). A completed transfer is
+> now offered: the engine holds the origin's verdict until the entry
+> reaches the clipboard, so `Stored` means the user can paste it rather
+> than that bytes exist somewhere, and an offer that never lands deletes
+> the entry instead of leaving peer bytes nothing advertises. With
+> something on the clipboard to observe, the entry-lifetime rule is real —
+> an entry lives while the clipboard still offers what it backs and is
+> collected the moment it moves on, with the 24-hour age backstop only for
+> the case the rule cannot see. The same observation is what stops our own
+> offer being staged back to the peer that sent it, which no content hash
+> could do: a virtual file list has no bytes to hash.
+>
+> **The sender's two lower halves exist** (2026-08-18). A local `CF_HDROP`
+> copy is observed and handed up as paths rather than bytes, and a
+> selection is packed into one blob — a single file verbatim, a folder or
+> a multi-entry selection as one Stored-entry archive — with the exact
+> length and SHA-256 the offer must carry. Every refusal ADR 0015 names is
+> typed and happens before anything could travel: entry count, depth and
+> cumulative bytes are judged *during* the walk, a reparse point or an
+> unreadable entry refuses the whole item rather than quietly shrinking
+> it, and the temporary artifact is delete-on-close so no refusal path can
+> leave one behind. The five decisions this forced are recorded in ADR
+> 0015 rather than left in the code.
+>
+> **The send transaction is built** (2026-08-18). A local file selection
+> now becomes an offer and a chunk stream: the peer's negotiated file
+> support and its `clipboard_send` grant are judged *before* anything is
+> walked, because the build is the expensive step and an un-negotiated
+> file offer is fatal to an older peer's session rather than merely
+> unanswered. The bytes never enter the engine — an outbound item carries
+> either bytes it retains or a blob the driver holds open, and for a blob
+> the engine names each chunk's offset and length and the driver reads
+> exactly that slice, so the sender is O(chunk) exactly as the receiver's
+> write-through is. Every path that ends the transaction hands the blob
+> back, which is what deletes the artifact: delivered, declined,
+> superseded, timed out, session lost, unreadable. The sender's half of
+> loop prevention is in too — a `CF_HDROP` resolving inside the spool is
+> never staged.
+>
+> **The sender side is built** (2026-08-18): local `CF_HDROP` observation
+> (feature/133, PR #38), the blob builder (feature/134, PR #39), and the
+> engine's send transaction over it (feature/135, PR #40) — the three
+> paragraphs above.
+>
+> **`FILE_CLIPBOARD` is advertised** (2026-08-18, feature/136). This was the
+> deliberate final act: `FeatureFlags::ADVERTISED` is now `ALL`, so a
+> conforming peer can actually reach either half of the file path instead of
+> negotiating it away. The send policy is computed the way
+> `file_receive_policy` already computes its twin — `SessionRoute` now
+> carries each live session's negotiated features, `file_send_policy` folds
+> them with the trust store's `clipboard_send` grant into
+> `FileSend::{Unsupported, NotNegotiated, Denied, Allowed}`, and it is
+> published at the same two points `file_receive_policy` is: session
+> establishment/loss, and the trust-store revocation poll — so revoking
+> `clipboard_send` reaches a running worker within one poll, exactly as
+> revoking `file_receive` already did.
+>
+> Two things worth being plain about, so this entry does not overstate what
+> landed. **`clipboard_send` is, as of this slice, the first permission this
+> codebase enforces anywhere** — text and images still travel without
+> checking it, unchanged from before; this slice was not scoped to fix that.
+> And **this closes construction, not validation**: the whole file path —
+> offer, blob build, chunked send, spool, verify, virtual-file paste — has
+> been exercised by the test suites only. No two-machine hardware run has
+> moved a real file between the two workstations yet, which is what the
+> phase needs next before files can be called done. One question is still
+> answered by a human rather than by CI before that: whether Windows honours
+> the clipboard-history/cloud exclusions the virtual-file object declares
+> (docs/TESTING.md §1.6) — open, carried forward.
+>
+> **The files slice is hardware-validated** (2026-08-19), closing the item
+> above. A two-machine session over a direct 2.5/10 GbE wired link —
+> machines A (listener) and B (dialer), initial build `e689a3b`, final
+> retests on the build containing PRs #43–#46 — exercised the whole path
+> construction had previously only test suites for
+> ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)'s 2026-08-19 addendum
+> and [SOAK.md](SOAK.md)'s Phase 7 files section carry the full session
+> record). Single-file and folder/multi-selection transfers arrived
+> byte-identical in both directions and opened without SmartScreen or
+> Protected View, carrying `ZoneId=1`; `AlreadyHave` dedup, the >256 MiB
+> `TooLarge` refusal (observed live, 268,500,992 bytes vs. the 268,435,456
+> max), and loop prevention (a deliberate spool-path copy probe suppressed
+> silently, `clipboard_loop_suppressed` incrementing exactly once) all held.
+> **The question left open above is now answered**: docs/TESTING.md §1.6's
+> third exception (F16) is confirmed on wire-crossed hardware, not just
+> locally — a received offer does not appear in Win+V history and does not
+> cloud-sync, and the pasted file opens unprompted with `ZoneId=1`.
+>
+> The session found and fixed four real defects, all merged to `dev`: an
+> edge-transfer bounce under a hand tremor at the seam, ADR 0009's
+> deliberately deferred push-through risk materializing (PR #44, feature/137,
+> re-arm hysteresis); a control-request lockout from a ~4.7 s-late answer
+> racing its own retry into a self-healing ~7 s lockout (PR #45, feature/139);
+> an inbound head-of-line block — control frames were gated on the clipboard
+> driver's queue, with no inbound interactive/bulk separation, ADR 0013
+> having been outbound-only until now (PR #46, feature/140); and a silent
+> worker death on B at 02:05:38 UTC that self-healed in ~1.3 s with no stuck
+> input, but whose root cause the service recorded nowhere — fixed forward,
+> not diagnosed, by durable supervision logging (PR #43, feature/138, ADR
+> 0011 addendum). Retests on the post-#46 build confirm the seam no longer
+> bounces and ~20 rapid crossings ran clean.
+>
+> **This closes delivery-proven for files, not Phase 7.** The phase's input
+> latency exit criterion is still open: it remains held at 64 KiB
+> (2026-08-16, above), and this session's hardware read — input responsive
+> throughout large file transfers, p50 input-path latency ~3 ms during sends
+> — is an informal wired-link data point, not the rigorous max-latency
+> instrumentation (feature/117/118) redone over wired. The wired link that
+> just proved out files is exactly the link that decision was waiting to be
+> revisited on; a formal wired re-run of that measurement is a candidate next
+> step, not undertaken here. (It was undertaken on 2026-08-20 and closed the
+> phase — the closure summary at the top of this marker.) Also skipped, deliberately: the mid-transfer
+> network-disconnect case — at 2.5 Gbps a 200 MiB transfer completes
+> sub-second, leaving no practical "mid" — with the 02:05:38 abrupt-disconnect
+> recovery standing as live evidence for that class of fault ([SOAK.md](SOAK.md)).
 >
 > Phase 6 (Windows Prototype Hardening) closed 2026-08-14: the multi-day
 > unattended soak — the last exit criterion — ran 2026-08-11 → 2026-08-14
@@ -57,6 +345,21 @@
 > background operation ([ADR 0011](adr/0011-background-service-launcher.md),
 > [ADR 0012](adr/0012-elevated-worker-integrity.md)), and Windows packaging —
 > were validated on hardware as they landed.
+>
+> **Sequencing (2026-08-16):** after Phase 7's files half, the next phase is
+> **dynamic display topology with a drag-and-drop editor** — maintainer
+> decision. Cross-platform validation moves to Phase 9 and productization to
+> Phase 10. The reasoning is that two Windows machines sharing a keyboard and
+> mouse *well* are worth more than three platforms sharing one adequately,
+> and that the topology model is far easier to change before three platform
+> crates depend on it than after. The macOS and Linux risk catalogues written
+> for the old Phase 8 keep their value and simply wait
+> ([platform-risks-macos.md](platform-risks-macos.md),
+> [platform-risks-linux.md](platform-risks-linux.md)).
+>
+> Accepted ADRs that name "Phase 8" meaning cross-platform are left as
+> written — they are immutable, and ADR 0014 already annotates the same
+> drift from the previous re-sequencing.
 >
 > **Sequencing (2026-08-11):** after Phase 6, **rich clipboard (images and
 > files) is scheduled before cross-platform validation** — maintainer decision.
@@ -395,27 +698,180 @@ The hermetic stress and fault-injection suites extend to cover chunked transfers
 and the priority guarantee. Files/folders may run as a second sub-milestone
 after images, given the added security surface.
 
-## Phase 8 — Cross-Platform Validation
+Verified 2026-08-20 — **all four criteria met, phase closed**:
+
+- **Images, both directions, byte-identical, plus hash-dedup**: the
+  2026-08-16 two-machine session (7h45m, ~144 MiB received, real snips into
+  Paint/Word/browser on the far side), and feature/116's session evidence
+  that an image the receiver already holds costs one offer and one
+  `AlreadyHave` decline with nothing following it onto the wire.
+- **Live input stays responsive during a concurrent bulk transfer,
+  measured**: the wired measurement of 2026-08-21T00:19:07Z under ten
+  back-to-back 200 MiB file transfers with continuous input on the same
+  writer — socket write avg 0.019 ms / max 0.147 ms, total queue-to-wire
+  avg 0.43 ms / max 72.2 ms, inside ADR 0013's per-chunk budget (full record
+  in the marker above and docs/SOAK.md's Phase 7 input-latency section).
+- **Files materialize only through an explicit user paste, guardrails
+  enforced, refusals observable**: the 2026-08-18 → 2026-08-19 files session
+  — both directions byte-identical from the spool via Ctrl+V, `TooLarge`
+  refused live at 268,500,992 bytes, loop prevention suppressing a
+  spool-path probe exactly once ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)'s
+  2026-08-19 addendum).
+- **No regression in text-clipboard reliability or in input
+  latency/correctness**: the Phase 2 stress gate is hermetic and gates every
+  merge, and no hardware session in this phase left input stuck or looped
+  the clipboard.
+
+Small follow-ups carried out of the phase, none of them blocking:
+
+- **A ~72 ms tail in the interactive lane** (2026-08-21 measurement, one
+  sample in 4,558) with socket writes ≤ 0.147 ms — a pre-writer
+  scheduling/queueing stall to investigate, not bulk head-of-line blocking.
+- **The service relaunches the worker into a dying session at logoff**,
+  because it acts on the session-change notification before the `Logoff`
+  stop reason arrives. Cosmetic: the relaunch fails harmlessly.
+- **Exit code `0x40010004` (`DBG_TERMINATE_PROCESS`) is labelled
+  `crashed=true`** in the supervision log, when at logoff it is Windows
+  terminating the worker deliberately. Cosmetic: it misleads whoever reads
+  the log next (docs/SOAK.md, 2026-08-20 session).
+
+## Phase 8 — Dynamic Display Topology
+
+**Goal:** replace "which side is this machine on" with an arrangement the
+user draws. Monitors from both machines appear in one editor and are dragged
+into the layout they physically sit in, and edge crossing follows from that
+geometry instead of from a flag.
+
+Re-sequenced ahead of cross-platform by maintainer decision (2026-08-16):
+two Windows machines that share a keyboard and mouse well are worth more
+than three platforms that share one adequately, and the topology model is
+easier to change before three platform crates depend on it than after.
+
+What exists today is the floor this replaces. `--left` / `--right` declares
+a two-machine left–right pair (ADR 0009); a machine with several monitors is
+treated as **one desktop**, so the crossing edge is the outer edge of the
+whole desktop rather than a seam between monitors
+([SOAK.md](SOAK.md) records that as an honest limitation); and feature/107
+made the topology re-read at runtime when displays change, which this phase
+builds on rather than repeats.
+
+**Design recorded 2026-08-20.** The phase's decisions are in
+[ADR 0018](adr/0018-drawn-display-topology.md) (Accepted) — the drawn layout
+in one shared coordinate space, edges derived from exact adjacency,
+protocol v4, config schema v2, the worker↔editor state file, and the new
+`crossover-topology` crate. The UI toolkit decision deliverable 5 calls for is
+[ADR 0019](adr/0019-layout-editor-toolkit.md) (Accepted): egui through eframe,
+in its own on-demand user-session binary, `apps/crossover-layout`, which the
+service never touches. ADR 0018 supersedes ADR
+0009's *topology* only; the crossing mechanism (fractional position, the
+negotiated engine as the trigger's target, the re-arm hysteresis, the cursor
+mask) is retained and restated there.
+
+Deliverables:
+
+1. **A topology model that is a layout, not a side.** Both machines'
+   monitors placed in one shared coordinate space, with edges derived from
+   adjacency. This supersedes ADR 0009's side model and therefore needs an
+   ADR of its own — the crossing *mechanism* (fractional position, negotiated
+   transfer) is expected to survive; what changes is where edges come from.
+2. **Per-monitor edges.** Dragging individual monitors only means something
+   if a seam between two of one machine's monitors can differ from its outer
+   edge, which the current "one desktop" treatment cannot express.
+3. **An arrangement both machines agree on.** One layout describes two
+   machines, so ownership, editing, and disagreement have to be answered:
+   who holds it, how it reaches the peer, and what happens when they differ.
+   If it travels over the session, it is protocol work and needs the ADR to
+   say so.
+4. **Persistence** in the versioned startup configuration, replacing the
+   `side` setting rather than sitting beside it.
+5. **The editor itself** — monitors shown to scale, dragged, snapped. This
+   is the project's first GUI and needs a **UI toolkit decision recorded as
+   an ADR** (a core library choice, per `adr/README.md`), including where it
+   runs: the worker is a headless service-launched process (ADR 0011), so an
+   editor is a separate user-session surface, not a mode of the worker.
+
+Exit criteria:
+
+- A layout drawn in the editor produces crossings that match it, including a
+  seam between two monitors of the same machine and a corner where three
+  monitors meet.
+- Mixed DPI and mixed resolution behave: a pointer leaving a 4K monitor at
+  40% of its edge arrives at 40% of the adjacent edge, whatever the scaling.
+- A display added, removed, or rearranged at runtime updates the layout
+  without a restart and without a stuck cursor (the feature/107 property,
+  now with more to get wrong).
+- The arrangement survives restart, and two machines that disagree resolve
+  observably rather than silently mis-crossing.
+- No regression in seamless transfer's existing guarantees: control returns
+  at the reverse edge, no stuck keys, no cursor left hidden.
+
+**Implementation complete, validation pending (2026-08-21).** Every
+deliverable above is built and merged to `dev` — the drawn topology model
+and its crossing derivation, per-monitor edges, cross-machine `LayoutSync`
+with its `(revision, origin)` resolver, config schema v2 persistence, and
+the editor — through feature/156 and feature/152 (PRs #50–#62). What is
+left is the part no CI run can do: the exit criteria above are two-desk
+hardware work.
+
+**The runbook for it is [SOAK.md](SOAK.md)'s Phase 8 section**, written
+against the standing pair (A, two monitors, `192.168.1.151`; B,
+`192.168.1.146`). It is ordered as five passes — an implicit-side-model
+regression baseline, the drawn layout and its geometry (which is
+docs/TESTING.md §3.2's **E-7**, deliberately deferred to the soak), runtime
+display change, disagreement and restart, and the degrade-don't-die cases —
+and it closes with an explicit criterion→check table, so every criterion
+above maps to at least one named check. Its "known residuals to watch"
+subsection names five things the soak should expect rather than discover,
+three of them this phase's own: the inert-while-`Returning` window whose
+strong fix is deliberately not implemented (the soak provokes it once, on
+purpose), the one-restart cost of a first-ever adopted arrangement on a run
+holding no drawn layout (ADR 0018's 2026-08-21 amendment), and degraded
+cursor placement inside an edit's propagation window — plus a saved
+arrangement whose screens are all absent deriving inert rather than being
+rejected, and the caveats carried forward from earlier phases.
+
+**The phase closes on that soak's completion, not before**, and anything it
+finds becomes a fix or a recorded follow-up first. The current-phase marker
+at the top of this file moves only then.
+
+## Phase 9 — Cross-Platform Validation
 
 **Goal:** prove the architecture is genuinely portable.
 
 Deliverables: `crossover-platform-macos` and `crossover-platform-linux`
-(created now, not before — [ARCHITECTURE.md](ARCHITECTURE.md) §3.1), with a
-risk catalogue per platform written before implementation (macOS:
-accessibility permissions, event taps, pasteboard, Keychain; Linux:
-X11/Wayland split, clipboard ownership semantics, injection permissions,
-secret-service). Rich-clipboard image/file support (Phase 7) carries over here
-as new implementations of the clipboard trait, not new protocol design.
+(created now, not before — [ARCHITECTURE.md](ARCHITECTURE.md) §3.1). The
+risk catalogues this phase requires **before** implementation are written:
+[platform-risks-macos.md](platform-risks-macos.md) (M-1..M-10) and
+[platform-risks-linux.md](platform-risks-linux.md) (L-1..L-9).
+
+Two findings from writing them change how the phase should start:
+
+- **L-1 decides the Linux port's shape.** Wayland prohibits global input
+  capture and injection by design; the sanctioned routes are compositor
+  portals whose coverage varies. Verify that on current GNOME and KDE
+  *before* any Linux code, because the answer is either "a port" or "X11
+  today, Wayland when the portals are ready".
+- **M-5 and L-9 agree that `CF_DIB` is the outlier.** Neither macOS nor
+  Linux clipboards understand it, and PNG is the plausible interchange
+  format. Drafted as [ADR 0016](adr/0016-image-interchange-format.md)
+  (Proposed): the receiver advertises what it can install, the sender
+  produces it by converting its own local content, and a receiver never
+  decodes what a peer sent — which keeps an image decoder off the path that
+  handles hostile input. Windows-to-Windows stays verbatim DIB.
+
+Rich-clipboard image and file support (Phase 7) carries over here as new
+implementations of the clipboard trait, not new protocol design.
 
 Exit criteria: core feature set works Windows↔Windows, Windows↔macOS,
 Windows↔Linux, macOS↔macOS, Linux↔Linux — and macOS↔Linux requires no
 protocol changes.
 
-## Phase 9 — Productization
+## Phase 10 — Productization
 
 Potential work, each item gated on preserving the security and clipboard
-reliability requirements: tray application, graphical configuration and
-topology editor, peer discovery, >2 peers, further rich clipboard formats
+reliability requirements: tray application, graphical configuration (the
+*topology* editor moved to Phase 8), peer discovery, >2 peers, further rich
+clipboard formats
 (e.g. HTML), drag-and-drop, software updates, diagnostics UI, optional
 secure WAN operation.
 

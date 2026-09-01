@@ -43,17 +43,19 @@ use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crossover_platform::{CursorMask, DisplayInfo, InputCapture, InputInjector};
-use crossover_protocol::RawFrame;
+use crossover_protocol::{EntryPoint, RawFrame};
+use crossover_topology::MonitorId;
 
 use crate::command::{FrameTarget, SessionCommand};
 use crate::control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
     OutboundControl,
 };
-use crate::edge_driver::EdgeMode;
+use crate::crossing::CrossingMap;
+use crate::edge_driver::{CrossingSource, DetectedCrossing, EdgeMode, EdgeModeUpdate};
 use crate::input::InputEvent;
 use crate::outbound::{CommandReceiver, CommandSender, command_lanes};
-use crate::topology::{EdgeFraction, MonitorRect, Topology};
+use crate::topology::{CursorPoint, Edge, EdgeFraction, MonitorRect};
 
 /// How often, while controlling, the driver polls the platform for a
 /// lost capture (R-2) and for the release escape gesture (ADR 0008). One
@@ -100,17 +102,26 @@ pub enum InputControlEvent {
     RequestControl,
     /// The user asked to end whichever control relationship exists.
     ReleaseControl,
-    /// The cursor crossed the linked edge while controlling this machine:
-    /// take control of the peer, carrying where it crossed (ADR 0009).
+    /// The cursor crossed a span while controlling this machine: take
+    /// control of the peer, carrying where the crossing lands on it
+    /// (ADR 0009, ADR 0018).
     EdgeLeave {
-        /// Normalized crossing position along the edge.
-        position: EdgeFraction,
+        /// The destination in the receiver's terms, the position along it,
+        /// and the arrangement revision it was derived from.
+        crossing: DetectedCrossing,
+        /// The edge-mode generation the crossing was detected under; a
+        /// crossing from an earlier generation is stale and dropped.
+        generation: u64,
     },
-    /// The cursor returned to the linked edge while the peer controls this
-    /// machine: reclaim control, carrying where it crossed (ADR 0009).
+    /// The cursor returned to a span while the peer controls this machine:
+    /// reclaim control, carrying where the crossing lands on the
+    /// controller (ADR 0009, ADR 0018).
     EdgeReturn {
-        /// Normalized crossing position along the edge.
-        position: EdgeFraction,
+        /// As [`Self::EdgeLeave`]'s.
+        crossing: DetectedCrossing,
+        /// The edge-mode generation the crossing was detected under; a
+        /// crossing from an earlier generation is stale and dropped.
+        generation: u64,
     },
     /// One captured input event, pointer or key (platform sink bridge).
     Captured(InputEvent),
@@ -125,19 +136,47 @@ pub enum InputControlEvent {
 
 /// The control driver. Create with [`input_control`], then spawn
 /// [`InputControlDriver::run`].
-/// The extra wiring a machine configured for seamless transfer needs
-/// (ADR 0009). Absent for an explicit-only (console) run, which never
-/// places a cursor or drives an edge detector.
+/// The extra wiring a machine with an arrangement needs — implicit
+/// (`--left`/`--right`, ADR 0009) or drawn (`[layout]`, ADR 0018).
+/// Absent for an explicit-only (console) run, which never places a cursor
+/// or drives an edge detector.
 pub struct SeamlessInputs {
-    /// This machine's screen topology (from `--left`/`--right`), for
-    /// mapping a `PlaceCursor` fraction to a pixel on the entry edge.
-    pub topology: Topology,
-    /// Display geometry for that mapping.
+    /// This run's arrangement, as the derivation that turns live monitors
+    /// into every crossing they permit (ADR 0018) — implicit for
+    /// `--left`/`--right`, explicit for a drawn `[layout]`.
+    ///
+    /// **The same source the edge detector holds**, cloned rather than
+    /// copied in spirit: one definition of the derivation, consulted by
+    /// two components at their own cadences. The detector re-derives on a
+    /// display change while it polls; this driver derives at cursor-
+    /// placement time, from its own fresh display read, which is what
+    /// keeps placement's re-read-on-use property from ADR 0009 — a
+    /// placement never maps through geometry that has moved since it was
+    /// last polled, whatever the detector was doing (it is idle, by
+    /// design, exactly while this machine drives the peer).
+    ///
+    /// Publishing a derived map from the detector to here was the
+    /// alternative and was rejected: it would be a second, independently
+    /// aged copy of a pure function's result, stale in precisely that
+    /// idle window. What changes when a layout is adopted from the peer is
+    /// the *arrangement*, so that is what the sync branch puts on a
+    /// `watch` — inside the source, where both consumers see it at once.
+    pub crossings: CrossingSource,
+    /// Display geometry for that derivation and for the placement it
+    /// resolves.
     pub display: Arc<dyn DisplayInfo>,
-    /// Where the edge detector's watching mode is sent, derived from this
-    /// machine's control state so it watches to *leave* while local, to
-    /// *return* while controlled, and idles while it drives the peer.
-    pub edge_mode: mpsc::Sender<EdgeMode>,
+    /// Where the edge detector's watching mode is published, derived from
+    /// this machine's control state so it watches to *leave* while local,
+    /// to *return* while controlled, and idles while it drives the peer.
+    ///
+    /// A `watch`, not a queue: the mode is a level, so latest-wins is the
+    /// correct semantics and publishing never blocks. That last part is
+    /// load-bearing — the mode used to ride a bounded `mpsc` that closed a
+    /// cycle back onto this loop (mode → detector → crossings →
+    /// `control_events` → here, and this loop is the only thing draining
+    /// them), so any slowness here amplified itself into the stall-then-
+    /// burst the 2026-08-19 hardware logs show.
+    pub edge_mode: watch::Sender<EdgeModeUpdate>,
 }
 
 pub struct InputControlDriver {
@@ -175,12 +214,34 @@ pub struct InputControlDriver {
     /// capture state and placement instead of racing ahead of them. `None`
     /// between transitions.
     pending_cursor: Option<bool>,
-    /// Seamless wiring, present exactly when the machine runs
-    /// `--left`/`--right`. `None` makes placement and edge-mode emission
-    /// no-ops (an explicit-only run).
+    /// Seamless wiring, present exactly when this run has an arrangement —
+    /// `--left`/`--right` or a drawn `[layout]`. `None` makes placement and
+    /// edge-mode emission no-ops (an explicit-only run).
     seamless: Option<SeamlessInputs>,
-    /// The last edge mode emitted, so only changes are sent.
+    /// The last edge mode published, so an unchanged mode is republished
+    /// only when something else asks for it (see `edge_reprime_due`).
     last_edge_mode: EdgeMode,
+    /// The generation stamped on the last edge mode published. A crossing
+    /// carries the generation the detector was watching under when it
+    /// fired, and it reaches this loop through a bounded queue with its
+    /// `kind` frozen at detection time — so a crossing that queued behind a
+    /// mode change describes a control state that no longer exists (a
+    /// `Return` detected under a grant that has since ended would revoke a
+    /// *fresh* one). Anything that does not match this is dropped.
+    edge_mode_generation: u64,
+    /// Set when a `PlaceCursor` has just put the pointer *on* a crossing
+    /// span, meaning the detector must re-prime there or read the
+    /// placement itself as an arrival.
+    ///
+    /// A first grant re-primes for free, because taking it changes the edge
+    /// mode. A *refreshed* grant (ADR 0009 addendum, 2026-08-19: a
+    /// re-request from the session already holding control) does not change
+    /// `is_controlled`, so nothing would be published and the placement
+    /// could fire a spurious return — revoking the grant just re-issued.
+    /// Republishing under a new generation fixes both halves at once: the
+    /// detector re-primes on the placed cursor, and any crossing still in
+    /// flight from before the refresh no longer matches and is dropped.
+    edge_reprime_due: bool,
     /// The monitor layout last seen on the health tick, for noticing a
     /// display change (dock, undock, a monitor powering off) while running.
     /// The seamless machinery re-reads geometry on every use, so nothing
@@ -243,6 +304,8 @@ pub fn input_control(
         // Idle until a session establishes: emitting the initial mode is
         // the driver's job on the first state change.
         last_edge_mode: EdgeMode::Idle,
+        edge_mode_generation: 0,
+        edge_reprime_due: false,
         seen_monitors: None,
         events_rx,
         events_tx: events_tx.clone(),
@@ -327,7 +390,7 @@ impl InputControlDriver {
             }
             // Any branch may have changed the control state; keep the edge
             // detector's watching mode in step with it (ADR 0009).
-            self.sync_edge_mode().await;
+            self.sync_edge_mode();
         }
         // Dropping the sender ends the applier, which restores the cursor —
         // so it is never left hidden when the driver stops mid-control.
@@ -383,13 +446,24 @@ impl InputControlDriver {
                     ControlEvent::UserRequestControl { session }
                 }
                 InputControlEvent::ReleaseControl => ControlEvent::UserRelease,
-                InputControlEvent::EdgeLeave { position } => {
-                    // Same session choice as a console take-control, plus
-                    // where the cursor crossed (ADR 0009).
-                    let session = self.sessions.last().copied().unwrap_or_else(Uuid::nil);
-                    ControlEvent::EdgeLeave { session, position }
+                InputControlEvent::EdgeLeave {
+                    crossing,
+                    generation,
+                } => {
+                    let Some(event) = self.edge_leave_event(crossing, generation) else {
+                        continue;
+                    };
+                    event
                 }
-                InputControlEvent::EdgeReturn { position } => ControlEvent::EdgeReturn { position },
+                InputControlEvent::EdgeReturn {
+                    crossing,
+                    generation,
+                } => {
+                    let Some(event) = self.edge_return_event(crossing, generation) else {
+                        continue;
+                    };
+                    event
+                }
                 InputControlEvent::RequestTimeout {
                     session,
                     request_id,
@@ -432,48 +506,94 @@ impl InputControlDriver {
         true
     }
 
-    /// Actuate a `PlaceCursor` intent (ADR 0009): map the edge fraction to
-    /// a pixel on this machine's linked (entry) edge and inject an
-    /// absolute move, so the pointer appears where it crossed. A no-op
-    /// without a configured topology — placement is a seamless nicety, and
-    /// losing it never breaks control.
-    fn place_cursor(&self, fraction: EdgeFraction) {
+    /// Actuate a `PlaceCursor` intent (ADR 0009, ADR 0018): resolve the
+    /// arriving `EntryPoint` against this machine's live geometry and
+    /// inject an absolute move, so the pointer appears where it crossed.
+    ///
+    /// **The grant or release proceeds whatever happens here.** Nothing in
+    /// this function returns a result, and nothing it discovers reaches the
+    /// engine: a display that will not answer, an entry point naming a
+    /// monitor this machine does not have, a revision that disagrees, or an
+    /// injection that fails all cost the cursor its position and nothing
+    /// else (docs/PROTOCOL.md §6.1). A no-op for an explicit-only run,
+    /// which has no arrangement at all.
+    ///
+    /// The display is read **here**, not taken from anything the detector
+    /// last saw, and the arrangement is derived from that read — so the
+    /// monitor id is looked up in the list the platform reports at
+    /// placement time. This matters at exactly one moment: control
+    /// returning from a peer this machine was driving. The detector idles
+    /// while driving, so anything it holds may predate a dock or an
+    /// undock that happened in between; a fresh read cannot.
+    ///
+    /// # Cost, and why it runs inline
+    ///
+    /// For a drawn arrangement that read is
+    /// [`DisplayInfo::monitor_layout`], the identity query the platform
+    /// trait warns off the hot path: on Windows a `GetMonitorInfoW` and a
+    /// `String` per monitor. That warning is about the detector's 8 ms
+    /// poll. This runs **once per control transfer** — a handful of times
+    /// a minute at soak rates, against a handful of screens — so it stays
+    /// on the control loop rather than going to `spawn_blocking`, which
+    /// would buy nothing measurable and put the placement *after* the
+    /// re-prime that follows it, reordering the two things ADR 0009's
+    /// addendum requires in sequence. If a platform ever makes this query
+    /// genuinely slow, moving it off-loop means moving the re-prime with
+    /// it, not just the read.
+    fn place_cursor(&self, entry: &EntryPoint) {
         let Some(seamless) = &self.seamless else {
-            tracing::debug!("cursor placement requested but no topology configured");
+            tracing::debug!("cursor placement requested but no arrangement configured");
             return;
         };
-        match seamless.display.monitors() {
-            Ok(monitors) => {
-                let point = seamless.topology.entering(fraction, &monitors);
-                tracing::debug!(
-                    fraction = fraction.value(),
-                    x = point.x,
-                    y = point.y,
-                    "control: placing cursor on entry edge"
-                );
-                if let Err(error) = self.injector.place_cursor(point) {
-                    tracing::warn!(error = %error, "cursor placement failed");
-                }
-            }
+        let live = match seamless.crossings.read(&*seamless.display) {
+            Ok(live) => live,
             Err(error) => {
                 tracing::warn!(error = %error, "cannot place cursor: display unavailable");
+                return;
             }
+        };
+        let map = seamless.crossings.derive(&live);
+        let Some(point) = resolve_entry(&map, entry) else {
+            // Only a machine with no monitors at all reaches this, which
+            // no real display reports.
+            tracing::warn!("cannot place cursor: the display reports no monitors");
+            return;
+        };
+        tracing::debug!(
+            monitor = entry.monitor,
+            edge = ?entry.edge,
+            fraction = entry.fraction,
+            revision = entry.layout_revision,
+            x = point.x,
+            y = point.y,
+            "control: placing cursor at the arriving entry point"
+        );
+        if let Err(error) = self.injector.place_cursor(point) {
+            tracing::warn!(error = %error, "cursor placement failed");
         }
     }
 
     /// Notice a monitor-layout change while running (Phase 6 soak finding:
     /// under a boot-started service, docking and monitor power-off are
-    /// everyday events, not corner cases). Geometry is never cached — edge
-    /// detection and cursor placement re-read the layout on every use, and
-    /// the edge detector re-primes itself across a change — so what remains
-    /// is the stateful part: say in the log where the seamless edge now is
-    /// (the startup line is stale the moment the layout moves), and
+    /// everyday events, not corner cases). Geometry is never cached — the
+    /// detector re-derives and re-primes across a change, and placement
+    /// derives from its own fresh read — so what remains is the stateful
+    /// part: say in the log **where the crossings now are**, because the
+    /// startup line is stale the moment the layout moves and a drawn
+    /// arrangement can gain or lose seams without the user touching
+    /// anything (a screen unplugged is every span on it gone); and
     /// re-assert a hidden cursor mask, because a display change makes
     /// Windows reload the system cursors, which can un-blank a mask applied
     /// before it. A read failure skips the tick; the next one retries.
+    ///
+    /// Change detection stays on the **cheap** geometry query, polled five
+    /// times a second. Only once it reports a change is the identity query
+    /// paid for, to derive the arrangement the new line describes — the
+    /// same fidelity rule [`CrossingSource`] states, applied to the
+    /// diagnostic rather than to the hot path.
     fn refresh_display_topology(&mut self) {
         let Some(seamless) = &self.seamless else {
-            return; // explicit-only run: no display, no edge
+            return; // explicit-only run: no display, no arrangement
         };
         let Ok(monitors) = seamless.display.monitors() else {
             return;
@@ -481,11 +601,14 @@ impl InputControlDriver {
         match &self.seen_monitors {
             Some(seen) if *seen == monitors => {}
             Some(_) => {
+                let spans = seamless
+                    .crossings
+                    .read(&*seamless.display)
+                    .map(|live| seamless.crossings.derive(&live).describe_spans());
                 tracing::info!(
                     ?monitors,
-                    side = ?seamless.topology.side(),
-                    linked_edge = ?seamless.topology.linked_edge(),
-                    "display topology changed; the seamless edge follows the new layout"
+                    crossings = spans.as_deref().unwrap_or("unavailable"),
+                    "display topology changed; the crossing spans follow the new layout"
                 );
                 self.seen_monitors = Some(monitors);
                 if self.cursor_hidden {
@@ -496,7 +619,7 @@ impl InputControlDriver {
             }
             None => {
                 // First successful read is the baseline, not a change: the
-                // startup topology was already logged by the launcher.
+                // startup arrangement was already logged by the launcher.
                 self.seen_monitors = Some(monitors);
             }
         }
@@ -516,20 +639,100 @@ impl InputControlDriver {
         }
     }
 
-    /// Send the current edge mode to the detector when it has changed, so
+    /// Publish the current edge mode when it has changed — or when a cursor
+    /// placement has asked for a re-prime under an unchanged mode — so
     /// detection tracks the control state.
-    async fn sync_edge_mode(&mut self) {
-        if self.seamless.is_none() {
+    ///
+    /// Every publication carries a fresh generation, which the detector
+    /// stamps onto the crossings it then emits; crossings detected before
+    /// this publication no longer match and are dropped by
+    /// [`edge_crossing_is_current`](Self::edge_crossing_is_current). The
+    /// generation is advanced whether or not a detector is listening: it
+    /// travels *inside* the published value, so there are no two counts to
+    /// keep in step, and a crossing from a departed detector could not
+    /// arrive anyway.
+    ///
+    /// Non-blocking by construction (`watch`), so this cannot become the
+    /// slow step in a loop that is also the only drainer of what the
+    /// detector produces.
+    fn sync_edge_mode(&mut self) {
+        let reprime = std::mem::take(&mut self.edge_reprime_due);
+        let Some(seamless) = &self.seamless else {
+            return; // explicit-only run: no detector to publish to
+        };
+        let mode = self.edge_mode();
+        if mode == self.last_edge_mode && !reprime {
             return;
         }
-        let mode = self.edge_mode();
-        if mode != self.last_edge_mode {
-            tracing::debug!(?mode, "control: edge mode -> detector");
-            self.last_edge_mode = mode;
-            if let Some(seamless) = &self.seamless {
-                let _ = seamless.edge_mode.send(mode).await;
-            }
+        self.last_edge_mode = mode;
+        // Saturating so no run length can wrap a stale generation onto a
+        // current one.
+        self.edge_mode_generation = self.edge_mode_generation.saturating_add(1);
+        tracing::debug!(
+            ?mode,
+            generation = self.edge_mode_generation,
+            reprime,
+            "control: edge mode -> detector"
+        );
+        let _ = seamless.edge_mode.send_replace(EdgeModeUpdate {
+            mode,
+            generation: self.edge_mode_generation,
+        });
+    }
+
+    /// The engine event for a leave crossing, or `None` for a stale one
+    /// (`process`'s translation for [`InputControlEvent::EdgeLeave`]).
+    ///
+    /// The crossing travels through **whole**: the detector resolved its
+    /// destination against the arrangement it fired under (ADR 0018), and
+    /// nothing here re-derives, re-looks-up, or mirrors an edge. Anything
+    /// this driver added would be computed against the arrangement of
+    /// *now* rather than the one the crossing was detected against, which
+    /// is the staleness `DetectedCrossing` exists to make impossible.
+    fn edge_leave_event(
+        &self,
+        crossing: DetectedCrossing,
+        generation: u64,
+    ) -> Option<ControlEvent> {
+        if !self.edge_crossing_is_current(generation, "leave") {
+            return None;
         }
+        // Same session choice as a console take-control, plus where the
+        // crossing lands on the peer (ADR 0009, ADR 0018).
+        let session = self.sessions.last().copied().unwrap_or_else(Uuid::nil);
+        Some(ControlEvent::EdgeLeave { session, crossing })
+    }
+
+    /// The engine event for a return crossing, or `None` for a stale one
+    /// (`process`'s translation for [`InputControlEvent::EdgeReturn`]).
+    fn edge_return_event(
+        &self,
+        crossing: DetectedCrossing,
+        generation: u64,
+    ) -> Option<ControlEvent> {
+        if !self.edge_crossing_is_current(generation, "return") {
+            return None;
+        }
+        Some(ControlEvent::EdgeReturn { crossing })
+    }
+
+    /// Whether a crossing detected under `generation` still describes the
+    /// control state this machine is in. A crossing carries a `kind` frozen
+    /// at detection time and travels through bounded queues to get here; if
+    /// the edge mode was republished on the way — a changed mode, or a
+    /// re-prime after a cursor placement — acting on it would apply a
+    /// decision about the old state to the new one.
+    fn edge_crossing_is_current(&self, generation: u64, kind: &'static str) -> bool {
+        if generation == self.edge_mode_generation {
+            return true;
+        }
+        tracing::debug!(
+            kind,
+            generation,
+            current = self.edge_mode_generation,
+            "edge: stale crossing dropped; the control state changed after it was detected"
+        );
+        false
     }
 
     /// Hand `event` to the engine, tracing the transition — unless it is
@@ -739,7 +942,15 @@ impl InputControlDriver {
                         self.controlled_input_baseline = self.capture.last_input_tick();
                     }
                 }
-                ControlAction::PlaceCursor(fraction) => self.place_cursor(fraction),
+                ControlAction::PlaceCursor(entry) => {
+                    self.place_cursor(&entry);
+                    // The pointer now sits on a crossing span — the very
+                    // seam it arrived across, which is also a *trigger*
+                    // seam. Ask for a re-prime there — needed even when the
+                    // control state, and so the mode, did not change at all
+                    // (a refreshed grant).
+                    self.edge_reprime_due = true;
+                }
                 ControlAction::ScheduleRequestTimeout {
                     session,
                     request_id,
@@ -844,6 +1055,81 @@ async fn cursor_applier(mut desired: watch::Receiver<bool>, mask: Arc<dyn Cursor
     .await;
 }
 
+/// Where an arriving `EntryPoint` puts the cursor on this machine (ADR
+/// 0018, docs/PROTOCOL.md §6.1): the monitor it names when this machine
+/// can honour it, and the degraded desktop-bounds edge when it cannot —
+/// with the diagnostic that says which of the two it was and why.
+///
+/// The three degraded routes are deliberately **one** path rather than
+/// three, because they are one rule: an entry point this machine cannot
+/// honour costs placement, not control. They differ only in the line they
+/// log, and that difference is the whole diagnostic value.
+///
+/// - **Unaddressed** — the sender named no monitor. Not a mismatch: an
+///   implicit (`--left`/`--right`) arrangement has no destination id to
+///   give and says so, on every crossing, which is why this one is not a
+///   warning.
+/// - **Revision mismatch** — the sender derived the entry point from an
+///   arrangement this machine does not hold. Expected, and brief, while an
+///   edit propagates; the line names both revisions so a soak log says
+///   *which* two disagreed.
+/// - **Unknown monitor** — the id is one no live screen here carries (or
+///   is not a well-formed [`MonitorId`] at all, which a validated wire
+///   value only reaches by being the empty string, already handled above).
+///
+/// `None` only when the machine reports no monitors whatsoever, which no
+/// real display does; the caller then simply does not place.
+fn resolve_entry(map: &CrossingMap, entry: &EntryPoint) -> Option<CursorPoint> {
+    // Both derived here rather than passed in: this function's whole job
+    // is to honour one entry point, and a caller able to hand it an edge
+    // or a fraction from a *different* one is a way to be wrong that need
+    // not exist.
+    let edge = Edge::from_wire(entry.edge);
+    let fraction = EdgeFraction::from_wire(entry.fraction);
+    if entry.monitor.is_empty() {
+        tracing::debug!(
+            ?edge,
+            "control: unaddressed entry point; placing on the desktop-bounds edge"
+        );
+        return map.outer_entry(edge, fraction);
+    }
+    // Revision `0` is both "an implicit arrangement" and "the receiver has
+    // no drawn layout", so an addressed entry point could in principle
+    // match a local implicit map on revision alone. It cannot resolve
+    // against one: an implicit map reports every monitor's id as `None`
+    // (`Addressing::Implicit`), so the `enter` below finds nothing and the
+    // unknown-monitor branch takes it. Identity, not the revision, is what
+    // keeps the two apart — which is why the implicit path blanks ids
+    // rather than minting plausible ones.
+    if entry.layout_revision != map.revision() {
+        tracing::warn!(
+            monitor = entry.monitor,
+            sender_revision = entry.layout_revision,
+            local_revision = map.revision(),
+            ?edge,
+            "control: the entry point was derived from a layout revision this machine does not \
+             hold; placing on the desktop-bounds edge instead — the transfer itself is unaffected"
+        );
+        return map.outer_entry(edge, fraction);
+    }
+    // `enter` is `arrive`'s id-shaped sibling: the same lookup, for a
+    // caller holding a wire monitor id rather than a `CrossTarget`.
+    let placed = MonitorId::new(&entry.monitor)
+        .ok()
+        .and_then(|monitor| map.enter(&monitor, edge, fraction));
+    if placed.is_some() {
+        return placed;
+    }
+    tracing::warn!(
+        monitor = entry.monitor,
+        revision = entry.layout_revision,
+        ?edge,
+        "control: no live monitor here is named by the arriving entry point; placing on the \
+         desktop-bounds edge instead — the transfer itself is unaffected"
+    );
+    map.outer_entry(edge, fraction)
+}
+
 /// A short label for a control action, for the transition trace. Kept
 /// coarse (message *kind*, not contents) so the log never carries input.
 fn action_label(action: &ControlAction) -> &'static str {
@@ -870,7 +1156,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
     use uuid::Uuid;
 
@@ -880,21 +1166,66 @@ mod tests {
     use crossover_platform::{CursorMask, DisplayInfo, InputCapture, InputInjector, Screen};
     use crossover_protocol::hello::MessageType;
     use crossover_protocol::{
-        ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, InputBatch,
-        RawFrame, ReleaseAllInput, WireButton, WireInputEvent,
+        ControlRelease, ControlRequest, ControlResponse, ControlVerdict, DenyReason, EntryPoint,
+        InputBatch, RawFrame, ReleaseAllInput, WireButton, WireInputEvent,
+        control::Edge as WireEdge,
     };
 
     use super::{InputControlEvent, input_control};
     use crate::command::{FrameTarget, SessionCommand};
     use crate::control::{ControlConfig, ControlNotice};
-    use crate::edge_driver::EdgeMode;
+    use crate::crossing::CrossTarget;
+    use crate::edge_driver::DetectedCrossing;
+    use crate::edge_driver::{CrossingKind, EdgeMode, EdgeModeUpdate, REARM_MARGIN};
     use crate::input::{InputEvent, KeyEvent, PointerButton, PointerEvent, hid};
-    use crate::topology::{EdgeFraction, LinkSide, MonitorRect, Topology};
+    use crate::topology::{CursorPoint, Edge, EdgeFraction, LinkSide, MonitorRect};
+
+    /// A wire [`EntryPoint`] **arriving at the rig** from its peer,
+    /// unaddressed — what an implicit (`--left`/`--right`) peer sends on
+    /// every crossing (ADR 0018), so the rig places on its desktop-bounds
+    /// edge.
+    ///
+    /// `edge` is `Right`, and the direction is the whole reason to say so:
+    /// docs/PROTOCOL.md §6.1 states the edge in the **receiver's** terms,
+    /// the rig is a left member, and a cursor coming from the peer arrives
+    /// on the left member's `Right` edge. Compare
+    /// [`unaddressed_crossing`], the rig's own *outbound* crossing, which
+    /// names `Left` — the peer's edge. The two being opposite is the
+    /// receiver-terms rule made visible in one file.
+    ///
+    /// Before this branch the receiving side ignored the field entirely
+    /// and placed on whichever edge its own `--left`/`--right` named, so a
+    /// fixture could carry either value undetected. It cannot now.
+    fn entry_point(fraction: EdgeFraction) -> EntryPoint {
+        EntryPoint::unaddressed(WireEdge::Right, fraction.to_wire())
+    }
+
+    /// A detected crossing **leaving the rig**, from its implicit
+    /// arrangement: nothing named, revision 0, arriving on the peer's
+    /// `Left` edge — see [`entry_point`] for why that mirrors what
+    /// arrives here.
+    fn unaddressed_crossing(fraction: f64) -> DetectedCrossing {
+        DetectedCrossing {
+            target: CrossTarget {
+                device: None,
+                monitor: None,
+                edge: Edge::Left,
+            },
+            position: EdgeFraction::new(fraction),
+            layout_revision: 0,
+        }
+    }
 
     const HD: Screen = Screen {
         width: 1920,
         height: 1080,
     };
+
+    /// This machine's identity, for the rig's implicit arrangement. Only
+    /// the *shape* matters here — an implicit crossing is unaddressed, so
+    /// no identity from it ever reaches a message.
+    const RIG_LOCAL: crossover_topology::DeviceId =
+        crossover_topology::DeviceId::from_bytes([0x11; 16]);
 
     /// The session the single-session tests operate on.
     const SESSION: Uuid = Uuid::from_bytes([0xA1; 16]);
@@ -909,19 +1240,76 @@ mod tests {
         events: mpsc::Sender<InputControlEvent>,
         commands: crate::outbound::CommandReceiver,
         notices: mpsc::Receiver<ControlNotice>,
-        edge_modes: mpsc::Receiver<EdgeMode>,
+        /// A real subscription to what the driver publishes — the detecting
+        /// rig included, since a `watch` has as many receivers as it likes.
+        edge_modes: watch::Receiver<EdgeModeUpdate>,
     }
 
+    /// The rig's edge-poll period, mirroring the application's ~125 Hz.
+    const EDGE_POLL: Duration = Duration::from_millis(8);
+
     fn rig() -> Rig {
+        build_rig(false)
+    }
+
+    /// A rig wired the way the application wires a seamless machine: a real
+    /// [`EdgeDetectDriver`] watching the same [`FakeDisplay`] the injector
+    /// places the cursor on, with its crossings forwarded back in as control
+    /// events. That closes the loop placement → detection → transfer, which
+    /// a bare edge-mode receiver leaves open.
+    fn edge_detecting_rig() -> Rig {
+        build_rig(true)
+    }
+
+    fn build_rig(detect: bool) -> Rig {
+        let display = Arc::new(FakeDisplay::new(HD));
+        // A left-member implicit arrangement (crosses on the right edge)
+        // so `PlaceCursor` has geometry to resolve through; most tests
+        // never trigger it. Built through the worker's own constructor,
+        // not a copy of it (ADR 0018).
+        let source = crate::edge_driver::implicit_crossing_source(LinkSide::Left, RIG_LOCAL);
+        build_rig_over(detect, display, source)
+    }
+
+    /// A rig whose arrangement is **drawn**, over [`mixed_dpi_screens`] —
+    /// the explicit path this branch turned on, wired exactly as the
+    /// implicit one is and through the same production constructor.
+    fn drawn_rig(detect: bool) -> Rig {
+        let display = Arc::new(FakeDisplay::new(Screen {
+            width: 5760,
+            height: 2160,
+        }));
+        display.set_monitor_layout(mixed_dpi_screens());
+        let source = crate::edge_driver::explicit_crossing_source(mixed_dpi_layout(), RIG_LOCAL);
+        build_rig_over(detect, display, source)
+    }
+
+    fn build_rig_over(
+        detect: bool,
+        display: Arc<FakeDisplay>,
+        source: crate::edge_driver::CrossingSource,
+    ) -> Rig {
         let capture = Arc::new(FakeInputCapture::new());
         let injector = Arc::new(FakeInputInjector::new());
         let cursor_mask = Arc::new(FakeCursorMask::new());
-        let display = Arc::new(FakeDisplay::new(HD));
-        let (edge_mode_tx, edge_modes) = mpsc::channel(8);
-        // A left-member topology (links on the right edge) so PlaceCursor
-        // has geometry to map through; most tests never trigger it.
+        // Placements move the display's cursor, as a real absolute move does.
+        injector.follow(Arc::clone(&display));
+        let (edge_mode_tx, detection) = if detect {
+            let live = source.read(&*display).expect("a fake display");
+            let (edge_driver, mode_tx, crossings) = crate::edge_driver::edge_detect(
+                Arc::clone(&display) as Arc<dyn DisplayInfo>,
+                source.derive_current(&live),
+                source.clone(),
+                EDGE_POLL,
+            );
+            (mode_tx, Some((edge_driver, crossings)))
+        } else {
+            (watch::channel(EdgeModeUpdate::initial()).0, None)
+        };
+        // Subscribed before the driver exists, so no publication is missed.
+        let edge_modes = edge_mode_tx.subscribe();
         let seamless = super::SeamlessInputs {
-            topology: Topology::new(LinkSide::Left),
+            crossings: source,
             display: Arc::clone(&display) as Arc<dyn DisplayInfo>,
             edge_mode: edge_mode_tx,
         };
@@ -935,6 +1323,28 @@ mod tests {
             },
         );
         tokio::spawn(driver.run());
+        if let Some((edge_driver, mut crossings)) = detection {
+            tokio::spawn(edge_driver.run());
+            let control_events = events.clone();
+            // The application's `spawn_edge_wiring`, in miniature.
+            tokio::spawn(async move {
+                while let Some(crossing) = crossings.recv().await {
+                    let event = match crossing.kind {
+                        CrossingKind::Leave => InputControlEvent::EdgeLeave {
+                            crossing: crossing.crossing,
+                            generation: crossing.generation,
+                        },
+                        CrossingKind::Return => InputControlEvent::EdgeReturn {
+                            crossing: crossing.crossing,
+                            generation: crossing.generation,
+                        },
+                    };
+                    if control_events.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         Rig {
             capture,
             injector,
@@ -961,11 +1371,35 @@ mod tests {
             .expect("notice channel closed")
     }
 
-    async fn next_edge_mode(rig: &mut Rig) -> EdgeMode {
-        timeout(Duration::from_secs(5), rig.edge_modes.recv())
+    /// The next edge-mode publication. A `watch` coalesces, so this is the
+    /// newest value at the moment it is read, not necessarily every value
+    /// the driver sent — which is exactly the contract the detector reads
+    /// it under.
+    async fn next_edge_update(rig: &mut Rig) -> EdgeModeUpdate {
+        timeout(Duration::from_secs(5), rig.edge_modes.changed())
             .await
             .expect("timed out waiting for an edge mode")
-            .expect("edge-mode channel closed")
+            .expect("edge-mode channel closed");
+        *rig.edge_modes.borrow_and_update()
+    }
+
+    async fn next_edge_mode(rig: &mut Rig) -> EdgeMode {
+        next_edge_update(rig).await.mode
+    }
+
+    /// The edge-mode generation in force once `expected` has been reached.
+    /// A crossing injected by hand must carry this to be acted on. Read
+    /// from the published value rather than counted: the driver drains
+    /// events in batches (two control-state changes in one batch produce a
+    /// single publication) and the channel coalesces besides, so the only
+    /// authority on the current generation is the sender's own stamp.
+    async fn generation_at(rig: &mut Rig, expected: EdgeMode) -> u64 {
+        loop {
+            let update = next_edge_update(rig).await;
+            if update.mode == expected {
+                return update.generation;
+            }
+        }
     }
 
     /// Wait until the cursor mask reaches `hidden` (it is applied on a
@@ -1134,7 +1568,7 @@ mod tests {
 
         // The peer hands control back across the edge, carrying where it left.
         let release = ControlRelease {
-            entry: Some(EdgeFraction::new(0.5).to_wire()),
+            entry: Some(entry_point(EdgeFraction::new(0.5))),
         };
         rig.events
             .send(frame(
@@ -1208,7 +1642,7 @@ mod tests {
         // so the cursor stays visible.
         let take = ControlRequest {
             request_id: 1,
-            entry: Some(EdgeFraction::new(0.5).to_wire()),
+            entry: Some(entry_point(EdgeFraction::new(0.5))),
         };
         rig.events
             .send(frame(
@@ -1223,9 +1657,11 @@ mod tests {
 
         // The cursor returns across this machine's edge: the user has left,
         // so the cursor must hide even though control reverts to local.
+        let generation = generation_at(&mut rig, EdgeMode::Returning).await;
         rig.events
             .send(InputControlEvent::EdgeReturn {
-                position: EdgeFraction::new(0.5),
+                crossing: unaddressed_crossing(0.5),
+                generation,
             })
             .await
             .unwrap();
@@ -1239,7 +1675,7 @@ mod tests {
         // The user comes back — a fresh grant — so the cursor shows again.
         let re_enter = ControlRequest {
             request_id: 2,
-            entry: Some(EdgeFraction::new(0.5).to_wire()),
+            entry: Some(entry_point(EdgeFraction::new(0.5))),
         };
         rig.events
             .send(frame(
@@ -1268,7 +1704,7 @@ mod tests {
         // Be controlled, then return → hidden, and no longer controlled.
         let take = ControlRequest {
             request_id: 1,
-            entry: Some(EdgeFraction::new(0.5).to_wire()),
+            entry: Some(entry_point(EdgeFraction::new(0.5))),
         };
         rig.events
             .send(frame(
@@ -1279,9 +1715,11 @@ mod tests {
             .unwrap();
         let _grant = next_command(&mut rig).await;
         assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+        let generation = generation_at(&mut rig, EdgeMode::Returning).await;
         rig.events
             .send(InputControlEvent::EdgeReturn {
-                position: EdgeFraction::new(0.5),
+                crossing: unaddressed_crossing(0.5),
+                generation,
             })
             .await
             .unwrap();
@@ -1948,6 +2386,412 @@ mod tests {
         );
     }
 
+    // ---- resolving an arriving entry point (ADR 0018) ----
+
+    /// This machine's two screens for the placement tests: a 4K panel at
+    /// the origin and a 1080p one beside it, so a fraction that lands on
+    /// one lands on a *different pixel* on the other. That difference is
+    /// the mixed-DPI criterion, and having both in one map is what makes
+    /// "the named monitor" a claim with teeth.
+    fn mixed_dpi_screens() -> Vec<crossover_platform::MonitorInfo> {
+        vec![
+            crossover_platform::MonitorInfo {
+                id: Some("HIDPI".to_owned()),
+                rect: MonitorRect {
+                    left: 0,
+                    top: 0,
+                    width: 3840,
+                    height: 2160,
+                },
+            },
+            crossover_platform::MonitorInfo {
+                id: Some("STD".to_owned()),
+                rect: MonitorRect {
+                    left: 3840,
+                    top: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+        ]
+    }
+
+    /// The drawn revision the placement tests derive at — not `0`, so a
+    /// map that lost its revision cannot pass a mismatch test by accident.
+    const DRAWN_REVISION: u64 = 11;
+
+    /// The peer of the drawn arrangement.
+    const RIG_PEER: crossover_topology::DeviceId =
+        crossover_topology::DeviceId::from_bytes([0x22; 16]);
+
+    /// A drawn arrangement over [`mixed_dpi_screens`]: both local screens
+    /// placed as the OS reports them, with the peer's single screen drawn
+    /// off the 1080p one's right edge — so the only seam is `STD`'s right
+    /// edge, and the 4K panel's is interior.
+    fn mixed_dpi_layout() -> crossover_topology::Layout {
+        use crossover_topology::{DevicePair, Layout, LayoutRect, MonitorId, PlacedMonitor};
+
+        let placed = |device, id: &str, x, width, height| PlacedMonitor {
+            device,
+            id: MonitorId::new(id).unwrap(),
+            rect: LayoutRect {
+                x,
+                y: 0,
+                width,
+                height,
+            },
+        };
+        let pair = DevicePair::new(RIG_LOCAL, RIG_PEER).unwrap();
+        Layout::new(
+            DRAWN_REVISION,
+            RIG_LOCAL,
+            vec![
+                placed(RIG_LOCAL, "HIDPI", 0, 3840, 2160),
+                placed(RIG_LOCAL, "STD", 3840, 1920, 1080),
+                placed(RIG_PEER, "PEER-1", 5760, 1920, 1080),
+            ],
+            &pair,
+        )
+        .unwrap()
+    }
+
+    /// That arrangement as the map this machine's real screens give it.
+    fn mixed_dpi_map() -> crate::crossing::CrossingMap {
+        crate::crossing::derive(&mixed_dpi_layout(), RIG_LOCAL, &mixed_dpi_screens())
+    }
+
+    /// An entry point naming a monitor this machine has places on **that**
+    /// monitor, at that monitor's own pixels.
+    ///
+    /// The two literals are the mixed-DPI criterion stated as arithmetic:
+    /// the same fraction against the 4K panel's 2160-row edge and against
+    /// the 1080p panel's is `round(0.4 × 2159) = 864` and
+    /// `round(0.4 × 1079) = 432`. Neither is derived from the other, and
+    /// no scale factor appears anywhere — which is the property ADR 0018
+    /// says holds by construction.
+    #[test]
+    fn a_named_entry_point_places_on_that_monitor_in_its_own_pixels() {
+        let map = mixed_dpi_map();
+        let fraction = EdgeFraction::new(0.4);
+
+        let on_std = super::resolve_entry(
+            &map,
+            &EntryPoint {
+                monitor: "STD".to_owned(),
+                edge: WireEdge::Left,
+                fraction: fraction.to_wire(),
+                layout_revision: DRAWN_REVISION,
+            },
+        );
+        assert_eq!(on_std, Some(CursorPoint { x: 3840, y: 432 }));
+
+        let on_hidpi = super::resolve_entry(
+            &map,
+            &EntryPoint {
+                monitor: "HIDPI".to_owned(),
+                edge: WireEdge::Right,
+                fraction: fraction.to_wire(),
+                layout_revision: DRAWN_REVISION,
+            },
+        );
+        assert_eq!(on_hidpi, Some(CursorPoint { x: 3839, y: 864 }));
+    }
+
+    /// An id no live screen carries costs placement, not control: the
+    /// cursor lands on the desktop-bounds edge matching the entry point's
+    /// edge, and the log names the monitor that was asked for
+    /// (docs/PROTOCOL.md §6.1).
+    #[test]
+    fn an_unknown_monitor_degrades_to_the_desktop_edge_with_a_diagnostic() {
+        let map = mixed_dpi_map();
+        let fraction = EdgeFraction::new(0.4);
+        let mut placed = None;
+        let log = crate::testing::captured(|| {
+            placed = super::resolve_entry(
+                &map,
+                &EntryPoint {
+                    monitor: "GONE".to_owned(),
+                    edge: WireEdge::Left,
+                    fraction: fraction.to_wire(),
+                    layout_revision: DRAWN_REVISION,
+                },
+            );
+        });
+        // The desktop's left edge is the 4K panel's, so the fraction is
+        // taken against *its* height — not the 1080p panel's. Note this
+        // fixture cannot tell the monitor's height from the bounding
+        // box's, since the tallest screen is also the outermost one;
+        // `the_degraded_fraction_is_the_outer_monitors_not_the_boxs`
+        // is the case that can.
+        assert_eq!(placed, Some(CursorPoint { x: 0, y: 864 }));
+        assert!(
+            log.contains("GONE"),
+            "the diagnostic must name the monitor that could not be honoured: {log}"
+        );
+        assert!(
+            log.contains("no live monitor"),
+            "the diagnostic must say what went wrong: {log}"
+        );
+    }
+
+    /// The degraded fraction is taken against the **outer monitor's** edge,
+    /// never against the desktop bounding box's — ADR 0009's 2026-08-09
+    /// refinement, which every implicit crossing depends on
+    /// (docs/PROTOCOL.md §6.1).
+    ///
+    /// [`mixed_dpi_map`] cannot show this: its outermost screen on the
+    /// tested edge is also its tallest, so monitor height and box height
+    /// are both 2160 and the two rules agree by accident. Here the
+    /// arrangement is reversed — the **short** 1080p screen sits at the
+    /// origin, the 4K one beside it — so the two rules give visibly
+    /// different rows and only one of them is right:
+    ///
+    /// - against the outer monitor: `round(0.4 × 1079) = 432` ✓
+    /// - against the bounding box:  `round(0.4 × 2159) = 864` ✗
+    #[test]
+    fn the_degraded_fraction_is_the_outer_monitors_not_the_boxs() {
+        let screens = vec![
+            crossover_platform::MonitorInfo {
+                id: Some("STD".to_owned()),
+                rect: MonitorRect {
+                    left: 0,
+                    top: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            crossover_platform::MonitorInfo {
+                id: Some("HIDPI".to_owned()),
+                rect: MonitorRect {
+                    left: 1920,
+                    top: 0,
+                    width: 3840,
+                    height: 2160,
+                },
+            },
+        ];
+        // The map's spans are irrelevant here — degraded placement reads
+        // only the live rectangles — so an inert map states exactly the
+        // inputs this rule depends on and nothing else.
+        let map = crate::crossing::CrossingMap::inert(RIG_LOCAL, &screens);
+        let fraction = EdgeFraction::new(0.4);
+
+        let placed = super::resolve_entry(
+            &map,
+            &EntryPoint::unaddressed(WireEdge::Left, fraction.to_wire()),
+        );
+        assert_eq!(
+            placed,
+            Some(CursorPoint { x: 0, y: 432 }),
+            "the fraction was taken against the desktop bounding box, not the outer monitor"
+        );
+
+        // The mirrored edge picks the *other* screen, and its own height:
+        // `round(0.4 × 2159) = 864` on the 4K panel's right column.
+        let placed = super::resolve_entry(
+            &map,
+            &EntryPoint::unaddressed(WireEdge::Right, fraction.to_wire()),
+        );
+        assert_eq!(placed, Some(CursorPoint { x: 5759, y: 864 }));
+    }
+
+    /// A revision this machine does not hold degrades the same way, and
+    /// the diagnostic names **both** revisions — which is what makes an
+    /// edit's propagation window diagnosable rather than merely visible.
+    #[test]
+    fn a_revision_mismatch_degrades_and_names_both_revisions() {
+        let map = mixed_dpi_map();
+        let fraction = EdgeFraction::new(0.4);
+        let mut placed = None;
+        let log = crate::testing::captured(|| {
+            placed = super::resolve_entry(
+                &map,
+                &EntryPoint {
+                    // A monitor that really is here — so only the revision
+                    // can be what refuses it.
+                    monitor: "STD".to_owned(),
+                    edge: WireEdge::Left,
+                    fraction: fraction.to_wire(),
+                    layout_revision: DRAWN_REVISION + 1,
+                },
+            );
+        });
+        assert_eq!(placed, Some(CursorPoint { x: 0, y: 864 }));
+        assert!(
+            log.contains(&format!("sender_revision={}", DRAWN_REVISION + 1))
+                && log.contains(&format!("local_revision={DRAWN_REVISION}")),
+            "the diagnostic must name both revisions: {log}"
+        );
+    }
+
+    /// An unaddressed entry point takes the same degraded path — it *is*
+    /// that path, reached deliberately rather than by mismatch — and does
+    /// not warn, because every implicit crossing arrives this way and a
+    /// warning per crossing is a warning nobody reads.
+    #[test]
+    fn an_unaddressed_entry_point_is_the_same_degraded_placement() {
+        let map = mixed_dpi_map();
+        let fraction = EdgeFraction::new(0.4);
+        let mut placed = None;
+        let log = crate::testing::captured(|| {
+            placed = super::resolve_entry(
+                &map,
+                &EntryPoint::unaddressed(WireEdge::Left, fraction.to_wire()),
+            );
+        });
+        assert_eq!(placed, Some(CursorPoint { x: 0, y: 864 }));
+        assert!(
+            !log.contains("WARN"),
+            "an ordinary implicit crossing warned: {log}"
+        );
+    }
+
+    /// Revision `0` means two things — "the sender had an implicit
+    /// arrangement" and "this receiver holds no drawn layout" — so an
+    /// *addressed* entry point at revision 0 gets past the revision check
+    /// on a machine running implicitly. It must still degrade, and it does,
+    /// because an implicit map reports no monitor identities at all: the id
+    /// matches nothing and the unknown-monitor branch takes it.
+    ///
+    /// Pinned because the safety here rests on identity rather than on the
+    /// revision, and blanking those ids
+    /// (`crossing::Addressing::Implicit`) is the sort of thing a later
+    /// "helpful" change might undo.
+    #[test]
+    fn an_addressed_entry_point_cannot_resolve_against_an_implicit_map() {
+        let source = crate::edge_driver::implicit_crossing_source(LinkSide::Left, RIG_LOCAL);
+        let map = source.derive(&mixed_dpi_screens());
+        assert_eq!(map.revision(), 0, "an implicit arrangement is revision 0");
+
+        let fraction = EdgeFraction::new(0.4);
+        let mut placed = None;
+        let log = crate::testing::captured(|| {
+            placed = super::resolve_entry(
+                &map,
+                &EntryPoint {
+                    // A real screen of this machine's, named at the same
+                    // revision the implicit map reports.
+                    monitor: "STD".to_owned(),
+                    edge: WireEdge::Left,
+                    fraction: fraction.to_wire(),
+                    layout_revision: 0,
+                },
+            );
+        });
+        // Degraded, not resolved: the 4K panel is outermost on the left.
+        assert_eq!(placed, Some(CursorPoint { x: 0, y: 864 }));
+        assert!(
+            log.contains("no live monitor"),
+            "an implicit map answered an addressed entry point: {log}"
+        );
+    }
+
+    /// The whole inbound path, not just its resolver: a driver wired to a
+    /// drawn arrangement receives a grant request naming a real screen and
+    /// moves the pointer onto that screen's pixels.
+    #[tokio::test]
+    async fn a_drawn_grant_places_the_cursor_on_the_named_monitor() {
+        let mut rig = drawn_rig(false);
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        let request = ControlRequest {
+            request_id: 1,
+            entry: Some(EntryPoint {
+                monitor: "STD".to_owned(),
+                edge: WireEdge::Left,
+                fraction: EdgeFraction::new(0.4).to_wire(),
+                layout_revision: DRAWN_REVISION,
+            }),
+        };
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                request.encode_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+
+        let placements = rig.injector.placements();
+        assert_eq!(placements.len(), 1, "exactly one placement on entry");
+        assert_eq!(
+            placements[0],
+            CursorPoint { x: 3840, y: 432 },
+            "the grant did not enter on the monitor the peer named"
+        );
+    }
+
+    /// The drawn arrangement end to end, on the sending side: a real
+    /// detector over a real drawn layout sees the cursor reach the seam,
+    /// and the request that goes out carries the peer's **real** monitor
+    /// id, the peer's arrival edge, and the layout's revision.
+    ///
+    /// Every one of those is a literal here, because each is a thing the
+    /// side model could not say at all: before ADR 0018 the wire carried
+    /// an empty monitor, an edge derived from a `--left` flag, and
+    /// revision `0`.
+    ///
+    /// The seam is `STD`'s right column (`3840 + 1919`), and the 4K
+    /// panel's right column is *interior* — so this also pins that a drawn
+    /// arrangement makes exactly the seams the user drew, not every outer
+    /// edge of the desktop.
+    #[tokio::test]
+    async fn a_drawn_seam_sends_a_fully_addressed_entry_point() {
+        tokio::time::pause();
+        let mut rig = drawn_rig(true);
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        assert_eq!(next_edge_mode(&mut rig).await, EdgeMode::Leaving);
+        // Somewhere harmless first, so the detector arms.
+        rig.display.set_cursor(CursorPoint { x: 1000, y: 1000 });
+        edge_polls(4).await;
+        // The interior seam between this machine's own two screens is not
+        // a crossing: nothing is drawn across it.
+        rig.display.set_cursor(CursorPoint { x: 3839, y: 540 });
+        edge_polls(4).await;
+        assert!(
+            timeout(Duration::from_millis(50), rig.commands.recv())
+                .await
+                .is_err(),
+            "an interior seam handed control away"
+        );
+
+        // The drawn seam: `STD`'s right column, 540 rows down its 1080.
+        rig.display.set_cursor(CursorPoint { x: 5759, y: 540 });
+        let SessionCommand::SendFrame {
+            message_type,
+            payload,
+            ..
+        } = next_command(&mut rig).await
+        else {
+            panic!("expected a ControlRequest for the drawn crossing");
+        };
+        assert_eq!(message_type, MessageType::ControlRequest.wire());
+        let entry = ControlRequest::decode_payload(&payload)
+            .unwrap()
+            .entry
+            .expect("a drawn crossing must address its destination");
+        assert_eq!(entry.monitor, "PEER-1");
+        assert_eq!(
+            entry.edge,
+            WireEdge::Left,
+            "the receiver's terms: the cursor left this machine's Right edge"
+        );
+        assert_eq!(entry.layout_revision, DRAWN_REVISION);
+        // 540 of `STD`'s 1080 rows, as a fraction of the peer screen's
+        // whole drawn edge — within a wire step of half way.
+        let fraction = f64::from(entry.fraction) / f64::from(u16::MAX);
+        assert!(
+            (fraction - 540.0 / 1079.0).abs() < 1e-3,
+            "crossed at {fraction}"
+        );
+    }
+
     /// An edge-driven grant places the cursor on the entry edge (ADR
     /// 0009): the rig is a left member, so control enters on its right
     /// edge, at the crossing fraction of the screen height.
@@ -1962,7 +2806,7 @@ mod tests {
         let position = EdgeFraction::new(0.5);
         let request = ControlRequest {
             request_id: 1,
-            entry: Some(position.to_wire()),
+            entry: Some(entry_point(position)),
         };
         rig.events
             .send(frame(
@@ -1983,6 +2827,233 @@ mod tests {
             (placements[0].y - 540).abs() <= 1,
             "placed at mid-height, got y={}",
             placements[0].y
+        );
+    }
+
+    /// Let the edge detector run a few polls. Under `tokio::time::pause`
+    /// this advances the clock deterministically rather than waiting.
+    async fn edge_polls(count: u32) {
+        tokio::time::sleep(EDGE_POLL * count).await;
+    }
+
+    /// Bring an edge-detecting rig to "a peer controls this machine",
+    /// entered at mid-height so the cursor is placed on the linked column —
+    /// exactly where a real transfer leaves it.
+    async fn peer_takes_control_across_the_edge(rig: &mut Rig) {
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest {
+                    request_id: 1,
+                    entry: Some(entry_point(EdgeFraction::new(0.5))),
+                }
+                .encode_payload()
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(rig).await;
+        assert_eq!(next_notice(rig).await, ControlNotice::PeerTookControl);
+    }
+
+    /// The hardware bounce this margin exists for (ADR 0009 addendum,
+    /// 2026-08-19). Entry parks the cursor **on** the linked column, and the
+    /// same column means *return* while the peer drives this machine — so
+    /// with a bare one-pixel rising edge, a wobble at the seam fired a
+    /// complete reverse transfer, which re-parked both cursors on their
+    /// trigger columns and repeated (ten take/revoke cycles in five seconds
+    /// on hardware). Here the whole loop is real: the injector's placement
+    /// moves the display's cursor and a real detector polls it.
+    #[tokio::test]
+    async fn a_wobble_on_the_entry_column_does_not_bounce_control_back() {
+        tokio::time::pause();
+        let mut rig = edge_detecting_rig();
+        peer_takes_control_across_the_edge(&mut rig).await;
+        // The placement really moved the cursor onto the linked column.
+        assert_eq!(
+            rig.display.cursor_position().unwrap(),
+            CursorPoint { x: 1919, y: 540 }
+        );
+        // Let the detector adopt Returning mode and prime on that cursor.
+        edge_polls(4).await;
+
+        // The seam wobble: a pixel off the column and back, twice — what a
+        // hand resting against the edge produces at 125 Hz polling.
+        for _ in 0..2 {
+            rig.display.set_cursor(CursorPoint { x: 1918, y: 540 });
+            edge_polls(4).await;
+            rig.display.set_cursor(CursorPoint { x: 1919, y: 540 });
+            edge_polls(4).await;
+        }
+        assert!(
+            timeout(Duration::from_millis(500), rig.notices.recv())
+                .await
+                .is_err(),
+            "a wobble at the seam revoked the peer's control"
+        );
+
+        // Deliberate travel back into the screen re-arms, and the next
+        // touch of the column returns control as it should.
+        let clear = 1919 - i32::try_from(REARM_MARGIN).unwrap() - 1;
+        rig.display.set_cursor(CursorPoint { x: clear, y: 540 });
+        edge_polls(4).await;
+        rig.display.set_cursor(CursorPoint { x: 1919, y: 540 });
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::PeerControlRevoked
+        );
+    }
+
+    /// A *refreshed* grant — a re-request from the session that already
+    /// holds control, so a late answer converges rather than deadlocking
+    /// (ADR 0009 addendum, 2026-08-19) — places the cursor on the linked
+    /// column exactly as a first grant does. But it does not change
+    /// `is_controlled`, so the edge mode does not change either, and
+    /// nothing used to be republished. With the trigger armed (the user had
+    /// moved clear of the column in the meantime) the placement itself then
+    /// read as an arrival: the refresh revoked the grant it had just
+    /// re-issued.
+    #[tokio::test]
+    async fn a_refreshed_grant_re_primes_the_detector_instead_of_returning() {
+        tokio::time::pause();
+        let mut rig = edge_detecting_rig();
+        peer_takes_control_across_the_edge(&mut rig).await;
+        let before = generation_at(&mut rig, EdgeMode::Returning).await;
+        edge_polls(4).await; // the detector adopts Returning and primes
+
+        // The user's cursor travels well clear of the linked column, which
+        // is what arms the trigger — without this the placement could not
+        // fire whatever the mode did, and the test would prove nothing.
+        let clear = 1919 - i32::try_from(REARM_MARGIN).unwrap() - 1;
+        rig.display.set_cursor(CursorPoint { x: clear, y: 540 });
+        edge_polls(4).await;
+
+        // The grant holder asks again (its own answer came too late), so
+        // the engine refreshes the grant and places the cursor back on the
+        // entry column.
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest {
+                    request_id: 2,
+                    entry: Some(entry_point(EdgeFraction::new(0.5))),
+                }
+                .encode_payload()
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected a response to the refreshing request");
+        };
+        assert_eq!(message_type, MessageType::ControlResponse.wire());
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+        assert_eq!(
+            rig.display.cursor_position().unwrap(),
+            CursorPoint { x: 1919, y: 540 },
+            "the refresh did not place the cursor on the entry column"
+        );
+
+        // The refresh's own placement must fire nothing.
+        edge_polls(8).await;
+        assert!(
+            timeout(Duration::from_millis(500), rig.notices.recv())
+                .await
+                .is_err(),
+            "the refresh's cursor placement revoked the grant it had just re-issued"
+        );
+
+        // What makes that true: the (unchanged) mode is republished under a
+        // new generation, which re-primes the detector on the placed cursor.
+        let after = generation_at(&mut rig, EdgeMode::Returning).await;
+        assert!(
+            after > before,
+            "a refreshed grant left the detector primed for the state before it"
+        );
+
+        // And a crossing detected before the refresh — in flight while it
+        // happened — is stale, so it cannot revoke the refreshed grant.
+        rig.events
+            .send(InputControlEvent::EdgeReturn {
+                crossing: unaddressed_crossing(0.5),
+                generation: before,
+            })
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(500), rig.commands.recv())
+                .await
+                .is_err(),
+            "a crossing from before the refresh revoked the refreshed grant"
+        );
+    }
+
+    /// A crossing carries a `kind` frozen at detection time through two
+    /// bounded queues. If the control state changed on the way — the grant
+    /// it was detected under ended, and a new one began — acting on it would
+    /// revoke the *fresh* grant. The mode generation makes that impossible.
+    #[tokio::test]
+    async fn a_crossing_detected_under_a_superseded_mode_is_dropped() {
+        tokio::time::pause();
+        let mut rig = rig();
+        rig.events
+            .send(InputControlEvent::SessionEstablished { session: SESSION })
+            .await
+            .unwrap();
+        let before = generation_at(&mut rig, EdgeMode::Leaving).await;
+        rig.events
+            .send(frame(
+                MessageType::ControlRequest,
+                ControlRequest {
+                    request_id: 1,
+                    entry: None,
+                }
+                .encode_payload()
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let _grant = next_command(&mut rig).await;
+        assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
+        let current = generation_at(&mut rig, EdgeMode::Returning).await;
+        assert!(current > before, "the grant must advance the generation");
+
+        // A Return detected back under the pre-grant generation arrives
+        // late: it says nothing about the grant that exists now, so it is
+        // dropped.
+        rig.events
+            .send(InputControlEvent::EdgeReturn {
+                crossing: unaddressed_crossing(0.5),
+                generation: before,
+            })
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(500), rig.commands.recv())
+                .await
+                .is_err(),
+            "a stale crossing revoked the current grant"
+        );
+
+        // The same crossing under the current generation does revoke.
+        rig.events
+            .send(InputControlEvent::EdgeReturn {
+                crossing: unaddressed_crossing(0.5),
+                generation: current,
+            })
+            .await
+            .unwrap();
+        let SessionCommand::SendFrame { message_type, .. } = next_command(&mut rig).await else {
+            panic!("expected a ControlRelease for the edge return");
+        };
+        assert_eq!(message_type, MessageType::ControlRelease.wire());
+        assert_eq!(
+            next_notice(&mut rig).await,
+            ControlNotice::PeerControlRevoked
         );
     }
 

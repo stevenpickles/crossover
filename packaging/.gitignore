@@ -1,3 +1,7 @@
 # Build artifacts staged/produced by pack.ps1 — never committed.
 chocolatey/tools/*.exe
 chocolatey/*.nupkg
+# pack.ps1 copies the notice into tools\ so the nuspec packs it. The committed
+# source of truth is packaging/THIRD-PARTY-NOTICES.txt, one directory up; the
+# staged copy is an artifact like the executables beside it.
+chocolatey/tools/THIRD-PARTY-NOTICES.txt

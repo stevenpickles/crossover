@@ -10,12 +10,64 @@ use crate::ProtocolError;
 ///
 /// v2 (Phase 5): the control-transfer messages carry a normalized edge
 /// crossing position (ADR 0009), an incompatible layout change from v1.
-pub const PROTOCOL_VERSION: u16 = 2;
+///
+/// v3 (Phase 7): `ClipboardOffer` carries an optional `FileDescriptor`
+/// (ADR 0015). Unlike ADR 0014's additions — a new message type and an
+/// appended enum variant, both reachable only after a feature bit is
+/// negotiated — this one appends a field to a message that already
+/// travels, so *every* offer gains a byte and no feature bit can hide it
+/// from a peer that predates the change. A v2 peer would read the extra
+/// byte as trailing data and fail the payload, which by
+/// docs/PROTOCOL.md §7 is fatal to the session. The bump turns that into
+/// a clean, diagnosable refusal at `Hello` instead.
+///
+/// v4 (Phase 8, [ADR 0018](../../../docs/adr/0018-drawn-display-topology.md)):
+/// `ControlRequest.entry` and `ControlRelease.entry` change shape, from
+/// `Option<u16>` to `Option<EntryPoint>` (docs/PROTOCOL.md §6.1) — a
+/// structural change to messages that already travel between every pair
+/// of peers, exactly the v2→v3 case above and ADR 0017's rule applied
+/// unchanged: no feature bit can hide a layout change to a message that
+/// is not gated by one, so it is a version bump rather than a bit. A v3
+/// peer would read `EntryPoint`'s extra fields as trailing data (or
+/// misread `Option<u16>`'s single byte as `EntryPoint`'s multi-field
+/// encoding) and fail the payload — fatal per docs/PROTOCOL.md §7 — so
+/// the bump turns that into a clean, diagnosable refusal at `Hello`
+/// instead.
+///
+/// v5 (Phase 8, ADR 0018's 2026-08-21 amendment): `MonitorTopology`'s
+/// per-monitor entry gains an optional monitor `label` — the EDID product
+/// name, so the peer's editor can caption a rectangle `DELL U2720Q`
+/// instead of `\\.\DISPLAY1` (docs/PROTOCOL.md §6.2). ADR 0017's rule one
+/// more time: `MonitorTopology` travels between every pair of v4 peers
+/// and carries no feature bit, so the extra `Option` byte on every
+/// monitor of every report is on the wire whatever either side wants. A
+/// v4 peer would read it as trailing data and fail the payload — fatal
+/// per docs/PROTOCOL.md §7 — so the bump turns that into a refusal at
+/// `Hello`. The label itself is display-only and never identity; the
+/// bump is about the byte, not about what it means.
+///
+/// v6 (Phase 8, ADR 0018's 2026-08-22 amendment): the same per-monitor
+/// entry gains an optional `physical_size` — the panel's real width and
+/// height in millimetres, so the peer's editor can draw a 27" screen and a
+/// 13" one in proportion rather than by pixel count, which is what makes a
+/// crossing physically continuous across the seam between two desks
+/// (docs/PROTOCOL.md §6.2). ADR 0017's rule for the third time in this
+/// message: `MonitorTopology` travels between every pair of v5 peers and
+/// carries no feature bit, so the extra `Option` byte on every monitor of
+/// every report is on the wire whatever either side wants. A v5 peer would
+/// read it as trailing data and fail the payload — fatal per
+/// docs/PROTOCOL.md §7 — so the bump turns that into a refusal at `Hello`.
+/// Like the label before it the size is display-only and never identity;
+/// the bump is about the byte, not about what it means.
+pub const PROTOCOL_VERSION: u16 = 6;
 
-/// The lowest protocol version this build accepts. v1's control messages
-/// cannot be decoded by v2 (added fields), and there are no deployed v1
-/// peers, so v2 is the floor rather than a compatibility burden.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 2;
+/// The lowest protocol version this build accepts. Each bump has been an
+/// incompatible layout change (v1's control messages cannot be decoded by
+/// v2; v2's offers cannot be decoded by v3; v3's `entry` cannot be decoded
+/// by v4; v4's `MonitorTopology` cannot be decoded by v5, nor v5's by v6),
+/// and peers are deployed in lockstep, so the floor tracks the ceiling
+/// rather than carrying compatibility code for a version nobody runs.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 6;
 
 /// An inclusive range of supported protocol versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

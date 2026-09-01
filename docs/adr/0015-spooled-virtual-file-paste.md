@@ -1,7 +1,7 @@
 # 0015. Files and folders spool internally and paste as virtual files
 
-Status: Proposed (Phase 7 — design captured 2026-08-11, model revised
-2026-08-12, not yet scheduled)
+Status: Accepted (design captured 2026-08-11, model revised 2026-08-12,
+open forks settled and accepted 2026-08-17)
 Date: 2026-08-12
 
 ## Context
@@ -143,13 +143,27 @@ verified completion is what this ADR revises.
   high-integrity worker deletes from and reads** — an ordinary unprivileged
   local process, not the compromised-machine attacker §6 puts out of scope.
   Three properties close that, and SECURITY.md carries them as **F15**:
-  1. **An explicit security descriptor at creation, not an inherited one:** a
-     DACL granting only the worker's user and the local administrators group,
-     **plus a High mandatory integrity label with no-write-up**, so a
-     medium-integrity process running as the same user can neither replace the
-     directory nor modify an entry. (Where the worker is *not* elevated there is
-     no integrity boundary to cross and the label is inert; the DACL still
-     applies.)
+  1. **An explicit security descriptor, asserted on every open — not merely at
+     creation:** a DACL granting only the worker's user and the local
+     administrators group, **plus a mandatory integrity label with
+     no-write-up**, so a medium-integrity process running as the same user can
+     neither replace the directory nor modify an entry. Two corrections the
+     platform slice (feature/126) forced, both recorded here rather than left
+     in the code:
+     - *At creation* was not enough. Property 2's check — a real directory,
+       not a reparse point — **passes for a root a lower-integrity same-user
+       process pre-created** with a permissive DACL and no label, which is the
+       cheapest attack available and would satisfy the check while providing
+       none of the protection F14's "protected since written" rests on. The
+       descriptor is therefore re-asserted on the verified handle at every
+       open, and a root whose descriptor cannot be asserted is refused rather
+       than used unprotected.
+     - The label is stamped at **the worker's own integrity level, capped at
+       High**, not hard-coded High. Windows refuses a label above the caller's
+       own without `SeRelabelPrivilege`, so a fixed High would make the spool
+       unusable for a non-elevated worker — the case this ADR already
+       describes as the label being inert while the DACL still applies. Now
+       that case is expressed by the level rather than by a failed call.
   2. **Open once, verify, then never re-resolve by path:** the root is opened
      with `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` and
      rejected unless it is a real directory and **not** a reparse point. If it
@@ -255,11 +269,12 @@ verified completion is what this ADR revises.
   - `CFSTR_FILECONTENTS`, `lindex` 0 — **delayed rendering**: the bytes are
     produced only when something asks, and they are produced by reading the
     spool entry;
-  - `CFSTR_ZONEIDENTIFIER` — Internet zone, so the file the shell creates
-    carries Mark-of-the-Web and SmartScreen / Office Protected View treat it as
-    the untrusted content it is. The spool entry itself is stamped the same way.
-    This is Windows-specific and lives behind a `crossover-platform` trait,
-    no-op where the concept does not exist.
+  - `CFSTR_ZONEIDENTIFIER` — **Local intranet zone** (see the 2026-08-17
+    decision below; this originally read *Internet*), so the file the shell
+    creates records where it came from without the execution-warning
+    machinery treating it as internet-sourced. This is Windows-specific and
+    lives behind a `crossover-platform` trait, no-op where the concept does
+    not exist.
 - **The accepted `FORMATETC` set is exact, and everything else is refused.**
   `CFSTR_FILECONTENTS` is served **only** as `TYMED_ISTREAM`, and only for
   `lindex == 0`; the descriptor and the zone identifier are served only as
@@ -414,7 +429,8 @@ before acceptance and again after each completion:
 |---|---|---|
 | `MAX_SPOOL_BYTES` | 1 GiB | Total bytes of all spool entries **including any in-flight `.part`**. Exactly four maximum-size (256 MiB) items, and no headroom beyond that by construction — the round number is the point: enough that a normal working session never evicts something the user still wanted, small enough to be an unremarkable footprint in app data. Since files are rare and typically far below the cap, four *maximum-size* items is a floor on how many real ones fit, not a typical count |
 | `MAX_SPOOL_ENTRIES` | 16 | Entries retained. Bounds directory scan, GC cost, and index size independently of item size, so a thousand tiny files cannot accumulate |
-| `SPOOL_ENTRY_TTL` | 24 h | Maximum age of an entry. Peer-controlled bytes should not sit at rest indefinitely for a feature whose whole point is "paste it now" |
+| *(entry lifetime)* | while it is the clipboard | An entry lives exactly as long as the clipboard still offers it. See "Entry lifetime" below — this replaces the age-based TTL the draft proposed |
+| `SPOOL_SWEEP_TTL` | 24 h | **Backstop only.** The age at which an entry is swept even though no clipboard change was ever observed for it — a lost listener, an ownership change we missed. Not the user-visible rule, and not a bound anything should normally reach |
 
 - **Eviction is oldest-completion-first**, applied until all three bounds hold,
   and it is **observable**: every eviction logs the entry id, its age, and the
@@ -439,6 +455,15 @@ before acceptance and again after each completion:
   completed `.bin` entries, and anything else that has appeared there. This
   removes the entire orphan-reconciliation surface and makes the spool's
   contents exactly "what this process received".
+  **Two things the sweep deliberately does not do** (feature/126): it does not
+  recurse, so a *directory* found in the root — a junction included — is
+  reported and left, because a recursive delete from the high-integrity worker
+  through a planted junction is the exact arbitrary-file-delete this design
+  forbids; and it unlinks only names that pass the spool's own strict name
+  rule, so a foreign file planted under a name we would never generate is
+  reported rather than removed. Both cases mean something else is writing to a
+  directory whose descriptor excludes it, which is a warning worth raising and
+  not a tidy-up worth performing silently.
 - **The spool index is in memory only.** Entry id → validated name, length,
   hash, completion time. Nothing about an entry is persisted or trusted across
   restarts, so there is no on-disk metadata format for a peer to influence.
@@ -531,8 +556,9 @@ happen.
 
 Every quantity below is network-influenced, is a named constant beside the
 existing `MAX_*` family, and is validated **before allocation or write**
-(NFR-1); every violation returns a typed value, never a panic. Proposed
-defaults, to be ratified when scheduled:
+(NFR-1); every violation returns a typed value, never a panic. **Ratified
+as proposed** when the receiving half was implemented (feature/128); the
+column is now what the code holds, not what it hoped to.
 
 | Constant | Proposed | Bounds |
 |---|---|---|
@@ -541,11 +567,11 @@ defaults, to be ratified when scheduled:
 | `MAX_ARCHIVE_DEPTH` | 32 | Directory recursion depth on the sender |
 | `MAX_FILE_NAME_BYTES` | 255 | Encoded length of the name field, validated at decode and again before the descriptor is built. 255 is NTFS's per-component limit, so a name that cannot be a filename anywhere never enters the system |
 | `MAX_FILE_NAME_UTF16_UNITS` | 259 | The *character* bound F4 requires, in the units that actually matter downstream: `FILEDESCRIPTORW.cFileName` is `WCHAR[260]`, so 259 units plus the NUL is the exact capacity. Both bounds are checked — 255 UTF-8 bytes can encode at most 255 UTF-16 units (all-ASCII worst case), so the byte bound already implies this one today; it is stated and tested separately so that raising either cap cannot silently overrun a fixed-size Win32 buffer |
-| `MAX_CONCURRENT_FILE_TRANSFERS` | 1 | In-flight file transactions per session |
+| `MAX_CONCURRENT_FILE_TRANSFERS` | 1 | In-flight file transactions per session — structural: the engine holds one `Option`, so a second cannot exist to be counted |
 | `MIN_FREE_SPACE_MARGIN_BYTES` | 64 MiB | Headroom required on the spool volume beyond `content_length` |
 | `MAX_SPOOL_BYTES` | 1 GiB | Total spool footprint (above) |
 | `MAX_SPOOL_ENTRIES` | 16 | Retained spool entries (above) |
-| `SPOOL_ENTRY_TTL` | 24 h | Maximum entry age (above) |
+| `SPOOL_SWEEP_TTL` | 24 h | Backstop age for entries whose clipboard state was never observed (above) |
 
 `MAX_NAME_COLLISION_ATTEMPTS` from the previous draft is **deleted**: nothing
 collides any more. Spool entries are named by locally generated UUID, and
@@ -664,10 +690,22 @@ NFR-4.
   Wayland clipboard models, and the drop folder is the standing fallback
   candidate there. Neither is designed in this ADR.
 - **Schema addition in one persisted store:** `PeerPermissions` gains
-  `file_receive`. Additive and optional, so existing files keep loading, and
-  reading an older store yields `false`. **The config file gains nothing** —
-  the drop-folder key is not introduced, which is one fewer persisted surface
-  than the previous draft.
+  `file_receive`, and reading an older store yields `false`. **Implementation
+  correction (2026-08-17):** this ADR originally called that addition "additive
+  and optional, so existing files keep loading". It is not. The trust store is
+  postcard-encoded, so its fields are positional with no names and no defaults;
+  appending the flag shifts every field of an existing record after the fourth
+  permission byte, and the byte that lands where the new flag is read is the
+  length prefix of `remembered_addresses` — `1`, i.e. *granted*, for any peer
+  with a remembered address. The realistic outcome is a store that fails to
+  load; the unacceptable one is a store that loads with a filesystem-write
+  permission the user never gave. So the at-rest **format version moves to 2**,
+  the version byte selects the decoder before any decoding happens, and version
+  1 keeps a frozen decoder whose upgrade writes `file_receive: false` as a
+  literal. The user-visible consequence is unchanged — old stores load, with the
+  permission off — but it is a versioned migration, not a free field. **The
+  config file gains nothing** — the drop-folder key is not introduced, which is
+  one fewer persisted surface than the previous draft.
 - **A new sender-only dependency** (a zip *writer*). Nothing in the workspace
   gains an archive *reader*, so the supply-chain and parsing surface is
   write-path only.
@@ -692,8 +730,11 @@ NFR-4.
   control *and* `Cf` format characters — `U+202E` explicitly — over-length in
   both bytes and UTF-16 units, non-UTF-8) as part of the malformed-input suite,
   asserting that a failing name produces no descriptor at all; a spool-bounds
-  test proving bytes, entries, and TTL are all enforced, that admission reserves
-  before accepting, and that every eviction is logged; a fault-injection test
+  test proving bytes, entries, and the backstop age are all enforced, that
+  admission reserves before accepting, and that every eviction is logged; a
+  **lifetime test** proving an entry is collected when the clipboard moves on,
+  is *not* collected while it is still offered however many times it is
+  pasted, and is never collected out from under a render in flight; a fault-injection test
   proving a truncated or aborted transfer leaves no advertisable entry and no
   orphaned `.part`; a **loop test** proving that placing a virtual file list
   produces zero outbound offers; a startup-purge test; a **junction test**
@@ -712,31 +753,94 @@ NFR-4.
   cleanup — from a high-integrity process, so deletion needed an invariant of
   its own.
 
+## Decisions taken (2026-08-17)
+
+The design forks below were settled by the maintainer when files was
+scheduled as the next work. The remaining items are verify-at-implementation,
+not forks.
+
+### Entry lifetime: while the clipboard still offers it
+
+An entry lives as long as the clipboard holds the item it backs, and is
+collected once the clipboard moves on. **Not** an age-based TTL.
+
+This is a better rule than the 24 h the draft proposed, for the reason the
+draft itself gave away: a TTL is "the only bound that can delete something
+the user was still planning to paste". Tying the lifetime to the clipboard
+removes that failure entirely — an entry can only disappear once the thing
+it backs is no longer on offer, at which point it could not have been pasted
+anyway.
+
+It is also the smaller exposure window. Peer-controlled bytes rest on disk
+for exactly as long as they are useful rather than for a fixed period, which
+is what the TTL was reaching for and misses in both directions: too long for
+an item replaced a minute later, too short for one still wanted tomorrow.
+
+And it composes with the repeatable-paste decision below: within the
+clipboard's lifetime an item may be pasted any number of times, and after it
+there is nothing to paste.
+
+Three things follow, and are requirements rather than notes:
+
+1. **A sweep at startup.** Entries from a previous run cannot correspond to
+   the current clipboard, so they are collected unconditionally on start.
+   This is also what makes "an unpasted item does not survive a worker
+   restart" true by construction rather than by intention.
+2. **A backstop age (`SPOOL_SWEEP_TTL`).** The rule depends on *observing*
+   that the clipboard moved on. A lost listener or a missed ownership change
+   would otherwise strand an entry forever, so an unobserved entry is swept
+   on age as a floor-sweeper — a safety net, not the policy.
+3. **A dependency on Clipboard History exclusion.** If Windows retained our
+   item in history (Win+V), the clipboard "moving on" would not make it
+   unreachable, and collecting the entry would break a history paste. The
+   ADR already requires exclusion from history and cloud sync for
+   invariant-7 reasons; this decision now *also* depends on it, which raises
+   that verify-at-implementation item from ergonomic to load-bearing.
+
+Collection is by handle on the opened spool root, and must not race a render
+already in flight — an entry being read is not collected out from under the
+reader.
+
+### A paste does not consume the entry
+
+As proposed. A render is idempotent, so an item can be pasted into several
+places, which is how a clipboard behaves everywhere else; a
+consume-on-paste rule would make the second paste of the same thing fail,
+which no user expects. With the lifetime rule above, the entry is collected
+when the clipboard moves on rather than lingering.
+
+### `MAX_CLIPBOARD_FILE_BYTES` stays at 256 MiB
+
+As proposed. It covers documents, archives and photo sets — a convenience
+feature, not a file-sync product — and refusals are observable (FR-3.6)
+rather than silent truncation. The measured cost of a saturated Background
+lane (docs/ROADMAP.md, 2026-08-16) argues against raising it: a larger
+ceiling buys reach and spends responsiveness.
+
 ## Open questions (to settle when scheduled)
 
-- **Spool retention values.** `MAX_SPOOL_BYTES` (1 GiB), `MAX_SPOOL_ENTRIES`
-  (16), and `SPOOL_ENTRY_TTL` (24 h) are proposals, and the TTL is the least
-  confident of the three: it is the only bound that can delete something the
-  user was still planning to paste. The maintainer's call on how much app-data
-  disk a rare convenience feature may occupy.
-- **Whether a paste consumes the spool entry.** *Proposed: no* — a render is
-  idempotent and the entry survives until GC, so an item can be pasted into
-  several places. Flagged because it is the one place where "the clipboard
-  holds a file" and "the file exists once" could be argued the other way, and
-  because a consume-on-paste rule would let the spool shrink faster.
+- ~~**Spool retention values.**~~ Settled above: entry lifetime follows the
+  clipboard, with a 24 h backstop for unobserved entries. `MAX_SPOOL_BYTES`
+  (1 GiB) and `MAX_SPOOL_ENTRIES` (16) stand as written — with the lifetime
+  rule there is normally one live entry, so both are backstops rather than
+  working limits.
+- ~~**Whether a paste consumes the spool entry.**~~ Settled above: no.
 - **Whether Linux's fallback is the drop folder.** The X11/Wayland clipboard has
   no promised-file mechanism, so the Phase 8 Linux port either revives the drop
   folder for that platform (a per-platform UX divergence, but the design is
   already written and its threat entries mostly still apply) or ships without
   file receive. Not decided here.
-- Whether `MAX_CLIPBOARD_FILE_BYTES` (256 MiB) is the right ceiling for a rare,
-  convenience-grade transfer — carried over from the previous draft.
+- ~~Whether `MAX_CLIPBOARD_FILE_BYTES` (256 MiB) is the right ceiling.~~
+  Settled above: it stands.
 - Whether `CFSTR_ZONEIDENTIFIER` on the data object actually causes the shell to
-  stamp Mark-of-the-Web on the pasted file across the Explorer versions we care
+  stamp the zone onto the pasted file across the Explorer versions we care
   about, or whether the marking is only reliable on the spool copy. A
-  verify-at-implementation item, not a design fork.
-- **Clipboard History (Win+V) and Cloud Clipboard**, per the clipboard-
-  integration section: whether the history service renders `CFSTR_FILECONTENTS`
+  verify-at-implementation item, not a design fork — and one the manual
+  paste probe now checks by reading the file's `Zone.Identifier` stream.
+- ~~**Clipboard History (Win+V) and Cloud Clipboard.**~~ Settled below: the
+  file item is excluded (F16), text and images are disclosed rather than
+  suppressed. The behavioural half remains verify-before-ship, per the
+  clipboard-integration section: whether the history service renders `CFSTR_FILECONTENTS`
   at copy time (which would defeat delayed rendering), whether
   `CanIncludeInClipboardHistory` and
   `ExcludeClipboardContentFromMonitorProcessing` reliably keep the item out of
@@ -752,3 +856,456 @@ NFR-4.
 - Whether an oversized selection should offer a graceful fallback (e.g. refuse
   with a message naming the cap and the actual size) beyond the plain typed
   refusal — a diagnostics question, not a design one.
+
+## Decisions taken while implementing the receiving half (2026-08-17)
+
+Three things this ADR specified turned out differently in contact with the
+code. They are recorded here rather than left as drift.
+
+### A second offer supersedes the transfer in flight; it is not declined
+
+The ADR said a second file offer arriving mid-transfer is declined
+`NotReady`. The engine supersedes it instead — the partial is deleted and
+the new item admitted — and the reason is a property of the transaction
+model this ADR inherited rather than a preference.
+
+A peer holds **one** outbound transaction. A second offer therefore means
+it has already abandoned the first at its origin and stopped sending
+chunks for it. Declining the new offer would refuse the user's newest copy
+in order to keep writing a partial nobody is feeding, until the transfer
+deadline expires a minute later. Superseding preserves everything
+`MAX_CONCURRENT_FILE_TRANSFERS` was for — one transfer, one partial, a
+bounded disk commitment — and is the rule every other inbound item already
+follows, so files stop being a special case in the state machine.
+
+### Free space is asked of the volume behind the open handle
+
+Admission needs the volume's free space, and the obvious call
+(`GetDiskFreeSpaceExW`) takes a **path**. The spool deliberately has none
+to give: the root is a handle so that nothing re-resolves
+`%LOCALAPPDATA%\...` (F15). The check therefore goes through
+`NtQueryVolumeInformationFile` on the root handle, and reports the
+*caller-available* figure so a volume quota is answered honestly. This is
+the second place the no-path rule forced the NT layer rather than the Win32
+one, after the relative opens.
+
+### The engine decides, the driver touches the disk
+
+The receiving path is split the way clipboard reads and writes already are:
+the engine (sans-io) owns permission, budget, sequence and abort
+discipline and emits `AdmitFile` / `WriteFileChunk` / `CommitFile` /
+`AbortFile` / `EvictSpoolEntry`; the driver performs them and reports back.
+
+That split is what makes this ADR's guarantees unit-testable without a
+filesystem — "nothing is answered before the spool has taken the transfer",
+"a chunk is judged before it is written", "every outcome but a verified
+completion deletes the partial" are all assertions over an action list.
+It also produced one rule the ADR did not state: the commit waits for the
+*write* of the final chunk to be confirmed, not merely for the hash to
+verify, since an entry promoted ahead of its own last bytes would be
+registered before it was whole.
+
+### Clipboard History and Cloud Clipboard: exclude the item, disclose the rest
+
+The ADR listed this as one open question. It is two, and they have different
+answers (maintainer, 2026-08-17).
+
+**The file item is excluded from both**, and the deciding reason is not the
+cloud one the ADR leads with — it is that a history entry for a virtual file
+list is *a promise that cannot be kept*. The render callback can only be
+answered by this process holding this spool entry, and the object dies with
+the worker while the entry is collected when the clipboard moves on. A
+retained Win+V entry would therefore fail on paste, later, with no diagnostic
+from us. "No entry" beats "an entry that breaks", and that argument holds
+whatever the cloud service does. Recorded as SECURITY.md **F16**. The two
+behavioural questions the ADR raised are unchanged and still verify-before-ship:
+whether history renders `CFSTR_FILECONTENTS` at copy time, and whether the
+opt-out formats are honoured on the supported builds.
+
+**Text and images are left alone.** Crossover sets no exclusion formats on any
+write today, so a user with Cloud Clipboard enabled has already been syncing
+peer-delivered *text* to their Microsoft account — a larger surface than files
+and one that predates this ADR. Suppressing it would silently break Win+V for
+ordinary synchronized text, which is a real usability loss and a surprising
+one, and invariant 7 is a claim about what Crossover introduces rather than
+about the user's own OS features. So the gap is closed by naming it — in
+invariant 7, in the threat table as T22, and in the README — rather than by
+overriding a setting the user chose.
+
+### Two findings from the data object (2026-08-17)
+
+**`OleIsCurrentClipboard` is not sufficient on its own.** It answered
+"still ours" after a same-process Win32 `SetClipboardData` had replaced
+the clipboard, which would have made the loop guard suppress a copy the
+user really made. Ownership is therefore the conjunction of that call and
+an unchanged `GetClipboardSequenceNumber` since the placement. Recorded in
+SECURITY.md F13, because the guard's wording claimed more than the API
+delivers.
+
+**The OLE clipboard hands consumers a mediating object.** Asking the
+clipboard's data object for file contents as `TYMED_HGLOBAL` returns
+`DV_E_FORMATETC` without our `GetData` running at all: the intermediary
+answers out-of-enumeration requests itself. The refusal still happens,
+which is what production needs, but the specific codes this ADR
+specifies — `DV_E_TYMED`, `DV_E_LINDEX` — are only observable by calling
+our object directly, which is how they are tested.
+
+### The zone is intranet, not internet (2026-08-17)
+
+The design stamped `ZoneId=3` and leaned on it: the reject-not-repair
+name rules explicitly *do not* try to catch `report.pdf.exe`, a homoglyph,
+or a double extension, and argue instead that such names are "contained
+downstream" because the pasted file carries Mark-of-the-Web. Zone 3 is
+what makes SmartScreen challenge an executable and Office open a document
+in Protected View.
+
+Changed to `ZoneId=1`, Local intranet, on a maintainer decision, for two
+reasons that point the same way.
+
+**It is the accurate description.** The file came from a paired machine on
+the local network. Zone 3 says it came from the internet, which is simply
+untrue, and a marking that misdescribes its own provenance is a poor
+foundation for anything downstream to reason about.
+
+**The friction is certain and the protection is against an attacker
+already out of scope.** Every ordinary document pasted between the user's
+two machines pays the Protected View banner and the blocked-file warning.
+What zone 3 buys in return is a challenge on content sent by a *paired
+peer that has itself been compromised* — which SECURITY.md §6 documents as
+out of scope and does not defend against.
+
+**What is lost, stated plainly.** The downstream containment for
+extension-hiding names is weaker: the `Zone.Identifier` stream is still
+written and still readable, so provenance survives and anything that
+inspects zones can act on it, but SmartScreen and Protected View will not
+treat a pasted file as untrusted content. F10 is unaffected — Crossover
+still never opens, launches, previews, or hands anything to a shell
+association — and the containment that remains is the one §6 names:
+nothing leaves the spool without the user's own paste gesture, and
+anti-malware on the receiving machine is the user's.
+
+Making the zone configurable was considered and rejected for now: it is a
+security-relevant knob whose two settings are hard to explain, on a
+feature whose whole design brief is "deliberately minimal".
+
+### What is deliberately not here yet
+
+Entry lifetime — collection when the clipboard moves on, and the
+`SPOOL_SWEEP_TTL` backstop — needs the clipboard object that makes "the
+clipboard still offers it" observable. That object now exists
+(`is_current`), so the rule is the next slice's work rather than a
+dependency waiting on one. The startup sweep, which needs no such
+observation, is already implemented: the spool is purged in full when it
+is opened.
+
+The data object is also **not yet wired to the engine**: a completed
+transfer spools and registers, and nothing offers it. That is deliberate
+— the object is worth landing and testing on its own, and `FILE_CLIPBOARD`
+stays unadvertised until the whole path exists, so no conforming peer can
+produce an entry that would sit unoffered.
+
+## Decisions taken while implementing the sending half (2026-08-18)
+
+The blob builder — the piece that turns a `CF_HDROP` selection into one
+offerable blob — settled five things this ADR either left open or stated
+only in passing.
+
+### Archive entries are Stored, never deflated
+
+The ADR says a single file travels verbatim and rejects compressing it
+"for symmetry", but never says what happens to entries *inside* an
+archive. They are stored uncompressed, for three reasons that agree.
+
+ADR 0014's rule is the LAN is faster than any codec would save, and this
+is the same LAN. Compression is the whole reason a zip crate has a
+supply-chain footprint at all — the default feature set pulls aes, bzip2,
+zopfli, lzma, ppmd, xz and zstd — and none of it is built. And it is what
+keeps the byte bound honest: with Stored entries the finished archive is
+the walked content plus a small fixed header per entry, so the cumulative
+byte check performed **during** the walk genuinely bounds the artifact.
+Deflating would make the mid-walk figure an input to a compressor whose
+output size is not known until it is written, which turns "refuse before
+building something oversized" back into "build it and measure".
+
+The cost is stated plainly: a folder of compressible documents travels at
+its full size, and a selection that would have fitted under 256 MiB
+compressed can be refused. That is the same trade images already make.
+
+### The blob is a delete-on-close handle, not a path
+
+The ADR says the archive is built "to a temporary file in the sender's own
+temp directory". The boundary carries an **open handle and no path**, and
+the file is created `FILE_FLAG_DELETE_ON_CLOSE` with `FILE_SHARE_DELETE`.
+
+Cleanup on every refusal path was a requirement, and a `Drop` is the
+obvious way to meet it — but a `Drop` does not run when the process dies
+mid-build, and this build can be a 256 MiB copy. Delete-on-close makes the
+cleanup the operating system's, covering the crash case the ADR did not
+have to think about on the receiving side (the spool has a startup purge
+for exactly this reason; the sender now needs no equivalent). Not exposing
+the path follows the spool's rule for the same reason F15 gives: a caller
+that can name the artifact can keep it, re-resolve it, or hand it
+somewhere else.
+
+### A single file is copied, not streamed from where it sits
+
+The offer's length and hash are fixed before any byte travels, so the
+bytes that travel must be a snapshot. Reading them from the user's own
+file instead would leave a window in which editing or deleting it during
+a transfer changes what the receiver hash-verifies — a failure the user
+could not connect to what they did. One local copy of an item already
+bounded at 256 MiB, on a path this ADR describes as rare, is the cheaper
+half of that trade.
+
+### Depth is counted in archive path components
+
+`MAX_ARCHIVE_DEPTH` had no counting convention. A selected file or folder
+sits at depth 1 and its children at depth 2, so the cap admits a selected
+folder plus 31 levels beneath it. The constant now lives beside its
+sibling caps in `crossover-protocol` — it has no wire field, because
+nothing on the receiving side ever looks inside an archive (F9), but it is
+the same family of bound on what one clipboard item may become.
+
+`MAX_CLIPBOARD_FILE_ENTRIES` counts **directories as well as files**,
+because they are archive entries: an empty folder is written as one so a
+folder's shape survives the round trip, and the count is what bounds the
+archive's central directory.
+
+### The name is derived at the platform boundary and judged above it
+
+`validate_file_name` lives in `crossover-protocol` and a platform crate
+carries no dependencies, so the builder cannot ask whether the name it
+derived from the filesystem conforms. Mirroring the validator would have
+meant two rules for the one string of a file transfer that reaches a
+shell, which is precisely the shape of bug the reject-not-repair design
+exists to avoid.
+
+So the builder reports the name *and where it came from*, and the layer
+that can name both crates applies this ADR's two answers: a name the
+selection gave itself — a file's own name, or `<folder>.zip` — is refused
+when it does not conform, and a name derived from a multi-entry
+selection's parent folder falls back to `files.zip`. The fallback is
+asserted to be a conforming name in its own test, since it is the one
+name with nothing left to fall back to.
+
+Two smaller rules fell out of the walk. A name that is not valid Unicode
+is refused rather than lossily converted, for the same reject-not-repair
+reason. And two entries that would pack under one name refuse the item
+rather than one of them being suffixed: ordinary shell selections come
+from a single folder where the filesystem has already made names unique,
+so this is a pathological clipboard rather than a case worth
+accommodating.
+
+## Decisions taken while implementing the sending transaction (2026-08-18)
+
+The engine half — the piece that takes an observed selection, has it
+packed, and runs the ADR 0005 transaction over the result — settled six
+more things.
+
+### The engine is told the feature bit, because the send gate is too late
+
+Everywhere else in the system the negotiated feature set is enforced at
+`gate_outbound`, the one place every frame passes on its way to the wire
+(PROTOCOL.md §3.1), and the engine deliberately knows nothing about it —
+`TRANSFER_TIMEOUT`'s doc even records the cost of that: an offer the gate
+refuses locally waits out the full deadline, because the engine cannot
+know a capability was missing.
+
+Files cannot pay that cost, and not because a minute is long. By the time
+a frame reaches the send gate the archive has already been built: a walk
+over the selection and a write of up to 256 MiB, spent to learn something
+a single bit answered before any of it started. So the engine takes a
+`FileSend` policy the way it already takes `FileReceive` — supplied by the
+application, refreshed as the negotiated features or the trust store
+change, closed by default — and judges it *before* emitting a build. The
+send gate still stands behind it; this is a second check in front of an
+expensive step, not a replacement for the authoritative one.
+
+The four states are the ADR's own refusal list made legible: no sending
+half in this build, the peer never advertised `FILE_CLIPBOARD`, the peer
+holds no `clipboard_send` grant, and allowed. A user acts on each
+differently (NFR-3), and collapsing them to a boolean would report "not
+sent" for all three.
+
+### The spool root travels as a string, for one comparison
+
+Loop-prevention layer 2 — "a `CF_HDROP` path resolving inside the spool
+root is never staged" — needs the root's *name*, and F15 built the spool
+so that it has none to give: it is a handle precisely so nothing
+re-resolves `%LOCALAPPDATA%\...`.
+
+The resolution is that `SpoolStorage` now answers where it is, for
+comparison and diagnostics only, and the engine holds that string and
+compares path components against it. Nothing opens it, resolves it, or
+hands it to an API; every spool operation still goes through the handle,
+so the property F15 rests on is untouched. Where there is no spool the
+answer is `None`, which is not a hole but the truthful statement that
+nothing of ours is on disk for a selection to point at.
+
+Two properties of the comparison are deliberate. It matches components
+case-insensitively, because the only filesystem this rule currently
+guards does, and a case-sensitive check would miss `...\SPOOL\`. And it
+answers *"treat as ours"* for anything it cannot judge without resolving
+— a relative path, or one carrying a `..` component — because the safe
+direction of a wrong answer here is a copy that does not synchronize,
+not a loop on the largest payload type in the system. A shell `CF_HDROP`
+produces absolute, normalized paths, so the concession costs nothing
+real.
+
+One path inside the spool refuses the **whole** selection rather than
+being dropped from it: one clipboard item is one blob, so a partial
+selection would send something the user did not select.
+
+### The engine names the chunk; the driver reads it
+
+The receiving side's split — "the engine decides, the driver touches the
+disk" — inverts cleanly. An outbound item now carries a *body* that is
+either bytes the engine retains (text, images, as before) or a blob the
+driver holds open, and `Action::SendFileChunk` names an offset and a
+length rather than carrying a payload. The driver reads exactly that
+slice when it sends the frame.
+
+That is what makes the sender O(chunk) rather than O(file), mirroring the
+receiver's write-through, and it is why a 256 MiB file costs the engine
+the same memory a 4 KiB one does. The chunk *plan* is shared with images
+unchanged: same `ChunkPlan`, same one-chunk-per-command pacing, so a file
+is preempted by live input exactly as ADR 0013 requires without a second
+implementation of anything.
+
+Dropping the blob deletes the artifact (delete-on-close, above), so every
+exit path emits `ReleaseFileBlob`: delivered, declined, superseded by a
+newer local copy, lost to the conflict race, timed out, session lost,
+unreadable. The driver's slot is one deep by construction as well, so a
+second selection replaces the first even if a release were ever missed.
+
+### A build gets its own deadline scope
+
+`TransferScope` gains `Build`. Two scopes existed because an outbound
+offer and an inbound reassembly can be in flight at once and a shared
+deadline would let one keep resetting the other's clock; a build is a
+third such thing, and a sharper case: it runs *while an unrelated
+outbound transfer is still going*, since it does not supersede anything
+until it has something to supersede with. Arming it on the outbound clock
+would leave that transfer unbounded.
+
+A build that never answers is abandoned on that deadline, and its answer,
+if it arrives later, is released rather than offered — the same
+supersession rule the transaction slot has always had, one step earlier
+in the pipeline.
+
+### `AlreadyHave` is handled on the sending side, though we never send it
+
+This ADR rules out hash dedup for files: a spool entry may have been
+evicted, so *our* receiver cannot honestly claim to already have one, and
+a test asserts it never does. The sending side still handles the decline,
+because a peer's may — the decline path is typed and shared with images,
+and `AlreadyHave` is success-shaped there. The outcome is the right one
+either way: the transaction closes, the blob is released, and **zero
+payload bytes** follow, which is what the offered flow at any size buys.
+
+### The name is judged once more, at the last point before the wire
+
+`wire_file_name` is applied here rather than at the encoder, and the
+length is re-checked against `MAX_CLIPBOARD_FILE_BYTES` even though the
+builder already bounded it. Both are NFR-1's rule about validating
+*before* the wire rather than at it: a name or a length that first failed
+inside `encode_payload` would be a refusal with no diagnostic and no
+counter, which is exactly the silent drop FR-3.6 forbids.
+
+### What is deliberately not here yet
+
+`FILE_CLIPBOARD` is still unadvertised and the application supplies no
+send policy, so the gate is closed and nothing is packed in production.
+That is the next slice, and it is a small one: advertise the bit, and
+compute `FileSend` from the session's negotiated features and the peer's
+`clipboard_send` grant the way `file_receive_policy` already computes its
+twin.
+
+## FILE_CLIPBOARD is advertised (feature/136, 2026-08-18)
+
+That next slice landed, closing the sender-side construction this ADR
+specifies. `FeatureFlags::ADVERTISED` is now `ALL`; `SessionRoute` carries
+each live session's negotiated features, and `file_send_policy` in
+`apps/crossover/src/commands.rs` computes `FileSend` exactly as planned
+above, published at the same two points `file_receive_policy` is —
+session establishment and loss, and the trust-store revocation poll — so
+revoking `clipboard_send` reaches a running worker within one poll, the
+same way revoking `file_receive` already did.
+
+Two things this closes are worth stating plainly rather than left
+implicit: `clipboard_send` is, as of this slice, the **first** permission
+this codebase enforces anywhere — text and images still travel without
+checking it, which is unchanged from before and is not something this
+slice was scoped to fix. And advertising the bit is validated by the test
+suites only; no two-machine hardware run has exercised a real file
+transfer end to end yet, so this is construction complete, not delivery
+proven (docs/TESTING.md's Definition of Done).
+
+## Addendum: hardware-validated on wire-crossed machines (2026-08-19)
+
+Construction-complete became delivery-proven. A two-machine session over a
+direct 2.5/10 GbE link — machine A listening, machine B dialing, initial
+build `e689a3b`, final retests on the build carrying PRs #43–#46 — moved
+real files and folders across the wire in both directions and exercised
+this ADR's guardrails as guardrails rather than as assertions over test
+fixtures. The full session record is docs/SOAK.md's Phase 7 files section;
+this addendum states the outcome against this ADR specifically.
+
+**What passed.** Single-file transfer both directions, byte-identical,
+opening without SmartScreen or Protected View but carrying `ZoneId=1` in
+`Zone.Identifier` — the 2026-08-17 zone decision above, confirmed live, not
+just unit-tested. Folder and multi-selection packing into one Stored-entry
+zip, contents identical after extraction. `AlreadyHave` dedup instant with
+nothing on the wire. The >256 MiB refusal observed live as `TooLarge`
+(268,500,992 bytes against the 268,435,456-byte `MAX_CLIPBOARD_FILE_BYTES`),
+nothing partial sent, the clipboard path unwedged afterward. Loop
+prevention held under both passive observation and a deliberate
+provocation: a spool-path copy probe was suppressed silently,
+`clipboard_loop_suppressed` incrementing exactly once. A 200 MiB /
+130-entry zip packed in ~2 s with input responsive throughout.
+
+**The open question this ADR carried is answered.** §1.6's third exception
+(F16, invariant 7) — whether Windows actually honors the Clipboard
+History/Cloud Clipboard exclusions the data object declares — was verified
+on two machines with a real wire crossing between them, not only locally:
+the received offer does not appear in Win+V history and does not
+cloud-sync; the pasted file opens unprompted, `ZoneId=1` intact. This
+satisfies the Definition of Done's platform-test item
+(docs/TESTING.md §1.6, §5) for the files slice.
+
+**An operational fact worth recording here, for whoever next runs
+`allow-files`:** `file_receive` is default-off per this ADR and must be
+granted on the *receiving* machine, which sounds obvious until a two-way
+test needs it granted on **both** machines — the first attempt on this
+session failed `NotPermitted` because it was granted on only one side.
+
+**What was deliberately not exercised on hardware, and why that is
+defensible.** The mid-transfer network-disconnect case was skipped: at
+2.5 Gbps a 200 MiB transfer completes sub-second, leaving no practical
+"mid" for a manual disconnect to land in. Engine-level fault injection
+remains the primary evidence for the abandonment paths this ADR and
+docs/TESTING.md §1.5 both describe (a tampered final chunk, a spool write
+failure, a lost session, an expired deadline — all hermetic). A real
+abrupt disconnect was nonetheless observed live during the session,
+described next.
+
+**What this session found and fixed, none of it specific to the file
+path itself.** An edge-transfer bounce (PR #44, feature/137), a
+control-request lockout (PR #45, feature/139), and an inbound
+head-of-line block that had control frames sharing the clipboard driver's
+queue (PR #46, feature/140) were all fixed forward during this validation
+pass. Separately, the worker on machine B died abruptly at 02:05:38 UTC
+(the peer saw a TCP RST); the service relaunched it in ~1.3 s, the session
+re-established, and no input was left stuck — but the worker's root cause
+**remains unknown**, unrecorded by design until PR #43 (feature/138, the
+ADR 0011 addendum) landed durable supervision logging. That fix makes a
+recurrence diagnosable; it does not explain this one. docs/SOAK.md carries
+the full account, including the retest that shows the edge/control/routing
+fixes hold under ~20 rapid crossings.
+
+**What this addendum does not close.** This is the files slice, not
+Phase 7. The phase's separate input-latency exit criterion
+(docs/ROADMAP.md, held at 64 KiB) was not re-measured with the rigor of
+feature/117/118 on this wired link — the informal p50 reading taken here
+is a data point toward doing that measurement, not the measurement
+itself.

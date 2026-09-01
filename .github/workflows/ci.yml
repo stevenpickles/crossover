@@ -111,7 +111,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: cargo-deny
 
@@ -142,7 +142,7 @@ jobs:
         run: rustup component add llvm-tools-preview
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: cargo-llvm-cov
 
@@ -194,7 +194,7 @@ jobs:
         run: rustup toolchain install nightly --profile minimal
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@b27e114ddbae5cc01df19a22cf70a124d5177567 # v2
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: cargo-fuzz
 
@@ -205,7 +205,9 @@ jobs:
         # the statically linked CRT.
         run: |
           for target in frame_decoder hello pairing_start pairing_confirm \
-                        clipboard_data clipboard_chunk clipboard_control input; do
+                        clipboard_data clipboard_chunk clipboard_control \
+                        clipboard_file_offer input control monitor_topology \
+                        layout_sync; do
             cargo +nightly fuzz run "$target" \
               --target x86_64-unknown-linux-gnu \
               -- -max_total_time=20 -print_final_stats=1

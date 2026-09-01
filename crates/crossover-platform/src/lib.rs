@@ -1,5 +1,6 @@
 //! Platform abstraction traits for Crossover: clipboard, input capture and
-//! injection, display enumeration, cursor control, and secure storage.
+//! injection, display enumeration, cursor control, secure storage, and
+//! local network-link state.
 //!
 //! Trait definitions only — no OS dependencies. Platform crates such as
 //! `crossover-platform-windows` implement these traits; nothing above the
@@ -10,22 +11,39 @@ pub mod cursor;
 pub mod display;
 #[cfg(any(test, feature = "fakes"))]
 pub mod fakes;
+pub mod file_blob;
 pub mod input;
+pub mod link;
 pub mod secure_storage;
 pub mod service;
+pub mod spool;
+pub mod virtual_file;
 
 pub use clipboard::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
-    MAX_CLIPBOARD_IMAGE_BYTES,
+    MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
 };
 pub use cursor::{CursorMask, CursorMaskError, NoopCursorMask};
-pub use display::{CursorPoint, DisplayError, DisplayInfo, MonitorRect, Screen};
+pub use display::{
+    CursorPoint, DisplayError, DisplayInfo, MonitorDescription, MonitorInfo, MonitorRect,
+    PhysicalSizeMm, Screen,
+};
+pub use file_blob::{
+    BlobNaming, FileBlob, FileBlobBuilder, FileBlobRefusal, MAX_ARCHIVE_DEPTH,
+    MAX_CLIPBOARD_FILE_BYTES, UnsupportedFileBlobBuilder,
+};
 pub use input::{
     InputCapture, InputError, InputEvent, InputInjector, InputSink, KeyEvent, PointerButton,
     PointerEvent, SCROLL_UNITS_PER_DETENT, hid,
 };
+pub use link::{LinkState, LinkStateProbe, UnknownLinkStateProbe};
 pub use secure_storage::{SecureStorage, SecureStorageError};
 pub use service::{ServiceError, ServiceManager, ServiceStatus, UnsupportedServiceManager};
+pub use spool::{
+    MAX_SPOOL_ENTRY_NAME_BYTES, MAX_SPOOL_ENUMERATED_OBJECTS, SpoolEntry, SpoolError, SpoolStorage,
+    SpoolSweep, UnsupportedSpoolStorage, validate_entry_name,
+};
+pub use virtual_file::{UnsupportedVirtualFileClipboard, VirtualFile, VirtualFileClipboard};
 
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str =

@@ -1,6 +1,6 @@
 [package]
 name = "crossover-platform-windows"
-version = "0.1.0"
+version.workspace = true
 publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,17 +13,45 @@ crossover-platform = { workspace = true }
 # Win32 bindings only when actually building for Windows; on other targets
 # this crate compiles as an empty shell so tri-OS CI builds the workspace.
 [target.'cfg(windows)'.dependencies]
+# sha2: the sender hashes a blob while it still has the bytes, so nothing
+# re-reads a 256 MiB item to learn its own identity. The algorithm is not
+# a local choice — it is what crossover_protocol::clipboard::content_hash
+# computes and what the receiver's ChunkStream verifies incrementally, and
+# a core test holds the two together.
+sha2 = { workspace = true }
 # tracing: hook loss is an asynchronous event with no error path to
 # surface through, and NFR-3 forbids a silent failure of an important
 # state transition — the watchdog logs it at the moment of detection.
 tracing = { workspace = true }
 windows = { workspace = true }
+windows-core = { workspace = true }
+# Write-only: this crate packs archives and nothing in the workspace reads
+# one (docs/SECURITY.md F9). See the workspace manifest for the feature
+# reasoning, and clippy.toml for the ban that keeps the reader out of
+# production code.
+zip = { workspace = true }
 
 # tracing-subscriber only for the manual key-capture probe, which prints
 # the per-key diagnostic (scan code, extended/injected flags, HID) to
 # stderr; the library itself installs no subscriber.
 [target.'cfg(windows)'.dev-dependencies]
 tracing-subscriber = { workspace = true }
+
+# Tests only, and deliberately not a real dependency: the display test
+# asserts that every `szDevice` this machine reports is a usable
+# `MonitorId` — ADR 0018's byte bound and printable-ASCII rule — and the
+# EDID test asserts that this reader's plausibility range is the layout
+# model's own, both imported rather than restated so the two cannot drift.
+# The platform crates stay free of the layout model at build time; a
+# platform trait that could only report ids the model already accepts would
+# have no way to say that a machine's display configuration is unusable.
+#
+# Not Windows-gated, unlike the entry above it: `edid` is the one module
+# here that compiles on every OS (its bytes-in/size-out half is pure), so
+# the range it mirrors is pinned on every CI OS rather than only where the
+# bytes can be fetched.
+[dev-dependencies]
+crossover-topology = { workspace = true }
 
 # The workspace forbids unsafe_code (NFR-6). This crate is the designated
 # exception: Win32 FFI requires `unsafe`. The relaxation is local and

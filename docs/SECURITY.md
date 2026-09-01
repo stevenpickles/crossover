@@ -32,6 +32,21 @@ These hold at all times, in every phase:
 7. **Local first.** No cloud dependency, no external telemetry (FR-7.5).
    Cloud infrastructure is never introduced to solve a local problem without
    explicit ADR-level approval.
+   **What this does not claim, stated plainly:** once content is installed on
+   the destination clipboard, it is subject to that machine's own clipboard
+   settings like any other copy. Windows **Clipboard History** (Win+V) and
+   **Cloud Clipboard** ("sync across your devices", which sends clipboard
+   content to the signed-in Microsoft account) both observe the clipboard, and
+   a user who has enabled them has enabled them for everything — including
+   items Crossover received from a peer. Crossover introduces neither and does
+   not suppress either: they are the user's own OS features acting on the
+   user's own clipboard, and silently overriding that choice would break Win+V
+   for ordinary synchronized text with no explanation. A user who does not
+   want peer content leaving the machine that way turns Cloud Clipboard off in
+   Windows Settings → System → Clipboard. **The one exception is the virtual
+   file list** (§7): it is excluded from both, because an entry that outlives
+   the spool entry or the process behind it is a promise that cannot be kept —
+   see F16.
 8. **Pairing is not permission.** A paired peer holds exactly the capabilities
    its trust-store record grants, and nothing more. Any capability that writes
    to the local filesystem is **off by default**, requires an explicit per-peer
@@ -50,9 +65,10 @@ Each installation generates a persistent identity at first run (FR-1.1):
 
 - device UUID (random)
 - human-readable device name
-- asymmetric keypair; credential form (raw public key vs. self-signed
-  certificate) and its binding into TLS 1.3 mutual authentication are fixed
-  by ADR (deferred decision 3)
+- asymmetric keypair; the credential form and its binding into TLS 1.3
+  mutual authentication are fixed by
+  [ADR 0003](adr/0003-device-identity-credential.md) — an Ed25519 key
+  pinned by the SHA-256 of its SPKI
 - creation timestamp
 
 Storage: private key material goes through the `SecureStorage` platform
@@ -81,11 +97,12 @@ connections authenticate automatically; identities not in the trust store
 are rejected (FR-1.3).
 
 **MITM requirement:** the ceremony must defeat an active man-in-the-middle
-on first contact. The verification mechanism — short authentication string
-(SAS) derived from the key exchange vs. a PAKE (e.g., SPAKE2 over a short
-code) — is deferred decision 2. Whichever is chosen, the security argument
-(what the human comparison/entry actually proves, and the probability an
-active attacker survives it) must be written into the ADR.
+on first contact. The verification mechanism is fixed by
+[ADR 0002](adr/0002-pairing-verification-mechanism.md): a PAKE — SPAKE2 over
+a typed one-time code — chosen over a short authentication string derived
+from the key exchange. The security argument (what the human entry actually
+proves, and the probability an active attacker survives it) is written into
+that ADR.
 
 ## 4. Trusted peer store
 
@@ -102,8 +119,19 @@ addresses.
   peer, existing records included, and only an explicit user grant turns it on
   (invariant 8, §7). A trust store written before file transfer existed reads
   back as `file_receive: false`; no migration may enable it.
-- `crossover peers` lists the store; `crossover peers remove <device-id>`
-  revokes (a `show` subcommand can come later). Removal revokes
+- The at-rest blob is versioned, and the version selects the decoder *before*
+  anything is decoded. `file_receive` arrived with format version 2; version 1
+  keeps a frozen decoder of its own, whose upgrade sets the flag to a literal
+  `false`. This is not optional carefulness: the store is postcard-encoded, so
+  fields are positional with no names and no defaults, and decoding a version-1
+  record against the current record shifts every field after the fourth
+  permission byte — the byte that would be read as `file_receive` is the
+  remembered-address count. An appended field would therefore either lose the
+  store or grant a filesystem write nobody consented to.
+- `crossover peers` lists the store, including each peer's file permission;
+  `crossover peers remove <device-id>` revokes trust entirely, and
+  `crossover peers allow-files <device-id>` / `deny-files <device-id>` grant and
+  withdraw `file_receive` (a `show` subcommand can come later). Removal revokes
   authorization immediately (FR-1.4): future connections are rejected (the
   store is re-read on every accept/attempt), and active sessions from that
   identity are terminated within the running process's trust-store poll
@@ -153,6 +181,8 @@ table:
 | T19 | A virtual file list we placed is read back and offered to the peer, looping the largest payload type in the system | F13: own-object ownership check, applied-hash memory, and the rule that spool paths are never a send source (§7, FR-3.3) |
 | T20 | Clipboard-object lifetime abuse: rendering after the peer's grant is revoked, or a render callback used to reach content of the caller's choosing, or driven in a loop as a local denial of service | F14: rendering resolves an opaque entry id to a registered, complete spool entry only — no path or name from the caller, index 0 only, one render at a time, no network read. Revocation gates *acceptance*, not already-delivered items (§7 F1, and the rejected alternative recorded below) |
 | T21 | Same-user, medium-integrity local process abuses the high-integrity worker's spool: replaces the root with a directory junction to obtain an arbitrary-file delete, or swaps a completed entry's bytes between verification and render | F15: explicit DACL plus High mandatory label (no write-up), root opened and verified as a non-reparse-point directory, every delete performed relative to that handle and never as a path-resolved recursive delete (§7) |
+| T22 | Peer-delivered content leaves the machine through the *destination's own* clipboard features — Windows Clipboard History (Win+V) or Cloud Clipboard sync to a Microsoft account | For the file item, F16: excluded from both, so a promise we cannot keep is never retained and file content never reaches an account. For text and images, **not defended and deliberately so** — they are the user's own OS features acting on their own clipboard, disclosed in invariant 7 and the README rather than silently overridden |
+| T23 | Peer-supplied display layout (`LayoutSync`) steers a local state transition: an arrangement that hides a crossing, invents one at a seam the user never drew, or churns adoption to destabilize the edge detector or grind the disk | [ADR 0018](adr/0018-drawn-display-topology.md): one arrangement describing both machines **is the design** — a trusted peer legitimately changes where this machine hands control away, and a hostile **trusted** peer stays out of scope per the carve-out below. Containment for everything short of that: the layout is network input and is treated as such (invariant 5) — counts, rectangle dimensions, and coordinates bounded by named constants and validated on encode *and* decode, before allocation, with all derivation in `i64` at bounds where overflow is impossible; a malformed layout terminates the session (fail closed, [PROTOCOL.md](PROTOCOL.md) §7); a well-formed-but-impossible one — naming a device that is not this session's pair, or overlapping rectangles — is rejected, logged, and charged as a violation, never adopted, and a peer that keeps sending them loses the session on [PROTOCOL.md](PROTOCOL.md) §7's graduated rule. **Amended 2026-08-21 (feature/152):** "a monitor neither peer reported" was listed here and is deliberately no longer a rejection reason — an arrangement may legitimately name a screen that is unplugged right now, which is what lets a drawing survive an undock, and such a layout derives *inert* (no crossing spans) rather than dangerous, so it cannot invent a crossing at all. The containment is the derivation plus a warning at adoption naming the drawn and the attached ids, not a refusal that would forget the desk. Adoption-driven persistence is rate-bounded (at most one config write per `LAYOUT_PERSIST_INTERVAL`, latest revision wins), so this network-driven filesystem write cannot run at wire speed. Revisions saturate rather than wrap. Every adoption and every supersession is logged (NFR-3): an arrangement never changes silently. Control correctness does not rest on any of it — an entry point the receiver cannot match degrades cursor *placement* only, never the grant. Two adjacent facts the ADR states: `MonitorTopology` discloses local display geometry, scale, device strings, (since the 2026-08-21 label amendment) monitor product names, and (since the 2026-08-22 physical-size amendment) each panel's dimensions in millimetres to the trusted peer — every one of them already written in clear to `~/.crossover/state/topology.json`, a file this design deliberately leaves unprotected because it holds nothing secret (ADR 0018), so the peer learns nothing that is not already readable by anything running as this user; and neither the label nor the size steers anything on the receiving side, because both are drawing inputs and never identities; and the config file gains a second, medium-integrity writer (the editor) feeding the high-integrity worker — T21's shape, contained as the config always was, by validation on load |
 
 Out of scope (documented, not defended): a fully compromised trusted peer
 machine — a peer you paired with and that is now malicious can do whatever
@@ -167,7 +197,7 @@ Physical attackers with local admin on either machine are likewise out of scope.
 ## 7. Received files (the filesystem-write surface)
 
 Phase 7 file transfer ([ADR 0015](adr/0015-spooled-virtual-file-paste.md),
-Proposed) is the first capability that lets a remote peer cause a **write to
+Accepted) is the first capability that lets a remote peer cause a **write to
 the local filesystem**. Every other subsystem consumes network input into
 memory and the OS clipboard; this one creates objects on disk that outlive the
 session, so it carries its own invariants (F1–F15) on top of §1. They apply to
@@ -179,6 +209,38 @@ field influences. They reach a user-visible location only when the operating
 system's paste mechanism, executing the user's own gesture, copies them out of
 a completed spool entry — Crossover advertises a virtual file list and the
 shell performs that write.
+
+**Implemented and released in 0.2.0:** the protected spool and its
+handle-only boundary (F15), the `file_receive` grant (F1), the receiving
+path from offer to verified entry (F3, F5, F6, F7, F8), the virtual file
+list and its render bound (F4's descriptor construction, F10, F13, F14,
+F16), the whole of F12 — byte and entry budgets, the clipboard lifetime
+rule, and the age backstop behind it — and the sending half: a local
+`CF_HDROP` copy is observed, and a selection is packed into one blob under
+the refusals ADR 0015 requires — count, depth and cumulative bytes judged
+during the walk, and a symlink, junction, or other reparse point refusing
+the **whole** item rather than being followed or silently skipped, so a
+copied shortcut cannot pack out-of-tree content into something the user
+believes they selected. The engine transaction over that blob judges the
+peer's negotiated file support and its `clipboard_send` grant **before**
+anything is walked or packed, enforces F13's third guard — no path inside
+the spool root is ever a send source — and drops the blob on every path
+that ends the transaction, its delete-on-close handle being what removes
+the artifact. `FILE_CLIPBOARD` is advertised: the application computes
+`FileSend` the same way it computes `file_receive`'s policy — negotiated
+feature set, then trust-store grant, re-published on the same revocation
+poll — so a conforming peer can actually reach both halves.
+`clipboard_send` is the first permission this codebase enforces anywhere;
+text and images still travel without checking it (§4).
+
+The whole path — offer, blob build, chunked send, spool, verify,
+virtual-file paste — was validated on two machines over a direct wired link
+on 2026-08-19: single-file and folder/multi-selection transfers arrived
+byte-identical in both directions, the `TooLarge` refusal and `AlreadyHave`
+dedup were observed live, loop prevention suppressed a deliberate
+spool-path copy, and F16 was confirmed on wire-crossed hardware — a
+received offer does not appear in Win+V history and does not cloud-sync
+([SOAK.md](SOAK.md)).
 
 1. **F1 — Consent before bytes.** No file transfer is accepted from a peer
    whose trust-store record does not carry `file_receive` (§4). The check runs
@@ -247,7 +309,9 @@ shell performs that write.
    mislead without malforming — `report.pdf.exe`, homoglyph spellings, a double
    extension under a shell that hides known types — are valid filenames and are
    accepted knowingly; they are contained downstream by the Internet-zone
-   marking (F10's no-execution rule plus Mark-of-the-Web on the pasted file),
+   marking (F10's no-execution rule plus the zone stamped on the pasted file,
+   which since ADR 0015's 2026-08-17 decision is Local intranet rather than
+   Internet — provenance without the execution-warning machinery),
    not by this validator.
 5. **F5 — No overwrite, ever, of anything we create.** Spool entries are
    created with an exclusive create (`CREATE_NEW` / `O_EXCL`) under a locally
@@ -269,10 +333,16 @@ shell performs that write.
 7. **F7 — A cap breached mid-transfer aborts and cleans up.** Bytes actually
    written are counted against the same caps, so a sender that under-declares
    is cut off at the limit rather than trusted: the receiver stops writing,
-   deletes its partial spool artifact, reports the reason (NFR-3), and — because
-   exceeding a declared length is a protocol violation — terminates the session
-   fail-closed (invariant 1). No partial entry survives, and none is ever
-   registered as advertisable.
+   deletes its partial spool artifact, and reports the reason (NFR-3). The
+   breach is a protocol violation and is charged as one — which ends the
+   session once the peer makes a habit of it, on
+   [PROTOCOL.md](PROTOCOL.md) §7's graduated rule, rather than on the
+   first frame. That is the same handling every malformed chunk already
+   receives, and the reason it is graduated is written there: a single
+   violation must not be able to kill a healthy session over an in-flight
+   tail. What is *not* graduated is the effect on the transfer itself — it
+   is over at the first bad chunk. No partial entry survives, and none is
+   ever registered as advertisable.
 8. **F8 — Nothing incomplete is ever advertisable.** Payload bytes are written
    to a temporary name inside the spool, flushed, and verified against the
    offered length and hash; only then is the entry renamed atomically and
@@ -305,8 +375,9 @@ shell performs that write.
     **contents** of a received file are never logged, on the same footing as
     clipboard contents (invariant 6).
 12. **F12 — The spool is bounded, and shrinking it is observable.** Retention is
-    capped on three axes — total bytes, entry count, and entry age — each a
-    named constant. The byte cap is enforced **by evicting at admission, not by
+    capped on three axes — total bytes (`MAX_SPOOL_BYTES`), entry count
+    (`MAX_SPOOL_ENTRIES`), and entry age (`SPOOL_SWEEP_TTL`, the backstop
+    behind the clipboard-lifetime rule) — each a named constant. The byte cap is enforced **by evicting at admission, not by
     testing feasibility at admission and evicting later**: before an offer is
     accepted the receiver evicts oldest-first until the incoming length fits and
     then reserves that length against the in-flight partial, so the cap is the
@@ -327,6 +398,27 @@ shell performs that write.
     item's content hash and suppresses a matching outbound offer; and no path
     inside the spool root may ever be staged as a send source. The first fires
     without reading or rendering anything.
+    **The spool-path rule is a comparison, not a resolution.** Answering it
+    needs the root's name, which F15 deliberately keeps out of every
+    operational path, so the boundary reports the root for *comparison and
+    diagnostics only* and the engine matches path components against it —
+    case-insensitively, and answering "ours" for anything it cannot judge
+    without resolving (a relative path, a `..` component), because the safe
+    direction of a wrong answer is a copy that does not synchronize rather
+    than a loop. Every spool operation still goes through the opened handle.
+    One path inside the root refuses the whole selection: one clipboard item
+    is one blob, so a partial send would be content the user did not select.
+    **Ownership is two conditions, not one**, and the second was added
+    because the first was observed answering wrongly: `OleIsCurrentClipboard`
+    compares against the object OLE last placed, and it still reported "ours"
+    after a plain Win32 `SetClipboardData` in the same process had replaced
+    the clipboard contents — OLE learns of ownership changes through its own
+    window, and a non-OLE write next door does not always tell it. A stale
+    "yes" here is the harmful direction: it would suppress staging a copy the
+    user genuinely made. So the check also requires the clipboard sequence
+    number to be unchanged since the placement, which any update by anyone
+    moves. A race can then only produce a stale *"no"*, which costs one
+    redundant read.
 14. **F14 — Rendering serves registered spool content and nothing else, one at
     a time.** A delayed-render callback resolves an **opaque entry id** to a
     registered, complete spool entry whose bytes were hash-verified against the
@@ -358,16 +450,22 @@ shell performs that write.
     therefore an in-scope attacker here: it is not the compromised-machine or
     local-admin attacker §6 excludes. Three properties, each independently
     load-bearing:
-    - **Explicit security descriptor at creation, never inherited.** The spool
-      root is created with a DACL granting only the worker's user and local
-      administrators, **and a High mandatory integrity label with no-write-up**,
-      so a same-user medium-integrity process can neither replace the directory
-      nor alter an entry inside it. This is also what makes F14's
-      "protected since written" true: without it, an entry's bytes could be
-      swapped after verification and before a render, and the shell would write
-      attacker bytes under a name the user trusts. Where the worker is not
-      elevated there is no integrity boundary to cross and the label is inert;
-      the DACL still applies.
+    - **Explicit security descriptor, asserted on every open and never
+      inherited.** The spool root is created with a DACL granting only the
+      worker's user and local administrators, **and a mandatory integrity label
+      with no-write-up**, so a same-user medium-integrity process can neither
+      replace the directory nor alter an entry inside it. This is also what
+      makes F14's "protected since written" true: without it, an entry's bytes
+      could be swapped after verification and before a render, and the shell
+      would write attacker bytes under a name the user trusts. Asserting the
+      descriptor **at creation alone would not hold**: the reparse-point check
+      below passes for a root a lower-integrity same-user process pre-created
+      with a permissive DACL, so the descriptor is re-applied to the verified
+      handle on every open, and a root that will not take it is refused rather
+      than used unprotected. The label is stamped at the worker's own integrity
+      level capped at High, because Windows refuses a label above the caller's
+      own: where the worker is not elevated there is no integrity boundary to
+      cross and the label is inert, and the DACL still applies.
     - **Opened once and verified, never re-resolved.** The root is opened with
       reparse-point-opening semantics and rejected unless it is a real directory
       and **not** a reparse point. A root that exists and fails the check
@@ -382,7 +480,29 @@ shell performs that write.
       spool was, deleted through by a high-integrity process, is an
       arbitrary-file-delete elevation of privilege: exactly the confused-deputy
       abuse of the worker that T11 asserts is contained. Nothing outside the
-      verified root is ever unlinked.
+      verified root is ever unlinked, and a directory found *inside* it is
+      reported rather than descended into — the sweep has no recursive form to
+      misuse.
+16. **F16 — The virtual file list is excluded from Clipboard History and
+    Cloud Clipboard.** The data object carries the
+    `CanIncludeInClipboardHistory` and
+    `ExcludeClipboardContentFromMonitorProcessing` formats, and the reason is
+    a property of the item rather than a policy about clipboards. A file item
+    is a *promise* served by a render callback that only this process, holding
+    this spool entry, can answer: the object dies with the worker, and the
+    entry is collected when the clipboard moves on. A retained history entry
+    would therefore fail on paste, later, with no diagnostic from us because
+    the failure happens inside the shell — "no entry" is a better outcome
+    than "an entry that breaks". Two consequences follow and are checked
+    rather than assumed (ADR 0015): the history service must not render
+    `CFSTR_FILECONTENTS` at copy time, which would pull up to
+    `MAX_CLIPBOARD_FILE_BYTES` with no paste and no user gesture; and cloud
+    sync must not retain the item, which would take peer-delivered file
+    content off the machine — the invariant-7 half of the question, and the
+    reason this is verified on the supported builds before the paste path
+    ships rather than observed afterwards. This exclusion covers the file item
+    only; text and images are left to the user's own settings, as invariant 7
+    records.
 
 ## 8. Security-sensitive code areas
 

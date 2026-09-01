@@ -27,6 +27,7 @@ use crossover_protocol::hello::{FeatureFlags, Hello, MessageType, OsFamily};
 use crossover_protocol::version::{MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionRange};
 use crossover_protocol::{FrameDecoder, ProtocolError, RawFrame, encode_frame, negotiate};
 
+use crate::link::LinkDiagnostics;
 use crate::metrics::{FrameClass, Metrics};
 use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TlsError, TrustStore,
@@ -68,6 +69,15 @@ pub struct SessionOptions {
     /// in between, with a fake provider. Advertising is a promise to
     /// handle, so the constant stays honest and the override is explicit.
     pub advertised_features: FeatureFlags,
+    /// Optional platform probe for the state of the *local* interface that
+    /// carries this session (docs/ARCHITECTURE.md §10).
+    ///
+    /// Purely diagnostic: it is read when a session dies or a connect
+    /// attempt fails, so the log can say `local_link=down` instead of
+    /// repeating the OS's "forcibly closed by the remote host" about a
+    /// wire that went down at this end. `None` — the default, and what
+    /// tests want — logs `local_link=unknown` and changes nothing else.
+    pub link_probe: Option<Arc<dyn crossover_platform::LinkStateProbe>>,
 }
 
 impl Default for SessionOptions {
@@ -76,6 +86,7 @@ impl Default for SessionOptions {
             establish_timeout: Duration::from_secs(10),
             metrics: None,
             advertised_features: FeatureFlags::ADVERTISED,
+            link_probe: None,
         }
     }
 }
@@ -173,6 +184,11 @@ pub struct EstablishedSession {
     next_message_id: u64,
     info: SessionInfo,
     metrics: Option<Arc<Metrics>>,
+    /// How to ask, when this session dies, whether the local end of its
+    /// path was up (see [`crate::link`]). Captured at establishment because
+    /// that is the one moment the *actual* peer socket address is in hand —
+    /// afterwards the socket may already be gone.
+    link: LinkDiagnostics,
 }
 
 /// The send-path gate (docs/PROTOCOL.md §3.1): refuse anything this
@@ -217,6 +233,16 @@ impl EstablishedSession {
     #[must_use]
     pub fn info(&self) -> &SessionInfo {
         &self.info
+    }
+
+    /// How to ask whether the local end of this session's path is up.
+    ///
+    /// Cloned rather than borrowed because the caller that needs it —
+    /// supervision's session loop — asks *after* [`Self::split`] has
+    /// consumed the session.
+    #[must_use]
+    pub fn link(&self) -> LinkDiagnostics {
+        self.link.clone()
     }
 
     /// Send one frame; returns the assigned message id.
@@ -336,15 +362,23 @@ impl SessionWriter {
     /// matters under traffic nobody is waiting on. Saturates rather than
     /// wrapping — a wait past an hour is already a catastrophe, and the
     /// exact figure would not change the reading.
-    pub fn record_input_queue_latency(&self, message_type: u16, queued_at: Instant) {
+    pub fn record_input_queue_latency(
+        &self,
+        message_type: u16,
+        queued_at: Instant,
+        taken_at: Instant,
+    ) {
         let Some(metrics) = &self.metrics else {
             return;
         };
         if FrameClass::of(message_type) != FrameClass::Input {
             return;
         }
-        let micros = u32::try_from(queued_at.elapsed().as_micros()).unwrap_or(u32::MAX);
-        metrics.record_input_queue_latency(micros);
+        let micros = |span: Duration| u32::try_from(span.as_micros()).unwrap_or(u32::MAX);
+        metrics.record_input_queue_latency(
+            micros(taken_at.saturating_duration_since(queued_at)),
+            micros(taken_at.elapsed()),
+        );
     }
 
     /// Facts about this session.
@@ -518,6 +552,14 @@ async fn establish(
     options: &SessionOptions,
 ) -> Result<EstablishedSession, SessionError> {
     let metrics = options.metrics.clone();
+    // Taken here, while the socket is certainly open: by the time a session
+    // dies the peer address may no longer be readable from it, and it is the
+    // key the link probe routes on. `.ok()` because a diagnostic must never
+    // be the thing that fails an establishment.
+    let link = LinkDiagnostics::new(
+        peer_socket_addr(&stream),
+        options.link_probe.as_ref().map(Arc::clone),
+    );
     // Send our Hello (message id 1). What it advertises is a promise to
     // handle, so it comes from the build's own constant unless a caller
     // deliberately says otherwise (docs/PROTOCOL.md §3.1).
@@ -581,7 +623,17 @@ async fn establish(
             features: FeatureFlags::negotiate(advertised, peer_hello.supported_features),
         },
         metrics,
+        link,
     })
+}
+
+/// The peer's socket address, or `None` if the socket cannot say.
+///
+/// Best effort by design: this feeds a log field, so a socket that has
+/// already lost its peer produces `local_link=unknown` rather than an error
+/// anybody has to handle.
+fn peer_socket_addr(stream: &TlsStream<TcpStream>) -> Option<std::net::SocketAddr> {
+    stream.get_ref().0.peer_addr().ok()
 }
 
 /// Read one frame from the stream, growing the decoder as bytes arrive.
@@ -653,7 +705,9 @@ mod tests {
     use crossover_protocol::{ProtocolError, encode_frame};
     use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore, TrustedPeer};
 
-    use super::{LocalNode, SessionError, SessionListener, SessionOptions, connect};
+    use super::{
+        LocalNode, PROTOCOL_VERSION, SessionError, SessionListener, SessionOptions, connect,
+    };
 
     struct Node {
         identity: DeviceIdentity,
@@ -701,6 +755,61 @@ mod tests {
         }
     }
 
+    /// The link probe has to reach a live session with the peer address the
+    /// session is *actually* using, on both roles. Everything downstream —
+    /// the `local_link` field on a disconnect, the same field on a failed
+    /// reconnect — is worthless if the address is wrong or the probe never
+    /// arrives, and neither failure is visible from a log line.
+    #[tokio::test]
+    async fn both_roles_carry_a_link_probe_pointed_at_their_real_peer() {
+        use std::sync::Arc;
+
+        use crossover_platform::LinkState;
+        use crossover_platform::fakes::FakeLinkStateProbe;
+
+        let mut a = Node::new("machine-a");
+        let mut b = Node::new("machine-b");
+        a.trust_peer(&b);
+        b.trust_peer(&a);
+
+        let listener = SessionListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let probe = Arc::new(FakeLinkStateProbe::answering(LinkState::Down));
+        let opts = SessionOptions {
+            link_probe: Some(probe.clone()),
+            ..options()
+        };
+        let (a_local, b_local) = (a.local(), b.local());
+        let (inbound, outbound) = tokio::join!(
+            listener.accept(&b_local, &opts),
+            connect(addr, &a_local, &opts),
+        );
+        let server_session = inbound.unwrap();
+        let client_session = outbound.unwrap();
+
+        // The connector's peer is the address it dialled.
+        assert_eq!(client_session.link().peer(), Some(addr));
+        assert_eq!(client_session.link().state(), LinkState::Down);
+        // The listener's peer is the connector's ephemeral port — the
+        // address *this* session runs over, which is what routes.
+        let server_peer = server_session.link().peer().expect("no peer address");
+        assert!(server_peer.ip().is_loopback(), "{server_peer}");
+        assert_ne!(server_peer, addr);
+        assert_eq!(server_session.link().state(), LinkState::Down);
+
+        // With no probe configured — every build that has no platform
+        // implementation — establishment is unchanged and the answer is
+        // `Unknown`, never an optimistic `Up`.
+        let bare = options();
+        let (inbound, outbound) = tokio::join!(
+            listener.accept(&b_local, &bare),
+            connect(addr, &a_local, &bare),
+        );
+        assert_eq!(inbound.unwrap().link().state(), LinkState::Unknown);
+        assert_eq!(outbound.unwrap().link().state(), LinkState::Unknown);
+    }
+
     #[tokio::test]
     async fn trusted_peers_establish_and_exchange_frames() {
         let mut a = Node::new("machine-a");
@@ -721,8 +830,8 @@ mod tests {
 
         // Both sides agree on the current version and name the peer they
         // authenticated by fingerprint and Hello metadata.
-        assert_eq!(client_session.info().protocol_version, 2);
-        assert_eq!(server_session.info().protocol_version, 2);
+        assert_eq!(client_session.info().protocol_version, PROTOCOL_VERSION);
+        assert_eq!(server_session.info().protocol_version, PROTOCOL_VERSION);
         assert_eq!(
             client_session.info().peer_fingerprint,
             b.certified.fingerprint()
@@ -736,15 +845,15 @@ mod tests {
 
         // Capability negotiation is the intersection of the two Hellos
         // (docs/PROTOCOL.md §3), and both sides here are this build, so
-        // the intersection is what it advertises — CHUNKED_CLIPBOARD
-        // since ADR 0014's platform slice.
+        // the intersection is what it advertises — CHUNKED_CLIPBOARD and
+        // FILE_CLIPBOARD, both since ADR 0015's final slice (feature/136).
         //
         // Note what this does and does not prove: written this way it is
         // tautological in the value (negotiating a set with itself), so
         // it pins the *plumbing* — that each side's advertisement reaches
         // the other and lands on `SessionInfo::features` — and nothing
         // about which bits are advertised. The value itself is pinned by
-        // the golden Hello snapshot's `0x01`
+        // the golden Hello snapshot's `0x03`
         // (`crossover-protocol::hello`), and the asymmetric case that
         // actually matters is
         // `unnegotiated_content_is_refused_before_it_reaches_the_wire`
@@ -885,6 +994,7 @@ mod tests {
                 content_length: 4096,
                 content_hash: content_hash(b"a snip"),
             },
+            descriptor: None,
         };
         assert!(matches!(
             client

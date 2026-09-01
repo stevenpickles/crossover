@@ -8,7 +8,7 @@
 //!   text above it;
 //! - **offered and chunked** (`Offer` → `Accept`/`Decline` →
 //!   `Chunk`×N → `Applied`) for the types [`ContentType::is_chunked`]
-//!   marks — images today (ADR 0014), files later (ADR 0015).
+//!   marks — images (ADR 0014) and files (ADR 0015).
 //!
 //! The non-negotiable semantic lives in `Applied`: a sync succeeded only
 //! if the destination OS clipboard was updated (FR-3.2).
@@ -29,8 +29,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::ProtocolError;
-use crate::decode_strict;
 use crate::hello::{FeatureFlags, MessageType};
+use crate::{decode_strict, encode};
 
 /// SHA-256 of clipboard content — the identity that dedup and loop
 /// prevention key on. Exposed so the engine hashes local observations
@@ -65,6 +65,44 @@ pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 4 * 1024 * 1024;
 /// reassembly at a time.
 pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Hard cap on file clipboard content (ADR 0015, FR-3.6).
+///
+/// One clipboard item is one blob: a single file verbatim, or one zip
+/// archive built by the sender for a folder or a multi-entry selection.
+/// 256 MiB covers documents, archives and photo sets — this is a
+/// convenience feature, not a file-sync product — and a selection over it
+/// is refused observably rather than truncated.
+///
+/// Unlike an image, this is **not** a memory commitment: file content is
+/// written straight through to the receiver's spool as chunks arrive, so
+/// the receiver holds one chunk, never the item (which is why
+/// [`ChunkReassembly`] refuses this type outright). It bounds the wire
+/// and the disk instead.
+pub const MAX_CLIPBOARD_FILE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum number of filesystem entries one archived item may pack
+/// (ADR 0015). The sender refuses a larger selection before any bytes
+/// leave; the receiver refuses a descriptor that claims more.
+pub const MAX_CLIPBOARD_FILE_ENTRIES: u32 = 256;
+
+/// Maximum directory nesting the sender will walk when it packs a
+/// selection into one archive (ADR 0015).
+///
+/// A sender-side bound with no wire field of its own: nothing in a
+/// message carries a depth, because nothing on the receiving side ever
+/// looks inside the archive (F9). It lives here beside its sibling caps
+/// because it is the same family of limit — a bound on what one clipboard
+/// item may become — and because the platform crate that enforces it may
+/// carry no dependencies and so mirrors the value rather than importing
+/// it.
+///
+/// Depth is counted in archive path components: a selected file or folder
+/// sits at depth 1, its children at depth 2. Thirty-two is far past any
+/// real project tree and comfortably inside the shell's own path limits,
+/// so a selection that trips it is either pathological or a cycle the
+/// reparse-point refusal did not already catch.
+pub const MAX_ARCHIVE_DEPTH: u32 = 32;
+
 /// Maximum payload bytes in one [`ClipboardChunk`].
 ///
 /// A chunk is the *preemption unit* (ADR 0013): the writer emits at most
@@ -96,18 +134,32 @@ const _: () = assert!(MAX_CHUNK_BYTES_U32 as usize == MAX_CHUNK_BYTES);
 /// Maximum number of chunks one item may be split into.
 ///
 /// Derived, not chosen: the largest chunked item divided by the largest
-/// chunk. It is what stops a peer from declaring a legal-looking transfer
-/// made of millions of tiny chunks — a sender that picks a smaller chunk
-/// size simply has to keep the *count* inside this bound, which
-/// [`ChunkPlan::derive`] enforces before a single byte is buffered.
-pub const MAX_CHUNK_COUNT: u32 = 1024;
+/// chunk. That is 256 MiB ÷ 64 KiB since ADR 0015 — files are the largest
+/// chunked type, and a bound that could not carry one would refuse a
+/// conforming transfer rather than an abusive one. It is what stops a
+/// peer from declaring a legal-looking transfer made of millions of tiny
+/// chunks — a sender that picks a smaller chunk size simply has to keep
+/// the *count* inside this bound, which [`ChunkPlan::derive`] enforces
+/// before a single byte is buffered.
+///
+/// Raising it does not raise what any transfer may cost: a plan must
+/// reconcile *exactly* with the offered `content_length`, which is itself
+/// bounded per type, so the count a given item is allowed is still its
+/// own length divided by its own chunk size.
+pub const MAX_CHUNK_COUNT: u32 = 4096;
 
-/// Keep [`MAX_CHUNK_COUNT`] tied to the two constants it is derived from:
-/// if either moves, the build fails here rather than silently admitting a
-/// maximum item that cannot be split inside the count bound.
+/// Keep [`MAX_CHUNK_COUNT`] tied to the constants it is derived from: if
+/// any of them moves, the build fails here rather than silently admitting
+/// a maximum item that cannot be split inside the count bound. One
+/// assertion per chunked type, so adding a type without revisiting the
+/// bound is a compile error.
 const _: () = assert!(
     (MAX_CHUNK_COUNT as usize) * MAX_CHUNK_BYTES >= MAX_CLIPBOARD_IMAGE_BYTES,
     "MAX_CHUNK_COUNT chunks of MAX_CHUNK_BYTES must cover MAX_CLIPBOARD_IMAGE_BYTES"
+);
+const _: () = assert!(
+    (MAX_CHUNK_COUNT as usize) * MAX_CHUNK_BYTES >= MAX_CLIPBOARD_FILE_BYTES,
+    "MAX_CHUNK_COUNT chunks of MAX_CHUNK_BYTES must cover MAX_CLIPBOARD_FILE_BYTES"
 );
 
 /// Raster formats an image item may carry (ADR 0014).
@@ -143,6 +195,15 @@ pub enum ContentType {
     /// [`FeatureFlags::CHUNKED_CLIPBOARD`]; always offered, always
     /// chunked.
     Image(ImageFormat),
+    /// One file's bytes, or one zip archive the sender built from a
+    /// folder or a multi-entry selection (ADR 0015). Gated by
+    /// [`FeatureFlags::FILE_CLIPBOARD`]; always offered, always chunked.
+    ///
+    /// The item's *name* does not live here — it rides
+    /// [`ClipboardOffer::descriptor`], because [`ClipboardMeta`] stays
+    /// `Copy` and fixed-size and a name is neither. Appended after
+    /// `Image`: discriminants are wire values and are never renumbered.
+    File,
 }
 
 impl ContentType {
@@ -154,6 +215,7 @@ impl ContentType {
         match self {
             Self::Utf8Text => MAX_CLIPBOARD_TEXT_BYTES as u64,
             Self::Image(_) => MAX_CLIPBOARD_IMAGE_BYTES as u64,
+            Self::File => MAX_CLIPBOARD_FILE_BYTES as u64,
         }
     }
 
@@ -167,7 +229,17 @@ impl ContentType {
     /// arrive (ADR 0014).
     #[must_use]
     pub const fn is_chunked(self) -> bool {
-        matches!(self, Self::Image(_))
+        matches!(self, Self::Image(_) | Self::File)
+    }
+
+    /// Whether this type carries a [`FileDescriptor`] on its offer.
+    ///
+    /// Exactly the file type, and stated as a predicate so the "a file
+    /// offer has a descriptor, nothing else does" rule is written once
+    /// and enforced in both directions.
+    #[must_use]
+    pub const fn needs_file_descriptor(self) -> bool {
+        matches!(self, Self::File)
     }
 
     /// The capability a peer must advertise in its `Hello` before this
@@ -180,6 +252,11 @@ impl ContentType {
         match self {
             Self::Utf8Text => FeatureFlags::NONE,
             Self::Image(_) => FeatureFlags::CHUNKED_CLIPBOARD,
+            // A separate bit from images, and necessarily so: an ADR 0014
+            // peer advertises CHUNKED_CLIPBOARD and has no `File`
+            // discriminant, so sending it one is fatal to its session
+            // rather than skippable (docs/PROTOCOL.md §3.1).
+            Self::File => FeatureFlags::FILE_CLIPBOARD,
         }
     }
 
@@ -246,12 +323,95 @@ impl ClipboardMeta {
     }
 }
 
+/// What a file item is, beyond its bytes (ADR 0015).
+///
+/// It rides [`ClipboardOffer`] rather than [`ClipboardMeta`] because the
+/// meta is the engine's working currency: fixed-size and `Copy`, which a
+/// variable-length name cannot be.
+///
+/// The whole struct is peer-controlled, and `file_name` is the field that
+/// reaches a shell, so it is validated as network input here — the same
+/// check that runs again before a descriptor is built for the OS. A
+/// descriptor that does not validate makes its offer malformed, so a
+/// hostile name is unrepresentable past the parser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDescriptor {
+    /// The bare file name to present at the destination — never a path.
+    /// Validated by [`crate::validate_file_name`].
+    pub file_name: String,
+    /// Whether the blob is a zip archive the sender built (a folder or a
+    /// multi-entry selection), rather than one file verbatim.
+    pub archived: bool,
+    /// How many filesystem entries the blob packs, at most
+    /// [`MAX_CLIPBOARD_FILE_ENTRIES`]. Exactly 1 when not archived.
+    pub entry_count: u32,
+    /// Total uncompressed bytes of those entries, for the user-facing
+    /// report. Not a promise about the blob: nothing in Crossover reads
+    /// an archive, so this number is never used to size anything.
+    pub original_bytes: u64,
+}
+
+impl FileDescriptor {
+    /// Everything a descriptor can be judged on alone: a conforming name,
+    /// an entry count inside its bound, and an entry count that agrees
+    /// with `archived`.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] for an invalid name (naming the
+    /// fault, never the name), a zero or over-large `entry_count`, a
+    /// multi-entry blob that claims not to be an archive, or
+    /// `original_bytes` past [`MAX_CLIPBOARD_FILE_BYTES`].
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        crate::validate_file_name(&self.file_name)?;
+        if self.entry_count == 0 {
+            return Err(ProtocolError::Malformed {
+                reason: "file descriptor packing no entries".to_owned(),
+            });
+        }
+        if self.entry_count > MAX_CLIPBOARD_FILE_ENTRIES {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "file descriptor packs {} entries, over the {MAX_CLIPBOARD_FILE_ENTRIES}-entry \
+                     maximum",
+                    self.entry_count
+                ),
+            });
+        }
+        if self.entry_count > 1 && !self.archived {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "file descriptor packs {} entries without being an archive",
+                    self.entry_count
+                ),
+            });
+        }
+        if self.original_bytes > MAX_CLIPBOARD_FILE_BYTES as u64 {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "file descriptor declares {} original bytes, over the \
+                     {MAX_CLIPBOARD_FILE_BYTES}-byte maximum",
+                    self.original_bytes
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Announce a large item without its content: the receiver decides
 /// whether the bytes should travel at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Copy` since ADR 0015: a file offer carries a variable-length
+/// [`FileDescriptor`]. [`ClipboardMeta`] keeps `Copy`, which is what the
+/// engine actually passes around.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipboardOffer {
     /// The offered item.
     pub meta: ClipboardMeta,
+    /// The file half of the offer: `Some` for — and only for —
+    /// [`ContentType::File`] (ADR 0015).
+    pub descriptor: Option<FileDescriptor>,
 }
 
 impl ClipboardOffer {
@@ -263,8 +423,10 @@ impl ClipboardOffer {
     ///
     /// # Errors
     ///
-    /// [`ProtocolError::Malformed`] for out-of-range lengths, and for a
-    /// non-chunked offer at or below the inline threshold.
+    /// [`ProtocolError::Malformed`] for out-of-range lengths, for a
+    /// non-chunked offer at or below the inline threshold, and for a
+    /// descriptor that is missing, unexpected, invalid, or inconsistent
+    /// with the offered length.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.meta.validate()?;
         if !self.meta.content_type.is_chunked()
@@ -278,7 +440,41 @@ impl ClipboardOffer {
                 ),
             });
         }
-        Ok(())
+        self.validate_descriptor()
+    }
+
+    /// The descriptor rules of ADR 0015, in both directions: a file offer
+    /// has a descriptor, no other offer has one, and the descriptor
+    /// agrees with the item it describes.
+    fn validate_descriptor(&self) -> Result<(), ProtocolError> {
+        match (
+            self.meta.content_type.needs_file_descriptor(),
+            &self.descriptor,
+        ) {
+            (false, None) => Ok(()),
+            (true, None) => Err(ProtocolError::Malformed {
+                reason: "file offer without a file descriptor".to_owned(),
+            }),
+            (false, Some(_)) => Err(ProtocolError::Malformed {
+                reason: format!("file descriptor on a {:?} offer", self.meta.content_type),
+            }),
+            (true, Some(descriptor)) => {
+                descriptor.validate()?;
+                // A single file travels verbatim and uncompressed
+                // (ADR 0014's principle, kept by ADR 0015), so its
+                // uncompressed size *is* the offered length. Only an
+                // archive may declare a different one.
+                if !descriptor.archived && descriptor.original_bytes != self.meta.content_length {
+                    return Err(ProtocolError::Malformed {
+                        reason: format!(
+                            "unarchived file offer declares {} original bytes for {} content bytes",
+                            descriptor.original_bytes, self.meta.content_length
+                        ),
+                    });
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Whether this offer may be sent to a peer advertising `features`
@@ -343,6 +539,21 @@ pub enum DeclineReason {
     /// will never be accepted (NFR-3). Appended after `Superseded` —
     /// discriminants are wire values and are never renumbered.
     UnsupportedType,
+    /// The receiver has not been granted the permission this item needs
+    /// — `file_receive` for a file item, which is default-off and not
+    /// part of `PeerPermissions::FULL` (ADR 0015). Permanent for the
+    /// session, and deliberately distinct from
+    /// [`DeclineReason::UnsupportedType`]: the type is understood, the
+    /// user simply has not consented to it.
+    NotPermitted,
+    /// The offered file name failed validation (ADR 0015). The name is
+    /// never echoed back — the reason is the diagnostic.
+    InvalidName,
+    /// The receiver has no room: volume headroom below the required
+    /// margin, or an item larger than the whole spool budget (ADR 0015).
+    /// Distinct from [`DeclineReason::TooLarge`], which is about the
+    /// item's own ceiling rather than this machine's free space.
+    InsufficientSpace,
 }
 
 /// Decline an offered item.
@@ -425,7 +636,7 @@ impl ClipboardData {
             }
             // No UTF-8 rule for binary types — and no ClipboardData
             // either: a chunked item is only ever assembled from chunks.
-            ContentType::Image(_) => {
+            ContentType::Image(_) | ContentType::File => {
                 return Err(ProtocolError::Malformed {
                     reason: format!(
                         "{:?} content travels as chunks, not as ClipboardData",
@@ -728,6 +939,18 @@ impl ChunkReassembly {
                 reason: format!("{:?} items do not travel as chunks", meta.content_type),
             });
         }
+        // Chunked, but never buffered: a file is written straight through
+        // to the spool as chunks arrive, so the receiver's commitment is
+        // O(chunk) rather than O(file) (ADR 0015). Reassembling one here
+        // would reserve up to MAX_CLIPBOARD_FILE_BYTES of memory for an
+        // item that is never supposed to be in memory, so this type is
+        // refused rather than served by the wrong mechanism.
+        if meta.content_type.needs_file_descriptor() {
+            return Err(ProtocolError::Malformed {
+                reason: "file content is spooled as it arrives, never reassembled in memory"
+                    .to_owned(),
+            });
+        }
         // Bounded by the check inside `validate` above; `try_from` covers
         // the 32-bit target where the bound alone would not.
         let Ok(capacity) = usize::try_from(meta.content_length) else {
@@ -888,6 +1111,215 @@ impl ChunkReassembly {
     }
 }
 
+/// What a chunk did to a [`ChunkStream`].
+///
+/// Both variants mean "this payload is admissible — write it". The
+/// difference is what follows the write, and the caller must not act on
+/// [`StreamOutcome::Final`] before the write is durable: the item is only
+/// complete once the last payload is where it is going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// Accepted; more chunks are expected.
+    More,
+    /// The final chunk, and the item's `content_hash` verified over every
+    /// payload accepted: what has been handed out *is* the offered item.
+    Final,
+}
+
+/// Accounts for a chunked item written straight through instead of
+/// buffered (ADR 0015) — the file receiver's counterpart to
+/// [`ChunkReassembly`].
+///
+/// Same rules, same reject list, one difference that is the whole point:
+/// payloads are never retained. The caller writes each accepted payload
+/// to its own sink and this type keeps only what proves the result is the
+/// offered item — a running hash, a running length, and the next expected
+/// index. The receiver's commitment is therefore O(chunk), not O(item),
+/// which is what lets a file be 256 MiB while an image is capped at the
+/// 64 MiB a machine must actually hold (docs/PROTOCOL.md §5).
+///
+/// **A chunk is judged before it is written, never after.** `accept`
+/// returns before the caller writes, so a payload that fails any check
+/// never reaches the sink at all — the sink's contents are always a
+/// prefix of a conforming transfer, and a rejected transfer leaves a
+/// partial that is deleted rather than a partial that is corrupt.
+///
+/// Pure accounting — no I/O, no platform, no clock — so every rejection
+/// path is reachable in a unit test (docs/ARCHITECTURE.md §3).
+#[derive(Debug)]
+pub struct ChunkStream {
+    meta: ClipboardMeta,
+    plan: Option<ChunkPlan>,
+    /// Running digest over every payload accepted so far. The item's
+    /// `content_hash` is verified against it when the last chunk lands —
+    /// the same guarantee [`ChunkReassembly`] gives, obtained without
+    /// keeping the bytes.
+    digest: Sha256,
+    received: u64,
+    next_index: u32,
+    complete: bool,
+}
+
+impl ChunkStream {
+    /// Begin streaming the offered item.
+    ///
+    /// Validates `meta` — crucially the declared length against the
+    /// per-type maximum — before the caller commits any resource to it
+    /// (NFR-1). Nothing is allocated here: the whole point of this type
+    /// is that the item's size buys it no memory.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] if the meta is invalid or if the type
+    /// does not travel as chunks.
+    pub fn begin(meta: ClipboardMeta) -> Result<Self, ProtocolError> {
+        meta.validate()?;
+        if !meta.content_type.is_chunked() {
+            return Err(ProtocolError::Malformed {
+                reason: format!("{:?} items do not travel as chunks", meta.content_type),
+            });
+        }
+        Ok(Self {
+            meta,
+            plan: None,
+            digest: Sha256::new(),
+            received: 0,
+            next_index: 0,
+            complete: false,
+        })
+    }
+
+    /// The item being streamed.
+    #[must_use]
+    pub const fn meta(&self) -> ClipboardMeta {
+        self.meta
+    }
+
+    /// Bytes handed out for writing so far.
+    #[must_use]
+    pub const fn received_bytes(&self) -> u64 {
+        self.received
+    }
+
+    /// The plan, once chunk 0 has fixed the sender's chunk size.
+    #[must_use]
+    pub const fn plan(&self) -> Option<ChunkPlan> {
+        self.plan
+    }
+
+    /// Take one chunk, judging it against the transfer before any of it
+    /// is written.
+    ///
+    /// The reject list is [`ChunkReassembly::accept`]'s, unchanged: a
+    /// chunk for a different item; an index that is not exactly the next
+    /// one; a chunk after the transfer completed; a first chunk implying
+    /// a plan that does not reconcile with the offered length; any chunk
+    /// whose length is not the exact length its position requires — which
+    /// is what makes the running total incapable of passing the declared
+    /// length, so the receiver never trusts the sender to stop.
+    /// Completion additionally requires the running length to equal the
+    /// declared one and the item's `content_hash` to verify.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] for every case above.
+    pub fn accept(&mut self, chunk: &ClipboardChunk) -> Result<StreamOutcome, ProtocolError> {
+        chunk.validate()?;
+        if self.complete {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk {} for item {} arrived after the transfer completed",
+                    chunk.index, self.meta.id
+                ),
+            });
+        }
+        if chunk.id != self.meta.id {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk for item {} during the transfer of {}",
+                    chunk.id, self.meta.id
+                ),
+            });
+        }
+        if chunk.index != self.next_index {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk index {} out of sequence; expected {}",
+                    chunk.index, self.next_index
+                ),
+            });
+        }
+
+        // Chunk 0 fixes the sender's chunk size, and with it the whole
+        // plan — reconciled against the offered length before a byte of
+        // it is admitted. Computed here but **not stored yet**: a
+        // rejection must leave no trace, and storing before the checks
+        // below would let a refused chunk decide how the rest of the
+        // transfer is measured.
+        let plan = if let Some(plan) = self.plan {
+            plan
+        } else {
+            let Ok(chunk_bytes) = u32::try_from(chunk.payload.len()) else {
+                return Err(ProtocolError::Malformed {
+                    reason: "chunk payload length is not representable".to_owned(),
+                });
+            };
+            ChunkPlan::derive(self.meta.content_length, chunk_bytes)?
+        };
+
+        let Some(expected) = plan.chunk_len(chunk.index) else {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk index {} is past the {}-chunk transfer",
+                    chunk.index,
+                    plan.chunk_count()
+                ),
+            });
+        };
+        if chunk.payload.len() as u64 != u64::from(expected) {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "chunk {} carries {} bytes; the plan requires exactly {expected}",
+                    chunk.index,
+                    chunk.payload.len()
+                ),
+            });
+        }
+
+        // Accepted: only now does any of it become state, and only the
+        // accounting — the payload itself belongs to the caller's sink.
+        self.plan = Some(plan);
+        self.digest.update(&chunk.payload);
+        self.received = self.received.saturating_add(chunk.payload.len() as u64);
+        self.next_index = self.next_index.saturating_add(1);
+        if self.next_index < plan.chunk_count() {
+            return Ok(StreamOutcome::More);
+        }
+
+        // Every declared byte has been handed out. Verify the item's
+        // identity before the caller is allowed to treat the sink's
+        // contents as the item.
+        if self.received != self.meta.content_length {
+            return Err(ProtocolError::Malformed {
+                reason: format!(
+                    "streamed {} bytes for a declared length of {}",
+                    self.received, self.meta.content_length
+                ),
+            });
+        }
+        let digest: [u8; 32] = std::mem::replace(&mut self.digest, Sha256::new())
+            .finalize()
+            .into();
+        if digest != self.meta.content_hash {
+            return Err(ProtocolError::Malformed {
+                reason: format!("streamed content hash mismatch for item {}", self.meta.id),
+            });
+        }
+        self.complete = true;
+        Ok(StreamOutcome::Final)
+    }
+}
+
 /// The capability a peer must have advertised before this frame may be
 /// sent to it (docs/PROTOCOL.md §3.1), from the frame alone.
 ///
@@ -970,6 +1402,17 @@ pub enum ApplyResult {
     /// race; the destination kept the newer content. Closes the losing
     /// transaction as converged, not failed.
     Superseded,
+    /// A file item is verified, spooled, and offered on the destination's
+    /// clipboard as a virtual file (ADR 0015) — the file type's
+    /// definition of FR-3.2 success: the destination clipboard holds a
+    /// promise of bytes that are already local. Appended after
+    /// `Superseded`; discriminants are wire values.
+    Stored,
+    /// A file item arrived intact but could not be spooled — a write
+    /// error, a spool that could not be opened, or an abort that left
+    /// nothing advertisable. A failure, reported rather than swallowed
+    /// (NFR-3).
+    StorageFailed,
 }
 
 /// Close a transaction: what happened at the destination.
@@ -1009,12 +1452,6 @@ plain_payload!(ClipboardAccept, "ClipboardAccept");
 plain_payload!(ClipboardDecline, "ClipboardDecline");
 plain_payload!(ClipboardApplied, "ClipboardApplied");
 
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
-    postcard::to_stdvec(value).map_err(|e| ProtocolError::Encode {
-        reason: e.to_string(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -1022,16 +1459,27 @@ mod tests {
 
     use super::{
         ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ChunkOutcome, ChunkPlan, ChunkReassembly,
-        ClipboardAccept, ClipboardApplied, ClipboardChunk, ClipboardData, ClipboardDecline,
-        ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, ImageFormat, MAX_CHUNK_BYTES,
-        MAX_CHUNK_BYTES_U32, MAX_CHUNK_COUNT, MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_TEXT_BYTES,
-        chunk_content, content_hash,
+        ChunkStream, ClipboardAccept, ClipboardApplied, ClipboardChunk, ClipboardData,
+        ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
+        FileDescriptor, ImageFormat, MAX_CHUNK_BYTES, MAX_CHUNK_BYTES_U32, MAX_CHUNK_COUNT,
+        MAX_CLIPBOARD_FILE_BYTES, MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
+        MAX_CLIPBOARD_TEXT_BYTES, StreamOutcome, chunk_content, content_hash,
     };
     use crate::ProtocolError;
+    use crate::file_name::MAX_FILE_NAME_BYTES;
     use crate::hello::FeatureFlags;
 
     const ITEM: Uuid = Uuid::from_bytes([0x11; 16]);
     const ORIGIN: Uuid = Uuid::from_bytes([0x22; 16]);
+
+    /// An offer with no file descriptor — every type but
+    /// [`ContentType::File`].
+    fn offer(meta: ClipboardMeta) -> ClipboardOffer {
+        ClipboardOffer {
+            meta,
+            descriptor: None,
+        }
+    }
 
     fn data(content: &[u8]) -> ClipboardData {
         ClipboardData::from_content(
@@ -1105,17 +1553,17 @@ mod tests {
     #[test]
     fn offers_below_the_inline_threshold_are_malformed() {
         let small = data(b"tiny");
-        let offer = ClipboardOffer { meta: small.meta };
+        let tiny = offer(small.meta);
         assert!(matches!(
-            offer.encode_payload(),
+            tiny.encode_payload(),
             Err(ProtocolError::Malformed { .. })
         ));
 
         let mut big_meta = small.meta;
         big_meta.content_length = (CLIPBOARD_INLINE_MAX_BYTES as u64) + 1;
-        let offer = ClipboardOffer { meta: big_meta };
-        let decoded = ClipboardOffer::decode_payload(&offer.encode_payload().unwrap()).unwrap();
-        assert_eq!(decoded, offer);
+        let big = offer(big_meta);
+        let decoded = ClipboardOffer::decode_payload(&big.encode_payload().unwrap()).unwrap();
+        assert_eq!(decoded, big);
     }
 
     #[test]
@@ -1134,6 +1582,9 @@ mod tests {
             DeclineReason::NotReady,
             DeclineReason::Superseded,
             DeclineReason::UnsupportedType,
+            DeclineReason::NotPermitted,
+            DeclineReason::InvalidName,
+            DeclineReason::InsufficientSpace,
         ] {
             let decline = ClipboardDecline {
                 id: Uuid::from_bytes([0x44; 16]),
@@ -1150,6 +1601,8 @@ mod tests {
             ApplyResult::ClipboardUnavailable,
             ApplyResult::ContentRejected,
             ApplyResult::Superseded,
+            ApplyResult::Stored,
+            ApplyResult::StorageFailed,
         ] {
             let applied = ClipboardApplied {
                 id: Uuid::from_bytes([0x55; 16]),
@@ -1221,6 +1674,9 @@ mod tests {
             (DeclineReason::NotReady, 0x02),
             (DeclineReason::Superseded, 0x03),
             (DeclineReason::UnsupportedType, 0x04),
+            (DeclineReason::NotPermitted, 0x05),
+            (DeclineReason::InvalidName, 0x06),
+            (DeclineReason::InsufficientSpace, 0x07),
         ] {
             let mut expected: Vec<u8> = vec![0x10];
             expected.extend([0x11; 16]);
@@ -1239,6 +1695,8 @@ mod tests {
             (ApplyResult::ClipboardUnavailable, 0x01),
             (ApplyResult::ContentRejected, 0x02),
             (ApplyResult::Superseded, 0x03),
+            (ApplyResult::Stored, 0x04),
+            (ApplyResult::StorageFailed, 0x05),
         ] {
             let mut expected: Vec<u8> = vec![0x10];
             expected.extend([0x11; 16]);
@@ -1257,6 +1715,7 @@ mod tests {
             (ContentType::Image(ImageFormat::Dib), vec![0x01, 0x00]),
             (ContentType::Image(ImageFormat::Png), vec![0x01, 0x01]),
             (ContentType::Image(ImageFormat::Jpeg), vec![0x01, 0x02]),
+            (ContentType::File, vec![0x02]),
         ] {
             assert_eq!(
                 super::encode(&content_type).unwrap(),
@@ -1353,9 +1812,7 @@ mod tests {
             "v2 ClipboardChunk wire layout changed: bump the protocol version"
         );
 
-        let offer = ClipboardOffer {
-            meta: image_meta(b"px"),
-        };
+        let offer = offer(image_meta(b"px"));
         let encoded = offer.encode_payload().unwrap();
         // ContentType sits after id (17), origin (17) and the sequence
         // varint (1): Image = 1, ImageFormat::Dib = 0.
@@ -1372,15 +1829,13 @@ mod tests {
     /// already-have-this-hash decline makes a re-paste move zero bytes.
     #[test]
     fn images_are_offered_at_any_size_while_text_keeps_the_inline_threshold() {
-        let tiny_image = ClipboardOffer {
-            meta: image_meta(b"a tiny snip"),
-        };
+        let tiny_image = offer(image_meta(b"a tiny snip"));
         assert!(tiny_image.encode_payload().is_ok());
 
         let mut tiny_text = tiny_image.meta;
         tiny_text.content_type = ContentType::Utf8Text;
         assert!(matches!(
-            ClipboardOffer { meta: tiny_text }.encode_payload(),
+            offer(tiny_text).encode_payload(),
             Err(ProtocolError::Malformed { .. })
         ));
     }
@@ -1414,14 +1869,14 @@ mod tests {
             content_length: MAX_CLIPBOARD_IMAGE_BYTES as u64,
             ..image_meta(b"unused")
         };
-        assert!(ClipboardOffer { meta: at_limit }.validate().is_ok());
+        assert!(offer(at_limit).validate().is_ok());
 
         let over = ClipboardMeta {
             content_length: (MAX_CLIPBOARD_IMAGE_BYTES as u64) + 1,
             ..at_limit
         };
         assert!(matches!(
-            ClipboardOffer { meta: over }.validate(),
+            offer(over).validate(),
             Err(ProtocolError::Malformed { .. })
         ));
         // An image-sized *text* item is still refused at the text bound.
@@ -1431,7 +1886,7 @@ mod tests {
             ..at_limit
         };
         assert!(matches!(
-            ClipboardOffer { meta: text }.validate(),
+            offer(text).validate(),
             Err(ProtocolError::Malformed { .. })
         ));
         // A zero-byte image is not an image.
@@ -1551,10 +2006,19 @@ mod tests {
             ChunkPlan::derive(MAX_CLIPBOARD_IMAGE_BYTES as u64, 1),
             Err(ProtocolError::Malformed { .. })
         ));
-        // The largest item still fits, at the largest chunk size.
+        // The largest item of each chunked type still fits at the largest
+        // chunk size, and the largest of all — a file — is exactly what
+        // MAX_CHUNK_COUNT is derived from.
         let plan =
             ChunkPlan::derive(MAX_CLIPBOARD_IMAGE_BYTES as u64, MAX_CHUNK_BYTES_U32).unwrap();
+        assert!(plan.chunk_count() <= MAX_CHUNK_COUNT);
+        let plan = ChunkPlan::derive(MAX_CLIPBOARD_FILE_BYTES as u64, MAX_CHUNK_BYTES_U32).unwrap();
         assert_eq!(plan.chunk_count(), MAX_CHUNK_COUNT);
+        // One byte past the largest chunked item needs one chunk too many.
+        assert!(matches!(
+            ChunkPlan::derive((MAX_CLIPBOARD_FILE_BYTES as u64) + 1, MAX_CHUNK_BYTES_U32),
+            Err(ProtocolError::Malformed { .. })
+        ));
         // No length math overflows, however absurd the declaration.
         assert!(matches!(
             ChunkPlan::derive(u64::MAX, 1),
@@ -1730,22 +2194,29 @@ mod tests {
     /// said it can take.
     #[test]
     fn chunked_content_is_offered_only_to_a_peer_that_advertised_it() {
-        let image = ClipboardOffer {
-            meta: image_meta(b"a snip"),
-        };
-        let text = ClipboardOffer {
-            meta: ClipboardMeta {
-                content_type: ContentType::Utf8Text,
-                content_length: (CLIPBOARD_INLINE_MAX_BYTES as u64) + 1,
-                ..image.meta
-            },
-        };
+        let image = offer(image_meta(b"a snip"));
+        let text = offer(ClipboardMeta {
+            content_type: ContentType::Utf8Text,
+            content_length: (CLIPBOARD_INLINE_MAX_BYTES as u64) + 1,
+            ..image.meta
+        });
 
         assert!(!image.negotiated_by(FeatureFlags::NONE));
         assert!(image.negotiated_by(FeatureFlags::CHUNKED_CLIPBOARD));
         assert!(image.negotiated_by(FeatureFlags::ALL));
         // The base protocol's types need no bit at all.
         assert!(text.negotiated_by(FeatureFlags::NONE));
+
+        // Files take a bit of their own: an ADR 0014 peer advertises
+        // CHUNKED_CLIPBOARD and has no `File` discriminant, so the image
+        // bit must not carry a file offer to it.
+        let file = file_offer(b"a document");
+        assert!(!file.negotiated_by(FeatureFlags::NONE));
+        assert!(!file.negotiated_by(FeatureFlags::CHUNKED_CLIPBOARD));
+        assert!(file.negotiated_by(FeatureFlags::FILE_CLIPBOARD));
+        assert!(file.negotiated_by(FeatureFlags::ALL));
+        // ... and the file bit does not carry an image either.
+        assert!(!image.negotiated_by(FeatureFlags::FILE_CLIPBOARD));
 
         // A feature is active only when both sides advertise it.
         assert_eq!(
@@ -1754,6 +2225,10 @@ mod tests {
         );
         assert_eq!(
             FeatureFlags::negotiate(FeatureFlags::ALL, FeatureFlags::ALL),
+            FeatureFlags::ALL
+        );
+        assert_eq!(
+            FeatureFlags::negotiate(FeatureFlags::ALL, FeatureFlags::CHUNKED_CLIPBOARD),
             FeatureFlags::CHUNKED_CLIPBOARD
         );
         // An unknown bit from a future peer never activates anything.
@@ -1838,6 +2313,38 @@ mod tests {
             }
         }
 
+        /// The same, for the stream a file rides: arbitrary sequences
+        /// never panic, a refusal leaves no trace, and — the property
+        /// only this type has — the accounting never runs ahead of the
+        /// item, so what a caller wrote can never exceed what was
+        /// declared.
+        #[test]
+        fn arbitrary_file_chunk_sequences_never_panic(
+            declared in 1u64..300_000,
+            chunks in proptest::collection::vec(
+                (0u32..8, proptest::collection::vec(any::<u8>(), 0..70_000)),
+                0..8,
+            ),
+        ) {
+            let meta = ClipboardMeta {
+                content_length: declared,
+                ..file_meta(b"unused")
+            };
+            let Ok(mut stream) = ChunkStream::begin(meta) else { return Ok(()); };
+            for (index, payload) in chunks {
+                let chunk = ClipboardChunk { id: meta.id, index, payload };
+                let (bytes_before, plan_before) = (stream.received_bytes(), stream.plan());
+                if stream.accept(&chunk).is_err() {
+                    // A rejection leaves no trace: nothing counted, and no
+                    // plan fixed by a chunk that was refused.
+                    prop_assert_eq!(stream.received_bytes(), bytes_before);
+                    prop_assert_eq!(stream.plan(), plan_before);
+                    break; // fail closed: the transfer is over
+                }
+                prop_assert!(stream.received_bytes() <= declared);
+            }
+        }
+
         /// Arbitrary bytes never panic the chunk decoder, and anything
         /// that decodes survives a re-encode unchanged.
         #[test]
@@ -1848,6 +2355,571 @@ mod tests {
                 let again = ClipboardChunk::decode_payload(&chunk.encode_payload().unwrap())
                     .unwrap();
                 prop_assert_eq!(chunk, again);
+            }
+        }
+    }
+
+    // --- files (ADR 0015) --------------------------------------------------
+
+    fn file_meta(content: &[u8]) -> ClipboardMeta {
+        ClipboardMeta {
+            id: ITEM,
+            origin: ORIGIN,
+            sequence: 5,
+            content_type: ContentType::File,
+            content_length: content.len() as u64,
+            content_hash: content_hash(content),
+        }
+    }
+
+    /// A single-file descriptor: one entry, not an archive, verbatim.
+    fn file_descriptor(name: &str, original_bytes: u64) -> FileDescriptor {
+        FileDescriptor {
+            file_name: name.to_owned(),
+            archived: false,
+            entry_count: 1,
+            original_bytes,
+        }
+    }
+
+    fn file_offer(content: &[u8]) -> ClipboardOffer {
+        let meta = file_meta(content);
+        ClipboardOffer {
+            descriptor: Some(file_descriptor("report.pdf", meta.content_length)),
+            meta,
+        }
+    }
+
+    #[test]
+    fn file_offers_round_trip_with_their_descriptor() {
+        let item = file_offer(b"a document's bytes");
+        let decoded = ClipboardOffer::decode_payload(&item.encode_payload().unwrap()).unwrap();
+        assert_eq!(decoded, item);
+
+        // The archived shape too: a folder or multi-entry selection is one
+        // zip, so entry_count may exceed 1 and original_bytes need not
+        // equal the compressed blob.
+        let archive = ClipboardOffer {
+            descriptor: Some(FileDescriptor {
+                file_name: "holiday photos.zip".to_owned(),
+                archived: true,
+                entry_count: 42,
+                original_bytes: 900_000,
+            }),
+            ..file_offer(b"pretend zip bytes")
+        };
+        let decoded = ClipboardOffer::decode_payload(&archive.encode_payload().unwrap()).unwrap();
+        assert_eq!(decoded, archive);
+    }
+
+    /// Golden wire snapshot (ADR 0001). Two things are pinned here: that
+    /// `ContentType::File` is discriminant 2 — appended after `Image`,
+    /// never renumbered — and the descriptor's own layout.
+    #[test]
+    fn golden_wire_snapshot_for_a_file_offer() {
+        let meta = file_meta(b"pdf");
+        let item = ClipboardOffer {
+            meta,
+            descriptor: Some(file_descriptor("a.txt", 3)),
+        };
+        let mut expected: Vec<u8> = Vec::new();
+        expected.push(0x10); // id: 16-byte length prefix
+        expected.extend([0x11; 16]);
+        expected.push(0x10); // origin: 16-byte length prefix
+        expected.extend([0x22; 16]);
+        expected.push(0x05); // sequence varint
+        expected.push(0x02); // ContentType::File
+        expected.push(0x03); // content_length varint
+        expected.extend(meta.content_hash); // hash: fixed 32, no prefix
+        expected.push(0x01); // descriptor: Some
+        expected.extend([0x05, b'a', b'.', b't', b'x', b't']); // file_name
+        expected.push(0x00); // archived: false
+        expected.push(0x01); // entry_count varint
+        expected.push(0x03); // original_bytes varint
+        assert_eq!(
+            item.encode_payload().unwrap(),
+            expected,
+            "v3 file ClipboardOffer wire layout changed: bump the protocol version"
+        );
+    }
+
+    /// The layout change that made this protocol version 3: every offer,
+    /// of every type, now ends in the descriptor's `Option` tag. A v2 peer
+    /// reads that byte as trailing data and fails the payload, which is
+    /// why the floor moved with the ceiling.
+    #[test]
+    fn every_offer_carries_the_descriptor_tag() {
+        let image = offer(image_meta(b"px")).encode_payload().unwrap();
+        assert_eq!(
+            image.last(),
+            Some(&0x00),
+            "a non-file offer ends in the None tag"
+        );
+    }
+
+    /// A descriptor belongs to a file offer and to nothing else, in both
+    /// directions — the rule that keeps a name from arriving attached to
+    /// an item nothing will validate it for.
+    #[test]
+    fn descriptor_presence_must_match_the_content_type() {
+        let naked = ClipboardOffer {
+            descriptor: None,
+            ..file_offer(b"a document")
+        };
+        assert!(matches!(
+            naked.encode_payload(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // And on the way in, not merely on the way out.
+        let bytes = super::encode(&naked).unwrap();
+        assert!(matches!(
+            ClipboardOffer::decode_payload(&bytes),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        let dressed_image = ClipboardOffer {
+            meta: image_meta(b"a snip"),
+            descriptor: Some(file_descriptor("sneaky.txt", 6)),
+        };
+        assert!(matches!(
+            dressed_image.encode_payload(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        let bytes = super::encode(&dressed_image).unwrap();
+        assert!(matches!(
+            ClipboardOffer::decode_payload(&bytes),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// The corpus ADR 0015 requires, run through the *wire* path rather
+    /// than the validator alone: a hostile name must not survive decode,
+    /// so no descriptor carrying one ever exists to be handed to a shell.
+    #[test]
+    fn hostile_file_names_never_survive_decode() {
+        let hostile = [
+            "",                                    // empty
+            "../../etc/passwd",                    // traversal
+            "..\\..\\Windows\\System32\\evil.dll", // traversal, Windows form
+            "..",                                  // the parent directory itself
+            ".",                                   // the current one
+            "/etc/passwd",                         // absolute
+            "\\Windows\\System32\\evil.dll",       // absolute, Windows form
+            "\\\\server\\share\\payload.exe",      // UNC
+            "C:\\Windows\\System32\\evil.dll",     // drive letter
+            "c:payload.exe",                       // drive-relative
+            "subdir/payload.exe",                  // a path, not a name
+            "CON",                                 // reserved device name
+            "nul.txt",                             // ... with an extension
+            "LPT9",                                // ... and the numbered family
+            "report.pdf.",                         // trailing dot
+            "report.pdf ",                         // trailing space
+            "na\u{0}me.txt",                       // NUL
+            "na\nme.txt",                          // Cc
+            "invoice\u{202E}gnp.exe",              // Cf: right-to-left override
+            "invoice\u{200F}gnp.exe",              // Cf: right-to-left mark
+            "stream.txt:$DATA",                    // reserved character
+            "wild*.txt",                           // ... and the rest of the set
+        ];
+        for name in hostile {
+            let item = ClipboardOffer {
+                descriptor: Some(file_descriptor(name, 10)),
+                ..file_offer(b"ten bytes!")
+            };
+            // Encoding refuses it: we never send what we would refuse.
+            assert!(
+                matches!(item.encode_payload(), Err(ProtocolError::Malformed { .. })),
+                "a hostile name encoded: {name:?}"
+            );
+            // And decoding refuses it, which is the direction that matters:
+            // the bytes come from a peer that does not run our encoder.
+            let bytes = super::encode(&item).unwrap();
+            assert!(
+                matches!(
+                    ClipboardOffer::decode_payload(&bytes),
+                    Err(ProtocolError::Malformed { .. })
+                ),
+                "a hostile name survived decode: {name:?}"
+            );
+        }
+
+        // Over-length in bytes, built past the validator the same way.
+        let item = ClipboardOffer {
+            descriptor: Some(file_descriptor(&"x".repeat(MAX_FILE_NAME_BYTES + 1), 10)),
+            ..file_offer(b"ten bytes!")
+        };
+        let bytes = super::encode(&item).unwrap();
+        assert!(matches!(
+            ClipboardOffer::decode_payload(&bytes),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// A name is a `String` on the wire, so invalid UTF-8 is refused by
+    /// the decoder itself — before any of our rules run, and without
+    /// allocating a name.
+    #[test]
+    fn a_non_utf8_file_name_is_refused_by_the_decoder() {
+        let good = file_offer(b"a document").encode_payload().unwrap();
+        // The name is the only text field; corrupt its first byte into an
+        // invalid UTF-8 lead byte.
+        let start = good
+            .windows(10)
+            .position(|window| window == b"report.pdf")
+            .expect("the encoded name is findable");
+        let mut broken = good;
+        broken[start] = 0xFF; // never a valid UTF-8 byte
+        assert!(matches!(
+            ClipboardOffer::decode_payload(&broken),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn descriptor_counts_and_sizes_are_bounded() {
+        let base = file_offer(b"ten bytes!");
+        let with = |descriptor: FileDescriptor| ClipboardOffer {
+            descriptor: Some(descriptor),
+            ..base.clone()
+        };
+
+        // Nothing packed at all.
+        let mut empty = file_descriptor("a.zip", 10);
+        empty.entry_count = 0;
+        assert!(matches!(
+            with(empty).validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // More entries than an archive may pack.
+        let over = FileDescriptor {
+            file_name: "a.zip".to_owned(),
+            archived: true,
+            entry_count: MAX_CLIPBOARD_FILE_ENTRIES + 1,
+            original_bytes: 10,
+        };
+        assert!(matches!(
+            with(over).validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // The boundary itself is fine.
+        let at_limit = FileDescriptor {
+            entry_count: MAX_CLIPBOARD_FILE_ENTRIES,
+            ..FileDescriptor {
+                file_name: "a.zip".to_owned(),
+                archived: true,
+                entry_count: 1,
+                original_bytes: 10,
+            }
+        };
+        assert!(with(at_limit).validate().is_ok());
+
+        // Many entries but not an archive: the two fields disagree.
+        let inconsistent = FileDescriptor {
+            file_name: "a.txt".to_owned(),
+            archived: false,
+            entry_count: 7,
+            original_bytes: 10,
+        };
+        assert!(matches!(
+            with(inconsistent).validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // An uncompressed total past the item ceiling.
+        let huge = FileDescriptor {
+            file_name: "a.zip".to_owned(),
+            archived: true,
+            entry_count: 2,
+            original_bytes: (MAX_CLIPBOARD_FILE_BYTES as u64) + 1,
+        };
+        assert!(matches!(
+            with(huge).validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // A single file travels verbatim, so its uncompressed size is the
+        // offered length; only an archive may declare a different one.
+        let lying = file_descriptor("a.txt", 9);
+        assert!(matches!(
+            with(lying).validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn files_are_bounded_by_their_own_ceiling() {
+        let at_limit = ClipboardOffer {
+            meta: ClipboardMeta {
+                content_length: MAX_CLIPBOARD_FILE_BYTES as u64,
+                ..file_meta(b"unused")
+            },
+            descriptor: Some(file_descriptor("big.zip", MAX_CLIPBOARD_FILE_BYTES as u64)),
+        };
+        assert!(at_limit.validate().is_ok());
+
+        let over = ClipboardOffer {
+            meta: ClipboardMeta {
+                content_length: (MAX_CLIPBOARD_FILE_BYTES as u64) + 1,
+                ..file_meta(b"unused")
+            },
+            ..at_limit.clone()
+        };
+        assert!(matches!(
+            over.validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // A file is far larger than an image is allowed to be, and each
+        // type is judged by its own maximum.
+        assert_eq!(
+            ContentType::File.max_content_bytes(),
+            MAX_CLIPBOARD_FILE_BYTES as u64
+        );
+        assert!(
+            ContentType::File.max_content_bytes()
+                > ContentType::Image(ImageFormat::Dib).max_content_bytes()
+        );
+
+        // A zero-byte item is not a transfer, for files as for images.
+        let empty = ClipboardOffer {
+            meta: ClipboardMeta {
+                content_length: 0,
+                ..file_meta(b"unused")
+            },
+            ..at_limit
+        };
+        assert!(matches!(
+            empty.validate(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Files are chunked, but never buffered: the receiver writes them
+    /// through to its spool, so the in-memory reassembly is refused
+    /// outright rather than quietly reserving up to 256 MiB (ADR 0015).
+    #[test]
+    fn file_content_is_never_reassembled_in_memory() {
+        assert!(ContentType::File.is_chunked());
+        assert!(matches!(
+            ChunkReassembly::begin(file_meta(b"a document")),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Feed every chunk into a stream, collecting what the caller would
+    /// have written. The bytes come back out of the *caller's* sink, never
+    /// out of the stream — which is the difference being tested.
+    fn stream_through(
+        meta: ClipboardMeta,
+        chunks: &[ClipboardChunk],
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let mut stream = ChunkStream::begin(meta)?;
+        let mut sink: Vec<u8> = Vec::new();
+        let mut last = StreamOutcome::More;
+        for chunk in chunks {
+            last = stream.accept(chunk)?;
+            sink.extend_from_slice(&chunk.payload);
+        }
+        assert_eq!(last, StreamOutcome::Final, "the last chunk must complete");
+        assert_eq!(stream.received_bytes(), meta.content_length);
+        Ok(sink)
+    }
+
+    /// The happy path, over more than one chunk: what the caller wrote is
+    /// the offered item, proved by a hash the stream computed without ever
+    /// holding the bytes.
+    #[test]
+    fn a_streamed_file_verifies_without_being_buffered() {
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let meta = file_meta(&content);
+        let chunks = chunk_content(ITEM, &content).unwrap();
+        assert!(chunks.len() > 1, "the fixture must span several chunks");
+        assert_eq!(stream_through(meta, &chunks).unwrap(), content);
+    }
+
+    /// The one type `ChunkReassembly` refuses is the one this exists for,
+    /// and the two agree on everything else about what may be streamed.
+    #[test]
+    fn a_stream_takes_the_types_a_reassembly_does_and_the_file_type_too() {
+        assert!(ChunkStream::begin(file_meta(b"a document")).is_ok());
+        assert!(ChunkStream::begin(image_meta(b"raster")).is_ok());
+
+        let text = ClipboardMeta {
+            content_type: ContentType::Utf8Text,
+            ..file_meta(b"not chunked")
+        };
+        assert!(matches!(
+            ChunkStream::begin(text),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        let oversized = ClipboardMeta {
+            content_length: (MAX_CLIPBOARD_FILE_BYTES as u64) + 1,
+            ..file_meta(b"unused")
+        };
+        assert!(matches!(
+            ChunkStream::begin(oversized),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Content that is not what was offered never completes: the final
+    /// chunk is refused, so the caller deletes its partial rather than
+    /// registering bytes nobody vouched for.
+    #[test]
+    fn a_stream_refuses_content_that_is_not_the_offered_item() {
+        let content = b"the document that was offered".to_vec();
+        let chunks = chunk_content(ITEM, &content).unwrap();
+        let lying = ClipboardMeta {
+            content_hash: content_hash(b"something else entirely"),
+            ..file_meta(&content)
+        };
+        let mut stream = ChunkStream::begin(lying).unwrap();
+        assert!(matches!(
+            stream.accept(&chunks[0]),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// Every fail-closed rule of the reassembly holds here too, and each
+    /// one fires *before* the payload would have been written.
+    #[test]
+    fn a_stream_rejects_out_of_sequence_short_and_late_chunks() {
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 241) as u8).collect();
+        let meta = file_meta(&content);
+        let chunks = chunk_content(ITEM, &content).unwrap();
+
+        // A gap: chunk 1 without chunk 0.
+        let mut stream = ChunkStream::begin(meta).unwrap();
+        assert!(matches!(
+            stream.accept(&chunks[1]),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        assert_eq!(stream.received_bytes(), 0, "a refusal writes nothing");
+
+        // A repeat.
+        let mut stream = ChunkStream::begin(meta).unwrap();
+        assert_eq!(stream.accept(&chunks[0]).unwrap(), StreamOutcome::More);
+        assert!(matches!(
+            stream.accept(&chunks[0]),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // A chunk that is not the length its position requires: the check
+        // that stops a running total from ever passing the declared one.
+        let mut stream = ChunkStream::begin(meta).unwrap();
+        let short = ClipboardChunk {
+            id: ITEM,
+            index: 0,
+            payload: chunks[0].payload[..chunks[0].payload.len() - 1].to_vec(),
+        };
+        assert_eq!(stream.accept(&chunks[0]).unwrap(), StreamOutcome::More);
+        let mut fresh = ChunkStream::begin(meta).unwrap();
+        assert_eq!(fresh.accept(&short).unwrap(), StreamOutcome::More);
+        assert!(
+            matches!(
+                fresh.accept(&chunks[1]),
+                Err(ProtocolError::Malformed { .. })
+            ),
+            "a plan derived from a short chunk 0 cannot admit a full chunk 1"
+        );
+
+        // A chunk for another item.
+        let mut stream = ChunkStream::begin(meta).unwrap();
+        let foreign = ClipboardChunk {
+            id: Uuid::from_u128(0xfeed),
+            index: 0,
+            payload: chunks[0].payload.clone(),
+        };
+        assert!(matches!(
+            stream.accept(&foreign),
+            Err(ProtocolError::Malformed { .. })
+        ));
+
+        // A tail after completion.
+        let mut stream = ChunkStream::begin(meta).unwrap();
+        for chunk in &chunks {
+            stream.accept(chunk).unwrap();
+        }
+        assert!(matches!(
+            stream.accept(&chunks[0]),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    /// One path per type: a file never travels as `ClipboardData` either.
+    #[test]
+    fn file_content_is_rejected_as_clipboard_data() {
+        let content = b"a document".to_vec();
+        let item = ClipboardData {
+            meta: file_meta(&content),
+            content,
+        };
+        assert!(matches!(
+            item.encode_payload(),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        let bytes = super::encode(&item).unwrap();
+        assert!(matches!(
+            ClipboardData::decode_payload(&bytes),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    proptest! {
+        /// Arbitrary bytes never panic the offer decoder — the path that
+        /// now carries a peer-supplied name — and anything it accepts
+        /// round-trips and carries a name that still validates.
+        #[test]
+        fn arbitrary_bytes_never_panic_the_offer_decoder(
+            bytes in proptest::collection::vec(any::<u8>(), 0..512),
+        ) {
+            if let Ok(item) = ClipboardOffer::decode_payload(&bytes) {
+                let again = ClipboardOffer::decode_payload(&item.encode_payload().unwrap())
+                    .unwrap();
+                prop_assert_eq!(&item, &again);
+                if let Some(descriptor) = &item.descriptor {
+                    prop_assert!(crate::validate_file_name(&descriptor.file_name).is_ok());
+                    prop_assert!(descriptor.file_name.len() <= MAX_FILE_NAME_BYTES);
+                    prop_assert!(descriptor.entry_count >= 1);
+                    prop_assert!(descriptor.entry_count <= MAX_CLIPBOARD_FILE_ENTRIES);
+                }
+            }
+        }
+
+        /// Arbitrary *descriptors*, most of them nonsense: every outcome
+        /// is a value, and an accepted one survives the wire unchanged.
+        #[test]
+        fn arbitrary_file_offers_reject_or_round_trip(
+            name in ".{0,300}",
+            archived in any::<bool>(),
+            entry_count in 0u32..1000,
+            original_bytes in 0u64..(2 * MAX_CLIPBOARD_FILE_BYTES as u64),
+            content_length in 0u64..(2 * MAX_CLIPBOARD_FILE_BYTES as u64),
+        ) {
+            let item = ClipboardOffer {
+                meta: ClipboardMeta { content_length, ..file_meta(b"unused") },
+                descriptor: Some(FileDescriptor {
+                    file_name: name,
+                    archived,
+                    entry_count,
+                    original_bytes,
+                }),
+            };
+            let wire = super::encode(&item).unwrap();
+            match ClipboardOffer::decode_payload(&wire) {
+                Ok(decoded) => {
+                    prop_assert_eq!(&decoded, &item);
+                    let descriptor = decoded.descriptor.expect("a file offer has a descriptor");
+                    prop_assert!(crate::validate_file_name(&descriptor.file_name).is_ok());
+                    prop_assert!(content_length >= 1);
+                    prop_assert!(content_length <= MAX_CLIPBOARD_FILE_BYTES as u64);
+                    prop_assert!(descriptor.original_bytes <= MAX_CLIPBOARD_FILE_BYTES as u64);
+                    prop_assert!(descriptor.archived || descriptor.entry_count == 1);
+                }
+                Err(ProtocolError::Malformed { .. }) => {}
+                Err(other) => prop_assert!(false, "unexpected error: {other:?}"),
             }
         }
     }

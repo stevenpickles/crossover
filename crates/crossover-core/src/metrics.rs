@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::hello::{MessageClass, MessageType};
 
 use crate::supervision::DisconnectReason;
 
@@ -101,12 +101,16 @@ impl FrameClass {
                 | MessageType::ClipboardApplied,
             ) => Self::Clipboard,
             Some(MessageType::InputBatch | MessageType::ReleaseAllInput) => Self::Input,
-            Some(
-                MessageType::ControlRequest
-                | MessageType::ControlResponse
-                | MessageType::ControlRelease,
-            ) => Self::Control,
-            None => Self::Other,
+            // Everything left that `MessageType::class` reports as
+            // docs/PROTOCOL.md §4's CONTROL class: control-transfer
+            // negotiation and display topology (ADR 0018) — negotiating
+            // crossing geometry, not application content. Keepalive and
+            // setup are CONTROL class too, but the two arms above already
+            // claimed them for this finer-grained report, and
+            // `ReleaseAllInput` for the same reason rides `Self::Input`
+            // here rather than `Self::Control`.
+            Some(ty) if ty.class() == MessageClass::Control => Self::Control,
+            Some(_) | None => Self::Other,
         }
     }
 }
@@ -204,7 +208,43 @@ pub struct Metrics {
     clipboard_loop_suppressed: AtomicU64,
     clipboard_conflicts: AtomicU64,
     clipboard_abandoned: AtomicU64,
+    // Two counters about the *install* half specifically, which nothing
+    // above could distinguish. `clipboard_applied` says how many peer
+    // items reached this machine's clipboard; until these existed nothing
+    // said how many did not, and nothing at all said how often the fast
+    // retry budget was not enough. On 2026-09-01 five of eight reconnects
+    // lost their re-announced item to about a second of external
+    // contention, and the only trace was a warn line per item — countable
+    // by grep, not by the run report (FR-7.3).
+    clipboard_installs_parked: AtomicU64,
+    clipboard_installs_failed: AtomicU64,
+    // Local copies made while no peer was connected (ADR 0006, addendum
+    // 2026-09-01). Named for the situation rather than for "deferred",
+    // which `clipboard_deferred_peak` below already spends on the
+    // driver's event queue.
+    clipboard_offline_changes: AtomicU64,
     clipboard_deferred_peak: AtomicU64,
+    // Files (ADR 0015) are counted apart from clipboard items generally,
+    // because they are the one content type that reaches disk: how many a
+    // peer was allowed to spool, how many were refused before a byte
+    // travelled, and how many failed after being accepted are three
+    // different questions about a write surface, and the run report is
+    // where the answers have to be visible (FR-7.3).
+    clipboard_files_stored: AtomicU64,
+    clipboard_files_declined: AtomicU64,
+    clipboard_files_failed: AtomicU64,
+    clipboard_file_bytes: AtomicU64,
+    // The sending half of the same three questions (ADR 0015, "Sender
+    // side"). Kept apart from the receiving counters rather than folded
+    // into them: a refusal here happened on *this* machine, before any of
+    // the selection travelled, and FR-3.6 requires that to be visible as
+    // something other than "nothing happened". Without the split, a user
+    // whose copy is refused locally and a user whose peer declined would
+    // read the same number.
+    clipboard_files_sent: AtomicU64,
+    clipboard_files_send_refused: AtomicU64,
+    clipboard_files_send_failed: AtomicU64,
+    clipboard_file_sent_bytes: AtomicU64,
     clipboard_latency_ms: Mutex<Vec<u32>>,
     clipboard_latency_dropped: AtomicU64,
     // Count/total/max rather than a sample vector, because this is the one
@@ -216,6 +256,14 @@ pub struct Metrics {
     input_queue_latency_count: AtomicU64,
     input_queue_latency_total_us: AtomicU64,
     input_queue_latency_max_us: AtomicU64,
+    // The same wait, split at the moment the writer picks the frame up.
+    // Waiting in the lane and waiting for the socket to accept the bytes
+    // have different causes and different fixes, and a single figure cannot
+    // tell them apart — which is the whole reason for measuring both.
+    input_lane_latency_total_us: AtomicU64,
+    input_lane_latency_max_us: AtomicU64,
+    input_write_latency_total_us: AtomicU64,
+    input_write_latency_max_us: AtomicU64,
 
     // ---- control & input ----
     control_gained: AtomicU64,
@@ -230,6 +278,11 @@ pub struct Metrics {
     input_events_received: AtomicU64,
     key_events_sent: AtomicU64,
     key_events_received: AtomicU64,
+
+    // ---- display topology (ADR 0018) ----
+    layout_adopted_from_peer: AtomicU64,
+    layout_sent: AtomicU64,
+    layout_rejected: AtomicU64,
 }
 
 impl Metrics {
@@ -322,6 +375,47 @@ impl Metrics {
         self.clipboard_abandoned.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// An inbound install exhausted its fast retry budget and entered the
+    /// parked phase (ADR 0005's 2026-09-01 addendum).
+    ///
+    /// Not a failure: a parked install usually lands. It is the signal
+    /// that something on this machine held the clipboard for longer than
+    /// the fast schedule covers, which is a property of the *machine*
+    /// rather than of the peer, and the only number that separates "the
+    /// clipboard is contended here" from "the peer is sending a lot".
+    pub fn record_clipboard_install_parked(&self) {
+        self.clipboard_installs_parked
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// An inbound item was permanently dropped: the destination clipboard
+    /// never took it, and the origin was told `ClipboardUnavailable`.
+    ///
+    /// The counterpart to [`Self::record_clipboard_applied`], and the one
+    /// clipboard-reliability number a run report was missing (priority #2,
+    /// FR-7.3): a run with a non-zero value here lost user content, which
+    /// no combination of the other counters could show.
+    pub fn record_clipboard_install_failed(&self) {
+        self.clipboard_installs_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A local clipboard change was recorded but not transmitted, because
+    /// no session was live to transmit it to (ADR 0006, addendum
+    /// 2026-09-01).
+    ///
+    /// The counterpart to [`Self::record_clipboard_sent`] for the hours a
+    /// pair spends apart, and the number that keeps
+    /// [`Self::record_clipboard_abandoned`] meaning what it says: before
+    /// this rule, every offline copy minted a transaction that nobody
+    /// could answer and expired sixty seconds later as an `abandoned`, so
+    /// a night with a sleeping peer read exactly like a night of a peer
+    /// that stopped replying. This counts those copies as what they are —
+    /// held, and offered whole on the next connect.
+    pub fn record_clipboard_offline_change(&self) {
+        self.clipboard_offline_changes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record how deep the clipboard driver's deferred-event queue got
     /// while it was parked on bulk backpressure.
     ///
@@ -352,6 +446,46 @@ impl Metrics {
     pub fn record_clipboard_conflict(&self) {
         self.clipboard_conflicts.fetch_add(1, Ordering::Relaxed);
     }
+    /// A peer file was verified and registered in the spool (ADR 0015).
+    pub fn record_file_stored(&self, byte_len: u64) {
+        self.clipboard_files_stored.fetch_add(1, Ordering::Relaxed);
+        self.clipboard_file_bytes
+            .fetch_add(byte_len, Ordering::Relaxed);
+    }
+    /// A file offer was refused before any of it travelled — no
+    /// permission, no room, or one already in flight (FR-3.6).
+    pub fn record_file_declined(&self) {
+        self.clipboard_files_declined
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// An accepted file transfer ended with nothing registered: a bad
+    /// chunk, a storage failure, a deadline, or a lost session.
+    pub fn record_file_failed(&self) {
+        self.clipboard_files_failed.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A local file selection was packed and offered to the peer (ADR
+    /// 0015). Counted at the offer, which is the first moment anything
+    /// about the item leaves this machine.
+    pub fn record_file_sent(&self, byte_len: u64) {
+        self.clipboard_files_sent.fetch_add(1, Ordering::Relaxed);
+        self.clipboard_file_sent_bytes
+            .fetch_add(byte_len, Ordering::Relaxed);
+    }
+    /// A local file selection was refused here, before any of it could
+    /// travel: no negotiated file support, no `clipboard_send` grant, a
+    /// selection the builder would not pack, or a name that does not
+    /// conform (FR-3.6 — never a silent drop).
+    pub fn record_file_send_refused(&self) {
+        self.clipboard_files_send_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// An outbound file transaction that started and did not deliver: the
+    /// peer declined it, the deadline expired, the session went, or the
+    /// blob could not be read back.
+    pub fn record_file_send_failed(&self) {
+        self.clipboard_files_send_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
     /// How long an input frame waited between being handed to the send
     /// path and reaching the wire, in microseconds.
     ///
@@ -360,13 +494,29 @@ impl Metrics {
     /// running mean and maximum rather than a distribution — the guarantee
     /// is a bound, which the maximum states directly, and aggregating with
     /// atomics keeps the input path lock-free.
-    pub fn record_input_queue_latency(&self, micros: u32) {
+    ///
+    /// Recorded in two halves, because they fail for different reasons and
+    /// are fixed differently. `lane_us` is the wait before the writer picked
+    /// the frame up — the writer was busy with something else, which is what
+    /// a dedicated writer task would remove. `write_us` is how long the
+    /// socket took to accept these few dozen bytes — backpressure or the
+    /// link itself, which no amount of local scheduling improves.
+    pub fn record_input_queue_latency(&self, lane_us: u32, write_us: u32) {
+        let total = u64::from(lane_us) + u64::from(write_us);
         self.input_queue_latency_count
             .fetch_add(1, Ordering::Relaxed);
         self.input_queue_latency_total_us
-            .fetch_add(u64::from(micros), Ordering::Relaxed);
+            .fetch_add(total, Ordering::Relaxed);
         self.input_queue_latency_max_us
-            .fetch_max(u64::from(micros), Ordering::Relaxed);
+            .fetch_max(total, Ordering::Relaxed);
+        self.input_lane_latency_total_us
+            .fetch_add(u64::from(lane_us), Ordering::Relaxed);
+        self.input_lane_latency_max_us
+            .fetch_max(u64::from(lane_us), Ordering::Relaxed);
+        self.input_write_latency_total_us
+            .fetch_add(u64::from(write_us), Ordering::Relaxed);
+        self.input_write_latency_max_us
+            .fetch_max(u64::from(write_us), Ordering::Relaxed);
     }
 
     /// A completed clipboard round-trip latency, on the originating
@@ -435,6 +585,32 @@ impl Metrics {
         self.key_events_received.fetch_add(keys, Ordering::Relaxed);
     }
 
+    // ---- display topology (ADR 0018) ----
+
+    /// An arrangement drawn at the other desk won and was adopted here —
+    /// a peer-driven change to where this machine hands control away, so
+    /// it is counted as well as logged (docs/SECURITY.md T23).
+    pub fn record_layout_adopted(&self) {
+        self.layout_adopted_from_peer
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A `LayoutSync` was put on the wire — at session establishment, on a
+    /// local edit, or as the answer that supersedes a peer's older
+    /// arrangement.
+    pub fn record_layout_sent(&self) {
+        self.layout_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A well-formed `LayoutSync` was refused as semantically impossible
+    /// (docs/PROTOCOL.md §6.2, §7's graduated rule): it named a device
+    /// that is not this session's pair, or was not a believable
+    /// arrangement of that pair. Never adopted, always logged, and charged
+    /// here as the protocol violation it is.
+    pub fn record_layout_rejected(&self) {
+        self.layout_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read every counter into a plain, orderless snapshot for rendering.
     #[must_use]
     pub fn snapshot(&self) -> Report {
@@ -476,8 +652,35 @@ impl Metrics {
             clipboard_loop_suppressed: load(&self.clipboard_loop_suppressed),
             clipboard_conflicts: load(&self.clipboard_conflicts),
             clipboard_abandoned: load(&self.clipboard_abandoned),
+            clipboard_installs_parked: load(&self.clipboard_installs_parked),
+            clipboard_installs_failed: load(&self.clipboard_installs_failed),
+            clipboard_offline_changes: load(&self.clipboard_offline_changes),
             clipboard_deferred_peak: load(&self.clipboard_deferred_peak),
+            clipboard_files_stored: load(&self.clipboard_files_stored),
+            clipboard_files_declined: load(&self.clipboard_files_declined),
+            clipboard_files_failed: load(&self.clipboard_files_failed),
+            clipboard_file_bytes: load(&self.clipboard_file_bytes),
+            clipboard_files_sent: load(&self.clipboard_files_sent),
+            clipboard_files_send_refused: load(&self.clipboard_files_send_refused),
+            clipboard_files_send_failed: load(&self.clipboard_files_send_failed),
+            clipboard_file_sent_bytes: load(&self.clipboard_file_sent_bytes),
             clipboard_latency_dropped: load(&self.clipboard_latency_dropped),
+            input_lane_avg_us: {
+                let n = load(&self.input_queue_latency_count);
+                (n > 0).then(|| {
+                    u32::try_from(load(&self.input_lane_latency_total_us) / n).unwrap_or(u32::MAX)
+                })
+            },
+            input_lane_max_us: (load(&self.input_queue_latency_count) > 0)
+                .then(|| u32::try_from(load(&self.input_lane_latency_max_us)).unwrap_or(u32::MAX)),
+            input_write_avg_us: {
+                let n = load(&self.input_queue_latency_count);
+                (n > 0).then(|| {
+                    u32::try_from(load(&self.input_write_latency_total_us) / n).unwrap_or(u32::MAX)
+                })
+            },
+            input_write_max_us: (load(&self.input_queue_latency_count) > 0)
+                .then(|| u32::try_from(load(&self.input_write_latency_max_us)).unwrap_or(u32::MAX)),
             input_queue_avg_us: {
                 let n = load(&self.input_queue_latency_count);
                 (n > 0).then(|| {
@@ -503,6 +706,9 @@ impl Metrics {
             input_events_received: load(&self.input_events_received),
             key_events_sent: load(&self.key_events_sent),
             key_events_received: load(&self.key_events_received),
+            layout_adopted_from_peer: load(&self.layout_adopted_from_peer),
+            layout_sent: load(&self.layout_sent),
+            layout_rejected: load(&self.layout_rejected),
         }
     }
 }
@@ -569,13 +775,50 @@ pub struct Report {
     pub clipboard_loop_suppressed: u64,
     /// Clipboard conflicts resolved.
     pub clipboard_conflicts: u64,
+    /// Inbound installs that outlived the fast retry budget and were
+    /// parked (ADR 0005's 2026-09-01 addendum). Most of them still land.
+    pub clipboard_installs_parked: u64,
+    /// Inbound items the destination clipboard never took, after every
+    /// retry: content that was lost.
+    pub clipboard_installs_failed: u64,
+    /// Local copies recorded while no peer was connected, and therefore
+    /// never offered (ADR 0006, addendum 2026-09-01). Not a failure: the
+    /// current item is offered whole when a session next establishes.
+    pub clipboard_offline_changes: u64,
     /// Deepest the driver's deferred-event queue got while parked on bulk
     /// backpressure; `0` if it never had to defer.
     pub clipboard_deferred_peak: u64,
+    /// Peer files verified and registered in the spool (ADR 0015).
+    pub clipboard_files_stored: u64,
+    /// File offers refused before any of them travelled.
+    pub clipboard_files_declined: u64,
+    /// Accepted file transfers that registered nothing.
+    pub clipboard_files_failed: u64,
+    /// Bytes of spooled file content accepted from peers.
+    pub clipboard_file_bytes: u64,
+    /// Local file selections packed and offered to the peer (ADR 0015).
+    pub clipboard_files_sent: u64,
+    /// Local file selections refused here before any of them travelled.
+    pub clipboard_files_send_refused: u64,
+    /// Outbound file transactions that started and did not deliver.
+    pub clipboard_files_send_failed: u64,
+    /// Bytes of file content offered to the peer.
+    pub clipboard_file_sent_bytes: u64,
     /// Latency samples dropped past the retention cap.
     pub clipboard_latency_dropped: u64,
+    /// Mean time an input frame waited *before the writer took it* (µs) —
+    /// the writer was busy with something else.
+    pub input_lane_avg_us: Option<u32>,
+    /// Worst lane wait (µs).
+    pub input_lane_max_us: Option<u32>,
+    /// Mean time the socket took to accept an input frame (µs) —
+    /// backpressure or the link, not scheduling.
+    pub input_write_avg_us: Option<u32>,
+    /// Worst write wait (µs).
+    pub input_write_max_us: Option<u32>,
     /// Mean input queue-to-wire latency (µs), if any input flowed. The
-    /// ADR 0013 guarantee, as a number rather than an ordering.
+    /// ADR 0013 guarantee, as a number rather than an ordering. The sum of
+    /// the two halves above.
     pub input_queue_avg_us: Option<u32>,
     /// Worst input queue-to-wire latency (µs) — the one a saturating bulk
     /// transfer would inflate if the lane split stopped working.
@@ -614,6 +857,14 @@ pub struct Report {
     pub key_events_sent: u64,
     /// Of the received input events, how many were key events.
     pub key_events_received: u64,
+    /// Arrangements drawn at the other desk that won and were adopted here
+    /// (ADR 0018).
+    pub layout_adopted_from_peer: u64,
+    /// `LayoutSync` messages put on the wire.
+    pub layout_sent: u64,
+    /// Well-formed `LayoutSync` messages refused as semantically
+    /// impossible (docs/PROTOCOL.md §6.2).
+    pub layout_rejected: u64,
 }
 
 impl Report {
@@ -648,8 +899,19 @@ impl Report {
             clipboard_contention = self.clipboard_contention,
             clipboard_conflicts = self.clipboard_conflicts,
             clipboard_loop_suppressed = self.clipboard_loop_suppressed,
+            clipboard_installs_parked = self.clipboard_installs_parked,
+            clipboard_installs_failed = self.clipboard_installs_failed,
+            clipboard_offline_changes = self.clipboard_offline_changes,
             clipboard_latency_dropped = self.clipboard_latency_dropped,
             clipboard_deferred_peak = self.clipboard_deferred_peak,
+            clipboard_files_stored = self.clipboard_files_stored,
+            clipboard_files_declined = self.clipboard_files_declined,
+            clipboard_files_failed = self.clipboard_files_failed,
+            clipboard_file_bytes = self.clipboard_file_bytes,
+            clipboard_files_sent = self.clipboard_files_sent,
+            clipboard_files_send_refused = self.clipboard_files_send_refused,
+            clipboard_files_send_failed = self.clipboard_files_send_failed,
+            clipboard_file_sent_bytes = self.clipboard_file_sent_bytes,
             latency_p50_ms = self.latency_p50,
             latency_p95_ms = self.latency_p95,
             latency_max_ms = self.latency_max,
@@ -658,10 +920,17 @@ impl Report {
             control_denied = self.control_denied,
             capture_losses = self.capture_losses,
             input_queue_avg_us = self.input_queue_avg_us,
+            input_lane_avg_us = self.input_lane_avg_us,
+            input_lane_max_us = self.input_lane_max_us,
+            input_write_avg_us = self.input_write_avg_us,
+            input_write_max_us = self.input_write_max_us,
             input_queue_max_us = self.input_queue_max_us,
             input_queue_samples = self.input_queue_samples,
             input_events_sent = self.input_events_sent,
             input_events_received = self.input_events_received,
+            layout_adopted_from_peer = self.layout_adopted_from_peer,
+            layout_sent = self.layout_sent,
+            layout_rejected = self.layout_rejected,
             "execution metrics"
         );
     }
@@ -672,12 +941,78 @@ impl Report {
 
     /// The clipboard block of the shutdown report: one summary line, plus
     /// the sub-lines that only mean something when they happened.
+    /// The input block: volume, then the ADR 0013 guarantee as a number.
+    fn write_input(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "  input:      {} events sent ({} keys), {} events received ({} keys)",
+            self.input_events_sent,
+            self.key_events_sent,
+            self.input_events_received,
+            self.key_events_received,
+        )?;
+        // The ADR 0013 guarantee as a number. Printed only when input
+        // actually flowed, and last, so the line a soak is looking for is
+        // the one at the bottom of the block.
+        let (Some(avg), Some(max)) = (self.input_queue_avg_us, self.input_queue_max_us) else {
+            return Ok(());
+        };
+        writeln!(
+            f,
+            "                queue-to-wire avg {}, max {} (over {} frames)",
+            human_micros(avg),
+            human_micros(max),
+            self.input_queue_samples,
+        )?;
+        // Which half it was. Waiting for the writer and waiting for the
+        // socket have different causes and different remedies, so a reading
+        // that cannot tell them apart cannot be acted on.
+        match (
+            self.input_lane_avg_us,
+            self.input_lane_max_us,
+            self.input_write_avg_us,
+            self.input_write_max_us,
+        ) {
+            (Some(lane_avg), Some(lane_max), Some(write_avg), Some(write_max)) => write!(
+                f,
+                "                  waiting for the writer avg {}, max {}; for the socket avg {}, max {}",
+                human_micros(lane_avg),
+                human_micros(lane_max),
+                human_micros(write_avg),
+                human_micros(write_max),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// The display-topology block (ADR 0018), printed only by a run that
+    /// actually synced an arrangement.
+    ///
+    /// A run with no drawn layout — the deprecated side model, or nothing
+    /// at all — never sends, adopts, or refuses one, and three zeroes
+    /// would say only that the feature exists. A run that saw *any* of the
+    /// three prints all three, including the zeroes: "2 sent, 0 adopted, 0
+    /// rejected" is the line that separates a healthy sync from an
+    /// unreported one, and a rejection count that only appears when
+    /// non-zero is a rejection count nobody thinks to look for.
+    fn write_layout(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.layout_sent + self.layout_adopted_from_peer + self.layout_rejected == 0 {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "  layout:     {} sent, {} adopted from the peer, {} rejected",
+            self.layout_sent, self.layout_adopted_from_peer, self.layout_rejected,
+        )
+    }
+
     fn write_clipboard(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "  clipboard:  {} sent, {} applied, {} superseded, {} abandoned",
+            "  clipboard:  {} sent, {} applied, {} failed, {} superseded, {} abandoned",
             self.clipboard_sent,
             self.clipboard_applied,
+            self.clipboard_installs_failed,
             self.clipboard_superseded,
             self.clipboard_abandoned,
         )?;
@@ -693,6 +1028,48 @@ impl Report {
             self.clipboard_conflicts,
             self.clipboard_loop_suppressed,
         )?;
+        // Only when it happened: a run where the fast retry budget always
+        // sufficed has nothing to say, and the line exists to make the
+        // rarer case legible — how many installs had to be parked, against
+        // how many of them were nonetheless lost.
+        if self.clipboard_installs_parked > 0 {
+            writeln!(
+                f,
+                "                {} installs parked past the fast retry budget",
+                self.clipboard_installs_parked,
+            )?;
+        }
+        // Only when it happened, and phrased so it is not read as a loss:
+        // these copies are on this machine's clipboard and the next
+        // session establishment offers whatever is current (ADR 0006
+        // trigger 3). The line exists so a run whose `sent` count is low
+        // says *why* — a peer that was away, rather than a clipboard that
+        // stopped working.
+        if self.clipboard_offline_changes > 0 {
+            writeln!(
+                f,
+                "                {} local copies made with no peer connected (held, not lost)",
+                self.clipboard_offline_changes,
+            )?;
+        }
+        // Files are rare by design (ADR 0015), so a run that saw none
+        // says nothing rather than printing three zeroes. A run that saw
+        // any prints all three counts even where some are zero: "4 stored,
+        // 0 refused, 0 failed" is the line an operator needs, and dropping
+        // the zeroes would leave them unable to tell a clean run from an
+        // unreported one.
+        if self.clipboard_files_stored + self.clipboard_files_declined + self.clipboard_files_failed
+            > 0
+        {
+            writeln!(
+                f,
+                "                files: {} stored ({}), {} refused, {} failed",
+                self.clipboard_files_stored,
+                human_bytes(self.clipboard_file_bytes),
+                self.clipboard_files_declined,
+                self.clipboard_files_failed,
+            )?;
+        }
         // A run that never parked on bulk backpressure has nothing to say
         // here, and the block stays short.
         if self.clipboard_deferred_peak > 0 {
@@ -806,27 +1183,8 @@ impl fmt::Display for Report {
                 self.capture_losses
             )?;
         }
-        writeln!(
-            f,
-            "  input:      {} events sent ({} keys), {} events received ({} keys)",
-            self.input_events_sent,
-            self.key_events_sent,
-            self.input_events_received,
-            self.key_events_received,
-        )?;
-        // The ADR 0013 guarantee as a number. Printed only when input
-        // actually flowed, and last, so the line a soak is looking for is
-        // the one at the bottom of the block.
-        match (self.input_queue_avg_us, self.input_queue_max_us) {
-            (Some(avg), Some(max)) => write!(
-                f,
-                "                queue-to-wire avg {}, max {} (over {} frames)",
-                human_micros(avg),
-                human_micros(max),
-                self.input_queue_samples,
-            ),
-            _ => Ok(()),
-        }
+        self.write_layout(f)?;
+        self.write_input(f)
     }
 }
 
@@ -892,7 +1250,13 @@ mod tests {
         metrics.record_clipboard_contention();
         metrics.record_clipboard_conflict();
         metrics.record_clipboard_loop_suppressed();
+        metrics.record_clipboard_install_parked();
+        metrics.record_clipboard_install_failed();
+        metrics.record_clipboard_offline_change();
         metrics.record_deferred_depth(7);
+        metrics.record_file_stored(2 * 1024 * 1024);
+        metrics.record_file_declined();
+        metrics.record_file_failed();
 
         let rendered = metrics.snapshot().to_string();
         for expected in [
@@ -904,7 +1268,12 @@ mod tests {
             "1 contention",
             "1 conflicts",
             "1 own-write loops suppressed",
+            "1 installs parked",
+            "1 local copies made with no peer connected",
             "deferred peak 7",
+            "1 stored (2.0 MiB)",
+            "1 refused",
+            "1 failed",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -912,6 +1281,20 @@ mod tests {
 {rendered}"
             );
         }
+    }
+
+    /// Files are rare, so their line is conditional — and a run without
+    /// one must not print a row of zeroes that reads like a fault report.
+    #[test]
+    fn the_file_line_appears_only_when_a_file_transfer_happened() {
+        let metrics = Metrics::new();
+        metrics.record_clipboard_applied();
+        assert!(!metrics.snapshot().to_string().contains("files:"));
+
+        metrics.record_file_declined();
+        let rendered = metrics.snapshot().to_string();
+        assert!(rendered.contains("files: 0 stored"), "{rendered}");
+        assert!(rendered.contains("1 refused"), "{rendered}");
     }
 
     /// The retention note only earns its line when samples were actually
@@ -945,8 +1328,8 @@ mod tests {
     fn input_queue_latency_reaches_the_report_at_a_readable_scale() {
         let metrics = Metrics::new();
         metrics.record_sent(11, 40); // an InputBatch, so the line is earned
-        for micros in [40, 60, 2_500] {
-            metrics.record_input_queue_latency(micros);
+        for (lane, write) in [(30, 10), (40, 20), (2_000, 500)] {
+            metrics.record_input_queue_latency(lane, write);
         }
 
         let rendered = metrics.snapshot().to_string();
@@ -957,6 +1340,26 @@ mod tests {
         );
         assert!(rendered.contains("2.5ms"), "a slow wait in ms: {rendered}");
         assert!(rendered.contains("over 3 frames"), "{rendered}");
+    }
+
+    /// The whole point of the split is attribution, so a wait that is all
+    /// socket must not read as a wait for the writer, and vice versa.
+    #[test]
+    fn each_half_of_the_wait_is_attributed_to_its_own_cause() {
+        let stalled_writer = Metrics::new();
+        stalled_writer.record_sent(11, 40);
+        stalled_writer.record_input_queue_latency(300_000, 50);
+        let report = stalled_writer.snapshot();
+        assert_eq!(report.input_lane_max_us, Some(300_000));
+        assert_eq!(report.input_write_max_us, Some(50));
+        assert_eq!(report.input_queue_max_us, Some(300_050));
+
+        let stalled_socket = Metrics::new();
+        stalled_socket.record_sent(11, 40);
+        stalled_socket.record_input_queue_latency(50, 300_000);
+        let report = stalled_socket.snapshot();
+        assert_eq!(report.input_lane_max_us, Some(50));
+        assert_eq!(report.input_write_max_us, Some(300_000));
     }
 
     /// A run with no input says nothing rather than printing empty columns.

@@ -17,10 +17,19 @@ pub mod clipboard;
 pub mod cursor;
 #[cfg(windows)]
 pub mod display;
+// Pure EDID parsing (ADR 0018), deliberately not Windows-gated so the
+// bytes-in/size-out half is compiled and unit-tested on every CI OS even
+// though only the Windows backend can fetch the bytes — the same reasoning
+// as `worker_supervisor` below.
+pub mod edid;
+#[cfg(windows)]
+pub mod file_blob;
 #[cfg(windows)]
 pub mod input;
 #[cfg(windows)]
 pub mod keymap;
+#[cfg(windows)]
+pub mod link;
 
 /// Bounded shutdown for the Win32 message-pump threads (see the module).
 /// Windows-gated with its callers: it logs through `tracing`, which is a
@@ -34,7 +43,13 @@ pub mod service;
 #[cfg(windows)]
 pub mod service_daemon;
 #[cfg(windows)]
+pub mod spool;
+#[cfg(windows)]
 pub mod stdio;
+#[cfg(all(windows, test))]
+mod test_support;
+#[cfg(windows)]
+pub mod virtual_file;
 // Pure watchdog logic (ADR 0011), deliberately not Windows-gated so it is
 // compiled and unit-tested on every CI OS even though only the Windows daemon
 // drives it.
@@ -48,6 +63,8 @@ pub use clipboard::WindowsClipboard;
 pub use cursor::{WindowsCursorMask, restore_system_cursors};
 #[cfg(windows)]
 pub use display::WindowsDisplayInfo;
+#[cfg(windows)]
+pub use file_blob::WindowsFileBlobBuilder;
 
 /// Restore the default system cursors — a no-op off Windows, where there is
 /// no cursor masking. Called on shutdown so a quit never leaves the cursor
@@ -57,13 +74,19 @@ pub fn restore_system_cursors() {}
 #[cfg(windows)]
 pub use input::WindowsInputInjector;
 #[cfg(windows)]
+pub use link::WindowsLinkStateProbe;
+#[cfg(windows)]
 pub use secure_storage::DpapiSecureStorage;
 #[cfg(windows)]
 pub use service::WindowsServiceManager;
 #[cfg(windows)]
 pub use service_daemon::run_service_daemon;
 #[cfg(windows)]
+pub use spool::WindowsSpoolStorage;
+#[cfg(windows)]
 pub use stdio::ensure_standard_streams;
+#[cfg(windows)]
+pub use virtual_file::WindowsVirtualFiles;
 pub use worker_supervisor::{SessionId, WorkerAction, WorkerSupervisor, WorkerSupervisorConfig};
 
 /// Repoint invalid standard streams so output never panics in a console-less

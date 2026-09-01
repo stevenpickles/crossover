@@ -1,6 +1,6 @@
 [package]
 name = "crossover-platform"
-version = "0.1.0"
+version.workspace = true
 publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,11 +11,17 @@ repository.workspace = true
 # §4). Pure helper crates such as thiserror are acceptable.
 [dependencies]
 thiserror = { workspace = true }
+# sha2 is pulled in *only* by the `fakes` feature: the fake blob builder
+# has to report the hash the receiving side will verify, and a fake that
+# reported a wrong one would fail every transaction above it for a reason
+# no test is about. Still a pure helper crate, and still no OS or I/O
+# dependency in the trait definitions themselves.
+sha2 = { workspace = true, optional = true }
 
 [features]
 # In-memory fakes of the platform traits for consuming crates' tests
 # (docs/ARCHITECTURE.md §4). Enable via dev-dependencies only.
-fakes = []
+fakes = ["dep:sha2"]
 
 [lints]
 workspace = true

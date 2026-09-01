@@ -59,6 +59,17 @@ pub enum MessageType {
     /// [`FeatureFlags::CHUNKED_CLIPBOARD`] — a peer that has not
     /// advertised it is never sent one.
     ClipboardChunk = 16,
+    /// Control: the sender's own live monitors, in its own local
+    /// coordinates (CONTROL class, ADR 0018, docs/PROTOCOL.md §6.2). Sent
+    /// after `Hello` and again whenever the local display configuration
+    /// changes. Base protocol at v4 — no feature bit, since a v3 peer is
+    /// already excluded at `Hello` by the `entry` shape change.
+    MonitorTopology = 17,
+    /// Control: the drawn arrangement describing both machines (CONTROL
+    /// class, ADR 0018, docs/PROTOCOL.md §6.2). Sent after `Hello` when the
+    /// sender holds an explicit layout, and on every edit. Base protocol at
+    /// v4, for the same reason as [`MessageType::MonitorTopology`].
+    LayoutSync = 18,
 }
 
 impl MessageType {
@@ -84,6 +95,8 @@ impl MessageType {
             14 => Some(Self::ControlResponse),
             15 => Some(Self::ControlRelease),
             16 => Some(Self::ClipboardChunk),
+            17 => Some(Self::MonitorTopology),
+            18 => Some(Self::LayoutSync),
             _ => None,
         }
     }
@@ -93,6 +106,63 @@ impl MessageType {
     pub const fn wire(self) -> u16 {
         self as u16
     }
+
+    /// Which of docs/PROTOCOL.md §4's four logical classes this message
+    /// type belongs to — the wire-level fact the table there states, made
+    /// queryable instead of re-transcribed at each site that needs it.
+    ///
+    /// This is one partition of the sixteen (now eighteen) message types;
+    /// it is not the *only* one this crate's callers need. `SendPriority`
+    /// (`crossover-core::outbound`), inbound routing
+    /// (`apps/crossover::commands::inbound_route`), and session dispatch
+    /// (`crossover-core::supervision::dispatch_frame`) each partition the
+    /// same types differently, for reasons specific to what they are
+    /// deciding — `ReleaseAllInput` is CONTROL class here but rides the
+    /// same High-priority lane and INPUT-driver route as `InputBatch`, for
+    /// instance. Each of those three notes that this accessor exists;
+    /// none of them is wrong to partition differently.
+    #[must_use]
+    pub const fn class(self) -> MessageClass {
+        match self {
+            Self::Hello
+            | Self::Ping
+            | Self::Pong
+            | Self::PairingStart
+            | Self::PairingConfirm
+            | Self::ReleaseAllInput
+            | Self::ControlRequest
+            | Self::ControlResponse
+            | Self::ControlRelease
+            | Self::MonitorTopology
+            | Self::LayoutSync => MessageClass::Control,
+            Self::InputBatch => MessageClass::Input,
+            Self::ClipboardOffer
+            | Self::ClipboardAccept
+            | Self::ClipboardDecline
+            | Self::ClipboardData
+            | Self::ClipboardApplied
+            | Self::ClipboardChunk => MessageClass::Clipboard,
+        }
+    }
+}
+
+/// One of docs/PROTOCOL.md §4's four logical message classes —
+/// [`MessageType::class`]'s return type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageClass {
+    /// Hello, control-transfer negotiation, display topology (§6.2),
+    /// keepalive, `ReleaseAllInput`, session management. Ordered within
+    /// the class, lossless.
+    Control,
+    /// Key transitions, pointer motion/buttons/scroll. Keys ordered within
+    /// the class and lossless; pointer motion coalescable (§6).
+    Input,
+    /// Clipboard transaction messages. Ordered within the class, lossless,
+    /// acknowledged.
+    Clipboard,
+    /// Latency probes, statistics. Best effort. Not yet used by any
+    /// defined message type.
+    Telemetry,
 }
 
 /// Operating-system family, informational (diagnostics, future
@@ -136,25 +206,42 @@ impl FeatureFlags {
     /// it once it genuinely can.
     pub const CHUNKED_CLIPBOARD: Self = Self(1 << 0);
 
+    /// Bit 1 — file clipboard transfer (ADR 0015): the sender may offer
+    /// `ContentType::File` items, carrying a `FileDescriptor` on the
+    /// offer and streaming the blob as [`MessageType::ClipboardChunk`]
+    /// messages. A bit of its own rather than a widening of bit 0,
+    /// because a peer that implements ADR 0014 and not ADR 0015
+    /// advertises bit 0 and has no `File` discriminant: an un-negotiated
+    /// *content type* is not skipped, it fails that peer's payload decode
+    /// and terminates its session (docs/PROTOCOL.md §3.1).
+    ///
+    /// Advertising it means "I can spool a file and offer it to my OS
+    /// clipboard", which is a strictly larger promise than reassembling
+    /// bytes: it involves a permission grant, a disk budget, and a
+    /// virtual-file paste mechanism.
+    pub const FILE_CLIPBOARD: Self = Self(1 << 1);
+
     /// Every bit this protocol version defines.
-    pub const ALL: Self = Self(Self::CHUNKED_CLIPBOARD.0);
+    pub const ALL: Self = Self(Self::CHUNKED_CLIPBOARD.0 | Self::FILE_CLIPBOARD.0);
 
     /// What **this build** advertises in its `Hello`.
     ///
-    /// [`FeatureFlags::ALL`] since ADR 0014's platform slice: every layer
-    /// of the promise is now real. The wire carries chunked images, the
-    /// engine offers, streams, reassembles, verifies and installs them,
-    /// and `crossover-platform-windows` reads and writes `CF_DIB` on the
-    /// actual OS clipboard. Advertising is a promise to *handle*, and the
-    /// last step that could not be honoured — putting a raster format on a
-    /// real clipboard — is implemented.
+    /// [`FeatureFlags::ALL`] since ADR 0015's final slice (feature/136):
+    /// every layer beneath *both* bits is now real. Bit 0 has carried
+    /// chunked images since ADR 0014's platform slice — offered, streamed,
+    /// reassembled, verified and installed, with
+    /// `crossover-platform-windows` reading and writing `CF_DIB` on the
+    /// actual OS clipboard. Bit 1 is the same promise for files: the
+    /// receiving half — spool, verify, virtual-file paste — landed in
+    /// feature/126-132, and the sending half — observation, blob builder,
+    /// engine transaction — in feature/133-135; this bit is the deliberate
+    /// final act that lets a conforming peer actually reach either half.
     ///
-    /// Flipping it is wire-visible (the `Hello` a peer receives changes)
-    /// and deliberately safe: a feature activates only on the
+    /// Flipping a bit is wire-visible (the `Hello` a peer receives
+    /// changes) and deliberately safe: a feature activates only on the
     /// *intersection* of the two advertisements, so a peer that predates
-    /// the bit negotiates it away and is sent nothing new. Nothing about
-    /// the base protocol's layouts changed, so text keeps synchronizing
-    /// with such a peer exactly as before (docs/PROTOCOL.md §3.1).
+    /// the bit negotiates it away and is sent nothing new
+    /// (docs/PROTOCOL.md §3.1).
     pub const ADVERTISED: Self = Self::ALL;
 
     /// Whether every bit in `feature` is set. `NONE` is contained by
@@ -258,7 +345,7 @@ impl Hello {
 mod tests {
     use uuid::Uuid;
 
-    use super::{FeatureFlags, Hello, MAX_DEVICE_NAME_BYTES, MessageType, OsFamily};
+    use super::{FeatureFlags, Hello, MAX_DEVICE_NAME_BYTES, MessageClass, MessageType, OsFamily};
     use crate::ProtocolError;
     use crate::framing::{FrameDecoder, encode_frame};
 
@@ -302,7 +389,7 @@ mod tests {
             &[0x11; 16][..],                     // device_id bytes
             &[0x04, b'l', b'e', b'f', b't'][..], // device_name
             &[0x00],                             // OsFamily::Windows
-            &[0x01],                             // FeatureFlags(CHUNKED_CLIPBOARD)
+            &[0x03],                             // FeatureFlags(CHUNKED_CLIPBOARD | FILE_CLIPBOARD)
         ]
         .concat();
         assert_eq!(
@@ -311,15 +398,20 @@ mod tests {
         );
     }
 
-    /// The bit the snapshot above pins, stated as an invariant rather than
-    /// a byte: bit 0 is `CHUNKED_CLIPBOARD`, and it is what this build
-    /// advertises now that every layer beneath it — wire, engine, and the
-    /// Windows `CF_DIB` backend — can honour the promise (ADR 0014).
+    /// The bits the snapshot above pins, stated as an invariant rather
+    /// than a byte: bit 0 is `CHUNKED_CLIPBOARD`, advertised since ADR
+    /// 0014's platform slice, and bit 1 is `FILE_CLIPBOARD`, advertised
+    /// since ADR 0015's final slice (feature/136) now that both the
+    /// receiving half (feature/126-132) and the sending half
+    /// (feature/133-135) can honour the promise. This assertion is the one
+    /// that would have to be edited — deliberately — if either promise
+    /// ever had to be withdrawn.
     #[test]
-    fn this_build_advertises_chunked_clipboard() {
+    fn this_build_advertises_both_clipboard_feature_bits() {
         assert_eq!(FeatureFlags::ADVERTISED, FeatureFlags::ALL);
         assert!(FeatureFlags::ADVERTISED.contains(FeatureFlags::CHUNKED_CLIPBOARD));
-        // And a peer that has never heard of it still gets nothing: the
+        assert!(FeatureFlags::ADVERTISED.contains(FeatureFlags::FILE_CLIPBOARD));
+        // And a peer that has never heard of either still gets nothing: the
         // intersection with an empty advertisement is empty.
         assert_eq!(
             FeatureFlags::negotiate(FeatureFlags::ADVERTISED, FeatureFlags::NONE),
@@ -374,6 +466,37 @@ mod tests {
             MessageType::ReleaseAllInput,
         ] {
             assert_eq!(MessageType::from_wire(ty.wire()), Some(ty));
+        }
+    }
+
+    /// One class per PROTOCOL.md §4's table, over every message type this
+    /// build knows — total, and pinned so a new message type is a
+    /// deliberate edit here rather than a silent gap.
+    #[test]
+    fn every_message_type_has_a_class() {
+        let expectations = [
+            (MessageType::Hello, MessageClass::Control),
+            (MessageType::Ping, MessageClass::Control),
+            (MessageType::Pong, MessageClass::Control),
+            (MessageType::PairingStart, MessageClass::Control),
+            (MessageType::PairingConfirm, MessageClass::Control),
+            (MessageType::ClipboardOffer, MessageClass::Clipboard),
+            (MessageType::ClipboardAccept, MessageClass::Clipboard),
+            (MessageType::ClipboardDecline, MessageClass::Clipboard),
+            (MessageType::ClipboardData, MessageClass::Clipboard),
+            (MessageType::ClipboardApplied, MessageClass::Clipboard),
+            (MessageType::ClipboardChunk, MessageClass::Clipboard),
+            (MessageType::InputBatch, MessageClass::Input),
+            (MessageType::ReleaseAllInput, MessageClass::Control),
+            (MessageType::ControlRequest, MessageClass::Control),
+            (MessageType::ControlResponse, MessageClass::Control),
+            (MessageType::ControlRelease, MessageClass::Control),
+            (MessageType::MonitorTopology, MessageClass::Control),
+            (MessageType::LayoutSync, MessageClass::Control),
+        ];
+        assert_eq!(expectations.len(), 18, "a message type is missing here");
+        for (ty, expected) in expectations {
+            assert_eq!(ty.class(), expected, "{ty:?} classified wrong");
         }
     }
 

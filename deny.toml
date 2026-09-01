@@ -31,6 +31,17 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
+    # The Boost licence, for `clipboard-win` and `error-code` — both reached
+    # through `arboard`, which eframe's `egui-winit` links unconditionally
+    # (ADR 0019). Permissive, and the one licence here that explicitly waives
+    # attribution for machine-executable object code, so it adds no
+    # obligation to a shipped binary.
+    "BSL-1.0",
+    # `foldhash` and `slotmap`, egui's hash map and arena (ADR 0019).
+    # Permissive; its only condition — do not misrepresent the origin, and
+    # keep the notice in *source* distributions — leaves a binary
+    # distribution with nothing to carry.
+    "Zlib",
 ]
 confidence-threshold = 0.9
 

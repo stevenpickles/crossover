@@ -75,13 +75,22 @@ dependencies = [
 
 [[package]]
 name = "crossover-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "crossover-topology",
  "postcard",
  "serde",
  "sha2",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "crossover-topology"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

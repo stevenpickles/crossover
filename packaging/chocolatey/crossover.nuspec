@@ -2,8 +2,11 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>crossover</id>
-    <!-- Keep in step with apps/crossover/Cargo.toml; pack.ps1 can stamp it. -->
-    <version>0.1.0</version>
+    <!-- A placeholder: pack.ps1 always stamps the real version, taken from
+         what the built binaries report. Kept in step with the workspace
+         version anyway, so a hand-run `choco pack` here cannot mint a
+         package claiming a version that no longer exists. -->
+    <version>0.2.0</version>
     <title>Crossover</title>
     <authors>Steven Pickles</authors>
     <owners>Steven Pickles</owners>
@@ -13,13 +16,20 @@
     <!-- Chocolatey CLI does not support the embedded <icon> element (CHCU0002);
          it references the logo by URL. Resolves once the logo is on `main`. -->
     <iconUrl>https://raw.githubusercontent.com/stevenpickles/crossover/main/assets/branding/crossover-logo.png</iconUrl>
-    <tags>crossover kvm keyboard mouse clipboard synergy remote-input</tags>
+    <tags>crossover kvm keyboard mouse clipboard files file-transfer layout multi-monitor synergy remote-input</tags>
     <summary>Secure keyboard, mouse, and clipboard sharing between trusted computers.</summary>
     <description>
 Crossover shares one keyboard, mouse, and clipboard across two trusted
-computers over a pinned mutual-TLS link. Installing deploys crossover.exe and
-crossover-svc.exe to Program Files and registers a background service that
-launches the worker into your logon session and keeps it running (ADR 0011).
+computers over a pinned mutual-TLS link. Text, images, and files and folders
+travel on the clipboard in both directions; file transfer requires an explicit
+per-peer grant and is off by default.
+
+Installing deploys crossover.exe,
+crossover-svc.exe and crossover-layout.exe to Program Files and registers a
+background service that launches the worker into your logon session and keeps
+it running (ADR 0011). `crossover layout` opens the editor, where both
+machines' monitors are arranged into the layout they physically sit in
+(ADR 0018, ADR 0019).
 
 The binaries are embedded in this package (suited to a local or private feed).
 For the public community repository, switch tools\chocolateyInstall.ps1 to

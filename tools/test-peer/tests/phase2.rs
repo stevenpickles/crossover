@@ -41,11 +41,19 @@ fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFl
     let clipboard = Arc::new(InMemoryClipboard::new());
     let (driver, sync_events, mut sync_commands) = clipboard_sync(
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
+        None,
+        None,
+        None,
         node.identity.device_id(),
         ClipboardConfig {
             retry: ClipboardRetryPolicy {
                 max_attempts: 3,
                 delay: Duration::from_millis(20),
+                // The parked phase is real here, only shrunk: the
+                // proportions (a slower cadence, a budget an order of
+                // magnitude past it) are what the test exercises.
+                park_delay: Duration::from_millis(20),
+                park_budget: Duration::from_millis(200),
             },
             transmit_debounce: Duration::from_millis(5),
             ..ClipboardConfig::new()
@@ -391,7 +399,12 @@ async fn an_offered_image_round_trips_over_a_real_session() {
     conn.send_frame(
         MessageType::ClipboardOffer.wire(),
         2,
-        &ClipboardOffer { meta }.encode_payload().unwrap(),
+        &ClipboardOffer {
+            meta,
+            descriptor: None,
+        }
+        .encode_payload()
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -553,7 +566,12 @@ async fn an_image_that_already_matches_is_declined_with_no_bytes_behind_it() {
     conn.send_frame(
         MessageType::ClipboardOffer.wire(),
         5,
-        &ClipboardOffer { meta: repeat }.encode_payload().unwrap(),
+        &ClipboardOffer {
+            meta: repeat,
+            descriptor: None,
+        }
+        .encode_payload()
+        .unwrap(),
     )
     .await
     .unwrap();

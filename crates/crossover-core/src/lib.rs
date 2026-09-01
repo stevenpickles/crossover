@@ -1,6 +1,6 @@
-//! Core logic for Crossover: the topology model, control-transfer state
-//! machine, clipboard and input engines, and connection lifecycle
-//! supervision.
+//! Core logic for Crossover: the topology and crossing models, the
+//! control-transfer state machine, clipboard and input engines, and
+//! connection lifecycle supervision.
 //!
 //! Contains no direct OS API calls and compiles on all platforms; platform
 //! effects flow through the traits in `crossover-platform`
@@ -11,18 +11,24 @@ pub mod clipboard_driver;
 pub mod command;
 pub mod control;
 pub mod control_driver;
+pub mod crossing;
 pub mod edge_driver;
+pub mod file_blob;
 pub mod input;
+pub mod layout_sync;
+pub mod link;
 pub mod metrics;
 pub mod net;
 pub mod outbound;
 pub mod pairing;
 pub mod supervision;
+#[cfg(test)]
+mod testing;
 pub mod topology;
 
 pub use clipboard::{
-    ClipboardConfig, ClipboardEngine, RetryPolicy as ClipboardRetryPolicy, TransferScope,
-    WriteFailure,
+    ClipboardConfig, ClipboardEngine, FileReceive, FileSend, RetryPolicy as ClipboardRetryPolicy,
+    SpooledFile, TransferScope, WriteFailure,
 };
 pub use clipboard_driver::{ClipboardSyncDriver, SyncEvent, clipboard_sync};
 pub use command::{FrameTarget, SessionCommand};
@@ -31,12 +37,20 @@ pub use control::{
     OutboundControl,
 };
 pub use control_driver::{InputControlDriver, InputControlEvent, SeamlessInputs, input_control};
-pub use edge_driver::{
-    CrossingKind, EdgeCrossing, EdgeDetectDriver, EdgeDetector, EdgeMode, edge_detect,
+pub use crossing::{
+    CrossSpan, CrossTarget, CrossingMap, Departure, ImplicitLayout, ImplicitLayoutError,
+    LayoutSpan, MappedMonitor, SpanId, derive as derive_crossings, from_link_side,
 };
+pub use edge_driver::{
+    CrossingKind, CrossingSource, DerivedCrossings, DetectedCrossing, EdgeCrossing,
+    EdgeDetectDriver, EdgeDetector, EdgeMode, EdgeModeUpdate, LiveLayout, edge_detect,
+    explicit_crossing_source, implicit_crossing_source, live_crossing_source,
+};
+pub use file_blob::{FALLBACK_ARCHIVE_NAME, wire_file_name};
 pub use input::{
     InputEvent, InputState, KeyEvent, PointerButton, PointerEvent, coalesce, coalesce_input, hid,
 };
+pub use link::LinkDiagnostics;
 pub use metrics::{FrameClass, Metrics, Report};
 pub use net::{
     EstablishedSession, LocalNode, SessionError, SessionInfo, SessionListener, SessionOptions,
@@ -52,7 +66,7 @@ pub use supervision::{
     DisconnectReason, KeepaliveConfig, ReconnectPolicy, SessionEvent, SupervisorConfig,
     SupervisorHandle, run_session, supervise_outbound,
 };
-pub use topology::{CursorPoint, Edge, EdgeFraction, LinkSide, Screen, Topology};
+pub use topology::{CursorPoint, Edge, EdgeFraction, LinkSide, Screen};
 
 /// One-line statement of this crate's responsibility.
 pub const CRATE_PURPOSE: &str = "state machines, clipboard and input engines, topology, \

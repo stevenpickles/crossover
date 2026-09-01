@@ -58,18 +58,30 @@ Rules:
 crossover/
     Cargo.toml                      # workspace root
     apps/
-        build_identity.rs           # shared by both build scripts: resolves the
+        build_identity.rs           # shared by every build script: resolves the
                                     #   build version/commit/channel and emits it
         build_info.rs               # shared module: the BuildInfo the binaries
                                     #   report (`crossover version`). Source
                                     #   includes, not a crate, so the service
-                                    #   binary gains no dependency edge.
+                                    #   and editor binaries gain no dependency
+                                    #   edge.
         crossover/                  # the binary: CLI, config, wiring, worker
         crossover-svc/              # the service daemon (ADR 0011): a minimal
                                     #   Windows LocalSystem launcher. Depends
                                     #   ONLY on crossover-platform-windows —
                                     #   never on core/protocol/security — so the
                                     #   privileged process links no network code.
+        crossover-layout/           # the display layout editor (ADR 0019): an
+                                    #   egui/eframe window the user opens on
+                                    #   demand. Depends on the GUI stack and
+                                    #   crossover-topology (config feature),
+                                    #   and nothing else of
+                                    #   ours ever — so the GUI graph stays out
+                                    #   of the worker, and the worker's out of
+                                    #   it.
+    assets/
+        branding/                   # icon and logo, stamped into the binaries
+        fonts/                      # the editor's embedded faces + provenance
     crates/
         crossover-protocol/         # wire messages, framing, validation
         crossover-core/             # state machines, clipboard + input engines,
@@ -78,6 +90,10 @@ crossover/
                                     #   TLS configuration
         crossover-platform/         # platform trait definitions (no OS deps)
         crossover-platform-windows/ # Win32 implementations
+        crossover-topology/         # the drawn layout model and its validation,
+                                    #   plus (behind the non-default `config`
+                                    #   feature) the [layout] config writer and
+                                    #   the worker→editor state-file schema
     tools/
         test-peer/                  # headless scriptable peer (see TESTING.md)
     tests/                          # cross-crate integration tests
@@ -87,6 +103,28 @@ crossover/
     packaging/                      # install scripts and the Chocolatey package
     docs/
 ```
+
+> **`crossover-topology` and `apps/crossover-layout` joined the tree in
+> Phase 8**, both shown above.
+> `crates/crossover-topology` ([ADR 0018](adr/0018-drawn-display-topology.md))
+> is the drawn-layout model, its validation, the config `[layout]` types and
+> writer, and the state-file schema. `apps/crossover-layout`
+> ([ADR 0019](adr/0019-layout-editor-toolkit.md)) is the editor binary; it
+> depends on the GUI stack and `crossover-topology` (with its `config`
+> feature), and nothing else of ours.
+>
+> The crate exists so the editor shares the model and writer with the worker
+> without linking core's protocol/security/platform graph, which is why its
+> **default** dependencies are exactly `serde` and `thiserror`. The
+> non-default `config` feature adds `toml_edit` (the format-preserving
+> `[layout]` writer) and `serde_json` (the state-file schema) — the ADR's
+> dated amendment records the second. **`crossover-protocol` and
+> `crossover-core` both depend on the default graph** — protocol carries the
+> model types on the v6 wire (v4 introduced the model types; v5 and v6 added
+> the monitor label and its physical size), and core derives crossing spans
+> from a layout
+> (`core::crossing`, ADR 0018) — and neither enables the feature, so neither
+> the TOML writer nor the JSON schema enters their trees.
 
 ### 3.1 Deliberately not separate crates (yet)
 
@@ -100,12 +138,21 @@ only when a boundary proves real:
 | `crossover-network` | `crossover-core::net` (+ app wiring) | A second transport (e.g., QUIC) or reuse outside the app appears |
 | `crossover-config` | `apps/crossover` | Config is needed by tools/test-peer independently |
 | `crossover-telemetry` | `tracing` usage throughout | Local metrics grow beyond counters and spans |
-| `crossover-platform-macos` / `-linux` | not created | The corresponding port begins (Phase 7) |
+| `crossover-platform-macos` / `-linux` | not created | The corresponding port begins (Phase 9) |
 
 Creating or dissolving a crate is an ADR-level decision. The compile-time
 firewall that matters from day one is the **platform boundary** and the
 **protocol crate's independence** (testable without sockets) — both exist
 from Phase 0.
+
+> **Phase 8's `crossover-topology`** is the first split this table did not
+> anticipate: not one of the candidates above, but a new boundary created by
+> [ADR 0018](adr/0018-drawn-display-topology.md) so the editor binary and the
+> worker share one layout model and one config writer. `crossover-protocol`
+> carries the model types on the wire and depends on the default graph, with
+> the TOML writer and the JSON state schema both behind a non-default
+> `config` cargo feature so the protocol crate stays as dependency-light and
+> socket-free as this section requires.
 
 ## 4. Platform abstraction layer
 
@@ -119,6 +166,7 @@ trait InputInjector       // synthesize input on this machine
 trait DisplayProvider     // enumerate displays, dimensions, positions, DPI
 trait CursorController    // query/set pointer position, hide/show
 trait SecureStorage       // protect private key material at rest
+trait LinkStateProbe      // is the local interface carrying this peer up?
 ```
 
 Guidelines:
@@ -134,6 +182,40 @@ Guidelines:
   practical. Platform quirks (hook timeout budgets, clipboard retry,
   DPI mapping — see SPECIFICATION.md §6) are handled *inside*
   `crossover-platform-windows`, surfacing as normalized events/errors.
+- **The display trait is tiered by call frequency, not by convenience.**
+  Edge detection polls it every few milliseconds and its results feed the
+  detector's layout-equality check, so what that path asks for has to stay
+  cheap and has to stay stable. The three queries are therefore separate
+  methods rather than one struct with optional fields, each defaulted onto
+  the one below it:
+  - `monitors()` — geometry only, and the one method every backend must
+    implement. Polled by edge detection when the arrangement is the
+    side model, which needs no identity.
+  - `monitor_layout()` — adds the per-monitor identity a drawn layout
+    addresses (ADR 0018). **Also a hot query**: with a drawn arrangement
+    in force this is what edge detection polls, because matching a live
+    screen to a drawn rectangle is a match on device string. It must stay
+    about as cheap as `monitors()`.
+  - `monitor_descriptions()` — adds what the platform *says about* a
+    monitor rather than where it is: the human-readable name the editor
+    captions with, and the panel's physical size in millimetres, which the
+    editor draws rectangles in proportion to. Both display-only, never
+    identity, and on Windows both come out of a whole second
+    `QueryDisplayConfig` sweep — the size additionally costing a SetupAPI
+    walk and a registry read per monitor to reach its EDID — so **only**
+    the ~1 s topology-sync cadence calls it. This is the line the tiering
+    exists to draw: these are the facts expensive enough that the edge path
+    must not be able to reach them by accident. They ride one method
+    rather than two because they are acquired by the same sweep at the same
+    cadence and fail the same way; a fourth method would buy a second call
+    to the same OS interface and one more chance to put it on a hot path.
+
+  Two rules hold across all three: the lists always describe the *same*
+  monitors in the same order, so a name the OS will not give costs a
+  `None` on a present entry and never a missing one — a shorter list would
+  move the desktop's outer edge and turn an interior seam into a false
+  crossing; and a defaulted method means a port that cannot answer is
+  still a complete port, losing exactly the nicety that method adds.
 - `ClipboardProvider` on Windows handles two content types, each in the
   OS's own representation (ADR 0014, and the rules that fall out of it are
   written up on `crossover-platform-windows::clipboard`):
@@ -181,6 +263,51 @@ Guidelines:
     than reaching Win32. Type is judged before size, so an oversized JPEG
     is refused for being a JPEG: the durable answer, where "too big"
     invites a smaller retry that must also fail.
+  - **A contention failure names its holder** (FR-7.3; feature/162, from
+    2026-09-01 hardware evidence of `OpenClipboard` failing across ~1 s of
+    peer reconnects with no way to tell who held it). `Busy`'s `reason`
+    resolves the holder two ways, checked in order:
+    - **This process's own opens first**, via a process-global marker
+      (`OWN_HOLD`) `OpenGuard::open` and the OLE virtual-file placement
+      (`crossover-platform-windows::virtual_file`) set the instant their
+      open succeeds and clear the instant it ends, tagged with a `site`
+      (`"read"`/`"write"`/`"ole"`). This exists because every open here
+      uses a `NULL` window handle, which the second method below cannot
+      see at all — without it, Crossover contending with *itself* (the
+      OLE apartment thread against the ordinary text/image path, say)
+      would misreport as unidentified rather than naming the real cause.
+    - **Falling back to `GetOpenClipboardWindow` → `GetWindowThreadProcessId`**
+      for a holder that *does* associate a real window — an external
+      application, or in-process use this crate does not mark. The
+      window's class name (`GetClassNameW`, escaped per SECURITY.md F11
+      before it can reach a log line — a class name is attacker-influenced
+      text) and, for an external holder, the process's own executable
+      file name (`QueryFullProcessImageNameW`) are named; never a window
+      title or full path, both of which can carry document or user
+      content (FR-7.4). Whether the pid is this process's own
+      (`GetCurrentProcessId`) is the one bit that matters most here too.
+      A class name Win32 could not read prints unquoted
+      (`window class unreadable`) rather than a placeholder word, so it
+      can never be confused with a window genuinely classed that way.
+
+    Every lookup degrades to "unidentified" on failure rather than
+    blocking or panicking, the same discipline `LinkStateProbe` below
+    holds to. The reason reaching a live log at all is a separate concern
+    the driver owns: `crossover-core::clipboard_driver` logs a busy
+    write's or file offer's *first* attempt for a given item at `warn!`
+    and every retry after that (every 200 ms, up to the retry budget) at
+    `debug!` — so the holder is visible at this project's default log
+    level without a retry storm drowning it out.
+- `LinkStateProbe` is a **diagnostic** capability, not an operational one: it
+  is read on a failure path to label a log line and never gates, delays, or
+  reorders anything (see §10). Its contract is therefore unusually strict —
+  cheap, non-blocking, no `Result`, and no panic — and it answers three
+  values, because "could not tell" must stay distinguishable from "the local
+  link was fine". On Windows it is `GetBestInterfaceEx` (which interface
+  routes to *this* peer) plus `GetIfEntry2` (that interface's
+  `MediaConnectState` and `OperStatus`); platforms without an implementation
+  use `UnknownLinkStateProbe`, which answers `Unknown` rather than
+  pretending.
 - `InputCapture` on Windows is backed by two mechanisms rather than one
   (ADR 0007): low-level hooks, because only they can suppress an event
   locally, and Raw Input, because only it reports unaccelerated,
@@ -198,16 +325,31 @@ The three central state machines live in `crossover-core`, are pure
 Exactly one active input destination at all times (FR-5.1).
 
 ```
-          edge crossing detected
- LOCAL ─────────────────────────────► REQUESTING_REMOTE
-   ▲                                        │ peer acks ready
-   │ reverse edge / peer confirms           ▼
- RETURNING ◄──────────────────────────  REMOTE
+     edge crossing or console request            peer grants
+ LOCAL ──────────────────────────────► REQUESTING ───────────► REMOTE
+   ▲                                        │                     │
+   │        denied / timed out / cancelled  │                     │
+   ├────────────────────────────────────────┘                     │
+   │  handed back / peer revokes (reverse edge) / capture lost /   │
+   └───────────────────────── disconnect ──────────────────────────┘
 ```
+
+The three states are exactly `Outbound::{Local, Requesting, Remote}` in
+`control.rs`. [ADR 0009](adr/0009-seamless-edge-transfer.md) promised a
+fourth, `RETURNING`, between `REMOTE` and `LOCAL`; it was subsumed by this
+design — the reverse crossing is detected on the *controlled* side, which
+revokes, so the controller returns to `LOCAL` on the resulting release with
+no transitional state of its own.
 
 - Transitions are negotiated: request → acknowledge → switch (FR-5.3).
 - Timeout or disconnect in any transitional state falls back to `LOCAL` and
   triggers `ReleaseAllInput` on the remote side (FR-4.4).
+- **Late answers are self-correcting.** A request that timed out cancels
+  itself on the wire, and a re-request from the session that already holds
+  the grant refreshes it rather than being denied, so a slow answer cannot
+  leave the two machines disagreeing about who controls whom (ADR 0009
+  addendum, 2026-08-19). Denial for a request from any *other* session is
+  unchanged — that is the security boundary below.
 - While `REMOTE`: local input is captured and forwarded, local effects are
   suppressed, pointer position maps through the topology model.
 - **Authorization is scoped to the session that holds the grant.** The
@@ -228,9 +370,65 @@ origin + content-hash tracking of recently applied items, deduplication,
 bounded retry with observable failure, deterministic latest-wins conflict
 policy. Message flow is specified in [PROTOCOL.md](PROTOCOL.md) §5.
 
+**Bounded retry has two phases**
+([ADR 0005](adr/0005-clipboard-transaction-flow.md), addendum
+2026-09-01). A `Busy` install retries five times at 200 ms — the *fast*
+phase, sized for another application between `OpenClipboard` and
+`CloseClipboard` — and if the clipboard is still busy it **parks** rather
+than failing: retried once a second, and by the settle read that follows a
+local change, until a 20 s budget elapses. Only then does
+`ClipboardUnavailable` travel, so the wire contract is unchanged. The
+budget is set against the *origin's* 60 s `transfer_timeout`: a receiver
+still trying past that is answering a transaction nobody is listening to,
+and a test pins the relation.
+
+A change notification deliberately does **not** retry a parked install —
+the *read* does. A notification usually means new content just landed, so
+writing on it would race the user, and the loop guard would then swallow
+the evidence. The read is the first moment anything knows what the
+clipboard holds: our own content or unchanged content frees the install to
+retry; genuinely new content supersedes it. A parked install is also
+superseded by a newer inbound item and by one that already matches this
+clipboard, and it is dropped uncounted when its session ends — an install
+that can live for twenty seconds must never overwrite content the user made
+in that window, nor land during a session that did not carry it. The
+reconnect re-announce is not a local copy, which is why
+`on_session_established` keeps the dedup hash and sets a re-announce flag
+rather than clearing it: "announce this anyway" and "this is new" are
+different statements.
+
+The read side mirrors the two phases: fast nudges, then a one-second
+revival cadence for 20 s, because the re-announce on reconnect *is* a read
+and cannot depend on a change notification that may never come. Every clock
+is still the driver's; the engine only decides.
+
 Each observed OS clipboard change becomes an immutable `ClipboardItem`
 (id, origin peer, sequence, timestamp, content type, length, hash, content).
 Contents are never logged; metadata is (FR-7.4).
+
+**An outbound transaction starts only when a peer is there to answer it**
+([ADR 0006](adr/0006-clipboard-transmission-triggers.md), addendum
+2026-09-01). The engine counts live sessions —
+`on_session_established` / `on_session_lost`, the same events the
+violation budget and the re-announce already ride — and while that count
+is zero a local change is observed, hashed and recorded exactly as
+always, and then stops: no outbound slot, no `transfer_timeout` armed,
+no frame. It is counted as `clipboard_offline_changes`. Delivery is not
+lost, only moved: establishment marks a re-announcement pending and
+re-reads — keeping the dedup hash, so the read can still tell new
+content from a re-announcement — and the item that is current when a
+peer arrives is offered whole (ADR 0006's trigger 3). The count is a count and not a flag because a
+process can hold an inbound and an outbound session at once and both
+fan into one engine; a flag would be cleared by the first peer to drop
+and silently stop offering to the peer that stayed. The count governs
+*new copies only* — `on_session_lost` still tears down the in-flight
+outbound transaction, accepted offer, pending install, reassembly and
+file build on any
+loss, whichever session it was, and scoping that teardown per session
+is a named follow-up in the ADR rather than part of this rule. A local
+file
+selection is gated the same way and ahead of `FileSend`, so an absent
+peer is never reported as a refusing one.
 
 **Content is typed and opaque.** Since
 [ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md) an item is a
@@ -246,6 +444,7 @@ that keeps every buffer singular.
 |-----------|--------|---------|
 | Outbound | `AwaitingAccept` → (`Streaming` for chunked types) → `AwaitingApplied` | the item buffer, until the last chunk is out |
 | Inbound | accepted offer → (`ChunkReassembly` for chunked types) → pending write | the reassembly buffer, until it verifies |
+| Inbound, files | `Admitting` → `Streaming` → `Verified` → `Committing` → offering | an open partial on disk, and accounting — never the bytes |
 
 Chunks are emitted **one at a time**, sliced out of the retained buffer, so
 the sender never materializes the whole split; each becomes its own command
@@ -255,6 +454,37 @@ the complete reassembly before the OS clipboard is touched, so a torn
 transfer installs nothing (FR-3.2) — and `ClipboardApplied` is still emitted
 only from the write result, never on receipt of the last chunk.
 
+**Files are the one inbound type that is written through rather than
+held** ([ADR 0015](adr/0015-spooled-virtual-file-paste.md)). The engine
+stays sans-io: it holds a `ChunkStream` — the same admission rules as
+`ChunkReassembly`, with a running hash and length instead of a buffer —
+and emits actions the driver performs against a `SpoolStorage`
+(`AdmitFile`, `WriteFileChunk`, `CommitFile`, `AbortFile`,
+`EvictSpoolEntry`), each answered back into the engine exactly as a
+clipboard write's result is. So the sequencing stays testable without a
+filesystem, and three properties hold by construction: a chunk is judged
+before it is written, an offer is answered only once the spool has taken
+the transfer, and every outcome but a verified completion deletes the
+partial and registers nothing. `MAX_CONCURRENT_FILE_TRANSFERS` is the
+`Option` holding that state, not a counter.
+
+A file transfer is not finished when its bytes are: the engine offers the
+verified entry to the platform's paste mechanism and holds the origin's
+verdict until that lands, so `Stored` means *the user can paste this*
+rather than *the bytes are somewhere*. That is also what makes ADR 0015's
+entry-lifetime rule expressible — an entry lives while the clipboard still
+offers what it backs — and the same platform answer serves loop
+prevention, since a virtual file list has no bytes to hash and the
+applied-hash memory has nothing to match on (F13).
+
+Whether files may be received at all is a **policy input**
+(`FileReceive`), supplied by the composition root from the trust store and
+refreshed as it changes, because a sans-io engine can see neither the
+`file_receive` grant nor whether a protected spool was opened. It defaults
+to the closed value, and the driver clamps it closed again unless it has
+**both** a spool and somewhere to paste from — either alone can accept a
+transfer it cannot deliver.
+
 **The memory commitment is deliberate, bounded, and time-bounded — and
 larger than "one buffer".** Each individual slot is singular, but the slots
 are independent, so the honest worst case is their sum. Three item buffers
@@ -262,9 +492,12 @@ of up to `MAX_CLIPBOARD_IMAGE_BYTES` (64 MiB) are simultaneously reachable:
 
 | Slot | Held while |
 |------|-----------|
-| `pending_write` | an item is being installed, including across the bounded `Busy` retry schedule |
+| `pending_write` | an item is being installed, including across both phases of the bounded `Busy` retry schedule (up to ~22 s if it parks) |
 | the inbound reassembly | a *newer* offer, accepted while that write is still retrying, streams in |
 | the retained outbound item | a concurrent local copy is offered and awaiting its answer |
+
+A 256 MiB file adds nothing to that figure: its bytes go to the spool a
+chunk at a time and the engine's commitment is O(chunk).
 
 That is **192 MiB**, plus the Background lane's 8 MiB byte budget — about
 **200 MiB** steady-state — and transiently ~264 MiB during a supersession,
@@ -307,6 +540,11 @@ IDLE → CONNECTING → AUTHENTICATING → NEGOTIATING → ESTABLISHED
 - `ESTABLISHED` supervises keepalive, reconnect (FR-6.2), and channel
   backpressure. Loss of the session while `REMOTE` triggers the control
   transfer fallback above.
+- Every session captures a `LinkDiagnostics` at establishment — the peer
+  socket address it actually uses, plus the platform's `LinkStateProbe` —
+  so the disconnect record can name the *local* link state (§10). It is read
+  only on the way to a log line: `RECONNECT_WAIT` and its backoff are
+  identical whatever it says.
 
 ### 5.4 Outbound send path: two priority classes
 
@@ -461,21 +699,76 @@ A peer *can* stop it, by driving the cycle above, and killing the session is
 then exactly right: one whose frames are neither dispatched nor answered is
 doing nothing but holding the chain hostage.
 
-Bound 2 catches *continuous* stalling, and a peer that alternates one brisk
-write with one slow one evades it, since the brisk write clears the run —
-per-frame input delay stays inside bound 1's keepalive timeout, which is what
-this section claims, but such a peer is not disconnected; closing that needs
-a duty-cycle measure rather than a continuity one, and it matters less once
-ADR 0014's chunking caps how large a bulk frame can be.
+Bound 2 is a **duty cycle, not a run** — and it had to become one. Measured
+as a continuous run of stalling writes, any single brisk write cleared it, so
+a peer alternating one slow write with one fast one stalled the session
+indefinitely and was never disconnected: per-frame delay stayed inside
+bound 1, and the run never survived long enough to trip bound 2. This section
+carried that as an open residual until it was closed.
+
+What replaced it is a leaky bucket. A write slower than the keepalive
+interval charges its whole duration, because none of that time was usable
+throughput; every other interval — brisk writes and idle gaps alike — pays
+the debt back at the rate it actually earned. The session ends when the
+outstanding debt reaches the keepalive timeout. A continuous stall fills the
+bucket exactly as fast as the old measure did, so nothing that was caught
+before escapes now; alternating brisk writes buy a millisecond of
+forgiveness for a millisecond of throughput rather than an amnesty; and a
+link that hiccups once and then works is forgiven, because a minute of idle
+pays off any debt a single write can create.
 
 What these bounds do **not** do is keep the session loop responsive *during*
 a write. While one is pending the loop still polls nothing else, so a slow
 peer delays input by up to one write — the guarantee is that this ends the
-session in bounded time, not that it never happens. Two things shrink it:
-ADR 0014's chunking makes the unit smaller, and moving the writer to its own
-task would remove the freeze entirely. The latter is deferred, not
-forgotten — it would take keepalive off the direct path to the writer that
-ADR 0013 specifies, so it needs an ADR of its own.
+session in bounded time, not that it never happens.
+
+**Measured, 2026-08-16.** Over WiFi, with a saturating image transfer
+running, input frames waited a mean of 2.9 ms and a worst case of **124 ms**
+for the wire. The split says where: 124.3 ms of that maximum was the frame
+waiting for the writer and 0.18 ms was the socket accepting its own bytes.
+So the delay is entirely this paragraph's effect — one in-flight 64 KiB
+bulk chunk, on a link slow enough to make that write take a tenth of a
+second.
+
+Two things shrink it, and an earlier version of this section named a third
+that does not:
+
+- **ADR 0014's chunking makes the unit smaller.** This is the only lever
+  that acts on the delay directly, and it is a *sender-side* knob: the
+  receiver takes its plan from the first chunk's size
+  ([PROTOCOL.md](PROTOCOL.md) §8), so a sender may use anything up to
+  `MAX_CHUNK_BYTES` without negotiation or a protocol change. Held at
+  64 KiB pending a wired measurement — ADR 0013's arithmetic assumed
+  2.5 GbE, where the same chunk is 0.21 ms rather than 124 — and **left
+  there once that measurement was taken**, below.
+- **A faster link.** The measurement above is wireless; the design target
+  is wired.
+- **Moving the writer to its own task does _not_ fix this**, though this
+  section used to imply it would. A writer task still writes serially into
+  one TLS stream, so an input frame cannot overtake a bulk frame already
+  being written — the wait is unchanged. What it *would* fix is the loop
+  being unable to poll reads and the keepalive tick during a write, which
+  is a real but different problem. Genuine preemption mid-frame needs
+  separate streams (QUIC) or a second connection, both considered and
+  rejected in ADR 0013.
+
+**Re-measured wired, 2026-08-21.** The same instrumentation on a direct
+2.5 Gbps link, with one writer carrying continuous input and a bulk file
+stream at once (ten 200 MiB transfers back-to-back, 4,558 input frames
+timed): the socket took **0.019 ms** on average and **0.147 ms** at worst to
+accept an input frame's bytes, with the wait for the writer averaging
+0.41 ms and queue-to-wire totalling 0.43 ms average. The worst case is
+smaller than the 0.21 ms one 64 KiB chunk costs at this speed, so the
+in-flight-frame delay this section describes is real but sub-millisecond on
+the design link, and the WiFi figures above were the link rather than the
+chunk. **The chunk size therefore stays at 64 KiB** (maintainer, 2026-08-20;
+[ADR 0013](adr/0013-interactive-over-bulk-prioritization.md)'s 2026-08-20
+addendum), which closes the "pending a wired measurement" hold in the first
+bullet, and the writer-task work the third bullet already argued would not
+help has no latency case to make for it either. One tail of ~72 ms did occur
+in the lane *before* the writer while socket writes stayed at 0.147 ms or
+below — one sample in 4,558, tracked as a scheduling question in the
+roadmap's Phase 7 follow-ups, and not this section's effect.
 
 Session **teardown** has an ordering requirement that falls out of all this.
 When a session ends, its send path is retired — receiver dropped, registry
@@ -486,10 +779,11 @@ and the driver behind them. Every later step (draining the session's event
 task, fanning the loss out to the drivers) pushes into the drivers' bounded
 event channels, so doing any of it first waits on a driver that is waiting
 on the send path that this drop releases. For the same reason the fanout
-delivers to both drivers concurrently rather than in sequence: the clipboard
-driver is the one that parks under bulk backpressure, and sequencing the
-control driver behind it would gate `ReleaseAllInput` — a stuck key — on a
-stalled transfer.
+delivers *session lifecycle* events to both drivers concurrently rather than
+in sequence: the clipboard driver is the one that parks under bulk
+backpressure, and sequencing the control driver behind it would gate
+`ReleaseAllInput` — a stuck key — on a stalled transfer. Inbound *frames* are
+not fanned out at all any more; they are routed by class (§5.5).
 
 Keepalive never enters the queues at all: `run_session` writes `Ping`
 straight to the writer on its idle tick and answers `Pong` from the dispatch
@@ -499,6 +793,47 @@ Preemption granularity is bounded below by one frame: a frame in flight is
 unpreemptable. [ADR 0014](adr/0014-chunked-rich-clipboard-transfer.md)'s
 chunking is what shrinks that unit, which is why chunk size is a *latency*
 knob answering to this section, not just a memory one.
+
+### 5.5 Inbound frame routing
+
+The same two classes, read the other way round. §5.4 splits what this machine
+*sends*; this is what it does with what arrives.
+
+`run_session` hands each decoded application frame to the application's
+per-session frame pump, which is strictly serial. The pump used to broadcast
+every frame to **both** the clipboard driver and the control driver and await
+both — each driver discarding whatever was not its own. That made a
+`ControlRequest`'s delivery wait on the clipboard driver's queue, and under
+bulk backpressure that wait was **4.7 s** on 2026-08-19 hardware, which cost
+the requester a control timeout ([ADR
+0013](adr/0013-interactive-over-bulk-prioritization.md) addendum, 2026-08-19).
+
+Frames are now **routed by message type to exactly one driver**:
+
+| Route | Messages |
+|-------|----------|
+| **sync driver** | `ClipboardOffer`/`Accept`/`Decline`/`Data`/`Chunk`/`Applied` |
+| **control driver** | `InputBatch`, `ReleaseAllInput`, `ControlRequest`/`Response`/`Release` |
+| **both** | a message type this build does not recognize |
+
+The classification is **total**, and the unrecognized type is why the third
+row exists: whether to ignore an unknown frame is a driver's decision, not
+the classifier's, so it keeps its historical delivery to both rather than
+becoming a silent drop. Nothing else reaches here — `dispatch_frame` answers
+`Ping`, accepts `Pong`, and fails the session on `Hello` or a pairing
+message, so those never become application frames.
+
+Two invariants the routing keeps. **Order within a driver is arrival order**:
+one frame is delivered before the next is classified, which ADR 0005's
+transaction state machine and the applied-input sequence both require.
+**Nothing is buffered**: routing adds no queue, it removes a wait.
+
+It does not give inbound preemption, and cannot. Backpressure from a
+saturated clipboard path still reaches the peer, and one ordered TCP stream
+then delays whatever the peer sent behind it — priority #2 (clipboard
+reliability) outranks #5 (input latency), so bulk is never dropped to clear
+the way. What is guaranteed is narrower: an interactive frame is never
+delayed by a queue belonging to a driver with no interest in it.
 
 ## 6. Concurrency model
 
@@ -515,6 +850,16 @@ knob answering to this section, not just a memory one.
   ordered, per [PROTOCOL.md](PROTOCOL.md) §6. Backpressure on a bulk queue
   must never propagate to an interactive one, which is why the send path
   runs a task per priority class rather than a task per stage (§5.4).
+- **A level travels on a `watch`, not a queue.** State that means "what is
+  true right now" — desired cursor visibility, the edge detector's watching
+  mode — is latest-wins by nature, so queueing it buys nothing and costs a
+  blocking send. That matters where the consumer feeds back into the
+  producer: the edge mode used to ride a bounded `mpsc` inside a cycle
+  (control loop → mode → detector → crossings → control loop, which the same
+  loop drains), so the loop's own slowness pushed back on itself. Anything
+  that must be *counted* across such a channel has to travel inside the
+  value, since a `watch` coalesces — which is how the crossing generation is
+  carried ([ADR 0009](adr/0009-seamless-edge-transfer.md)).
 - No global mutable state; no sleeps as synchronization; state machines are
   deterministic functions of (state, event) for testability.
 
@@ -527,6 +872,7 @@ knob answering to this section, not just a memory one.
 | TLS | rustls + tokio-rustls, TLS 1.3 | See [SECURITY.md](SECURITY.md) |
 | Transport | TCP (+ `TCP_NODELAY` for input/control traffic) | QUIC only if measurement demands it (ADR) |
 | Serialization | postcard ([ADR 0001](adr/0001-wire-serialization-format.md)) | Explicit size limits, deterministic encoding, fuzzed parsers; `default-features = false` drops the unmaintained `atomic-polyfill` heapless brings in |
+| Archives (sender only) | `zip`, `default-features = false` | Write-only, Stored entries: no codec is built, so no decompression backend enters the tree, and nothing in the workspace reads an archive ([SECURITY.md](SECURITY.md) F9). `clippy.toml` disallows the reader type so the ban is mechanical rather than a convention |
 | Logging | tracing + tracing-subscriber | Structured from first commit |
 | CLI | clap | |
 | Config | TOML, versioned schema | |
@@ -542,11 +888,16 @@ transaction logic, control transfer) remain in Crossover code.
 
 The startup config file (`~/.crossover/config.toml`) is sectioned and versioned
 so it can evolve without breaking a hand-edited file. Every field is optional
-and every CLI flag overrides its file counterpart. (Config and logs live under
+and every CLI flag overrides its file counterpart, **with one deliberate
+exception**: an explicit `[layout]` beats `--left` / `--right`, because the
+service's saved command line (ADR 0011) would otherwise flatten a drawn
+arrangement back to a side on every launch — the flags still win over an
+*implicit* layout, where there is nothing to lose ([ADR
+0018](adr/0018-drawn-display-topology.md)). (Config and logs live under
 `~/.crossover`; secrets stay DPAPI-encrypted under `%LOCALAPPDATA%\Crossover`.)
 
 ```toml
-schema_version = 1
+schema_version = 2
 
 [device]
 name = "workstation-left"
@@ -555,19 +906,44 @@ name = "workstation-left"
 listen = "0.0.0.0:27677"          # present = accept inbound peers (default port, ADR 0004)
 connect = "192.168.1.25:27677"    # dial this peer
 
-[seamless]
-side = "right"                    # "left" | "right" — this machine's screen side
+[layout]
+revision = 3
+origin = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8"
+
+[[layout.monitor]]
+device = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8"
+id = '\\.\DISPLAY1'
+x = 0
+y = 0
+width = 1920
+height = 1080
 
 [cursor]
 mask = true                       # hide the local cursor while driving the peer
 ```
 
-Validated on load with actionable errors (unknown keys and unsupported
-`schema_version` are rejected); deterministic defaults; no private keys in
-this file (they live in `SecureStorage`). The two-machine model needs a
-single peer, so the peer is named inline under `[network]`; a richer
-`[peer.<name>]` / named-`[layout]` model can be added under a new
-`schema_version` if multi-peer arrangements arrive.
+Validated on load with actionable errors: unknown keys and an unsupported
+`schema_version` are rejected outright, and so is a `[layout]` whose
+`schema_version` cannot predict it (absent or `1` with `[layout]` present) —
+a config-shape contradiction, the same class as an unknown key. A `[layout]`
+that is well-formed TOML but semantically invalid (overlap, a bad device, an
+empty list) is different: it degrades the run to no layout — seamless off,
+explicit control intact — with a loud warning rather than a fatal error,
+because `crossover run` is what the background service relaunches on every
+crash (ADR 0011), and a fatal config error there is an infinite relaunch loop
+that loses all sharing, not just the drawn one. `crossover config` still
+surfaces the same invalidity loudly, as the check it exists to be. Deterministic
+defaults; no private keys in this file (they live in `SecureStorage`).
+
+`schema_version = 1` — a bare `[seamless] side`, with no `[layout]` — still
+loads, as an *implicit* layout reproducing the pre-ADR-0018 left–right
+behaviour exactly; so does a schema-2 file with a lingering `side` and no
+`[layout]` yet. `--left` / `--right` and `[seamless] side` are deprecated but
+functional for exactly this migration.
+
+The two-machine model needs a single peer, so the peer is named inline
+under `[network]`; a richer `[peer.<name>]` / named-`[layout]` model can be
+added under a new `schema_version` if multi-peer arrangements arrive.
 
 ## 9. Error-handling conventions
 
@@ -599,7 +975,12 @@ living exemplar.
 ## 10. Logging conventions
 
 `tracing` is wired from Phase 0 (FR-7.3); the subscriber is installed once
-in `apps/crossover/src/logging.rs`. Conventions:
+in `apps/crossover/src/logging.rs`. The service daemon (`crossover-svc`,
+ADR 0011) installs its own subscriber the same way in
+`apps/crossover-svc/src/logging.rs`, but to a different file location —
+`%ProgramData%\Crossover\logs` rather than `~/.crossover/logs` — because it
+runs as `LocalSystem`, not the console user, so `~` there is the SYSTEM
+profile (ADR 0011 addendum, 2026-08-19). Conventions:
 
 - **Metadata only.** Clipboard contents and private key material never
   appear in logs at any level (FR-7.4). Clipboard transactions log
@@ -608,7 +989,25 @@ in `apps/crossover/src/logging.rs`. Conventions:
 - **Canonical field names**, snake_case, reused verbatim across crates so
   log lines correlate: `peer_id`, `session_id`, `message_id`,
   `clipboard_id`, `protocol_version`, `state`, `latency_ms`, `error`,
-  `command`. Values go in fields; the event message is the human summary.
+  `command`, `local_link`. Values go in fields; the event message is the
+  human summary.
+- **A disconnect says which side broke.** `local_link` (`up` / `down` /
+  `unknown`, from `LinkStateProbe`) is carried by the two records where the
+  OS's own wording misleads: the session-end warning, and the
+  connect-attempt failure. It exists because a NIC that drops its physical
+  link ends the session on **both** machines with `An existing connection
+  was forcibly closed by the remote host` — false on both ends, and
+  disproving it once cost a manual correlation of two machines' event logs.
+  Rules that keep the field worth reading:
+  - It is asked only where a dead local interface is a possible cause — a
+    transport failure or a keepalive timeout. A protocol violation and a
+    clean peer close are not, so those lines carry no `local_link` at all
+    rather than a permanently uninformative one.
+  - `down` also changes the *message*, not just a field, so the conclusion
+    survives being read at a glance: `session ended; local link is down, so
+    the disconnect is local, not the peer`.
+  - `unknown` never reads as exoneration. `up` is evidence too, and is
+    recorded, but no line claims a local fault without `down`.
 - **Spans scope lifecycles**: one span per connection session (carrying
   `session_id` and `peer_id`), per clipboard transaction, per control
   transfer. Events inside inherit those fields — no re-stating.

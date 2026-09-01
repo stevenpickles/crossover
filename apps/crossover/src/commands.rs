@@ -5,6 +5,7 @@
 //! diagnostics go to structured logs (docs/ARCHITECTURE.md §9, §10).
 
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,27 +20,32 @@ use crossover_core::supervision::{
     supervise_outbound,
 };
 use crossover_core::{
-    ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, EdgeCrossing, EdgeDetectDriver,
-    FrameTarget, InputControlEvent, LinkSide, LocalNode, Metrics, OutboundSender, SeamlessInputs,
-    SessionCommand, SessionListener, SessionOptions, SyncEvent, Topology, clipboard_sync,
-    edge_detect, input_control, outbound_channel,
+    ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, CrossingMap, EdgeCrossing,
+    EdgeDetectDriver, FileReceive, FileSend, FrameTarget, InputControlEvent, LiveLayout, LocalNode,
+    Metrics, OutboundSender, SeamlessInputs, SessionCommand, SessionListener, SessionOptions,
+    SyncEvent, clipboard_sync, edge_detect, implicit_crossing_source, input_control,
+    live_crossing_source, outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
 use crossover_platform::{ServiceError, ServiceStatus};
 use crossover_protocol::DEFAULT_PORT;
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::hello::{FeatureFlags, MessageType};
 use crossover_protocol::input::{InputBatch, WireInputEvent};
 use crossover_security::pairing::{PairedPeer, PairingCode, PairingIdentity};
 use crossover_security::{
     CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TrustStore, TrustedPeer,
 };
+use crossover_topology::{DeviceId, Layout};
 
+use crate::config::LayoutSource;
 use crate::console::{self, ConsoleCommand};
 use crate::storage::{
-    open_clipboard_provider, open_cursor_mask, open_display, open_input, open_secure_storage,
-    open_service_manager,
+    open_clipboard_provider, open_cursor_mask, open_display, open_file_blob_builder, open_input,
+    open_secure_storage, open_service_manager, open_spool, open_virtual_files,
 };
+use crate::topology_state::{TopologyStateWriter, initial_state, watch_own_display};
+use crate::topology_sync::{TopologyEvent, TopologyHandle, TopologyInputs, TopologySync};
 
 /// One ceremony's allowance, listener and connector alike. Generous
 /// enough to read a code off one screen and type it on another; bounded
@@ -56,6 +62,15 @@ const EDGE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 /// tolerates a bounded few-second latency; this reuses the listener's
 /// per-accept load path.
 const REVOCATION_POLL: Duration = Duration::from_secs(2);
+
+/// How often `apply_config_changes` checks `config.toml`'s modification
+/// time for a re-read (ADR 0018), and — on the same tick, whether or not
+/// the file changed — refreshes the topology state file's heartbeat.
+/// Derived from [`crossover_topology::HEARTBEAT_INTERVAL_MS`] rather than a
+/// literal 2 s, so the two cannot drift apart: the heartbeat's staleness
+/// math ([`crossover_topology::HEARTBEAT_STALE_AFTER_MS`]) assumes the
+/// worker refreshes it at exactly this cadence.
+const CONFIG_POLL: Duration = Duration::from_millis(crossover_topology::HEARTBEAT_INTERVAL_MS);
 
 /// `crossover pair --listen [--bind <addr>]`
 pub async fn pair_listen(device_name: &str, bind: Option<String>) -> anyhow::Result<()> {
@@ -158,6 +173,17 @@ pub fn peers_list() -> anyhow::Result<()> {
             peer.last_connected_unix()
                 .map_or_else(|| "never".to_owned(), age)
         );
+        // Printed for every peer, granted or not: a permission you can
+        // only see when it is on is one you cannot audit (ADR 0015 —
+        // this is the grant that reaches the filesystem).
+        println!(
+            "      send files:     {}",
+            if peer.may_receive_files() {
+                "ALLOWED"
+            } else {
+                "not allowed"
+            }
+        );
         if !peer.remembered_addresses().is_empty() {
             println!(
                 "      addresses:      {}",
@@ -167,6 +193,63 @@ pub fn peers_list() -> anyhow::Result<()> {
     }
     println!();
     println!("Revoke a peer with `crossover peers remove <device-id>`.");
+    println!(
+        "Let a peer send you files with `crossover peers allow-files <device-id>` \
+         (`deny-files` to withdraw)."
+    );
+    Ok(())
+}
+
+/// `crossover peers allow-files <device-id>` / `peers deny-files <device-id>`
+///
+/// The only path that changes `file_receive`, and it takes a device id the
+/// user typed on the receiving machine. Nothing on the wire reaches here:
+/// pairing does not grant the permission and a peer cannot ask for it
+/// (docs/SECURITY.md invariant 8, ADR 0015).
+pub fn peers_set_file_receive(device_id: Uuid, allowed: bool) -> anyhow::Result<()> {
+    let storage = open_secure_storage()?;
+    let mut store = TrustStore::load(&*storage).context("loading trust store")?;
+
+    let Some(previous) = store.set_file_receive(device_id, allowed) else {
+        anyhow::bail!("no trusted peer with device id {device_id}; `crossover peers` lists them");
+    };
+    let name = store
+        .find_by_peer_id(device_id)
+        .map_or_else(String::new, |peer| peer.device_name().to_owned());
+
+    if previous == allowed {
+        println!(
+            "\"{name}\" ({device_id}) may {}send you files; nothing changed.",
+            if allowed { "already " } else { "already not " }
+        );
+        return Ok(());
+    }
+    store.save(&*storage).context("persisting trust store")?;
+    // A permission change on the filesystem-write surface belongs in the
+    // log as well as on the terminal: it is the record of who consented to
+    // what, and when (NFR-3).
+    tracing::info!(
+        peer = %device_id,
+        file_receive = allowed,
+        "file-receive permission changed"
+    );
+
+    if allowed {
+        println!(
+            "\"{name}\" ({device_id}) may now send you files. Offers from other \
+             peers are still refused."
+        );
+        println!(
+            "Withdraw it with `crossover peers deny-files {device_id}`; revoking \
+             trust entirely removes it too."
+        );
+    } else {
+        println!(
+            "\"{name}\" ({device_id}) may no longer send you files. Further offers \
+             are refused; anything already delivered stays where it landed \
+             (ADR 0015)."
+        );
+    }
     Ok(())
 }
 
@@ -238,25 +321,48 @@ pub fn status(device_name: &str) -> anyhow::Result<()> {
 }
 
 /// A commented example config for `crossover config` to show when no file
-/// exists yet — the user can save it verbatim and edit.
-const EXAMPLE_CONFIG: &str = "\
-# Crossover startup configuration (sectioned, versioned). Any `crossover run`
-# flag can live here; a flag on the command line always overrides the file.
-schema_version = 1
+/// exists yet — the user can save it verbatim and edit. Schema 2: `[layout]`
+/// is what `crossover layout` writes (sketched here, commented out, since
+/// this build cannot draw one for you); `[seamless] side` is shown because
+/// it is what actually works today, deprecated but functional (ADR 0018).
+const EXAMPLE_CONFIG: &str = r#"# Crossover startup configuration (sectioned, versioned). Any `crossover run`
+# flag can live here; a flag on the command line always overrides the file
+# (except an explicit [layout], which wins over --left/--right — ADR 0018).
+schema_version = 2
 
 [device]
-name = \"machine-b\"
+name = "machine-b"
 
 [network]
-# connect = \"192.168.1.151:27677\"   # dial this peer
-listen = \"0.0.0.0:27677\"            # or accept inbound peers (presence = listen)
+# connect = "192.168.1.151:27677"   # dial this peer
+listen = "0.0.0.0:27677"            # or accept inbound peers (presence = listen)
 
 [seamless]
-side = \"right\"                      # \"left\" | \"right\"
+# Deprecated but functional (ADR 0018): still drives a left-right seamless
+# run today. Draw an arrangement instead with `crossover layout`, which
+# writes [layout] below and retires this section.
+side = "right"                      # "left" | "right"
+
+# [layout] is written for you, not hand-edited: by `crossover layout`, and
+# by `crossover run` itself when it adopts an arrangement drawn on the
+# other machine (ADR 0018 — the peer's edit is your edit, made at the other
+# desk). Either write upgrades this file to schema 2 and removes `side`,
+# leaving your comments and every other section exactly as they are. This
+# is the shape it writes, for reference:
+# revision = 1
+# origin = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8"
+#
+# [[layout.monitor]]
+# device = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8"
+# id = '\\.\DISPLAY1'
+# x = 0
+# y = 0
+# width = 1920
+# height = 1080
 
 [cursor]
 # mask = false                       # default true; false = never hide the cursor
-";
+"#;
 
 /// `crossover config` — show where the startup config lives and its
 /// current settings, or an example when there is none (Phase 6).
@@ -269,8 +375,23 @@ pub fn config_show() -> anyhow::Result<()> {
     println!("  {}", path.display());
     println!();
     if path.exists() {
-        // Parse it first so a typo or bad value is reported, not hidden.
-        crate::config::load_run_config()?;
+        // Load and check it first so a typo, an unsupported schema, or a
+        // [layout]/schema_version contradiction is reported, not hidden —
+        // the same fatal checks `crossover run` applies at startup.
+        let loaded = crate::config::load_run_config()?;
+        // An invalid `[layout]` is not fatal to load — `crossover run`
+        // degrades to no layout and keeps going (ADR 0011's relaunch loop
+        // is the reason, see `crate::config`'s module docs) — but
+        // `crossover config` exists to be the check that catches this, so
+        // it is still reported loudly here even though the command itself
+        // succeeds.
+        if let Err(error) = &loaded.layout {
+            println!(
+                "WARNING: the [layout] section is invalid — `crossover run` would ignore it \
+                 (seamless off, explicit control intact): {error}"
+            );
+            println!();
+        }
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         println!("Current contents (parsed OK):");
@@ -316,6 +437,10 @@ pub fn service_install() -> anyhow::Result<()> {
         "It starts at boot and launches `crossover run` in your session, restarting it on \
          crash (ADR 0011)."
     );
+    println!(
+        "Service supervision events (launches, exits, stops) are logged to \
+         %ProgramData%\\Crossover\\logs — check there if the worker ever stops unexpectedly."
+    );
     Ok(())
 }
 
@@ -354,9 +479,11 @@ pub fn service_status() -> anyhow::Result<()> {
         }
         Ok(ServiceStatus::Installed { running: true }) => {
             println!("The Crossover background service is installed and running.");
+            println!("Supervision log: %ProgramData%\\Crossover\\logs");
         }
         Ok(ServiceStatus::Installed { running: false }) => {
             println!("The Crossover background service is installed but not running.");
+            println!("Supervision log: %ProgramData%\\Crossover\\logs");
         }
         Err(ServiceError::Unsupported) => {
             print_service_unsupported();
@@ -390,25 +517,65 @@ fn service_failure(error: &ServiceError, context: &str) -> anyhow::Error {
     }
 }
 
+/// `crossover layout` — open the display layout editor (ADR 0019).
+///
+/// The editor is its own binary and its own process: it is started, not
+/// hosted. This command exists because the editor ships beside `crossover.exe`
+/// rather than on `PATH`, and because a user who knows one Crossover command
+/// should not have to learn where its files live.
+pub fn layout() -> anyhow::Result<()> {
+    let editor = crate::storage::sibling_binary("crossover-layout")?;
+    if !editor.is_file() {
+        anyhow::bail!(
+            "the layout editor was not found at {}; reinstall Crossover so \
+             crossover-layout{} sits next to crossover{}",
+            editor.display(),
+            std::env::consts::EXE_SUFFIX,
+            std::env::consts::EXE_SUFFIX,
+        );
+    }
+
+    // Started and let go: the editor outlives this command, and the console
+    // that ran it is free immediately. Its streams go to null rather than to
+    // ours so nothing it writes interleaves with a console session that has
+    // moved on (`crossover run`'s notices, for instance).
+    std::process::Command::new(&editor)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("starting the layout editor at {}", editor.display()))?;
+
+    println!("Opened the Crossover layout editor.");
+    Ok(())
+}
+
 /// `crossover run [--listen [--bind <addr>]] [--connect <addr>]`
 ///
 /// Foreground session maintenance: accept trusted peers, keep an
 /// outbound session alive with reconnect, and run the clipboard and
 /// input-control engines over whichever session is live. Console
 /// commands (`c` take control, `r` release) drive explicit control
-/// transfer (Phase 3, FR-5.1); with `--left`/`--right`, crossing the
-/// linked screen edge transfers control automatically (Phase 5, ADR
-/// 0009). Ctrl-C or `q` stops.
+/// transfer (Phase 3, FR-5.1); an implicit layout (deprecated
+/// `--left`/`--right`, Phase 5, ADR 0009) or an explicit one drawn with
+/// `crossover layout` (ADR 0018) transfers control automatically on a
+/// crossing span. Ctrl-C or `q` stops.
 /// Bring up input control — capture/inject behind the platform traits, the
 /// control-transfer engine, cursor masking (ADR 0009), and, in seamless
 /// mode, the edge detector — spawning the driver, edge wiring, and notice
 /// printer. Returns the event sender and command receiver the session mux
 /// needs. Capture installs no hook until the first grant.
+///
+/// `identity` is here for the arrangement, not for the network: a crossing
+/// map is derived for a named local device (ADR 0018), and this run's
+/// device id is what names it.
 fn setup_input_control(
-    side: Option<LinkSide>,
+    layout_source: Option<&LayoutSource>,
+    identity: &DeviceIdentity,
     metrics: &Arc<Metrics>,
     no_cursor_mask: bool,
-) -> anyhow::Result<(mpsc::Sender<InputControlEvent>, CommandReceiver)> {
+) -> anyhow::Result<InputControl> {
+    let local = DeviceId::from_bytes(*identity.device_id().as_bytes());
     let (capture, injector) = open_input()?;
     // Diagnostic switch: run without masking to isolate cursor behavior
     // from control transfer (ADR 0009).
@@ -420,20 +587,31 @@ fn setup_input_control(
     };
     let display = open_display()?;
 
-    // Log the display and the configured seamless edge at startup (ADR
-    // 0009), so a soak report shows the geometry each side used.
-    log_display_and_edge(&*display, side);
+    // The arrangement — implicit or drawn — as the crossing source both the
+    // detector and cursor placement derive through, plus the mode channel
+    // that keeps the detector in step with control state. Built before
+    // `input_control` so its mode sender can ride in, and before the log so
+    // the startup line reports the crossings this machine really has rather
+    // than the configuration it was asked for (ADR 0018).
+    let seamless = build_seamless(layout_source, local, &display);
 
-    // Seamless mode (--left/--right): a topology and an edge detector, plus
-    // the mode channel that keeps the detector in step with control state.
-    // Built before input_control so its mode sender can ride in.
-    let (seamless, edge_wiring) = build_seamless(side, &display);
+    // Log the display and the derived arrangement at startup (ADR 0009,
+    // ADR 0018), so a soak report shows what each side actually ran with.
+    log_display_and_edge(&*display, layout_source, seamless.as_ref().map(|s| &*s.map));
 
+    let (inputs, edge_wiring, layout_publisher) = match seamless {
+        Some(seamless) => (
+            Some(seamless.inputs),
+            Some(seamless.wiring),
+            seamless.publisher,
+        ),
+        None => (None, None, None),
+    };
     let (control_driver, control_events, control_commands, control_notices) = input_control(
         capture,
         injector,
         cursor_mask,
-        seamless,
+        inputs,
         ControlConfig::default(),
     );
     tokio::spawn(control_driver.run());
@@ -445,16 +623,302 @@ fn setup_input_control(
     }
     tokio::spawn(print_control_notices(control_notices, Arc::clone(metrics)));
 
-    Ok((control_events, control_commands))
+    Ok(InputControl {
+        events: control_events,
+        commands: control_commands,
+        layout_publisher,
+    })
 }
 
-pub async fn run(
-    device_name: &str,
-    listen_bind: Option<String>,
-    connect: Option<String>,
-    side: Option<LinkSide>,
-    no_cursor_mask: bool,
-) -> anyhow::Result<()> {
+/// What [`setup_input_control`] hands back to the composition root: the
+/// control driver's two ends, plus the seam an adopted arrangement is
+/// published through (ADR 0018).
+struct InputControl {
+    events: mpsc::Sender<InputControlEvent>,
+    commands: CommandReceiver,
+    layout_publisher: Option<watch::Sender<LiveLayout>>,
+}
+
+/// Start clipboard synchronization: the provider, the spool a received
+/// file lands in, and the mechanism it is pasted from (ADR 0015).
+///
+/// Returns the event sender, the command receiver, and whether this run
+/// can deliver a file at all — which needs **both** halves. A spool with
+/// no paste mechanism, or a paste mechanism with no spool, is not a
+/// capability, and reporting it as one would mean accepting transfers
+/// nobody could use.
+fn setup_clipboard_sync(
+    device: Uuid,
+    metrics: &Arc<Metrics>,
+) -> anyhow::Result<(mpsc::Sender<SyncEvent>, CommandReceiver, bool)> {
+    let provider = open_clipboard_provider()?;
+    // The spool is opened (and swept) once per run. `None` means this run
+    // cannot receive files — never a fallback to an unprotected directory,
+    // which would void the guarantee the spool exists to make.
+    let spool = open_spool();
+    let virtual_files = open_virtual_files(spool.as_ref());
+    let file_paste_ready = spool.is_some() && virtual_files.is_some();
+    // The sending half's builder is wired now that the engine has a
+    // transaction to drive it from (ADR 0015). It stays inert until
+    // `FILE_CLIPBOARD` is advertised and a send policy is supplied: the
+    // engine's default is `FileSend::Unsupported`, so nothing is packed
+    // and nothing is offered until that lands.
+    let blob_builder = open_file_blob_builder();
+    let (driver, events, commands) = clipboard_sync(
+        provider,
+        spool,
+        virtual_files,
+        blob_builder,
+        device,
+        ClipboardConfig::new(),
+        Some(Arc::clone(metrics)),
+    )
+    .context("starting clipboard sync")?;
+    tokio::spawn(driver.run());
+    Ok((events, commands, file_paste_ready))
+}
+
+/// What `apply_config_changes` needs to know about `config.toml` as of the
+/// moment this run started watching it (ADR 0018): its path, and the
+/// `(mtime, len)` signature captured at the initial load — bundled into
+/// one value (rather than two parameters) so its one call site in `run`
+/// stays a short line, which is what keeps that already-long function
+/// under clippy's line cap.
+///
+/// The signature is captured *before* `run` does anything else — identity,
+/// trust store, clipboard and input-control setup, an outbound connection
+/// attempt — not lazily inside `apply_config_changes` once its task first
+/// polls, which could be well after that. Seeding the baseline from this
+/// early reading is what lets an edit landing in that window reach the
+/// topology state file on the task's very first re-read tick instead of
+/// requiring a second edit to be noticed.
+struct ConfigWatch {
+    path: Option<PathBuf>,
+    initial_signature: Option<(SystemTime, u64)>,
+}
+
+/// Bring up the worker's half of the worker→editor state file (ADR 0018):
+/// create `~/.crossover/state` on demand, write the startup snapshot, spawn
+/// the coalesced writer and the ~1 s own-display poll, and hand back what
+/// `apply_config_changes` re-reads from and the writer `run`'s shutdown
+/// gives a final write.
+///
+/// `state_writer` is `None` when no home directory was resolvable (logged
+/// here as the one place that decides it) — every other topology-state
+/// task tolerates that by simply having nothing to do.
+fn setup_topology_state(
+    identity: &DeviceIdentity,
+    layout_source: Option<&LayoutSource>,
+    config_path: Option<PathBuf>,
+    initial_config_signature: Option<(SystemTime, u64)>,
+) -> anyhow::Result<TopologyPlumbing> {
+    // A second, independent `DisplayInfo` handle from the one
+    // `setup_input_control` opened: both are thin, stateless Win32 query
+    // wrappers, and this one is polled on its own ~1 s cadence,
+    // deliberately separate from the 8 ms edge-detection poll.
+    let topology_display = open_display()?;
+    let topology_state_path = crate::paths::topology_state_path();
+    if let Some(dir) = crate::paths::state_dir() {
+        // Created on demand, the same shape `logging.rs` creates `log_dir`
+        // in the first time it opens a log file.
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                error = %error,
+                path = %dir.display(),
+                "could not create the topology state directory"
+            );
+        }
+    } else {
+        tracing::warn!(
+            "no home directory resolvable; the topology state file (ADR 0018, the layout \
+             editor's input) will not be written this run"
+        );
+    }
+    let state_writer = topology_state_path.map(|path| {
+        let initial = initial_state(
+            DeviceId::from_bytes(*identity.device_id().as_bytes()),
+            identity.device_name().to_owned(),
+            &*topology_display,
+            layout_source,
+        );
+        Arc::new(TopologyStateWriter::start(path, initial))
+    });
+    // The own-display poll is spawned by `run`, not here: it now also
+    // pings the layout-sync hub on a change (ADR 0018's "re-send
+    // `MonitorTopology` whenever the local display configuration
+    // changes"), and the hub cannot exist until this function has produced
+    // the writer it reports through.
+    let config_watch = ConfigWatch {
+        path: config_path,
+        initial_signature: initial_config_signature,
+    };
+    Ok(TopologyPlumbing {
+        config_watch,
+        state_writer,
+        display: topology_display,
+    })
+}
+
+/// Bring up layout sync (ADR 0018): the hub that states this machine's
+/// monitors and arrangement, receives the peer's, and resolves the two.
+/// Spawns the hub and — once the hub's queue exists to ping — the ~1 s
+/// own-display poll that keeps both the state file and the peer current.
+///
+/// Returns the sender every producer talks to it on, its command lane for
+/// the mux, and the handle shutdown flushes it through.
+///
+/// `publisher` is the seam that makes an adopted arrangement live: it is
+/// `Some` only for a run whose crossings come from a *drawn* layout, since
+/// there is nothing for a publication to replace otherwise (ADR 0018's
+/// 2026-08-21 amendment).
+///
+/// `state_writer` is `None` only when no home directory resolved, which
+/// `setup_topology_state` has already warned about. Two things follow, both
+/// harmless and neither silent: nothing reports to the editor, and the
+/// own-display poll — the thing that would re-state `MonitorTopology` on a
+/// display change — is not spawned, so on that run the peer learns of a
+/// display change at the next session instead. A machine with no home
+/// directory has no config file either, so there was nothing to persist to
+/// on it in the first place.
+fn setup_layout_sync(
+    identity: &DeviceIdentity,
+    display: &Arc<dyn DisplayInfo>,
+    layout_source: Option<&LayoutSource>,
+    publisher: Option<watch::Sender<LiveLayout>>,
+    metrics: &Arc<Metrics>,
+    state_writer: Option<&Arc<TopologyStateWriter>>,
+    config_path: Option<PathBuf>,
+) -> (mpsc::Sender<TopologyEvent>, CommandReceiver, TopologyHandle) {
+    let (commands_tx, commands) = command_lanes();
+    let (hub, events, shutdown) = TopologySync::start(TopologyInputs {
+        local: DeviceId::from_bytes(*identity.device_id().as_bytes()),
+        display: Arc::clone(display),
+        commands: commands_tx,
+        metrics: Arc::clone(metrics),
+        state: state_writer.map(Arc::clone),
+        // An implicit arrangement is never synced (ADR 0018), so such a run
+        // starts holding nothing and a peer's drawn layout wins outright —
+        // which is exactly the schema-1 upgrade path.
+        layout: match layout_source {
+            Some(LayoutSource::Explicit(layout)) => Some(layout.clone()),
+            Some(LayoutSource::Implicit(_)) | None => None,
+        },
+        publisher,
+        config_path,
+    });
+    let task = tokio::spawn(hub.run());
+    if let Some(writer) = state_writer {
+        tokio::spawn(watch_own_display(
+            Arc::clone(display),
+            Arc::clone(writer),
+            events.clone(),
+        ));
+    }
+    (events, commands, TopologyHandle::new(shutdown, task))
+}
+
+/// Everything the display-topology half of a run needs, brought up
+/// together (ADR 0018).
+pub struct Topology {
+    config_watch: ConfigWatch,
+    state_writer: Option<Arc<TopologyStateWriter>>,
+    events: mpsc::Sender<TopologyEvent>,
+    commands: CommandReceiver,
+    handle: TopologyHandle,
+}
+
+/// Bring up the state file, the config poll's baseline, and the layout-sync
+/// hub as one unit.
+///
+/// They are one unit because they share three things and would otherwise
+/// have to be handed them separately, in the right order, by the caller:
+/// the **config path** (resolved exactly once here, so the poll that
+/// watches the file and the hub that writes it cannot end up looking at
+/// different ones), the **display handle** the state file and
+/// `MonitorTopology` both read this desk through, and the **state writer**
+/// the hub reports into — which cannot exist before this function and which
+/// the hub cannot be built without.
+fn setup_topology(
+    identity: &DeviceIdentity,
+    layout_source: Option<&LayoutSource>,
+    layout_publisher: Option<watch::Sender<LiveLayout>>,
+    metrics: &Arc<Metrics>,
+    initial_config_signature: Option<(SystemTime, u64)>,
+) -> anyhow::Result<Topology> {
+    let config_path = crate::paths::config_path();
+    let TopologyPlumbing {
+        config_watch,
+        state_writer,
+        display,
+    } = setup_topology_state(
+        identity,
+        layout_source,
+        config_path.clone(),
+        initial_config_signature,
+    )?;
+    let (events, commands, handle) = setup_layout_sync(
+        identity,
+        &display,
+        layout_source,
+        layout_publisher,
+        metrics,
+        state_writer.as_ref(),
+        config_path,
+    );
+    Ok(Topology {
+        config_watch,
+        state_writer,
+        events,
+        commands,
+        handle,
+    })
+}
+
+/// What [`setup_topology_state`] hands [`setup_topology`].
+struct TopologyPlumbing {
+    config_watch: ConfigWatch,
+    state_writer: Option<Arc<TopologyStateWriter>>,
+    /// The display handle both the own-display poll and the layout-sync
+    /// hub read this machine's monitors through — one handle, so the desk
+    /// the editor is shown and the desk the peer is told about are read the
+    /// same way.
+    display: Arc<dyn DisplayInfo>,
+}
+
+/// Open the inbound role's listener, if this run has one, announcing the
+/// address it actually bound to — which is not always the one asked for
+/// (`0.0.0.0:0`, say). A failure to bind is fatal: a run told to listen
+/// that silently does not is a run whose peer can never reach it.
+async fn bind_listener(bind: Option<&str>) -> anyhow::Result<Option<SessionListener>> {
+    let Some(bind) = bind else {
+        return Ok(None);
+    };
+    let listener = SessionListener::bind(bind)
+        .await
+        .with_context(|| format!("binding listener on {bind}"))?;
+    println!("Listening for trusted peers on {}.", listener.local_addr()?);
+    Ok(Some(listener))
+}
+
+/// Who this run is and who it will talk to: the secure storage everything
+/// reads through, this machine's identity and its TLS-presentable
+/// credential, and the trust store as of startup.
+struct RunIdentity {
+    storage: Arc<dyn SecureStorage>,
+    identity: DeviceIdentity,
+    certified: CertifiedIdentity,
+    store: TrustStore,
+}
+
+/// Load (or generate) this machine's identity, certify it, and read the
+/// trust store — announcing all three, since "which identity, how many
+/// peers, what fingerprint" is the first thing anyone diagnosing a run
+/// needs and the last thing they should have to go looking for.
+///
+/// Refuses a run with no trusted peers: there is nothing for it to do, and
+/// failing here with the pairing command named is far better than a
+/// listener that accepts nobody.
+fn open_run_identity(device_name: &str) -> anyhow::Result<RunIdentity> {
     let storage: Arc<dyn SecureStorage> = Arc::from(open_secure_storage()?);
     let (identity, generated) = DeviceIdentity::load_or_generate(&*storage, device_name)
         .context("loading device identity")?;
@@ -478,6 +942,28 @@ pub async fn run(
         store.peers().len(),
         identity.spki_fingerprint()?
     );
+    Ok(RunIdentity {
+        storage,
+        identity,
+        certified,
+        store,
+    })
+}
+
+pub async fn run(
+    device_name: &str,
+    listen_bind: Option<String>,
+    connect: Option<String>,
+    layout_source: Option<LayoutSource>,
+    no_cursor_mask: bool,
+    initial_config_signature: Option<(SystemTime, u64)>,
+) -> anyhow::Result<()> {
+    let RunIdentity {
+        storage,
+        identity,
+        certified,
+        store,
+    } = open_run_identity(device_name)?;
 
     // One metrics registry for the whole run, shared by every layer that
     // knows something worth counting and dumped on the way out (FR-7.3,
@@ -486,26 +972,33 @@ pub async fn run(
 
     // Clipboard sync: one driver for the peer relationship; sessions of
     // either role feed it and carry its frames.
-    let provider = open_clipboard_provider()?;
-    let (sync_driver, sync_events, sync_commands) = clipboard_sync(
-        provider,
-        identity.device_id(),
-        ClipboardConfig::new(),
-        Some(Arc::clone(&metrics)),
-    )
-    .context("starting clipboard sync")?;
-    tokio::spawn(sync_driver.run());
+    let (sync_events, sync_commands, file_paste_ready) =
+        setup_clipboard_sync(identity.device_id(), &metrics)?;
 
     // Input control: capture/inject, the transfer engine, cursor masking,
     // and (in seamless mode) the edge detector.
-    let (control_events, control_commands) = setup_input_control(side, &metrics, no_cursor_mask)?;
+    let InputControl {
+        events: control_events,
+        commands: control_commands,
+        layout_publisher,
+    } = setup_input_control(layout_source.as_ref(), &identity, &metrics, no_cursor_mask)?;
 
-    // Session lifecycle and frames fan out to both drivers.
-    let fanout = SessionFanout {
-        sync: sync_events,
-        control: control_events.clone(),
-        metrics: Some(Arc::clone(&metrics)),
-    };
+    // Display topology (ADR 0018): what the editor needs to draw, the
+    // config poll that picks its edits up, and the engine that agrees one
+    // arrangement with the peer.
+    let Topology {
+        config_watch,
+        state_writer,
+        events: topology_events,
+        commands: topology_commands,
+        handle: topology_handle,
+    } = setup_topology(
+        &identity,
+        layout_source.as_ref(),
+        layout_publisher,
+        &metrics,
+        initial_config_signature,
+    )?;
 
     // Every live session, keyed by id, so the mux can route control and
     // input frames to the exact session the engine named and broadcast
@@ -513,27 +1006,38 @@ pub async fn run(
     let registry: SessionRegistry =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    // Both drivers emit the same SessionCommands; merge them into the two
-    // priority lanes the mux drains independently (ADR 0013).
-    let commands = merge_command_lanes(sync_commands, control_commands);
+    // Session lifecycle and frames fan out to every driver; every driver's
+    // commands merge back into the two priority lanes (ADR 0013).
+    let policy_events = sync_events.clone();
+    let fanout = SessionFanout {
+        sync: sync_events,
+        control: control_events.clone(),
+        topology: topology_events.clone(),
+        metrics: Some(Arc::clone(&metrics)),
+        storage: Arc::clone(&storage),
+        registry: Arc::clone(&registry),
+        spool_open: file_paste_ready,
+    };
+    let commands = merge_command_lanes([sync_commands, control_commands, topology_commands]);
+
+    // How a disconnect finds out whether the local wire went down (the
+    // `local_link` field on session-end and connect-failure records).
+    let link_probe = crate::storage::open_link_state_probe();
 
     // Outbound role: supervised session with automatic reconnect.
-    let (handle, events) =
-        start_outbound(connect.as_ref(), &identity, &certified, &store, &metrics);
+    let (handle, events) = start_outbound(
+        connect.as_ref(),
+        &identity,
+        &certified,
+        &store,
+        &metrics,
+        &link_probe,
+    );
 
     spawn_command_mux(Arc::clone(&registry), commands, Some(Arc::clone(&metrics)));
 
     // Inbound role: accept loop, one session at a time (two-machine scope).
-    let listener = match &listen_bind {
-        Some(bind) => {
-            let listener = SessionListener::bind(bind.as_str())
-                .await
-                .with_context(|| format!("binding listener on {bind}"))?;
-            println!("Listening for trusted peers on {}.", listener.local_addr()?);
-            Some(listener)
-        }
-        None => None,
-    };
+    let listener = bind_listener(listen_bind.as_deref()).await?;
 
     println!();
     println!("{}", console::HELP);
@@ -556,6 +1060,7 @@ pub async fn run(
             &fanout,
             &registry,
             &metrics,
+            &link_probe,
         ) => {}
         () = outbound_event_loop(
             events,
@@ -565,15 +1070,59 @@ pub async fn run(
             &registry,
             &metrics,
         ) => {}
-        // Enforce revocation on live sessions, not just new ones (ADR 0010).
-        () = enforce_revocations(&storage, &registry) => {}
+        // Act on trust-store edits made while this run is up: revocation
+        // (ADR 0010) and the file-receive grant (ADR 0015).
+        () = apply_trust_changes(&storage, &registry, &policy_events, file_paste_ready) => {}
+        // Re-read config.toml for a changed [layout] and drive the state
+        // file's heartbeat (ADR 0018). A changed, valid, explicit layout
+        // is offered to the layout-sync hub, which decides whether it is
+        // newer than what this run holds and states it to the peer.
+        () = apply_config_changes(
+            config_watch,
+            state_writer.clone(),
+            Some(topology_events),
+        ) => {}
     }
-    if let Some(handle) = &handle {
+    finish_run(
+        handle.as_ref(),
+        state_writer.as_ref(),
+        topology_handle,
+        &registry,
+        &metrics,
+    )
+    .await;
+    Ok(())
+}
+
+/// End-of-run teardown: signal the outbound supervisor to stop, land the
+/// two files this run owns, account for sessions still live at shutdown,
+/// and print the execution metrics summary.
+///
+/// Both file writes are here, side by side, because they are the same
+/// obligation in two places (ADR 0018): the **config** gets whatever
+/// arrangement the layout-sync hub adopted but has not yet written — a
+/// clean quit inside a coalescing window must not lose it — and the
+/// **state file** gets a final heartbeat, since it is never deleted and the
+/// editor keeps showing last-known geometry while the worker is down.
+async fn finish_run(
+    handle: Option<&Arc<crossover_core::supervision::SupervisorHandle>>,
+    state_writer: Option<&Arc<TopologyStateWriter>>,
+    topology: TopologyHandle,
+    registry: &SessionRegistry,
+    metrics: &Metrics,
+) {
+    if let Some(handle) = handle {
         handle.shutdown();
     }
-    close_live_sessions(&registry, &metrics);
-    print_execution_metrics(&metrics);
-    Ok(())
+    // The hub first: it can still change what the state file should report
+    // (its adoption writes the config and then reports), so flushing it
+    // before the final snapshot is what keeps the two agreeing.
+    topology.shutdown().await;
+    if let Some(writer) = state_writer {
+        writer.write_final().await;
+    }
+    close_live_sessions(registry, metrics);
+    print_execution_metrics(metrics);
 }
 
 /// Account for sessions that were still up when the run ended.
@@ -655,6 +1204,7 @@ fn start_outbound(
     certified: &CertifiedIdentity,
     store: &TrustStore,
     metrics: &Arc<Metrics>,
+    link_probe: &Arc<dyn crossover_platform::LinkStateProbe>,
 ) -> (
     Option<Arc<crossover_core::supervision::SupervisorHandle>>,
     Option<mpsc::Receiver<SessionEvent>>,
@@ -665,6 +1215,7 @@ fn start_outbound(
     println!("Maintaining an outbound session to {addr}.");
     let mut supervisor_config = SupervisorConfig::default();
     supervisor_config.session.metrics = Some(Arc::clone(metrics));
+    supervisor_config.session.link_probe = Some(Arc::clone(link_probe));
     let (handle, events) = supervise_outbound(
         addr.clone(),
         identity.clone(),
@@ -675,22 +1226,103 @@ fn start_outbound(
     (Some(Arc::new(handle)), Some(events))
 }
 
-/// Session lifecycle and inbound frames fanned out to both the clipboard
-/// and input-control drivers. Each driver ignores what is not its
-/// traffic, so broadcasting is simpler and cheaper than routing by type.
-/// The session id travels with every event: clipboard sync is
-/// session-agnostic (FR-5.4), but the control driver binds to one
-/// session and drops the rest (FR-5.1), so it must know which session
-/// each frame arrived on.
+/// Which driver an inbound frame belongs to — the inbound counterpart of
+/// [`SendPriority`](crossover_core::SendPriority), and the same partition
+/// by message type (ADR 0013 addendum, 2026-08-19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundRoute {
+    /// Clipboard and file traffic: the sync driver's, and nobody else's.
+    Sync,
+    /// Input and control-transfer traffic: the control driver's.
+    Control,
+    /// Display topology: the layout-sync hub's, and nobody else's
+    /// (ADR 0018, [`crate::topology_sync`]).
+    Topology,
+    /// Neither driver claims it. Reached only by a message type this build
+    /// does not know — the session layer answers or rejects everything
+    /// else before it becomes an app frame. Both drivers ignore what lands
+    /// here, but *ignoring* is their decision to make, not this function's,
+    /// so it keeps historical delivery to both rather than being dropped by
+    /// a classifier that predates its owner.
+    Both,
+}
+
+/// Route one inbound frame by message type. Total by construction: every
+/// arm of [`MessageType`], and the unknown, lands somewhere.
+///
+/// This is a driver partition, not docs/PROTOCOL.md §4's class —
+/// `MessageType::class` reports that fact directly; here CONTROL-class
+/// types split across `Control` (control-transfer) and `Topology` (the
+/// drawn arrangement) by which driver actually wants them.
+fn inbound_route(message_type: u16) -> InboundRoute {
+    match MessageType::from_wire(message_type) {
+        Some(
+            MessageType::ClipboardOffer
+            | MessageType::ClipboardAccept
+            | MessageType::ClipboardDecline
+            | MessageType::ClipboardData
+            | MessageType::ClipboardChunk
+            | MessageType::ClipboardApplied,
+        ) => InboundRoute::Sync,
+        Some(
+            MessageType::InputBatch
+            | MessageType::ReleaseAllInput
+            | MessageType::ControlRequest
+            | MessageType::ControlResponse
+            | MessageType::ControlRelease,
+        ) => InboundRoute::Control,
+        // Display topology (ADR 0018): the layout-sync hub decodes both,
+        // so neither driver ever sees them. Routing them to one owner is
+        // also what keeps a `LayoutSync` — which can cost a config write —
+        // off the clipboard driver's bulk queue.
+        Some(MessageType::MonitorTopology | MessageType::LayoutSync) => InboundRoute::Topology,
+        // Session-layer traffic never becomes an app frame: `dispatch_frame`
+        // answers Ping, accepts Pong, and fails the session on Hello or a
+        // pairing message. Listed so adding a message type is a compile
+        // error here rather than a silent misroute.
+        Some(
+            MessageType::Hello
+            | MessageType::Ping
+            | MessageType::Pong
+            | MessageType::PairingStart
+            | MessageType::PairingConfirm,
+        )
+        | None => InboundRoute::Both,
+    }
+}
+
+/// Session lifecycle and inbound frames routed to the clipboard and
+/// input-control drivers. The session id travels with every event:
+/// clipboard sync is session-agnostic (FR-5.4), but the control driver
+/// binds to one session and drops the rest (FR-5.1), so it must know which
+/// session each frame arrived on.
 #[derive(Clone)]
 struct SessionFanout {
     sync: mpsc::Sender<SyncEvent>,
     control: mpsc::Sender<InputControlEvent>,
+    /// Where display-topology frames and the session lifecycle go
+    /// (ADR 0018): a queue of its own, so a `LayoutSync` — which can cost
+    /// a config write — never rides the clipboard driver's bulk path and
+    /// never waits on it.
+    topology: mpsc::Sender<TopologyEvent>,
     metrics: Option<Arc<Metrics>>,
+    /// Where the `file_receive` grant is read from when a session comes up
+    /// or goes away (ADR 0015). The store on disk, not a cached copy: it
+    /// is edited by a *different* process (`crossover peers allow-files`).
+    storage: Arc<dyn SecureStorage>,
+    /// Live sessions, so the grant is judged over every peer that could
+    /// send a file rather than only the one that just connected.
+    registry: SessionRegistry,
+    /// Whether this run has a spool at all.
+    spool_open: bool,
 }
 
 impl SessionFanout {
     /// Deliver to both drivers **concurrently**, never one behind the other.
+    ///
+    /// For what genuinely concerns both: the session lifecycle, and the
+    /// unknown message type neither driver claims. Frames belonging to one
+    /// driver are routed there instead (see [`frame`](Self::frame)).
     ///
     /// Sequential delivery makes the first driver's backpressure the second
     /// driver's latency. That is exactly backwards here: the clipboard driver
@@ -714,12 +1346,34 @@ impl SessionFanout {
         let _ = control_sent;
     }
 
-    async fn established(&self, session: Uuid) {
+    /// A session came up.
+    ///
+    /// Takes the whole [`SessionInfo`] rather than the id alone because the
+    /// layout-sync hub needs the peer's identity to know which pair a
+    /// layout may describe (ADR 0018) — and because that is the one moment
+    /// it is in hand.
+    async fn established(&self, info: &crossover_core::SessionInfo) {
+        let session = info.session_id;
         self.fan_out(
             SyncEvent::SessionEstablished,
             InputControlEvent::SessionEstablished { session },
         )
         .await;
+        // Post-Hello, the same moment the file policies are published: the
+        // peer now knows what this machine has attached and, if there is
+        // one, the arrangement it is crossing by.
+        let _ = self
+            .topology
+            .send(TopologyEvent::SessionEstablished {
+                session,
+                peer_device: info.peer_device_id,
+                peer_name: info.peer_device_name.clone(),
+            })
+            .await;
+        // Immediately, not on the next poll: a file copied in the first
+        // seconds of a session would otherwise be refused for a permission
+        // the user has actually granted.
+        self.publish_file_policy().await;
     }
 
     async fn lost(&self, session: Uuid) {
@@ -728,8 +1382,43 @@ impl SessionFanout {
             InputControlEvent::SessionLost { session },
         )
         .await;
+        let _ = self
+            .topology
+            .send(TopologyEvent::SessionLost { session })
+            .await;
+        self.publish_file_policy().await;
     }
 
+    /// Tell the clipboard driver what the trust store and the negotiated
+    /// sessions currently say about receiving and sending files (ADR 0015).
+    async fn publish_file_policy(&self) {
+        let live = live_peer_fingerprints(&self.registry);
+        let receive_policy = file_receive_policy(self.spool_open, &*self.storage, &live);
+        let _ = self
+            .sync
+            .send(SyncEvent::FileReceivePolicy(receive_policy))
+            .await;
+
+        let live_sessions = live_peer_sessions(&self.registry);
+        let send_policy = file_send_policy(&*self.storage, &live_sessions);
+        let _ = self.sync.send(SyncEvent::FileSendPolicy(send_policy)).await;
+    }
+
+    /// Hand one inbound frame to the driver it belongs to — and only that
+    /// one (ADR 0013 addendum, 2026-08-19).
+    ///
+    /// Broadcasting was simpler, but it made every frame's delivery wait on
+    /// *both* queues, so an inbound `ControlRequest` had to be accepted by
+    /// the clipboard driver — which discards it — before this call returned
+    /// and the session's serial frame pump could move on. Under a saturated
+    /// bulk path that wait was 4.7 s on hardware, and it applied to the
+    /// 125 Hz input stream too. Routing by type removes the wait and the
+    /// clone of every bulk payload for a driver that threw it away.
+    ///
+    /// Same-driver order is unchanged: one frame is delivered before the
+    /// next is classified, so each driver still sees its own traffic in
+    /// exactly arrival order (ADR 0005's transaction state machine and the
+    /// input sequence both depend on that).
     async fn frame(&self, session: Uuid, frame: crossover_protocol::RawFrame) {
         // Count input events injected from the peer at the point they
         // arrive; the network layer already counts the frames, this adds
@@ -740,11 +1429,31 @@ impl SessionFanout {
         {
             metrics.record_input_received(total, keys);
         }
-        self.fan_out(
-            SyncEvent::Frame(frame.clone()),
-            InputControlEvent::Frame { session, frame },
-        )
-        .await;
+
+        match inbound_route(frame.message_type) {
+            InboundRoute::Sync => {
+                let _ = self.sync.send(SyncEvent::Frame(frame)).await;
+            }
+            InboundRoute::Control => {
+                let _ = self
+                    .control
+                    .send(InputControlEvent::Frame { session, frame })
+                    .await;
+            }
+            InboundRoute::Topology => {
+                let _ = self
+                    .topology
+                    .send(TopologyEvent::Frame { session, frame })
+                    .await;
+            }
+            InboundRoute::Both => {
+                self.fan_out(
+                    SyncEvent::Frame(frame.clone()),
+                    InputControlEvent::Frame { session, frame },
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -775,20 +1484,20 @@ struct ClassifiedCommands {
     background: BudgetedReceiver<SessionCommand>,
 }
 
-/// Fold both drivers' already-classified command lanes into one merged pair.
+/// Fold every driver's already-classified command lanes into one merged pair.
 ///
 /// **One forwarder task per source lane, never per source.** A task that read
 /// a driver's two lanes together would serialize them: parked handing a bulk
 /// command downstream, it could not pick up that driver's next High command —
 /// so a fail-closed `TerminateSession` emitted during a stalled transfer
-/// would sit behind the very bulk that stalled it. Four single-class tasks
-/// have nothing to serialize; each waits only on its own class.
+/// would sit behind the very bulk that stalled it. Two single-class tasks per
+/// source have nothing to serialize; each waits only on its own class.
 ///
 /// Classification is a pure function of the message type, so re-running it on
 /// the merged sender maps each lane onto the matching lane, never across.
-fn merge_command_lanes(a: CommandReceiver, b: CommandReceiver) -> ClassifiedCommands {
+fn merge_command_lanes(sources: impl IntoIterator<Item = CommandReceiver>) -> ClassifiedCommands {
     let (merged_tx, merged_rx) = command_lanes();
-    for source in [a, b] {
+    for source in sources {
         let (mut source_high, mut source_background) = source.into_lanes();
 
         let high_tx = merged_tx.clone();
@@ -819,27 +1528,144 @@ fn merge_command_lanes(a: CommandReceiver, b: CommandReceiver) -> ClassifiedComm
     ClassifiedCommands { high, background }
 }
 
-/// Build the seamless wiring for a `--left`/`--right` run (ADR 0009): the
-/// [`SeamlessInputs`] the control driver takes, and the edge detector plus
-/// its crossing stream to spawn once the control driver is up. `(None,
-/// None)` for an explicit-only run.
+/// Build the seamless wiring for a run that has an arrangement — implicit
+/// (ADR 0009's side, expressed as a drawn layout per ADR 0018) or explicit
+/// (a drawn `[layout]`): the [`SeamlessInputs`] the control driver takes,
+/// the derived map for the startup log, and the edge detector plus its
+/// crossing stream to spawn once the control driver is up.
+///
+/// All-`None` for an explicit-only run, no layout at all, a display that
+/// will not enumerate, or a drawn layout that does not describe this
+/// machine (below).
+///
+/// **The implicit path derives from geometry alone**
+/// ([`implicit_crossing_source`]), so nothing about what the platform can
+/// or cannot *name* decides whether seamless transfer runs. That matters
+/// here rather than only in core: a display adapter the OS declines to name
+/// is ordinary hardware, and the side model has worked on it since Phase 5.
+/// The only way this turns seamless off is the display refusing to report
+/// its monitors at all.
+///
+/// **The explicit path matches by device string**
+/// ([`explicit_crossing_source`]) — that is the mechanism, not a cost — and
+/// one thing is checked before it is trusted at all.
+///
+/// # The stale-device rule, at this branch's stage
+///
+/// A drawn layout names two machines. A layout left behind by a **previous
+/// pairing** names two machines that are not this pair, and ADR 0018 says
+/// such a layout is rejected with a diagnostic and treated as no layout:
+/// seamless off, explicit control intact. The repair is redrawing after the
+/// new pairing, never a guess about whose rectangles were whose.
+///
+/// What is checkable *here* is the half that needs no peer: **this run's
+/// own device id must appear in the layout.** Config load already checked
+/// the layout is a well-formed arrangement of the pair its own bytes imply
+/// ([`crate::config::RunConfig::merge`]), so what is left is whether that
+/// pair is *ours* — and only one end of it is knowable before a session
+/// exists.
+///
+/// A layout naming this machine but the **wrong peer** therefore survives
+/// this check, and it is worth being exact about what that costs, because
+/// it is less than it sounds. Crossings still fire on the seams the user
+/// drew, and control still transfers to whichever peer this run is
+/// actually connected to: the session decides that, not the layout. What
+/// degrades is **placement**, and only on the far side — the entry point
+/// names a monitor belonging to a machine that is not the one receiving
+/// it, so the receiver cannot honour the id, falls back to its
+/// desktop-bounds edge, and warns once per crossing (docs/PROTOCOL.md
+/// §6.1). Noisy and wrong-looking, never a lost or divided grant. The
+/// check that catches it needs the peer's identity, so it lands with
+/// layout sync, where the full [`crossover_topology::DevicePair`] test
+/// belongs.
 type EdgeWiring = (EdgeDetectDriver, mpsc::Receiver<EdgeCrossing>);
+struct Seamless {
+    inputs: SeamlessInputs,
+    /// The arrangement as derived at startup, for the log line — the very
+    /// map the detector begins with, not a second derivation of it.
+    map: Arc<CrossingMap>,
+    wiring: EdgeWiring,
+    /// Where an adopted arrangement is published so this run's crossings
+    /// change without a restart (ADR 0018's persist-**publish**-report).
+    /// `Some` only for a drawn arrangement: an implicit (side-model) run
+    /// has no drawn layout for a publication to replace, so adoption there
+    /// persists and reports but takes effect at the next start — see
+    /// `topology_sync::TopologySync::take`.
+    publisher: Option<watch::Sender<LiveLayout>>,
+}
+
 fn build_seamless(
-    side: Option<LinkSide>,
+    layout_source: Option<&LayoutSource>,
+    local: DeviceId,
     display: &Arc<dyn DisplayInfo>,
-) -> (Option<SeamlessInputs>, Option<EdgeWiring>) {
-    let Some(side) = side else {
-        return (None, None);
+) -> Option<Seamless> {
+    let mut publisher = None;
+    let source = match layout_source? {
+        LayoutSource::Implicit(side) => implicit_crossing_source(*side, local),
+        LayoutSource::Explicit(layout) => {
+            if layout.monitors_for(local).next().is_none() {
+                tracing::warn!(
+                    revision = layout.revision(),
+                    origin = %layout.origin(),
+                    "seamless: the drawn layout places no screen for this machine — it belongs to \
+                     a different pairing; edge transfer is off"
+                );
+                println!(
+                    "Seamless edge transfer off: the drawn layout describes other machines. \
+                     Redraw it with `crossover layout` after pairing. Explicit control (`c` / \
+                     `r`) still works."
+                );
+                return None;
+            }
+            // A drawn arrangement can be replaced while the run is live —
+            // the peer draws one at the other desk and this machine adopts
+            // it — so the source reads the layout from a `watch` rather
+            // than capturing it, and the hub owns the sending half
+            // (ADR 0018).
+            let (sender, layouts) = watch::channel(LiveLayout {
+                publication: 0,
+                layout: layout.clone(),
+            });
+            publisher = Some(sender);
+            live_crossing_source(layouts, local)
+        }
     };
-    let topology = Topology::new(side);
-    let (edge_driver, edge_mode, crossings_rx) =
-        edge_detect(Arc::clone(display), topology, EDGE_POLL_INTERVAL);
-    let seamless = SeamlessInputs {
-        topology,
-        display: Arc::clone(display),
-        edge_mode,
+    // One derivation at startup, through the same source the detector
+    // re-derives with — so there is a single derivation path rather than a
+    // startup copy that could drift from it — and its result *is* the
+    // detector's initial map and the startup log's subject.
+    let live = match source.read(&**display) {
+        Ok(live) => live,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "seamless: the display would not enumerate its monitors; edge transfer is off"
+            );
+            println!(
+                "Seamless edge transfer off: the display could not be enumerated. Explicit \
+                 control (`c` / `r`) still works."
+            );
+            return None;
+        }
     };
-    (Some(seamless), Some((edge_driver, crossings_rx)))
+    let initial = source.derive_current(&live);
+    let map = Arc::clone(&initial.map);
+    let (edge_driver, edge_mode, crossings_rx) = edge_detect(
+        Arc::clone(display),
+        initial,
+        source.clone(),
+        EDGE_POLL_INTERVAL,
+    );
+    Some(Seamless {
+        inputs: SeamlessInputs {
+            crossings: source,
+            display: Arc::clone(display),
+            edge_mode,
+        },
+        map,
+        wiring: (edge_driver, crossings_rx),
+        publisher,
+    })
 }
 
 /// Run the edge detector and forward its crossings into the control driver
@@ -852,12 +1678,20 @@ fn spawn_edge_wiring(
     tokio::spawn(edge_driver.run());
     tokio::spawn(async move {
         while let Some(crossing) = crossings.recv().await {
+            // The generation rides along so the control driver can drop a
+            // crossing whose control state has since changed (ADR 0009).
+            // The crossing itself travels whole — destination, position and
+            // the revision it was derived under — because it is already
+            // everything a wire `EntryPoint` needs (ADR 0018); nothing on
+            // the way in re-derives or re-addresses it.
             let event = match crossing.kind {
                 CrossingKind::Leave => InputControlEvent::EdgeLeave {
-                    position: crossing.position,
+                    crossing: crossing.crossing,
+                    generation: crossing.generation,
                 },
                 CrossingKind::Return => InputControlEvent::EdgeReturn {
-                    position: crossing.position,
+                    crossing: crossing.crossing,
+                    generation: crossing.generation,
                 },
             };
             if control_events.send(event).await.is_err() {
@@ -867,10 +1701,25 @@ fn spawn_edge_wiring(
     });
 }
 
-/// Log the primary display's geometry and the configured seamless edge at
-/// startup (ADR 0009) — both structured (FR-7.3) and as a human line, so a
-/// soak report records the geometry each machine ran with.
-fn log_display_and_edge(display: &dyn DisplayInfo, side: Option<LinkSide>) {
+/// Log the primary display's geometry and the crossings the configured
+/// arrangement actually produces, at startup (ADR 0009, ADR 0018) — both
+/// structured (FR-7.3) and as a human line, so a soak report records what
+/// each machine ran with.
+///
+/// `map` is the arrangement **as derived against this machine's real
+/// screens**, or `None` when there is no arrangement or it could not be
+/// derived. That distinction is the point of logging the derived spans
+/// rather than the configuration: a `--left` run and a drawn layout used to
+/// print a side or a revision, neither of which says whether any seam
+/// exists. A layout naming a screen this machine no longer has produces no
+/// spans, and the difference between "seamless is configured" and "seamless
+/// can currently cross" is exactly what a report of a transfer that did not
+/// happen needs to settle.
+fn log_display_and_edge(
+    display: &dyn DisplayInfo,
+    layout_source: Option<&LayoutSource>,
+    map: Option<&CrossingMap>,
+) {
     let screen = match display.desktop_bounds() {
         Ok(screen) => screen,
         Err(error) => {
@@ -879,28 +1728,66 @@ fn log_display_and_edge(display: &dyn DisplayInfo, side: Option<LinkSide>) {
             return;
         }
     };
-    if let Some(side) = side {
-        let edge = Topology::new(side).linked_edge();
+    let Some(map) = map else {
+        // The console gets the same two-way split the log does, for a
+        // sharper reason than tidiness: when an arrangement *was*
+        // configured, `build_seamless` has already printed the specific
+        // reason it could not be applied — a display that would not
+        // enumerate, a layout belonging to another pairing. Following that
+        // with "draw an arrangement with `crossover layout`" tells a user
+        // who has one that they have none, contradicting the line directly
+        // above it. So the generic guidance prints only when there is
+        // genuinely nothing configured; otherwise the specific reason
+        // already on screen stands alone.
+        let reason = match layout_source {
+            None => "no arrangement is configured",
+            Some(_) => "the configured arrangement could not be applied",
+        };
         tracing::info!(
             width = screen.width,
             height = screen.height,
-            ?side,
-            linked_edge = ?edge,
-            "virtual desktop and seamless edge"
+            arrangement = layout_source.map_or("none".to_owned(), LayoutSource::summary),
+            "virtual desktop; seamless transfer disabled: {reason}"
         );
+        if layout_source.is_none() {
+            println!(
+                "Desktop: {}x{} (all monitors). Seamless edge transfer off — draw an \
+                 arrangement with `crossover layout`, or pass the deprecated --left/--right.",
+                screen.width, screen.height,
+            );
+        } else {
+            println!(
+                "Desktop: {}x{} (all monitors). Seamless edge transfer off — see the reason \
+                 above.",
+                screen.width, screen.height,
+            );
+        }
+        return;
+    };
+    let spans = map.describe_spans();
+    tracing::info!(
+        width = screen.width,
+        height = screen.height,
+        arrangement = layout_source.map_or("none".to_owned(), LayoutSource::summary),
+        revision = map.revision(),
+        crossings = spans,
+        span_count = map.span_count(),
+        "virtual desktop and the crossings this arrangement gives it"
+    );
+    if map.is_inert() {
         println!(
-            "Desktop: {}x{} (all monitors). Seamless: {side:?} screen, crossing on its {edge:?} edge.",
-            screen.width, screen.height,
+            "Desktop: {}x{} (all monitors). Seamless: {} is configured but no screen here \
+             crosses anywhere — {spans}.",
+            screen.width,
+            screen.height,
+            layout_source.map_or("an arrangement".to_owned(), LayoutSource::summary),
         );
     } else {
-        tracing::info!(
-            width = screen.width,
-            height = screen.height,
-            "virtual desktop; seamless transfer disabled"
-        );
         println!(
-            "Desktop: {}x{} (all monitors). Seamless edge transfer off (pass --left or --right).",
-            screen.width, screen.height,
+            "Desktop: {}x{} (all monitors). Seamless: {} crossing span(s) — {spans}.",
+            screen.width,
+            screen.height,
+            map.span_count(),
         );
     }
 }
@@ -1046,6 +1933,11 @@ struct SessionRoute {
     sink: FrameSink,
     kill: Option<watch::Sender<bool>>,
     peer_fingerprint: SpkiFingerprint,
+    /// Capabilities negotiated for this session (`SessionInfo::features`,
+    /// docs/PROTOCOL.md §3.1) — what `file_send_policy` reads to judge
+    /// `FILE_CLIPBOARD` the same way `file_receive_policy` reads the trust
+    /// store (ADR 0015).
+    features: FeatureFlags,
     /// When this session was established, so a session still live at
     /// shutdown can still report how long it lasted (`close_live_sessions`).
     established_at: Instant,
@@ -1164,6 +2056,116 @@ fn revoked_session_ids(live: &[(Uuid, SpkiFingerprint)], trust: &TrustStore) -> 
         .collect()
 }
 
+/// Fingerprints of every peer with a live session — everyone who could
+/// send this machine a file right now.
+fn live_peer_fingerprints(registry: &SessionRegistry) -> Vec<SpkiFingerprint> {
+    registry_lock(registry)
+        .values()
+        .map(|route| route.peer_fingerprint)
+        .collect()
+}
+
+/// Fingerprint plus negotiated features of every peer with a live
+/// session — everyone this machine could send a file *to* right now, and
+/// what each one's `Hello` said about receiving one (`file_send_policy`,
+/// ADR 0015).
+fn live_peer_sessions(registry: &SessionRegistry) -> Vec<(SpkiFingerprint, FeatureFlags)> {
+    registry_lock(registry)
+        .values()
+        .map(|route| (route.peer_fingerprint, route.features))
+        .collect()
+}
+
+/// Whether peer files may be received right now (ADR 0015).
+///
+/// Fail-closed at every step, and deliberately judged over **all** live
+/// peers rather than one: clipboard sync is session-agnostic (FR-5.4), so
+/// the engine cannot tell which peer an offer came from, and a permission
+/// that cannot be attributed must not be granted. With one peer — the
+/// two-machine scope — this is simply that peer's grant; with two, an
+/// ungranted peer closes the door for both, which is the honest answer
+/// until the clipboard engine becomes session-aware.
+///
+/// A store that will not load is `Denied` rather than an error: the
+/// revocation poll has the same policy, and a transient read failure must
+/// never *open* a write surface.
+fn file_receive_policy(
+    spool_open: bool,
+    storage: &dyn SecureStorage,
+    live: &[SpkiFingerprint],
+) -> FileReceive {
+    if !spool_open {
+        return FileReceive::Unsupported;
+    }
+    if live.is_empty() {
+        return FileReceive::Denied;
+    }
+    let Ok(trust) = TrustStore::load(storage) else {
+        return FileReceive::Denied;
+    };
+    let granted = live.iter().all(|fingerprint| {
+        trust
+            .find_by_fingerprint(*fingerprint)
+            .is_some_and(TrustedPeer::may_receive_files)
+    });
+    if granted {
+        FileReceive::Allowed
+    } else {
+        FileReceive::Denied
+    }
+}
+
+/// Whether local files may be sent to the peer right now (ADR 0015) — the
+/// mirror of [`file_receive_policy`], judged from the same two inputs the
+/// engine's `FileSend` gate needs: what each live session's `Hello`
+/// negotiated, and what the trust store currently grants.
+///
+/// `NotNegotiated` unless **every** live session's `Hello` intersection
+/// contains `FILE_CLIPBOARD` — an offer built for a peer that never
+/// advertised it would be a content type its session cannot decode
+/// (docs/PROTOCOL.md §3.1), so this has to fail closed the same way an
+/// un-negotiated peer does for receiving. `Denied` unless every live peer
+/// also holds `clipboard_send`; otherwise `Allowed`. Judged over **all**
+/// live peers for the same session-agnostic reason `file_receive_policy`
+/// is: the engine cannot address one selection at one peer, so a peer
+/// that cannot take a file closes the door for everyone until the engine
+/// becomes session-aware.
+///
+/// A store that will not load is `Denied` rather than an error, matching
+/// its twin: a transient read failure must never *open* a send surface.
+///
+/// This does not need to know whether a blob builder is wired — the
+/// driver clamps to `FileSend::Unsupported` itself when none is
+/// (`clipboard_driver`'s handling of `SyncEvent::FileSendPolicy`), so this
+/// function only ever answers the negotiation and permission question.
+fn file_send_policy(
+    storage: &dyn SecureStorage,
+    live: &[(SpkiFingerprint, FeatureFlags)],
+) -> FileSend {
+    if live.is_empty() {
+        return FileSend::Denied;
+    }
+    if !live
+        .iter()
+        .all(|(_, features)| features.contains(FeatureFlags::FILE_CLIPBOARD))
+    {
+        return FileSend::NotNegotiated;
+    }
+    let Ok(trust) = TrustStore::load(storage) else {
+        return FileSend::Denied;
+    };
+    let granted = live.iter().all(|(fingerprint, _)| {
+        trust
+            .find_by_fingerprint(*fingerprint)
+            .is_some_and(|peer| peer.permissions().clipboard_send)
+    });
+    if granted {
+        FileSend::Allowed
+    } else {
+        FileSend::Denied
+    }
+}
+
 /// Terminate one session on revocation: fire an inbound session's kill
 /// switch, or shut the outbound supervisor down (its one peer is now
 /// untrusted, so stopping reconnection to it is correct). The normal
@@ -1179,12 +2181,26 @@ fn terminate_on_revocation(route: &SessionRoute) {
     }
 }
 
-/// Enforce revocation on *active* sessions (ADR 0010): periodically reload
-/// the trust store and terminate any live session whose peer is no longer
-/// trusted. New connections are already rejected by the per-accept/attempt
-/// trust read; this closes the active-session half of SECURITY.md §4 / T6.
+/// Act on trust-store changes made while the process runs. Two jobs, one
+/// re-read, because they are the same question asked of the same file.
+///
+/// **Revocation on *active* sessions** (ADR 0010): terminate any live
+/// session whose peer is no longer trusted. New connections are already
+/// rejected by the per-accept/attempt trust read; this closes the
+/// active-session half of SECURITY.md §4 / T6.
+///
+/// **File receive and file send** (ADR 0015): `crossover peers deny-files`
+/// runs in another process, and so does whatever edits `clipboard_send`,
+/// so withdrawing either grant reaches a running worker here — within one
+/// poll, and without waiting for a reconnect.
+///
 /// Never returns — runs as a branch of the foreground select.
-async fn enforce_revocations(storage: &Arc<dyn SecureStorage>, registry: &SessionRegistry) {
+async fn apply_trust_changes(
+    storage: &Arc<dyn SecureStorage>,
+    registry: &SessionRegistry,
+    sync: &mpsc::Sender<SyncEvent>,
+    spool_open: bool,
+) {
     let mut ticker = tokio::time::interval(REVOCATION_POLL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1202,6 +2218,21 @@ async fn enforce_revocations(storage: &Arc<dyn SecureStorage>, registry: &Sessio
             .iter()
             .map(|(id, route)| (*id, route.peer_fingerprint))
             .collect();
+        let fingerprints: Vec<SpkiFingerprint> =
+            live.iter().map(|(_, fingerprint)| *fingerprint).collect();
+        let _ = sync
+            .send(SyncEvent::FileReceivePolicy(file_receive_policy(
+                spool_open,
+                &**storage,
+                &fingerprints,
+            )))
+            .await;
+        let sessions = live_peer_sessions(registry);
+        let _ = sync
+            .send(SyncEvent::FileSendPolicy(file_send_policy(
+                &**storage, &sessions,
+            )))
+            .await;
         for id in revoked_session_ids(&live, &trust) {
             // Remove and terminate under the same intent; the session's own
             // teardown also removes by id (a harmless no-op) and fans out
@@ -1209,6 +2240,157 @@ async fn enforce_revocations(storage: &Arc<dyn SecureStorage>, registry: &Sessio
             if let Some(route) = registry_lock(registry).remove(&id) {
                 tracing::warn!(session = %id, "peer revoked; terminating active session");
                 terminate_on_revocation(&route);
+            }
+        }
+    }
+}
+
+/// Is `signature`'s modification time recent enough that a poll interval's
+/// worth of mtime-granularity coarseness could hide a second edit behind
+/// it?
+///
+/// Some filesystems — network shares in particular — report a
+/// modification time coarser than [`CONFIG_POLL`]: two saves landing
+/// inside one such tick can carry the exact same `(mtime, len)` signature
+/// [`crate::config::config_signature_at`] reads, which would otherwise
+/// look unchanged forever. Forcing a re-read whenever the observed mtime
+/// is still within one poll interval of *now* — every tick, for as long as
+/// that holds — costs at most one redundant reload per recent edit, which
+/// is cheap next to silently missing one.
+fn config_recently_modified(signature: Option<(SystemTime, u64)>, now: SystemTime) -> bool {
+    let Some((modified, _)) = signature else {
+        return false;
+    };
+    now.duration_since(modified)
+        .is_ok_and(|age| age < CONFIG_POLL)
+}
+
+/// Re-read `config.toml` on a ~2 s modification-time poll (ADR 0018) — the
+/// mtime-gated shape beside [`apply_trust_changes`]'s unconditional reload,
+/// because a re-validation here is worth skipping when nothing changed and
+/// a revocation check is not.
+///
+/// `config.initial_signature` seeds the baseline this poll compares
+/// against — see [`ConfigWatch`] for why it is captured early rather than
+/// read fresh when this task starts.
+///
+/// # What this does *not* do: write the layout
+///
+/// It offers what it reads to the layout-sync hub and stops there. The hub
+/// owns the state file's `layout` field, and it must, because the config
+/// file is allowed to lag: a rate-bounded adoption publishes immediately
+/// and writes seconds later (ADR 0018), so during that window this poll can
+/// read a revision *older* than the run is crossing by. Reporting that
+/// would put an arrangement the worker is not using in front of the editor,
+/// and the editor numbers its next save one past everything both files have
+/// seen — so a rolled-back report would let a save claim a revision this
+/// machine had already adopted. The hub resolves instead, and reports only
+/// what it actually holds.
+///
+/// # Two guards, both load-bearing
+///
+/// Mirroring `config`'s own module docs for the same failure at startup: a
+/// file that fails to parse, or whose `[layout]` fails structural
+/// validation, **keeps the last good state** and only warns *once* per
+/// failure streak — an editor caught mid-save (a half-written temp file, a
+/// not-yet-corrected typo) must never make the worker discard what it
+/// already knows, and must not spam the log on every subsequent tick while
+/// the file stays broken.
+///
+/// And `last_offered` gates the hand-off: only a layout that differs from
+/// the one last offered is offered again. The mtime poll already re-reads
+/// on every touch of the file, and `config_recently_modified` re-reads on
+/// *every tick* while the file is fresh, so without this a single save
+/// would be offered several times over. The hub would answer
+/// `Identical` each time and do nothing, but a queue nobody needed to fill
+/// is still a queue filled.
+///
+/// `writer` is `None` when no home directory was resolvable at startup
+/// (`run`'s own warning covers that case): this task then has no heartbeat
+/// to keep and simply never completes, the same as every other
+/// never-ending branch of `run`'s foreground select.
+///
+/// Never returns — runs as a branch of the foreground select, mirroring
+/// [`apply_trust_changes`].
+async fn apply_config_changes(
+    config: ConfigWatch,
+    writer: Option<Arc<TopologyStateWriter>>,
+    layout_changed: Option<mpsc::Sender<TopologyEvent>>,
+) {
+    let Some(writer) = writer else {
+        loop {
+            std::future::pending::<()>().await;
+        }
+    };
+    let config_path = config.path;
+
+    let mut ticker = tokio::time::interval(CONFIG_POLL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_signature = config.initial_signature;
+    // Warn once per failure streak, not once per tick: `warned` resets the
+    // moment a read succeeds again.
+    let mut warned = false;
+    // What was last handed to the hub, so one save is offered once.
+    let mut last_offered: Option<Layout> = None;
+    loop {
+        ticker.tick().await;
+        writer.heartbeat();
+
+        let now = SystemTime::now();
+        let signature = crate::config::config_signature_at(config_path.as_deref());
+        if signature == last_signature && !config_recently_modified(signature, now) {
+            continue;
+        }
+        last_signature = signature;
+
+        match crate::config::load_run_config_at(config_path.as_deref()) {
+            Ok(loaded) => match loaded.layout {
+                Ok(layout) => {
+                    warned = false;
+                    if last_offered == layout {
+                        continue;
+                    }
+                    last_offered.clone_from(&layout);
+                    let Some(layout) = layout else {
+                        // The file no longer names an arrangement. Nothing
+                        // is offered: "stop crossing" is not something the
+                        // resolver can express, and a run mid-session must
+                        // not lose its crossings to a file edit it cannot
+                        // resolve. It takes effect at the next start.
+                        tracing::info!(
+                            "topology: the config file no longer names an arrangement; this                              run keeps the one it is using until it restarts"
+                        );
+                        continue;
+                    };
+                    tracing::info!(
+                        revision = layout.revision(),
+                        origin = %layout.origin(),
+                        "topology: config re-read picked up a changed layout"
+                    );
+                    if let Some(sender) = layout_changed.as_ref() {
+                        let _ = sender
+                            .send(TopologyEvent::LocalLayoutEdited(Box::new(layout)))
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    if !warned {
+                        tracing::warn!(
+                            error = %error,
+                            "topology: config re-read has an invalid [layout]; keeping the                              last good one"
+                        );
+                        warned = true;
+                    }
+                }
+            },
+            Err(error) => {
+                if !warned {
+                    tracing::warn!(
+                        error = %error,
+                        "topology: config re-read failed; keeping the last good configuration"
+                    );
+                    warned = true;
+                }
             }
         }
     }
@@ -1333,6 +2515,9 @@ async fn dispatch_command(
     }
 }
 
+// Composition-root wiring: every argument is a distinct collaborator the run
+// loop already owns, and bundling them into a struct would only move the list.
+#[allow(clippy::too_many_arguments)]
 async fn listener_loop(
     listener: Option<&SessionListener>,
     identity: &DeviceIdentity,
@@ -1341,12 +2526,17 @@ async fn listener_loop(
     fanout: &SessionFanout,
     registry: &SessionRegistry,
     metrics: &Arc<Metrics>,
+    link_probe: &Arc<dyn crossover_platform::LinkStateProbe>,
 ) {
     let Some(listener) = listener else {
         return std::future::pending().await;
     };
     let options = SessionOptions {
         metrics: Some(Arc::clone(metrics)),
+        // The inbound role needs the same diagnostic as the outbound one:
+        // a dropped local wire ends both directions at once, and the
+        // listener's log was just as misleading during the incident.
+        link_probe: Some(Arc::clone(link_probe)),
         ..SessionOptions::default()
     };
     let keepalive = KeepaliveConfig::default();
@@ -1387,10 +2577,11 @@ async fn listener_loop(
                         sink: FrameSink::Inbound(outbound_tx),
                         kill: Some(shutdown_tx),
                         peer_fingerprint: info.peer_fingerprint,
+                        features: info.features,
                         established_at,
                     },
                 );
-                fanout.established(session_id).await;
+                fanout.established(&info).await;
 
                 let frame_sink = fanout.clone();
                 let drain = tokio::spawn(async move {
@@ -1469,12 +2660,13 @@ async fn outbound_event_loop(
                             sink: FrameSink::Outbound(Arc::clone(handle)),
                             kill: None,
                             peer_fingerprint: info.peer_fingerprint,
+                            features: info.features,
                             // Set just above, when the session came up.
                             established_at: established_at.unwrap_or_else(Instant::now),
                         },
                     );
                 }
-                fanout.established(info.session_id).await;
+                fanout.established(&info).await;
             }
             SessionEvent::Disconnected {
                 session_id,
@@ -1598,7 +2790,225 @@ mod tests {
     use crossover_protocol::hello::MessageType;
     use crossover_security::{CertifiedIdentity, DeviceIdentity, TrustStore, TrustedPeer};
 
-    use super::{SessionRegistry, age, registry_lock, revoked_session_ids};
+    use super::{SessionRegistry, TopologyEvent, age, registry_lock, revoked_session_ids};
+
+    /// A `--left` run must not start depending on what the platform can
+    /// *name*. The side model picks its crossing edge by position and
+    /// reports an unaddressed destination, so a screen the OS declines to
+    /// name — a USB display adapter, say — and two screens reporting one
+    /// device string are both ordinary hardware here, not refusals. The one
+    /// thing that does turn seamless off is a display that will not
+    /// enumerate at all, and even that is a log rather than a panic.
+    #[test]
+    fn the_implicit_path_needs_geometry_and_never_identity() {
+        use crossover_platform::fakes::FakeDisplay;
+        use crossover_platform::{DisplayInfo, MonitorInfo, MonitorRect, Screen};
+        use crossover_topology::DeviceId;
+
+        use super::{LayoutSource, build_seamless};
+        use crossover_core::LinkSide;
+
+        const LOCAL: DeviceId = DeviceId::from_bytes([0x11; 16]);
+        let implicit = LayoutSource::Implicit(LinkSide::Left);
+        let rect = |left: i32| MonitorRect {
+            left,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let display = Arc::new(FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        }));
+        let handle = Arc::clone(&display) as Arc<dyn DisplayInfo>;
+
+        // Named, unnamed, and two screens claiming one device string: all
+        // three are geometry the side model can cross on.
+        let layouts = [
+            vec![MonitorInfo {
+                id: Some("NAMED".to_owned()),
+                rect: rect(0),
+            }],
+            vec![MonitorInfo {
+                id: None,
+                rect: rect(0),
+            }],
+            vec![
+                MonitorInfo {
+                    id: Some("DUP".to_owned()),
+                    rect: rect(0),
+                },
+                MonitorInfo {
+                    id: Some("DUP".to_owned()),
+                    rect: rect(1920),
+                },
+            ],
+        ];
+        for layout in layouts {
+            display.set_monitor_layout(layout.clone());
+            let seamless = build_seamless(Some(&implicit), LOCAL, &handle)
+                .unwrap_or_else(|| panic!("identity decided whether seamless ran, for {layout:?}"));
+            assert!(
+                !seamless.map.is_inert(),
+                "the side model found no crossing at all, for {layout:?}"
+            );
+            // Whatever the platform named, an implicit arrangement reports
+            // nothing: no device, no monitor, revision 0.
+            assert_eq!(seamless.map.revision(), 0);
+            for span in seamless.map.spans() {
+                assert_eq!(span.target().device, None);
+                assert_eq!(span.target().monitor, None);
+            }
+        }
+
+        // A display that will not enumerate at all is the one refusal.
+        display.fail_with("no display");
+        assert!(build_seamless(Some(&implicit), LOCAL, &handle).is_none());
+
+        // And no layout at all stays off, as it always did.
+        display.clear_failure();
+        assert!(build_seamless(None, LOCAL, &handle).is_none());
+    }
+
+    /// A **drawn** layout drives crossings, which is what this branch
+    /// turned on: `build_seamless` builds an identified source from it, the
+    /// derived map names the peer's real screens, and it carries the
+    /// layout's own revision onto every crossing.
+    ///
+    /// The test that used to stand here asserted the opposite — that an
+    /// explicit layout was *not* driven and printed a "not yet" line. Its
+    /// intent (an explicit layout must not be silently flattened back to a
+    /// side) is preserved by asserting what the spans actually say.
+    #[test]
+    fn a_drawn_layout_drives_crossings() {
+        use crossover_platform::fakes::FakeDisplay;
+        use crossover_platform::{DisplayInfo, MonitorInfo, MonitorRect, Screen};
+        use crossover_topology::{
+            DeviceId, DevicePair, Layout, LayoutRect, MonitorId, PlacedMonitor,
+        };
+
+        use super::{LayoutSource, build_seamless};
+
+        const LOCAL: DeviceId = DeviceId::from_bytes([0x11; 16]);
+        const PEER: DeviceId = DeviceId::from_bytes([0x22; 16]);
+        const REVISION: u64 = 9;
+
+        let placed = |device: DeviceId, id: &str, x: i32| PlacedMonitor {
+            device,
+            id: MonitorId::new(id).unwrap(),
+            rect: LayoutRect {
+                x,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        };
+        let pair = DevicePair::new(LOCAL, PEER).unwrap();
+        let layout = Layout::new(
+            REVISION,
+            LOCAL,
+            vec![placed(LOCAL, "MINE", 0), placed(PEER, "THEIRS", 1920)],
+            &pair,
+        )
+        .unwrap();
+
+        let display = Arc::new(FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        }));
+        display.set_monitor_layout(vec![MonitorInfo {
+            id: Some("MINE".to_owned()),
+            rect: MonitorRect {
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+        }]);
+        let handle = Arc::clone(&display) as Arc<dyn DisplayInfo>;
+
+        let source = LayoutSource::Explicit(layout.clone());
+        let seamless =
+            build_seamless(Some(&source), LOCAL, &handle).expect("a drawn layout must drive");
+        assert_eq!(seamless.map.revision(), REVISION);
+        assert_eq!(seamless.map.span_count(), 1);
+        let span = &seamless.map.spans()[0];
+        assert_eq!(span.target().device, Some(PEER));
+        assert_eq!(
+            span.target().monitor.as_ref().map(MonitorId::as_str),
+            Some("THEIRS")
+        );
+        // Receiver's terms: the span sits on this machine's `Right` edge
+        // and the cursor arrives on the peer's `Left`.
+        assert_eq!(span.edge(), crossover_core::Edge::Right);
+        assert_eq!(span.target().edge, crossover_core::Edge::Left);
+
+        // A screen this machine no longer has is not a refusal: the
+        // arrangement stands, it simply gives no crossings, and the log
+        // line says so rather than the run failing.
+        display.set_monitor_layout(vec![MonitorInfo {
+            id: Some("SOMETHING-ELSE".to_owned()),
+            rect: MonitorRect {
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+        }]);
+        let seamless =
+            build_seamless(Some(&source), LOCAL, &handle).expect("still a configured arrangement");
+        assert!(seamless.map.is_inert());
+    }
+
+    /// The stale-device rule at this branch's stage (ADR 0018): a drawn
+    /// layout that places no screen for *this* machine is the residue of a
+    /// previous pairing, so seamless stays off rather than crossing by an
+    /// arrangement that describes other desks. The full pair check needs
+    /// the peer's identity and lands with layout sync.
+    #[test]
+    fn a_layout_naming_other_machines_turns_seamless_off() {
+        use crossover_platform::fakes::FakeDisplay;
+        use crossover_platform::{DisplayInfo, Screen};
+        use crossover_topology::{
+            DeviceId, DevicePair, Layout, LayoutRect, MonitorId, PlacedMonitor,
+        };
+
+        use super::{LayoutSource, build_seamless};
+
+        const LOCAL: DeviceId = DeviceId::from_bytes([0x11; 16]);
+        const STRANGER_A: DeviceId = DeviceId::from_bytes([0x33; 16]);
+        const STRANGER_B: DeviceId = DeviceId::from_bytes([0x44; 16]);
+
+        let placed = |device: DeviceId, id: &str, x: i32| PlacedMonitor {
+            device,
+            id: MonitorId::new(id).unwrap(),
+            rect: LayoutRect {
+                x,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        };
+        // A perfectly valid layout — of two machines that are not this one.
+        let pair = DevicePair::new(STRANGER_A, STRANGER_B).unwrap();
+        let layout = Layout::new(
+            3,
+            STRANGER_A,
+            vec![placed(STRANGER_A, "A", 0), placed(STRANGER_B, "B", 1920)],
+            &pair,
+        )
+        .unwrap();
+
+        let display = Arc::new(FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        }));
+        let handle = Arc::clone(&display) as Arc<dyn DisplayInfo>;
+        assert!(
+            build_seamless(Some(&LayoutSource::Explicit(layout)), LOCAL, &handle).is_none(),
+            "a layout from a previous pairing must not drive crossings"
+        );
+    }
 
     #[test]
     fn revoked_sessions_are_those_whose_peer_left_the_trust_store() {
@@ -1697,6 +3107,7 @@ mod tests {
                 sink: FrameSink::Inbound(sink),
                 kill: Some(kill_tx),
                 peer_fingerprint: certified.fingerprint(),
+                features: crossover_protocol::hello::FeatureFlags::NONE,
                 established_at: Instant::now(),
             },
         )])));
@@ -1705,7 +3116,7 @@ mod tests {
         let (control, control_rx) = command_lanes();
         spawn_command_mux(
             Arc::clone(&registry),
-            merge_command_lanes(clipboard_rx, control_rx),
+            merge_command_lanes([clipboard_rx, control_rx]),
             None,
         );
 
@@ -1891,6 +3302,7 @@ mod tests {
                 sink: FrameSink::Inbound(sink),
                 kill: None,
                 peer_fingerprint: certified.fingerprint(),
+                features: crossover_protocol::hello::FeatureFlags::NONE,
                 established_at: Instant::now()
                     .checked_sub(Duration::from_secs(90))
                     .expect("90s before now is representable"),
@@ -1999,7 +3411,16 @@ mod tests {
         let fanout = SessionFanout {
             sync: sync_tx,
             control: control_tx,
+            // Nothing in this test is about display topology; the hub's
+            // queue exists so the fanout is whole, and is never read.
+            topology: tokio::sync::mpsc::channel(4).0,
             metrics: None,
+            // No peer is trusted in this rig, so the file-receive policy
+            // it publishes is the closed one — which is all this test
+            // needs from it, since it is about teardown, not files.
+            storage: Arc::new(crossover_platform::fakes::InMemorySecureStorage::new()),
+            registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            spool_open: false,
         };
 
         // The clipboard driver, in miniature: a serial loop that turns each
@@ -2092,7 +3513,16 @@ mod tests {
         let fanout = SessionFanout {
             sync: sync_tx,
             control: control_tx,
+            // Nothing in this test is about display topology; the hub's
+            // queue exists so the fanout is whole, and is never read.
+            topology: tokio::sync::mpsc::channel(4).0,
             metrics: None,
+            // No peer is trusted in this rig, so the file-receive policy
+            // it publishes is the closed one — which is all this test
+            // needs from it, since it is about teardown, not files.
+            storage: Arc::new(crossover_platform::fakes::InMemorySecureStorage::new()),
+            registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            spool_open: false,
         };
 
         // Back the clipboard driver's channel right up; nothing drains it.
@@ -2124,6 +3554,392 @@ mod tests {
         lost.abort();
     }
 
+    /// A stand-in fanout over shallow channels, for the inbound-routing
+    /// tests. Nothing in them touches the trust store or the registry, so
+    /// both are empty.
+    fn routing_fanout(
+        sync: tokio::sync::mpsc::Sender<crossover_core::SyncEvent>,
+        control: tokio::sync::mpsc::Sender<crossover_core::InputControlEvent>,
+        topology: tokio::sync::mpsc::Sender<super::TopologyEvent>,
+    ) -> super::SessionFanout {
+        super::SessionFanout {
+            sync,
+            control,
+            topology,
+            metrics: None,
+            storage: Arc::new(crossover_platform::fakes::InMemorySecureStorage::new()),
+            registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            spool_open: false,
+        }
+    }
+
+    fn raw(message_type: MessageType, payload: Vec<u8>) -> crossover_protocol::RawFrame {
+        crossover_protocol::RawFrame {
+            message_type: message_type.wire(),
+            message_id: 1,
+            payload,
+        }
+    }
+
+    /// Let the runtime settle: a bounded number of polls, so a test that
+    /// depends on something *not* completing cannot pass by being slow.
+    async fn settle() {
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The inbound head-of-line block behind the 2026-08-19 incident: every
+    /// frame used to be broadcast to *both* drivers and awaited on both, so
+    /// an inbound `ControlRequest` waited on the clipboard driver's queue —
+    /// which then discarded it. With a saturated bulk path that wait was
+    /// 4.7 s on hardware. Routing by message type means a control frame
+    /// never touches the bulk path at all.
+    #[tokio::test]
+    async fn an_inbound_control_frame_is_not_gated_on_a_saturated_clipboard_queue() {
+        use crossover_core::{InputControlEvent, SyncEvent};
+
+        let (sync_tx, _sync_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(16);
+        let (topology_tx, _topology_rx) = tokio::sync::mpsc::channel(4);
+        let fanout = routing_fanout(sync_tx, control_tx, topology_tx);
+        let session = Uuid::from_bytes([0x5A; 16]);
+
+        // Back the clipboard driver's queue right up and park a bulk frame
+        // against it: the state the incident's machine was in.
+        while fanout.sync.try_send(SyncEvent::LocalChanged).is_ok() {}
+        let bulk = {
+            let fanout = fanout.clone();
+            tokio::spawn(async move {
+                fanout
+                    .frame(session, raw(MessageType::ClipboardChunk, vec![0xBB; 64]))
+                    .await;
+            })
+        };
+        settle().await;
+        assert!(
+            !bulk.is_finished(),
+            "the clipboard queue drained; this test no longer saturates the bulk path"
+        );
+
+        // The control request arrives next. It must be handed to the control
+        // driver and the call must *return* — a fanout that waits on the bulk
+        // queue here stalls every frame behind this one.
+        let answered = {
+            let fanout = fanout.clone();
+            tokio::spawn(async move {
+                fanout
+                    .frame(session, raw(MessageType::ControlRequest, vec![0x01, 0x00]))
+                    .await;
+            })
+        };
+        settle().await;
+        assert!(
+            answered.is_finished(),
+            "an inbound control frame waited on the saturated clipboard queue"
+        );
+
+        let event = control_rx
+            .try_recv()
+            .expect("the control request never reached the control driver");
+        assert!(matches!(
+            event,
+            InputControlEvent::Frame { frame, .. }
+                if frame.message_type == MessageType::ControlRequest.wire()
+        ));
+        // And the bulk frame was never copied to the control driver.
+        assert!(
+            control_rx.try_recv().is_err(),
+            "a clipboard frame was delivered to the control driver"
+        );
+        bulk.abort();
+    }
+
+    /// Routing is total and by class: clipboard traffic reaches only the
+    /// sync driver, input and control traffic only the control driver, and
+    /// same-driver order is exactly the arrival order.
+    #[tokio::test]
+    async fn inbound_frames_route_to_one_driver_in_arrival_order() {
+        use crossover_core::{InputControlEvent, SyncEvent};
+
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(32);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(32);
+        let (topology_tx, mut topology_rx) = tokio::sync::mpsc::channel(32);
+        let fanout = routing_fanout(sync_tx, control_tx, topology_tx);
+        let session = Uuid::from_bytes([0x5B; 16]);
+
+        let bulk = [
+            MessageType::ClipboardOffer,
+            MessageType::ClipboardAccept,
+            MessageType::ClipboardDecline,
+            MessageType::ClipboardChunk,
+            MessageType::ClipboardData,
+            MessageType::ClipboardApplied,
+        ];
+        let interactive = [
+            MessageType::InputBatch,
+            MessageType::ReleaseAllInput,
+            MessageType::ControlRequest,
+            MessageType::ControlResponse,
+            MessageType::ControlRelease,
+        ];
+        for message_type in bulk.into_iter().chain(interactive) {
+            fanout.frame(session, raw(message_type, vec![0x00])).await;
+        }
+
+        for expected in bulk {
+            let Some(SyncEvent::Frame(frame)) = sync_rx.try_recv().ok() else {
+                panic!("{expected:?} did not reach the sync driver in order");
+            };
+            assert_eq!(frame.message_type, expected.wire());
+        }
+        assert!(sync_rx.try_recv().is_err(), "interactive traffic leaked");
+
+        for expected in interactive {
+            let Some(InputControlEvent::Frame { frame, .. }) = control_rx.try_recv().ok() else {
+                panic!("{expected:?} did not reach the control driver in order");
+            };
+            assert_eq!(frame.message_type, expected.wire());
+        }
+        assert!(control_rx.try_recv().is_err(), "bulk traffic leaked");
+        assert!(
+            topology_rx.try_recv().is_err(),
+            "driver traffic reached the topology hub"
+        );
+    }
+
+    /// A message type this build does not know keeps its old behavior — both
+    /// drivers see it (each ignores it) — rather than being silently dropped
+    /// by a classification that only knows the types it was written for.
+    #[tokio::test]
+    async fn an_unknown_message_type_still_reaches_both_drivers() {
+        use crossover_core::{InputControlEvent, SyncEvent};
+
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        let (topology_tx, _topology_rx) = tokio::sync::mpsc::channel(4);
+        let fanout = routing_fanout(sync_tx, control_tx, topology_tx);
+
+        fanout
+            .frame(
+                Uuid::from_bytes([0x5C; 16]),
+                crossover_protocol::RawFrame {
+                    message_type: 0x7777,
+                    message_id: 1,
+                    payload: vec![0xEE],
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            sync_rx.try_recv(),
+            Ok(SyncEvent::Frame(frame)) if frame.message_type == 0x7777
+        ));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(InputControlEvent::Frame { frame, .. }) if frame.message_type == 0x7777
+        ));
+    }
+
+    /// Display topology has exactly one owner (ADR 0018): both message
+    /// types reach the layout-sync hub and **neither** driver, malformed
+    /// or not.
+    ///
+    /// Decoding moved with the routing. This used to decode here and throw
+    /// the value away, because there was no engine to hand it to; there is
+    /// one now, and it owns the decode — which is what lets a malformed
+    /// frame terminate the session through the ordinary
+    /// `SessionCommand::TerminateSession` path every other driver uses for
+    /// its own payload violations, instead of reaching into the registry
+    /// from the fanout. The hub's own tests
+    /// (`crate::topology_sync`) cover both outcomes.
+    #[tokio::test]
+    async fn topology_frames_reach_the_layout_sync_hub_and_no_driver() {
+        use crossover_protocol::layout::{LayoutSync, MonitorReport, MonitorTopology};
+        use crossover_topology::{DeviceId, LayoutRect, MonitorId, PlacedMonitor};
+
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(4);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        let (topology_tx, mut topology_rx) = tokio::sync::mpsc::channel(8);
+        let fanout = routing_fanout(sync_tx, control_tx, topology_tx);
+        let session = Uuid::from_bytes([0x5D; 16]);
+
+        let rect = LayoutRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let topology = MonitorTopology {
+            monitors: vec![MonitorReport {
+                id: MonitorId::new("A").unwrap(),
+                rect,
+                scale_percent: 100,
+                label: None,
+                physical_size: None,
+            }],
+        };
+        let layout = LayoutSync {
+            revision: 1,
+            origin: DeviceId::from_bytes([0x11; 16]),
+            monitors: vec![
+                PlacedMonitor {
+                    device: DeviceId::from_bytes([0x11; 16]),
+                    id: MonitorId::new("A").unwrap(),
+                    rect,
+                },
+                PlacedMonitor {
+                    device: DeviceId::from_bytes([0x22; 16]),
+                    id: MonitorId::new("B").unwrap(),
+                    rect: LayoutRect { x: 100, ..rect },
+                },
+            ],
+        };
+
+        // Well-formed, and deliberately malformed: both are the hub's, so
+        // the routing decision cannot depend on the payload.
+        let deliveries = [
+            (
+                MessageType::MonitorTopology,
+                topology.encode_payload().unwrap(),
+            ),
+            (MessageType::LayoutSync, layout.encode_payload().unwrap()),
+            (MessageType::MonitorTopology, vec![0xFF; 8]),
+            (MessageType::LayoutSync, vec![0xFF; 8]),
+        ];
+        for (message_type, payload) in &deliveries {
+            fanout
+                .frame(session, raw(*message_type, payload.clone()))
+                .await;
+        }
+
+        for (message_type, payload) in &deliveries {
+            let Some(TopologyEvent::Frame { session: id, frame }) = topology_rx.try_recv().ok()
+            else {
+                panic!("{message_type:?} did not reach the topology hub in order");
+            };
+            assert_eq!(id, session);
+            assert_eq!(frame.message_type, message_type.wire());
+            assert_eq!(&frame.payload, payload);
+        }
+        assert!(
+            sync_rx.try_recv().is_err(),
+            "a topology frame reached the sync driver"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "a topology frame reached the control driver"
+        );
+    }
+
+    /// The config poll, end to end (ADR 0018): a save lands in the file,
+    /// the poll notices, and the layout goes **to the hub** — while the
+    /// state file's own `layout` field is left strictly alone, because the
+    /// hub owns it (see `apply_config_changes`'s docs for why that
+    /// ownership is load-bearing rather than tidy).
+    ///
+    /// A paused clock for the 2 s poll, against a real file: the timing is
+    /// what is being tested, the filesystem is not being simulated.
+    #[tokio::test(start_paused = true)]
+    async fn the_config_poll_offers_a_changed_layout_to_the_hub_and_writes_no_layout_itself() {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use crossover_platform::Screen;
+        use crossover_platform::fakes::FakeDisplay;
+        use crossover_topology::DeviceId;
+
+        use super::{ConfigWatch, apply_config_changes};
+        use crate::topology_state::{TopologyStateWriter, initial_state};
+        use crate::topology_sync::TopologyEvent;
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        const LOCAL: &str = "11111111-1111-1111-1111-111111111111";
+        const PEER: &str = "22222222-2222-2222-2222-222222222222";
+
+        let dir: PathBuf = std::env::temp_dir().join(format!(
+            "crossover-config-poll-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("sandbox");
+        let config = dir.join("config.toml");
+        let display = FakeDisplay::new(Screen {
+            width: 1920,
+            height: 1080,
+        });
+        let writer = Arc::new(TopologyStateWriter::start(
+            dir.join("topology.json"),
+            initial_state(
+                DeviceId::from_bytes([0x11; 16]),
+                "a".to_owned(),
+                &display,
+                None,
+            ),
+        ));
+        let (topology_tx, mut topology_rx) = tokio::sync::mpsc::channel(8);
+
+        let poll = tokio::spawn(apply_config_changes(
+            ConfigWatch {
+                path: Some(config.clone()),
+                initial_signature: None,
+            },
+            Some(Arc::clone(&writer)),
+            Some(topology_tx),
+        ));
+
+        // The editor saves an arrangement.
+        std::fs::write(
+            &config,
+            format!(
+                "schema_version = 2\n\n[layout]\nrevision = 4\norigin = \"{LOCAL}\"\n\n\
+                 [[layout.monitor]]\ndevice = \"{LOCAL}\"\nid = \"A\"\nx = 0\ny = 0\n\
+                 width = 100\nheight = 100\n\n\
+                 [[layout.monitor]]\ndevice = \"{PEER}\"\nid = \"B\"\nx = 100\ny = 0\n\
+                 width = 100\nheight = 100\n"
+            ),
+        )
+        .unwrap();
+
+        // Two ticks' worth: one to notice, and slack for the mtime read.
+        tokio::time::advance(super::CONFIG_POLL * 3).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        let offered = topology_rx
+            .try_recv()
+            .expect("the changed layout never reached the hub");
+        let TopologyEvent::LocalLayoutEdited(layout) = offered else {
+            panic!("the poll offered something other than a layout: {offered:?}");
+        };
+        assert_eq!(layout.revision(), 4);
+
+        // One save, one offer: the poll re-reads on every tick while the
+        // file is fresh, and `last_offered` is what keeps that from
+        // becoming a queue of duplicates.
+        tokio::time::advance(super::CONFIG_POLL * 3).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            topology_rx.try_recv().is_err(),
+            "one save was offered to the hub more than once"
+        );
+
+        // And the state file's layout is untouched: reporting it is the
+        // hub's job, and the hub in this test never ran.
+        assert!(
+            writer.snapshot().layout.is_none(),
+            "the config poll wrote the layout into the state file"
+        );
+        // The heartbeat is still this task's, though.
+        assert!(writer.snapshot().written_at > 0);
+
+        poll.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ages_read_naturally() {
         let now = std::time::SystemTime::now()
@@ -2136,5 +3952,151 @@ mod tests {
         assert_eq!(age(now - 200_000), "2d ago");
         // A future timestamp (clock skew) saturates instead of panicking.
         assert_eq!(age(now + 500), "just now");
+    }
+
+    /// The one gate on the filesystem-write surface that this binary owns
+    /// (ADR 0015, SECURITY.md invariant 8). Every step of it fails closed,
+    /// and the two refusals stay distinguishable.
+    #[test]
+    fn file_receive_is_granted_only_when_every_live_peer_holds_the_grant() {
+        use crossover_platform::fakes::InMemorySecureStorage;
+        use crossover_security::{TrustStore, TrustedPeer};
+
+        use super::{FileReceive, file_receive_policy};
+
+        fn fingerprint(fill: u8) -> crossover_security::SpkiFingerprint {
+            crossover_security::SpkiFingerprint::from([fill; 32])
+        }
+
+        let storage = InMemorySecureStorage::new();
+        let mut trust = TrustStore::default();
+        let mut granted =
+            TrustedPeer::new(Uuid::from_bytes([1; 16]), "granted", fingerprint(1)).unwrap();
+        granted.set_file_receive(true);
+        let ungranted =
+            TrustedPeer::new(Uuid::from_bytes([2; 16]), "ungranted", fingerprint(2)).unwrap();
+        trust.add_peer(granted).unwrap();
+        trust.add_peer(ungranted).unwrap();
+        trust.save(&storage).unwrap();
+
+        // No spool: permanent, and distinct from "not permitted" — the
+        // origin learns files will never travel here, not that a grant
+        // would fix it.
+        assert_eq!(
+            file_receive_policy(false, &storage, &[fingerprint(1)]),
+            FileReceive::Unsupported
+        );
+        // Nobody connected: nothing to grant to.
+        assert_eq!(
+            file_receive_policy(true, &storage, &[]),
+            FileReceive::Denied
+        );
+        // The granted peer, alone.
+        assert_eq!(
+            file_receive_policy(true, &storage, &[fingerprint(1)]),
+            FileReceive::Allowed
+        );
+        // Default-off: a trusted peer is not a permitted one.
+        assert_eq!(
+            file_receive_policy(true, &storage, &[fingerprint(2)]),
+            FileReceive::Denied
+        );
+        // The case the rule exists for: clipboard sync cannot tell which
+        // peer an offer came from, so one ungranted peer closes the door
+        // for both rather than lending the other's permission.
+        assert_eq!(
+            file_receive_policy(true, &storage, &[fingerprint(1), fingerprint(2)]),
+            FileReceive::Denied
+        );
+        // An unknown fingerprint is not a grant either.
+        assert_eq!(
+            file_receive_policy(true, &storage, &[fingerprint(9)]),
+            FileReceive::Denied
+        );
+        // A store that will not load must never open the surface.
+        assert_eq!(
+            file_receive_policy(true, &InMemorySecureStorage::new(), &[fingerprint(1)]),
+            FileReceive::Denied
+        );
+    }
+
+    /// The sending half's mirror of the gate above (ADR 0015). Checked in
+    /// the same order a user needs to be told apart: whether the peer can
+    /// even decode a file offer at all (`NotNegotiated`, docs/PROTOCOL.md
+    /// §3.1 — an un-negotiated content type is fatal to the peer's
+    /// session, so this must fail closed before anything is built) before
+    /// whether it is permitted to (`Denied`).
+    #[test]
+    fn file_send_is_granted_only_when_negotiated_and_every_live_peer_holds_send() {
+        use crossover_platform::fakes::InMemorySecureStorage;
+        use crossover_protocol::hello::FeatureFlags;
+        use crossover_security::{TrustStore, TrustedPeer};
+
+        use super::{FileSend, file_send_policy};
+
+        fn fingerprint(fill: u8) -> crossover_security::SpkiFingerprint {
+            crossover_security::SpkiFingerprint::from([fill; 32])
+        }
+
+        let storage = InMemorySecureStorage::new();
+        let mut trust = TrustStore::default();
+        let paired = TrustedPeer::new(Uuid::from_bytes([1; 16]), "paired", fingerprint(1)).unwrap();
+        trust.add_peer(paired).unwrap();
+        trust.save(&storage).unwrap();
+
+        let negotiated = FeatureFlags::FILE_CLIPBOARD;
+        let not_negotiated = FeatureFlags::NONE;
+
+        // Nobody connected: nothing to send to.
+        assert_eq!(file_send_policy(&storage, &[]), FileSend::Denied);
+
+        // A negotiated, trusted peer: `clipboard_send` is on by default
+        // (`PeerPermissions::FULL`, unlike `file_receive`).
+        assert_eq!(
+            file_send_policy(&storage, &[(fingerprint(1), negotiated)]),
+            FileSend::Allowed
+        );
+
+        // The peer never advertised FILE_CLIPBOARD.
+        assert_eq!(
+            file_send_policy(&storage, &[(fingerprint(1), not_negotiated)]),
+            FileSend::NotNegotiated
+        );
+
+        // An unpaired fingerprint holds no `clipboard_send` grant at all,
+        // and it closes the door for the trusted peer beside it too — the
+        // same session-agnostic rule `file_receive_policy` applies, since
+        // clipboard sync cannot address one selection at one peer.
+        assert_eq!(
+            file_send_policy(&storage, &[(fingerprint(9), negotiated)]),
+            FileSend::Denied
+        );
+        assert_eq!(
+            file_send_policy(
+                &storage,
+                &[(fingerprint(1), negotiated), (fingerprint(9), negotiated)]
+            ),
+            FileSend::Denied
+        );
+
+        // A store that will not load must never open the surface.
+        assert_eq!(
+            file_send_policy(
+                &InMemorySecureStorage::new(),
+                &[(fingerprint(1), negotiated)]
+            ),
+            FileSend::Denied
+        );
+
+        // The transition `apply_trust_changes`'s poll relies on: the store
+        // changes underneath a live, previously-Allowed session, and the
+        // very next read answers `Denied` with no session teardown and no
+        // reconnect needed to observe it.
+        let revoked = TrustStore::default();
+        revoked.save(&storage).unwrap();
+        assert_eq!(
+            file_send_policy(&storage, &[(fingerprint(1), negotiated)]),
+            FileSend::Denied
+        );
     }
 }
