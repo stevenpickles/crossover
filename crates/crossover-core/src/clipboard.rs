@@ -1026,6 +1026,18 @@ pub struct ClipboardEngine {
     /// Hash of the last content this engine knows to be on the local
     /// clipboard (whatever its source) — outbound dedup.
     current_local_hash: Option<[u8; 32]>,
+    /// The next read should announce whatever it finds even if dedup
+    /// would suppress it — set by [`ClipboardEngine::on_session_established`]
+    /// so peers converge after a gap (ADR 0006, trigger 3).
+    ///
+    /// A flag rather than the older trick of clearing
+    /// [`Self::current_local_hash`], because that trick threw away the one
+    /// fact the read needs: whether the content is actually *new*. With
+    /// the hash gone, a reconnect's re-read of unchanged content was
+    /// indistinguishable from the user copying something, which made it
+    /// supersede a parked install in precisely the hardware scenario the
+    /// parked phase exists for (ADR 0005, addendum 2026-09-01).
+    reannounce_pending: bool,
     /// Hashes we wrote locally; the provider's own-write notification
     /// must not echo them back (FR-3.3).
     applied_hashes: VecDeque<[u8; 32]>,
@@ -1122,6 +1134,7 @@ impl ClipboardEngine {
             config,
             next_sequence: 0,
             current_local_hash: None,
+            reannounce_pending: false,
             applied_hashes: VecDeque::new(),
             outbound: None,
             expecting_data: None,
@@ -1157,20 +1170,27 @@ impl ClipboardEngine {
     /// clipboard lock, and a notification only means "something changed",
     /// which during a burst is true many times per second. Wait for quiet
     /// (ADR 0006), then read once.
+    /// A parked install is deliberately **not** retried here, and this is
+    /// the load-bearing half of the parked design's safety. A change
+    /// notification on Windows almost always means new content just
+    /// landed, and writing on it would race the user: a peer item parked
+    /// under contention would install itself over the copy the user made
+    /// one instant earlier, and the settle read would then find our own
+    /// content, suppress it as a loop, and report nothing. The user's copy
+    /// would be gone with no diagnostic anywhere.
+    ///
+    /// So the notification only starts the clock. The *read* decides
+    /// ([`Self::on_local_read`]): unchanged or our own content means the
+    /// clipboard is merely free and the parked install may take it;
+    /// genuinely new content means the user outranks it. The cost is one
+    /// settle window, with the parked timer as the backstop underneath.
     pub fn on_local_change(&mut self) -> Vec<Action> {
-        // A parked install goes first, and does not wait for the settle
-        // window: the notification is the evidence that the clipboard is
-        // free again, and the whole point of parking is to take that
-        // moment (ADR 0005, addendum 2026-09-01).
-        let mut actions = self.revive_parked_write();
         if self.config.transmit_debounce.is_zero() {
-            actions.push(Action::ReadClipboard);
-        } else {
-            actions.push(Action::ScheduleSettle {
-                delay: self.config.transmit_debounce,
-            });
+            return vec![Action::ReadClipboard];
         }
-        actions
+        vec![Action::ScheduleSettle {
+            delay: self.config.transmit_debounce,
+        }]
     }
 
     /// The settle window elapsed: now read the clipboard, once.
@@ -1190,12 +1210,40 @@ impl ClipboardEngine {
     /// clipboard item is judged on here — dedup, loop suppression, the
     /// type's maximum — applies to it too, one step later, where the
     /// numbers it is judged on first exist.
+    /// This is also where a **parked install** learns its fate (ADR 0005,
+    /// addendum 2026-09-01), because this is the first moment anything
+    /// knows what the clipboard actually holds:
+    ///
+    /// - content we ourselves installed, or content unchanged since we
+    ///   last looked — the clipboard is merely free again, so the parked
+    ///   install is retried now rather than waiting out its timer;
+    /// - genuinely new content — this machine's user copied something, and
+    ///   installing a peer item over it would destroy what they just made,
+    ///   so the parked install is superseded;
+    /// - nothing readable — no evidence either way, so the parked install
+    ///   is left to its own timer.
     pub fn on_local_read(&mut self, content: Option<ClipboardContent>) -> Vec<Action> {
+        // Consumed whatever the read shows: the re-announcement had its
+        // chance, and a flag left set would make the next ordinary read
+        // behave like a reconnect.
+        let reannouncing = std::mem::take(&mut self.reannounce_pending);
         let Some(content) = content else {
             return Vec::new(); // empty, or a format this build cannot read
         };
         if let ClipboardContent::FileList(selection) = content {
-            return self.on_local_file_list(selection);
+            // A selection has no hash until it is packed, so "new" cannot
+            // be tested here — but the driver filters our own offer out
+            // before the read (F13), so anything reaching this is a
+            // selection the user made. A re-announcement after a reconnect
+            // is the one case that is not, and it must not cost a parked
+            // install.
+            let mut actions = if reannouncing {
+                Vec::new()
+            } else {
+                self.supersede_parked_write("a local copy")
+            };
+            actions.extend(self.on_local_file_list(selection));
+            return actions;
         }
         let Some((content_type, bytes)) = into_wire(content) else {
             return Vec::new(); // never reached; see `into_wire`
@@ -1219,17 +1267,32 @@ impl ClipboardEngine {
         }
         let hash = content_hash(&bytes);
 
-        // Loop prevention: this is content we ourselves applied.
+        // Loop prevention: this is content we ourselves applied. Nothing
+        // travels — and the clipboard is demonstrably readable and holds
+        // our own content rather than the user's, which is exactly when a
+        // parked install may take it.
         if self.applied_hashes.contains(&hash) {
             self.current_local_hash = Some(hash);
             self.record(Metrics::record_clipboard_loop_suppressed);
-            return Vec::new();
+            return self.revive_parked_write();
         }
-        // Dedup: unchanged content never re-sends.
-        if self.current_local_hash == Some(hash) {
-            return Vec::new();
+        // Dedup: unchanged content never re-sends. Same reasoning — the
+        // user has not put anything here since we last looked.
+        let unchanged = self.current_local_hash == Some(hash);
+        if unchanged && !reannouncing {
+            return self.revive_parked_write();
         }
         self.current_local_hash = Some(hash);
+
+        // Only content that is genuinely new to this machine outranks a
+        // parked install. A reconnect's re-announcement of what was
+        // already here is not new, and must not cost the peer's item —
+        // that combination is the 2026-09-01 hardware scenario exactly.
+        let mut superseded = if unchanged {
+            Vec::new()
+        } else {
+            self.supersede_parked_write("a local copy")
+        };
 
         let sequence = self.next_sequence;
         self.next_sequence += 1;
@@ -1244,7 +1307,8 @@ impl ClipboardEngine {
         // The read only happens after the clipboard has settled, so
         // whatever we just read is the content worth sending: transmit
         // it directly.
-        self.start_outbound(meta, bytes)
+        superseded.extend(self.start_outbound(meta, bytes));
+        superseded
     }
 
     /// Set whether peer files may be received (ADR 0015).
@@ -2056,6 +2120,24 @@ impl ClipboardEngine {
     /// the write lived for 800 ms and is not once it can live for twenty
     /// seconds — ADR 0005 requires every transaction to end in a typed
     /// verdict within a bounded time.
+    /// [`Self::supersede_pending_write`], but only for an install that has
+    /// **parked**.
+    ///
+    /// The distinction is the whole reason the fast phase is unchanged: an
+    /// install inside the 800 ms fast budget is not a window a user copies
+    /// into and then waits, so nothing that happens there is evidence of a
+    /// race with them. Twenty seconds is.
+    fn supersede_parked_write(&mut self, by: &str) -> Vec<Action> {
+        if self
+            .pending_write
+            .as_ref()
+            .is_some_and(|pending| pending.parked_since.is_some())
+        {
+            return self.supersede_pending_write(by);
+        }
+        Vec::new()
+    }
+
     fn supersede_pending_write(&mut self, by: &str) -> Vec<Action> {
         let Some(superseded) = self.pending_write.take() else {
             return Vec::new();
@@ -2093,15 +2175,31 @@ impl ClipboardEngine {
         // process-lifetime grudge.
         self.violations = 0;
         // Ask the driver to re-read: the clipboard may have changed while
-        // disconnected, and re-reading routes through the normal dedup
-        // (and then through the debounce, like any other observation).
-        self.current_local_hash = None;
+        // disconnected. The dedup hash is *kept* and a re-announce flag
+        // set instead of clearing it, so the read still knows whether what
+        // it finds is new — clearing it made every reconnect's re-read
+        // look like a fresh local copy, which is a lie the parked install
+        // paid for (ADR 0005, addendum 2026-09-01).
+        self.reannounce_pending = true;
         actions.push(Action::ReadClipboard);
         actions
     }
 
     /// The session dropped: in-flight transaction state is meaningless
-    /// now. Pending local writes finish (the content is already here).
+    /// now, an install that has not landed included.
+    ///
+    /// A pending install used to be left running on the grounds that its
+    /// content was already here and the write would cost nothing. That was
+    /// true while it lived for 800 ms and stopped being true when it could
+    /// live for twenty seconds (ADR 0005, addendum 2026-09-01): a parked
+    /// install can outlive the session, land during the *next* one, and
+    /// overwrite whatever the user did in between, answering a peer that
+    /// stopped waiting long ago. It is dropped without a verdict — there
+    /// is nobody to tell — and without counting a failure, matching the
+    /// outbound slot beside it, which is also cleared here uncounted. The
+    /// content is not lost: the peer re-announces on reconnect (ADR 0006,
+    /// trigger 3) and the read revival makes sure that re-announcement is
+    /// heard.
     ///
     /// Every buffer the transaction machine can hold is released here —
     /// the retained outbound item and the inbound reassembly both, either
@@ -2121,6 +2219,19 @@ impl ClipboardEngine {
             tracing::debug!(
                 clipboard_id = %meta.id,
                 "accepted inbound offer abandoned: session lost"
+            );
+        }
+        // Info rather than debug: this is the one path that discards
+        // content the peer successfully delivered, and an operator
+        // reconciling "the item never appeared" against the logs needs to
+        // find it at default levels.
+        if let Some(dropped) = self.pending_write.take() {
+            tracing::info!(
+                clipboard_id = %dropped.meta.id,
+                origin_peer = %dropped.meta.origin,
+                attempt_count = dropped.attempts_made,
+                parked_ms = dropped.parked_since.map_or(0, elapsed_ms),
+                "inbound install dropped with its session"
             );
         }
         if let Some(reassembly) = self.reassembly.take() {
@@ -2325,22 +2436,13 @@ impl ClipboardEngine {
         body: OutboundBody,
         descriptor: Option<FileDescriptor>,
     ) -> Vec<Action> {
-        // A *parked* install loses to a local copy, and only a parked one
-        // does (ADR 0005, addendum 2026-09-01). Reaching here means this
-        // machine's user put something on this machine's clipboard that is
-        // neither a duplicate nor our own write, so installing a peer item
-        // over it — possibly many seconds later — would destroy content the
-        // user just made. Inside the fast budget the question does not
-        // arise: 800 ms is not a window a user copies into and then waits.
-        let mut superseded = if self
-            .pending_write
-            .as_ref()
-            .is_some_and(|pending| pending.parked_since.is_some())
-        {
-            self.supersede_pending_write("a local copy")
-        } else {
-            Vec::new()
-        };
+        // Note what is *not* decided here: whether a parked install loses
+        // to this item. That question needs to know whether the local
+        // content is genuinely new, which only the read that produced it
+        // can say (see `on_local_read`) — a re-announcement after a
+        // reconnect reaches this function looking identical to a fresh
+        // copy, and deciding it here got that case wrong.
+        let mut superseded = Vec::new();
         if let Some(previous) = self.outbound.take() {
             tracing::debug!(
                 clipboard_id = %previous.meta().id,
@@ -3030,7 +3132,17 @@ impl ClipboardEngine {
         }
 
         // Loop/echo guard: identical content is a success without a write.
+        //
+        // An earlier install still pending must not survive this, and the
+        // divergence if it does is silent and permanent: we tell the origin
+        // this item is `Applied`, the older install then writes its own
+        // content over the clipboard we just claimed agreement on, and its
+        // own-write notification is loop-suppressed so nothing ever
+        // notices. Both machines would believe they show this item while
+        // one shows the other.
         if self.current_local_hash == Some(meta.content_hash) {
+            actions
+                .extend(self.supersede_pending_write("an inbound item already on the clipboard"));
             actions.push(Action::Send(OutboundMessage::Applied(ClipboardApplied {
                 id: meta.id,
                 result: ApplyResult::Applied,
@@ -3939,56 +4051,97 @@ mod tests {
         assert_eq!(report.clipboard_applied, 0);
     }
 
-    /// The parked phase's primary revival: a change notification is the
-    /// best evidence available that whoever held the clipboard has let go,
-    /// and waiting out the slow cadence after it would be waiting for
-    /// nothing.
+    /// The safe order, and the regression it encodes. A notification must
+    /// **not** write: on Windows it almost always means new content just
+    /// landed, so a parked install taking that moment would land on top of
+    /// the copy the user made an instant earlier — and the settle read
+    /// would then find our own content, suppress it as a loop, and report
+    /// nothing at all. The user's copy would be gone silently.
+    ///
+    /// So the notification only starts the clock, and the read decides.
     #[test]
-    fn a_change_notification_retries_a_parked_install_immediately() {
+    fn a_notification_starts_the_clock_and_never_writes() {
         let metrics = Arc::new(Metrics::new());
         let mut e = parking_engine(&metrics);
-        let id = inbound_text(&mut e, 0, "revived by a notification");
+        let id = inbound_text(&mut e, 0, "the peer's item");
         park_the_install(&mut e, id);
 
-        let revived = e.on_local_change();
+        let notified = e.on_local_change();
+        assert!(
+            matches!(notified.as_slice(), [Action::ScheduleSettle { .. }]),
+            "a notification wrote before the read said what was there: {notified:?}"
+        );
+        // The parked timer is still the backstop underneath, untouched by
+        // the notification having come and gone.
+        assert!(matches!(
+            e.on_retry_due(id).as_slice(),
+            [Action::WriteClipboard { id: retried, .. }] if *retried == id
+        ));
+    }
+
+    /// The read's first answer: content unchanged since we last looked
+    /// means the clipboard is merely free again — nothing of the user's is
+    /// at risk, so the parked install takes it now rather than waiting out
+    /// its timer.
+    #[test]
+    fn a_read_of_unchanged_content_retries_the_parked_install() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        // Something of ours is already the known local content.
+        copy(&mut e, "what was already here");
+        let id = inbound_text(&mut e, 9, "the peer's item");
+        park_the_install(&mut e, id);
+
+        assert!(matches!(
+            e.on_local_change().as_slice(),
+            [Action::ScheduleSettle { .. }]
+        ));
+        assert_eq!(e.on_settle_due(), vec![Action::ReadClipboard]);
+        let read = e.on_local_read(Some(ClipboardContent::Text(
+            "what was already here".to_owned(),
+        )));
         assert!(
             matches!(
-                revived.as_slice(),
-                [
-                    Action::WriteClipboard { id: retried, .. },
-                    Action::ScheduleSettle { .. }
-                ] if *retried == id
+                read.as_slice(),
+                [Action::WriteClipboard { id: retried, .. }] if *retried == id
             ),
-            "a notification should retry the parked install and still settle: {revived:?}"
+            "an unchanged read should retry the parked install: {read:?}"
         );
         assert_eq!(
             verdict(&e.on_write_result(id, Ok(()))),
             ApplyResult::Applied
         );
-
         // The slow timer that was armed when the install parked fires
-        // afterwards into nothing: the notification took its turn, so
-        // there is never a second write in flight for one transaction.
+        // afterwards into nothing: the read took its turn, so there is
+        // never a second write in flight for one transaction.
         assert!(e.on_retry_due(id).is_empty());
     }
 
-    /// A notification arriving while the install is still inside its fast
-    /// budget changes nothing: the 200 ms timer is already about to take
-    /// that turn, and two writes for one transaction is the bug the
-    /// entitlement flag exists to prevent.
+    /// The same answer for the other kind of "not the user's": a read that
+    /// finds content this engine installed itself. It is loop-suppressed,
+    /// as always, and it frees the parked install to try.
     #[test]
-    fn a_change_notification_leaves_an_unparked_install_alone() {
+    fn a_read_of_our_own_installed_content_retries_the_parked_install() {
         let metrics = Arc::new(Metrics::new());
         let mut e = parking_engine(&metrics);
-        let id = inbound_text(&mut e, 0, "still in the fast phase");
-        assert!(matches!(
-            e.on_write_result(id, Err(WriteFailure::Busy)).as_slice(),
-            [Action::ScheduleRetry { .. }]
-        ));
-        assert!(matches!(
-            e.on_local_change().as_slice(),
-            [Action::ScheduleSettle { .. }]
-        ));
+        // An earlier install landed, so its hash is in the applied memory.
+        let first = inbound_text(&mut e, 0, "installed earlier");
+        assert_eq!(
+            verdict(&e.on_write_result(first, Ok(()))),
+            ApplyResult::Applied
+        );
+        let parked = inbound_text(&mut e, 1, "the peer's next item");
+        park_the_install(&mut e, parked);
+
+        let read = e.on_local_read(Some(ClipboardContent::Text("installed earlier".to_owned())));
+        assert!(
+            matches!(
+                read.as_slice(),
+                [Action::WriteClipboard { id: retried, .. }] if *retried == parked
+            ),
+            "our own applied content should free the parked install: {read:?}"
+        );
+        assert_eq!(metrics.snapshot().clipboard_loop_suppressed, 1);
     }
 
     /// A parked install lives long enough that the two things which can
@@ -4029,6 +4182,11 @@ mod tests {
     /// not simply "forever": a local copy is this machine's user putting
     /// something on this machine's clipboard, and installing a peer item
     /// over it seconds later would destroy what they just made.
+    ///
+    /// The *order* is the assertion. Nothing may be written between the
+    /// notification and the read, because until the read there is no way
+    /// to tell this case from the one above — and guessing wrong here is
+    /// how the user's copy disappears without a trace.
     #[test]
     fn a_local_copy_supersedes_a_parked_install() {
         let metrics = Arc::new(Metrics::new());
@@ -4036,20 +4194,19 @@ mod tests {
         let parked = inbound_text(&mut e, 0, "the peer's item");
         park_the_install(&mut e, parked);
 
-        // The notification revives it once; the write is still contended.
-        let revived = e.on_local_change();
-        assert!(matches!(
-            revived.first(),
-            Some(Action::WriteClipboard { .. })
-        ));
-        assert!(matches!(
-            e.on_write_result(parked, Err(WriteFailure::Busy))
-                .as_slice(),
-            [Action::ScheduleRetry { .. }]
-        ));
-
-        // Then the settle window closes on genuinely new local content.
+        // The user copies. The notification arrives first, and must not
+        // touch the clipboard.
+        let notified = e.on_local_change();
+        assert!(
+            !notified
+                .iter()
+                .any(|a| matches!(a, Action::WriteClipboard { .. })),
+            "the parked install was written before the read: {notified:?}"
+        );
         assert_eq!(e.on_settle_due(), vec![Action::ReadClipboard]);
+
+        // Only now, with genuinely new content in hand, does the parked
+        // install lose — and it is told so.
         let actions = e.on_local_read(Some(ClipboardContent::Text("mine".to_owned())));
         let messages = sent(&actions);
         assert!(
@@ -4065,7 +4222,163 @@ mod tests {
             ),
             "the local copy should close the parked install and travel: {messages:?}"
         );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::WriteClipboard { .. })),
+            "the superseded install was still written: {actions:?}"
+        );
         assert!(e.on_retry_due(parked).is_empty(), "a ghost install retried");
+    }
+
+    /// The echo guard's blind spot, which is silent and permanent when it
+    /// bites. A newer item whose content already matches this clipboard is
+    /// answered `Applied` without a write — correct — but an *older*
+    /// install still pending used to survive that answer, unpark, and
+    /// write its own content over the clipboard both machines had just
+    /// agreed on. Its own-write notification is loop-suppressed, so
+    /// nothing anywhere notices the two machines now disagree.
+    #[test]
+    fn an_item_that_already_matches_still_closes_a_pending_install() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        // This clipboard already holds "shared"; nothing of ours is in
+        // flight to complicate the conflict rule.
+        copy(&mut e, "shared");
+        e.on_session_lost();
+
+        let parked = inbound_text(&mut e, 9, "the older item");
+        park_the_install(&mut e, parked);
+
+        let matching = ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xAA; 16]),
+            10,
+            ContentType::Utf8Text,
+            b"shared".to_vec(),
+        );
+        let matching_id = matching.meta.id;
+        let actions = e.on_peer_message(InboundMessage::Data(matching));
+        let messages = sent(&actions);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [
+                    OutboundMessage::Applied(ClipboardApplied {
+                        id: older,
+                        result: ApplyResult::Superseded,
+                    }),
+                    OutboundMessage::Applied(ClipboardApplied {
+                        id: newer,
+                        result: ApplyResult::Applied,
+                    }),
+                ] if *older == parked && *newer == matching_id
+            ),
+            "the pending install outlived the item that agreed with us: {messages:?}"
+        );
+        assert!(
+            e.on_retry_due(parked).is_empty(),
+            "the superseded install can still write over the agreed content"
+        );
+    }
+
+    /// The reconnect case the parked phase exists for, and the one the
+    /// re-announce nearly broke. Establishing a session asks for a re-read
+    /// so peers converge (ADR 0006, trigger 3) — but a re-read of content
+    /// that was already here is not the user copying something, and must
+    /// not cost the peer's parked item.
+    #[test]
+    fn a_reconnect_re_read_of_unchanged_content_spares_a_parked_install() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        copy(&mut e, "already here");
+        e.on_session_lost();
+
+        let parked = inbound_text(&mut e, 9, "the peer's item");
+        park_the_install(&mut e, parked);
+
+        let established = e.on_session_established();
+        assert_eq!(established.last(), Some(&Action::ReadClipboard));
+
+        let actions = e.on_local_read(Some(ClipboardContent::Text("already here".to_owned())));
+        let messages = sent(&actions);
+        assert!(
+            matches!(messages.as_slice(), [OutboundMessage::Data(_)]),
+            "the reconnect should re-announce and say nothing else: {messages:?}"
+        );
+        assert!(matches!(
+            e.on_retry_due(parked).as_slice(),
+            [Action::WriteClipboard { id, .. }] if *id == parked
+        ));
+        assert_eq!(metrics.snapshot().clipboard_superseded, 0);
+    }
+
+    /// The other half of the same rule: content genuinely copied while the
+    /// link was down *is* the user's, and it outranks the parked install
+    /// exactly as a copy made with the session up would.
+    #[test]
+    fn a_reconnect_re_read_of_new_content_supersedes_a_parked_install() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        copy(&mut e, "already here");
+        e.on_session_lost();
+
+        let parked = inbound_text(&mut e, 9, "the peer's item");
+        park_the_install(&mut e, parked);
+
+        e.on_session_established();
+        let actions = e.on_local_read(Some(ClipboardContent::Text(
+            "copied during the outage".to_owned(),
+        )));
+        let messages = sent(&actions);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [
+                    OutboundMessage::Applied(ClipboardApplied {
+                        id,
+                        result: ApplyResult::Superseded,
+                    }),
+                    OutboundMessage::Data(_),
+                ] if *id == parked
+            ),
+            "new content copied during the gap should win: {messages:?}"
+        );
+        assert!(e.on_retry_due(parked).is_empty(), "a ghost install retried");
+    }
+
+    /// An install that has not landed belongs to the session that carried
+    /// it. Left alive, a parked one can outlive the session, land during
+    /// the *next* one, and overwrite whatever the user did in between —
+    /// answering a peer that stopped waiting long ago.
+    ///
+    /// Dropped without a verdict (there is nobody to tell) and without a
+    /// counted failure, matching the outbound slot beside it. The content
+    /// comes back on reconnect.
+    #[test]
+    fn a_lost_session_drops_the_install_it_was_carrying() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        let parked = inbound_text(&mut e, 0, "belongs to this session");
+        park_the_install(&mut e, parked);
+
+        let lost = e.on_session_lost();
+        assert!(
+            sent(&lost).is_empty(),
+            "a verdict was sent to a peer that is gone: {lost:?}"
+        );
+        assert!(
+            e.on_retry_due(parked).is_empty(),
+            "the install survived its session and can still write"
+        );
+        assert!(
+            e.on_write_result(parked, Ok(())).is_empty(),
+            "a late write result revived a dropped install"
+        );
+
+        let report = metrics.snapshot();
+        assert_eq!(report.clipboard_installs_failed, 0, "counted as a loss");
+        assert_eq!(report.clipboard_superseded, 0, "counted as a supersession");
     }
 
     #[test]
