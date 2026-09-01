@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crossover_core::{
-    ClipboardConfig, ClipboardRetryPolicy, SessionCommand, SyncEvent, clipboard_sync,
+    ClipboardConfig, ClipboardRetryPolicy, Metrics, SessionCommand, SyncEvent, clipboard_sync,
 };
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::InMemoryClipboard;
@@ -45,10 +45,15 @@ struct Side {
     clipboard: Arc<InMemoryClipboard>,
     events: mpsc::Sender<SyncEvent>,
     commands: crossover_core::outbound::CommandReceiver,
+    /// What the engine itself counted. A harness that asserts only on its
+    /// own bookkeeping proves the injection was *scheduled*, never that
+    /// the code path it was aimed at was reached.
+    metrics: Arc<Metrics>,
 }
 
 fn side(origin: u8) -> Side {
     let clipboard = Arc::new(InMemoryClipboard::new());
+    let metrics = Arc::new(Metrics::new());
     let (driver, events, commands) = clipboard_sync(
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
         None,
@@ -72,7 +77,7 @@ fn side(origin: u8) -> Side {
             transmit_debounce: Duration::ZERO,
             ..ClipboardConfig::new()
         },
-        None,
+        Some(Arc::clone(&metrics)),
     )
     .unwrap();
     tokio::spawn(driver.run());
@@ -80,6 +85,7 @@ fn side(origin: u8) -> Side {
         clipboard,
         events,
         commands,
+        metrics,
     }
 }
 
@@ -160,7 +166,6 @@ async fn sustained_contention_still_delivers_every_item() {
     b.events.send(SyncEvent::SessionEstablished).await.unwrap();
 
     let mut applied = 0;
-    let mut parked = 0;
     for i in 0..updates {
         // Every third item meets a busy clipboard twice before landing —
         // absorbed by the fast phase, as the blip it stands for is.
@@ -174,7 +179,6 @@ async fn sustained_contention_still_delivers_every_item() {
         if i.is_multiple_of(7) {
             b.clipboard
                 .fail_next(ClipboardOp::Write, ClipboardFailure::Busy, 8);
-            parked += 1;
         }
         let text = format!("contended item {i}");
         a.clipboard.set_text_locally(&text);
@@ -218,9 +222,18 @@ async fn sustained_contention_still_delivers_every_item() {
             .unwrap();
     }
     assert_eq!(applied, updates);
+    // The engine's own counter, not the harness's: the point of the
+    // long-hold injection is that the *parked* path ran, and only B can
+    // say whether it did.
+    let parked = b.metrics.snapshot().clipboard_installs_parked;
     assert!(
         parked > 0,
-        "the run never exercised the parked phase; the injection is not doing its job"
+        "no install ever parked, so the long-hold injection never reached the parked phase"
+    );
+    assert_eq!(
+        b.metrics.snapshot().clipboard_installs_failed,
+        0,
+        "an install was lost despite the parked phase"
     );
     println!(
         "contention stress: {applied} items delivered through injected contention \
