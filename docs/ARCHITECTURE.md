@@ -411,14 +411,16 @@ violation budget and the re-announce already ride — and while that count
 is zero a local change is observed, hashed and recorded exactly as
 always, and then stops: no outbound slot, no `transfer_timeout` armed,
 no frame. It is counted as `clipboard_offline_changes`. Delivery is not
-lost, only moved: establishment clears the dedup hash and re-reads, so
-the item that is current when a peer arrives is offered whole
-(ADR 0006's trigger 3). The count is a count and not a flag because a
+lost, only moved: establishment marks a re-announcement pending and
+re-reads — keeping the dedup hash, so the read can still tell new
+content from a re-announcement — and the item that is current when a
+peer arrives is offered whole (ADR 0006's trigger 3). The count is a count and not a flag because a
 process can hold an inbound and an outbound session at once and both
 fan into one engine; a flag would be cleared by the first peer to drop
 and silently stop offering to the peer that stayed. The count governs
 *new copies only* — `on_session_lost` still tears down the in-flight
-outbound transaction, accepted offer, reassembly and file build on any
+outbound transaction, accepted offer, pending install, reassembly and
+file build on any
 loss, whichever session it was, and scoping that teardown per session
 is a named follow-up in the ADR rather than part of this rule. A local
 file

@@ -2388,15 +2388,21 @@ impl ClipboardEngine {
         // copies to the one that stayed.
         //
         // That is the whole of what the count buys, and the rest of this
-        // method is deliberately unchanged: the outbound transaction, the
-        // accepted offer, the reassembly and the build are torn down by
-        // **any** loss, whichever session it was. So a transfer in flight
-        // to a surviving peer still dies here — and a file one still
-        // counts a `file_send_failed`. Scoping this teardown to the
-        // session that actually dropped means the engine tracking which
-        // session each transfer belongs to, which is a change to the
-        // transaction model rather than to the offline rule; it has its
-        // own branch (ADR 0006 addendum, "Named follow-up").
+        // method is deliberately unchanged and deliberately unconditional:
+        // the outbound transaction, the accepted offer, the pending
+        // install, the reassembly and the build are torn down by **any**
+        // loss, whichever session it was, and whatever the count now
+        // reads. So a transfer in flight to a surviving peer still dies
+        // here — and a file one still counts a `file_send_failed`.
+        // Scoping this teardown to the session that actually dropped
+        // means the engine tracking which session each transfer belongs
+        // to, which is a change to the transaction model rather than to
+        // the offline rule; it has its own branch (ADR 0006 addendum,
+        // "Named follow-up").
+        //
+        // The count is therefore read and warned about *before* any of
+        // it, and never gates it: an install that has not landed must be
+        // dropped on a session loss even when the count is already wrong.
         if self.live_sessions == 0 {
             // Not merely absorbed: reaching here means a `SessionLost`
             // arrived that no `SessionEstablished` paired with, and the
@@ -2405,7 +2411,9 @@ impl ClipboardEngine {
             // connected, and this line is the only thing that would say
             // why (FR-7.3).
             tracing::warn!(
-                "clipboard: session lost with no session counted as live;                  the liveness count is skewed and transmission may stop                  early until the next connect"
+                "clipboard: session lost with none counted as live; the liveness \
+                 count is skewed and transmission may stop early until the next \
+                 connect"
             );
         }
         self.live_sessions = self.live_sessions.saturating_sub(1);
@@ -4915,9 +4923,10 @@ mod tests {
 
     /// The other half of the rule: a held copy is not a lost copy.
     ///
-    /// `on_session_established` clears the dedup hash and re-reads, which
-    /// is ADR 0006's trigger 3 — and, since the addendum, the *only*
-    /// route by which an offline copy is ever offered. However many
+    /// `on_session_established` marks a re-announcement pending and
+    /// re-reads, which is ADR 0006's trigger 3 — and, since the addendum,
+    /// the *only* route by which an offline copy is ever offered. However
+    /// many
     /// copies the gap contained, the peer is offered the one that is
     /// current, which is the only one anybody can paste.
     #[test]

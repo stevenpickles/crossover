@@ -158,10 +158,14 @@ instrument unreadable.
   hours buries the lines a soak is read for.
 
 Delivery is not lost, only moved to **trigger 3, which already existed**.
-Session establishment clears the dedup hash and re-reads the clipboard,
-so the item that is current when a peer arrives is offered whole — and
-[ADR 0005](0005-clipboard-transaction-flow.md)'s 2026-09-01 addendum made
-that read survive a contended clipboard. However many copies a gap
+Session establishment marks a re-announcement pending and re-reads the
+clipboard — the hash itself is *kept*, so the read still knows whether
+what it finds is new, which is what stops a reconnect's re-read costing
+a peer its parked install ([ADR 0005](0005-clipboard-transaction-flow.md),
+addendum 2026-09-01). The pending mark is what lets the re-read offer
+content the dedup would otherwise swallow, so the item that is current
+when a peer arrives is offered whole — and that same addendum made the
+read survive a contended clipboard. However many copies a gap
 contained, the peer is offered the one item anybody could have pasted:
 the clipboard is a single-value register, which is this ADR's own
 argument for trigger-driven transmission in the first place.
@@ -181,9 +185,11 @@ worse fault than the one being fixed.
 about the limit.** It keeps *new copies* flowing to a session that
 survives another session's loss. It does **not** make `on_session_lost`
 session-aware: that method still tears down the outbound transaction,
-the accepted offer, the chunk reassembly and any file build
-*unconditionally*, whichever session dropped. So a transfer already in
-flight to a surviving peer is still destroyed by an unrelated peer's
+the accepted offer, the pending install, the chunk reassembly and any
+file build *unconditionally*, whichever session dropped — and whatever
+the count reads, since a loss must drop an install that has not landed
+even when the count is already skewed. So a transfer already in flight
+to a surviving peer is still destroyed by an unrelated peer's
 disconnect, and a file one still counts a `file_send_failed`. That is
 unchanged by this addendum, and it is not what this addendum is about —
 scoping the teardown means the engine tracking which session each
