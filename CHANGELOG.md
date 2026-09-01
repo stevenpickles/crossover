@@ -38,17 +38,23 @@ rather than establishing a session that dies later.
   decline. Validated on two machines over a wired link on 2026-08-19,
   byte-identical in both directions.
 
-- **A peer may only write files to your disk if you say so.** `file_receive`
-  and `clipboard_send` are per-peer grants, **off by default**, granted
-  explicitly with `crossover peers allow-files` / `deny-files` and printed
-  for *every* peer by `crossover peers` — a permission you can only see when
-  it is on is one you cannot audit. Revoking one reaches a running worker
+- **A peer may only write files to your disk if you say so.**
+  `file_receive` is a per-peer grant that is **off by default** — pairing
+  does not set it — granted explicitly with `crossover peers allow-files` /
+  `deny-files` and printed for *every* peer by `crossover peers`, granted or
+  not: a permission you can only see when it is on is one you cannot audit.
+  The sending side has its own flag, `clipboard_send`, but it is a different
+  thing and it is worth being exact about: pairing **does** set it, so it
+  defaults to *on*, and this release enforces it for **files only** — a peer
+  without it is refused before a selection is walked, while text and images
+  still travel without consulting it at all (see Known limitations).
+  Revoking either reaches a running worker
   within a single trust-store poll, exactly as active-session revocation
-  already did, and re-pairing drops a standing grant rather than carrying it
-  forward: pairing is not permission. The grant can never arrive by upgrade
-  — the trust store moves to format 2 with a frozen version-1 decoder, and
-  the new flag is written as a literal `false` rather than read from any
-  byte of an older store.
+  already did, and re-pairing drops a standing `file_receive` rather than
+  carrying it forward: pairing is not consent to a filesystem write surface.
+  That grant can never arrive by upgrade either — the trust store moves to
+  format 2 with a frozen version-1 decoder, and the new flag is written as a
+  literal `false` rather than read from any byte of an older store.
 
 - **A pasted file says where it came from.** It carries a
   `Zone.Identifier` marking it **Local intranet** (`ZoneId=1`) — the
@@ -372,7 +378,10 @@ rather than establishing a session that dies later.
   running it recurred on 2026-08-20 and read as exit `0x40010004`
   (`DBG_TERMINATE_PROCESS`) following a session-change notification, then
   `reason=Logoff` — Windows tearing the worker down at user logoff.
-  Environmental, not a crash, and no longer carried as a limitation.
+  Environmental, not a crash, and no longer carried as an unexplained
+  defect. Two cosmetic residuals of that same logoff sequence remain and are
+  listed under Known limitations, because explaining a signature is not the
+  same as making the log read correctly.
 
 ### Known limitations
 
@@ -461,6 +470,16 @@ rather than establishing a session that dies later.
   expect. One ~72 ms tail event appeared in the interactive lane while
   socket writes stayed at or below 0.147 ms — a pre-writer scheduling stall,
   one sample in 4,558, recorded as a follow-up rather than a blocker.
+- **The supervision log calls a deliberate logoff termination a crash.**
+  The service classifies any non-zero worker exit as `crashed=true`, so
+  `0x40010004` (`DBG_TERMINATE_PROCESS`) — Windows tearing the worker down
+  at logoff, the signature explained above — is logged as a crash. Cosmetic:
+  nothing acts on the flag differently, but it misleads whoever reads the
+  log next, which is the whole point of having one.
+- **The service relaunches the worker into a dying session at logoff**,
+  because it acts on the session-change notification before the `Logoff`
+  stop reason arrives. Cosmetic: the relaunch fails harmlessly and the
+  backoff absorbs it.
 - **Injection into an elevated window may still be swallowed** by UIPI, and
   an application with its own Home/End handling still interprets forwarded
   shifted navigation its own way. Both carried unchanged from earlier
