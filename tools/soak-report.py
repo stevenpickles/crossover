@@ -43,6 +43,7 @@ def summarize(path: Path) -> None:
     installs = 0
     retries = 0
     parked = 0
+    offline = 0
     contention = 0
     established = 0
     disconnects = 0
@@ -78,6 +79,11 @@ def summarize(path: Path) -> None:
         # contended attempt (ADR 0005, addendum 2026-09-01).
         elif "parking the install" in line:
             parked += 1
+        # The stretch marker, not the per-copy debug line: one of these
+        # per gap in the pairing, however many copies the gap held
+        # (ADR 0006, addendum 2026-09-01).
+        elif "no peer connected" in line:
+            offline += 1
         elif "busy" in line.lower() and "clipboard" in line.lower():
             contention += 1
         elif "session established" in line:
@@ -111,6 +117,8 @@ def summarize(path: Path) -> None:
     print(f"  write retries        : {retries}")
     if parked:
         print(f"  installs parked      : {parked}")
+    if offline:
+        print(f"  offline stretches    : {offline}")
     print(f"  contention events    : {contention}")
     if unparsed:
         print(f"  unparsed values      : {unparsed}")
@@ -137,6 +145,12 @@ def summarize(path: Path) -> None:
         notes.append(
             f"{parked} install(s) outlived the fast retry budget and were parked — "
             "not a failure in itself; read it against clipboard_unavailable above"
+        )
+    if offline:
+        notes.append(
+            f"{offline} stretch(es) with no peer connected — copies made then are "
+            "held and offered on the next connect, and account for a low "
+            "transaction count without any of them being a failure"
         )
     if disconnects and not established:
         notes.append("sessions failed without ever establishing — check the firewall rule")
