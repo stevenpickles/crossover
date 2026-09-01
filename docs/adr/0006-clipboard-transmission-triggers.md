@@ -175,10 +175,36 @@ can be serving one peer while dialling another — and both fan
 boolean would be cleared by the first of two peers to drop, and every
 copy after that would be silently held from the peer still connected: a
 clipboard that stops working with nothing visible anywhere, which is a
-worse fault than the one being fixed. The two events are strictly paired
-at every call site; the count saturates rather than wrapping, and
-establishment re-reads, so even a miscount heals at the next connect
-instead of persisting.
+worse fault than the one being fixed.
+
+**What the count buys is exactly one thing, and it is worth being plain
+about the limit.** It keeps *new copies* flowing to a session that
+survives another session's loss. It does **not** make `on_session_lost`
+session-aware: that method still tears down the outbound transaction,
+the accepted offer, the chunk reassembly and any file build
+*unconditionally*, whichever session dropped. So a transfer already in
+flight to a surviving peer is still destroyed by an unrelated peer's
+disconnect, and a file one still counts a `file_send_failed`. That is
+unchanged by this addendum, and it is not what this addendum is about —
+scoping the teardown means the engine tracking which session each
+transfer belongs to, which is a change to the transaction model of
+[ADR 0005](0005-clipboard-transaction-flow.md), not to the transmission
+trigger.
+
+**Named follow-up:** make `on_session_lost` tear down only the state
+belonging to the session that dropped, so a concurrent peer's transfer
+survives an unrelated disconnect — its own branch, deliberately not this
+one.
+
+The two events are strictly paired at every call site, and the count
+saturates rather than wrapping. Saturating is not correcting: an
+unpaired `SessionLost` leaves the count one low for good, so the last
+real session to drop finds it already at zero and transmission stops
+while a peer is still connected. The next establishment restores
+*transmission*, not the count — the stall lifts, the skew stays — which
+is why the engine warns when it reaches the saturating case rather than
+absorbing it silently. That warning is the only evidence such a skew
+would ever leave (FR-7.3).
 
 ### The file selection is gated the same way
 
@@ -198,5 +224,15 @@ refusals visible; it does not want them invented.
   single-value register can meaningfully deliver.
 - **It does not change the wire.** A peer cannot tell the difference: with
   no session there is no peer to tell.
+- **It does not keep the local sequence counter in step with the peer's.**
+  An offline copy no longer consumes a `sequence`, so after a long gap
+  this machine's counter lags a peer that stayed busy, and FR-3.5's
+  `(sequence, origin)` tie-break in a genuine near-simultaneous race is
+  correspondingly more likely to fall the peer's way. This is not a
+  regression: the two counters are per-machine observation counts that
+  were never synchronised, and the rule's guarantee is that the race
+  resolves *deterministically and identically on both sides*, never that
+  it resolves fairly. What changes is which arbitrary answer comes up,
+  not whether the answer is agreed.
 - **It does not touch the debounce, the conflict rule, or the deadline.**
   Every trigger behaves as before once a session is live.

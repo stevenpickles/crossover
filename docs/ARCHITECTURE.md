@@ -416,7 +416,12 @@ the item that is current when a peer arrives is offered whole
 (ADR 0006's trigger 3). The count is a count and not a flag because a
 process can hold an inbound and an outbound session at once and both
 fan into one engine; a flag would be cleared by the first peer to drop
-and silently stop offering to the peer that stayed. A local file
+and silently stop offering to the peer that stayed. The count governs
+*new copies only* — `on_session_lost` still tears down the in-flight
+outbound transaction, accepted offer, reassembly and file build on any
+loss, whichever session it was, and scoping that teardown per session
+is a named follow-up in the ADR rather than part of this rule. A local
+file
 selection is gated the same way and ahead of `FileSend`, so an absent
 peer is never reported as a refusing one.
 

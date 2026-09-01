@@ -1119,11 +1119,19 @@ pub struct ClipboardEngine {
     /// stops working with no fault visible anywhere, which is the
     /// priority-#2 failure this rule exists to avoid causing.
     ///
+    /// **What the count buys is scoped to new copies.** It keeps
+    /// *transmission* alive for a surviving session; it does not make
+    /// [`Self::on_session_lost`] session-aware, and that method still
+    /// tears down the in-flight state unconditionally. See the note there.
+    ///
     /// The two events are strictly paired at every call site, so the
     /// count tracks reality; `saturating_sub` keeps an unpaired loss from
-    /// wrapping, and [`Self::on_session_established`] re-reads the
-    /// clipboard, so even a miscount heals at the next connect rather
-    /// than persisting.
+    /// wrapping. It does not *correct* one: an unpaired loss leaves the
+    /// count permanently one low, so the last real session to drop would
+    /// find it already at zero. What the next
+    /// [`Self::on_session_established`] restores is transmission, not the
+    /// count — the stall lifts, the skew stays — which is why reaching
+    /// `saturating_sub` at zero is warned about rather than absorbed.
     live_sessions: u32,
     /// Whether the current offline stretch has already announced itself.
     ///
@@ -1219,6 +1227,12 @@ impl ClipboardEngine {
             return;
         }
         self.offline_announced = true;
+        // `tools/soak-report.py` counts offline *stretches* by matching
+        // the tail of this line — "will be offered when one connects" —
+        // precisely because the two per-copy `debug` lines share its
+        // opening and would otherwise be counted as stretches under
+        // `RUST_LOG=debug`. Reword the tail and the tool stops counting;
+        // reword either debug line into it and the tool over-counts.
         tracing::info!(
             "clipboard: no peer connected; the current item will be offered when one connects"
         );
@@ -2369,9 +2383,31 @@ impl ClipboardEngine {
     /// it becomes moot with the session.
     pub fn on_session_lost(&mut self) -> Vec<Action> {
         // One session of possibly several. Only the last one out turns
-        // transmission off (ADR 0006, addendum 2026-09-01): a machine
-        // serving one peer while dialling another must keep offering to
-        // the one that stayed.
+        // transmission off (ADR 0006, addendum 2026-09-01), so a machine
+        // serving one peer while dialling another goes on offering *new*
+        // copies to the one that stayed.
+        //
+        // That is the whole of what the count buys, and the rest of this
+        // method is deliberately unchanged: the outbound transaction, the
+        // accepted offer, the reassembly and the build are torn down by
+        // **any** loss, whichever session it was. So a transfer in flight
+        // to a surviving peer still dies here — and a file one still
+        // counts a `file_send_failed`. Scoping this teardown to the
+        // session that actually dropped means the engine tracking which
+        // session each transfer belongs to, which is a change to the
+        // transaction model rather than to the offline rule; it has its
+        // own branch (ADR 0006 addendum, "Named follow-up").
+        if self.live_sessions == 0 {
+            // Not merely absorbed: reaching here means a `SessionLost`
+            // arrived that no `SessionEstablished` paired with, and the
+            // count is now skewed against every session still up. The
+            // symptom is a clipboard that stops offering while a peer is
+            // connected, and this line is the only thing that would say
+            // why (FR-7.3).
+            tracing::warn!(
+                "clipboard: session lost with no session counted as live;                  the liveness count is skewed and transmission may stop                  early until the next connect"
+            );
+        }
         self.live_sessions = self.live_sessions.saturating_sub(1);
         let mut released_outbound = None;
         if let Some(outbound) = self.outbound.take() {
