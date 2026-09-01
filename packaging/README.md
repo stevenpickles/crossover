@@ -80,7 +80,7 @@ private feed).
 To build only the package, from binaries you already have:
 
 ```powershell
-.\chocolatey\pack.ps1                                   # target\release, Cargo version
+.\chocolatey\pack.ps1                                   # target\release, workspace version
 .\chocolatey\pack.ps1 -Version 0.2.0 -OutputDirectory ..\dist
 ```
 
