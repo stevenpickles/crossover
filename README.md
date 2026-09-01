@@ -25,8 +25,10 @@ larger workstation, without weakening the security boundary between them.
 
 - One keyboard and mouse drives both computers; arrange both machines'
   monitors in `crossover layout` and the pointer transfers control wherever
-  the drawing says two screens touch — including a seam between two of one
-  machine's own monitors, and a corner where three meet
+  the drawing says two screens **share an edge** — including a seam between
+  two of one machine's own monitors, and the edges around a corner where
+  three meet. A corner touch alone is not a crossing: a cursor cannot cross
+  a point
 - Clipboard contents synchronize in both directions — text, images, and
   files and folders. Images are carried in the source clipboard's own
   format, byte for byte; a copied file or folder is spooled, verified, and
@@ -89,8 +91,12 @@ crossover layout
 ```
 
 Opens the editor with both machines' monitors drawn to scale. Drag them into
-the arrangement they have on your desk and save; both running workers pick the
-change up within a couple of seconds. `crossover-layout.exe` must sit beside
+the arrangement they have on your desk and save. The worker on this machine
+picks the change up within a couple of seconds, and so does a peer that
+already holds a drawn arrangement; a peer that holds none — a `--left`/
+`--right` run, or one that has never been drawn for — adopts and saves the
+layout immediately but starts crossing by it at its next start.
+`crossover-layout.exe` must sit beside
 `crossover.exe` — the packages install them together. `--left` and `--right`
 still work and still warn that they are deprecated; they cannot express a seam
 between two monitors of one machine.
@@ -98,7 +104,7 @@ between two monitors of one machine.
 ## Letting a peer send you files
 
 ```powershell
-crossover peers                       # lists every peer and its grants
+crossover peers                       # every peer, and whether it may send files
 crossover peers allow-files <id>      # deny-files to withdraw
 ```
 
