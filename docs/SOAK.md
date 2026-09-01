@@ -191,6 +191,21 @@ What good looks like:
   ones is the fix doing exactly its job; a rising ratio of failed to parked
   says the 20 s budget is not enough for this machine and is worth
   investigating rather than raising.
+- `clipboard_abandoned` means **a peer was there and did not answer**.
+  Since ADR 0006's 2026-09-01 addendum a local copy made with no live
+  session mints no transaction at all, so nothing can expire against a
+  peer that was never asked. Before that change an evening with the peer
+  asleep produced one `abandoned` per copy — twenty in one evening on
+  machine A — and the counter could not be read for the silent stalls it
+  exists to catch. A non-zero value now is a real unanswered transaction.
+- `clipboard_offline_changes` is *not* a failure — it counts local copies
+  made while no peer was connected. They are held, not lost: establishing
+  a session re-reads the clipboard and offers whatever is current
+  (ADR 0006's trigger 3), so one offer follows a gap of any length. Its
+  line prints only when it happened, and a large count beside a small
+  `sent` count is a pair that spent the run apart, not a clipboard that
+  stopped working. `tools/soak-report.py` counts the stretches from the
+  log and says the same in its notes.
 - p50 latency in the low tens of milliseconds on a LAN; the max may
   spike when another application holds a clipboard.
 - Every disconnect is followed by a reconnect with no pairing.
@@ -202,6 +217,12 @@ What warrants investigation:
 - Sync traffic that continues when nobody is copying — the signature of
   a loop.
 - `clipboard_installs_failed` at rest.
+- `clipboard_abandoned` at rest with sessions up throughout: with the
+  offline case removed, this is a peer that accepted and went quiet, or
+  an offer that never reached one.
+- `clipboard_offline_changes` in a run where the pair was supposed to be
+  connected the whole time — the copies are safe, but the sessions were
+  not up when the operator thought they were.
 - Parked installs at rest, in any number: the fast budget covers everything
   a healthy desktop does to its own clipboard, so parking at rest means
   something on the machine is holding it for seconds at a time. Find out

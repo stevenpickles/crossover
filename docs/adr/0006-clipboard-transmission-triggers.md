@@ -106,3 +106,97 @@ finds the item in flight or already delivered.
 - The 10,000-update stress gate keeps driving the engine directly, so it
   measures transaction throughput rather than debounce behavior. A
   dedicated test covers the debounce itself.
+
+## Addendum (2026-09-01): a change with no peer is recorded, not transmitted
+
+This ADR redefined *when* a transaction starts and left one case
+unstated, because at the time it could not arise: what a trigger means
+when there is nobody on the other end. The implementation answered it by
+not asking. Every trigger minted a transaction, whatever the state of the
+world.
+
+On machine A (2026-08-31, build 84eea30), with the peer asleep for eight
+hours — this pair spends whole days apart, by design — every local copy
+produced, sixty seconds later:
+
+```
+WARN clipboard: outbound clipboard transaction abandoned: no answer
+     within the deadline clipboard_id=… byte_count=N
+     retained_content=false result="abandoned"
+```
+
+Twenty of them in one evening, each with a matching `clipboard_abandoned`.
+Nothing had gone wrong. The frame went out as a `Broadcast` that the
+application dropped for want of a sink; the deadline
+([ADR 0014](0014-chunked-rich-clipboard-transfer.md)) then expired against
+a peer that had never been asked, because a deadline cannot distinguish
+"did not answer" from "was not there".
+
+The cost is not the log noise. `clipboard_abandoned` is the *only* signal
+for a class of silent stall — an offer refused locally, a peer that
+accepts and goes quiet — and a counter that also fills up with ordinary
+offline evenings cannot be read for the thing it exists to find.
+Clipboard reliability is priority #2
+([SPECIFICATION.md](../SPECIFICATION.md) §2), and this made its principal
+instrument unreadable.
+
+### The rule
+
+**A local change with no live session is recorded, not transmitted.**
+
+- *Recorded*, in full: the content is read, hashed, and stored as the
+  current local hash, so loop suppression and dedup behave exactly as
+  they did. Observation was never the thing in question.
+- *Not transmitted*: no outbound slot, no `transfer_timeout` armed, no
+  frame. Nothing exists that a deadline could later abandon, so the
+  `abandoned` count means again what it says — **a peer was there and
+  did not answer**.
+- Counted as `clipboard_offline_changes`, so the copies are visible as
+  what they are rather than as an absence.
+- Logged once per offline stretch at `info`, and per copy at `debug`. A
+  pair can be apart for a working day; one `info` line per copy for eight
+  hours buries the lines a soak is read for.
+
+Delivery is not lost, only moved to **trigger 3, which already existed**.
+Session establishment clears the dedup hash and re-reads the clipboard,
+so the item that is current when a peer arrives is offered whole — and
+[ADR 0005](0005-clipboard-transaction-flow.md)'s 2026-09-01 addendum made
+that read survive a contended clipboard. However many copies a gap
+contained, the peer is offered the one item anybody could have pasted:
+the clipboard is a single-value register, which is this ADR's own
+argument for trigger-driven transmission in the first place.
+
+### Liveness is a count, not a flag
+
+A process can hold an inbound and an outbound session at the same time —
+the listener and the reconnect supervisor run independently, so a machine
+can be serving one peer while dialling another — and both fan
+`SessionEstablished` / `SessionLost` into the one clipboard engine. A
+boolean would be cleared by the first of two peers to drop, and every
+copy after that would be silently held from the peer still connected: a
+clipboard that stops working with nothing visible anywhere, which is a
+worse fault than the one being fixed. The two events are strictly paired
+at every call site; the count saturates rather than wrapping, and
+establishment re-reads, so even a miscount heals at the next connect
+instead of persisting.
+
+### The file selection is gated the same way
+
+A local `CF_HDROP` copy is gated on liveness *before* the `FileSend`
+policy ([ADR 0015](0015-spooled-virtual-file-paste.md)). Nothing was at
+risk: the application already publishes `Denied` when no session is live,
+so no selection was being walked and no archive packed. What was wrong
+was the diagnostic — answering an empty desk with "this peer holds no
+clipboard-send grant" names a peer that does not exist, and charges
+`files_send_refused` for a permission nobody was asked for. FR-3.6 wants
+refusals visible; it does not want them invented.
+
+### What this deliberately does not do
+
+- **It does not queue.** Copies made during a gap are not held for replay.
+  Only the current item is offered on connect, which is all that a
+  single-value register can meaningfully deliver.
+- **It does not change the wire.** A peer cannot tell the difference: with
+  no session there is no peer to tell.
+- **It does not touch the debounce, the conflict rule, or the deadline.**
+  Every trigger behaves as before once a session is live.
