@@ -446,7 +446,18 @@ impl ClipboardSyncDriver {
                 self.reset_read_backoff();
                 self.on_local_change()
             }
-            SyncEvent::ReadRetryDue => vec![Action::ReadClipboard],
+            SyncEvent::ReadRetryDue => {
+                if self.clipboard_holds_our_file_offer() {
+                    // Nothing to look for, and looking would be the F13
+                    // loop: the retry chain ends here rather than
+                    // rendering our own offer back into the engine. A real
+                    // change re-arms everything.
+                    tracing::debug!("read retry skipped; the clipboard holds our own file list");
+                    Vec::new()
+                } else {
+                    vec![Action::ReadClipboard]
+                }
+            }
             SyncEvent::SpoolSweepDue => self.engine.on_spool_sweep_due(),
             SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
             SyncEvent::TransferTimeout { scope, generation } => {
@@ -847,11 +858,7 @@ impl ClipboardSyncDriver {
     ///   the clipboard has moved on, so the entry behind the item it was
     ///   offering can no longer be pasted and is collected.
     fn on_local_change(&mut self) -> Vec<Action> {
-        if self
-            .virtual_files
-            .as_ref()
-            .is_some_and(|files| files.is_current())
-        {
+        if self.clipboard_holds_our_file_offer() {
             self.record(Metrics::record_clipboard_loop_suppressed);
             tracing::debug!("clipboard change is our own virtual file list; not staging it");
             return Vec::new();
@@ -859,6 +866,21 @@ impl ClipboardSyncDriver {
         let mut actions = self.engine.on_clipboard_moved_on();
         actions.extend(self.engine.on_local_change());
         actions
+    }
+
+    /// Whether the clipboard still holds the virtual file list *we* put
+    /// there (F13).
+    ///
+    /// Its own function because the guard has to hold on **every** path
+    /// that reaches a read, not only the notification path.
+    /// [`SyncEvent::ReadRetryDue`] is the second one, and it went straight
+    /// to the provider — which would render our own offer back into the
+    /// engine, the very loop the guard exists to prevent, reachable
+    /// whenever a contended read overlapped an outgoing file.
+    fn clipboard_holds_our_file_offer(&self) -> bool {
+        self.virtual_files
+            .as_ref()
+            .is_some_and(|files| files.is_current())
     }
 
     /// Offer a verified entry for paste, and report what the clipboard
@@ -2069,7 +2091,7 @@ mod tests {
     ///
     /// Contention here spans well past the fast nudges (5 × 100 ms), so
     /// only the slow revival can recover it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_reconnect_re_announce_survives_a_contended_clipboard() {
         let mut rig = rig();
         rig.clipboard.set_text_locally("copied while away");
@@ -2109,7 +2131,11 @@ mod tests {
     /// reset they are three fast nudges (~300 ms), and without it they are
     /// three attempts on the one-second revival cadence, which is what the
     /// deadline separates.
-    #[tokio::test]
+    /// Paused time, so the deadline is a statement about the *cadence*
+    /// rather than about the runner: the clock advances only when every
+    /// task is idle, so "within 1200 ms" means three 100 ms nudges
+    /// happened and three 1 s revivals did not, on any machine.
+    #[tokio::test(start_paused = true)]
     async fn a_contended_episode_does_not_poison_the_next_read() {
         let mut rig = rig();
         // Burn the fast nudges on an episode of its own. Six failures,
