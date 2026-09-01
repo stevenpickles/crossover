@@ -1385,7 +1385,7 @@ mod tests {
             ..ClipboardConfig::new()
         };
         let metrics = Arc::new(Metrics::new());
-        let (driver, events, commands) = clipboard_sync(
+        let (driver, events, mut commands) = clipboard_sync(
             Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
             spool,
             virtual_files,
@@ -1399,13 +1399,33 @@ mod tests {
         events
             .try_send(SyncEvent::SessionEstablished)
             .expect("a fresh event channel cannot be full");
-        // Let the driver take the event and drain the read it schedules.
-        // Yields rather than a sleep: everything in that path is
-        // in-process, so this is over in a handful of polls and adds no
-        // wall-clock time to a suite of forty tests.
-        for _ in 0..16 {
+        // Wait on the condition, not on a fixed number of polls: the
+        // driver must have *taken* the event before the caller touches
+        // the clipboard, or the establishment read lands on content the
+        // test set afterwards and the test sees an observation it never
+        // made. A restored capacity is what says it was taken.
+        for _ in 0..1_000 {
+            if events.capacity() == events.max_capacity() {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert_eq!(
+            events.capacity(),
+            events.max_capacity(),
+            "the driver never took the session event"
+        );
+        // And what it scheduled produced nothing, which is what lets this
+        // rig hand the caller a clean command channel: the clipboard is
+        // still empty here. Asserted rather than assumed, so an
+        // establishment path that grows an `Action::Send` fails loudly
+        // once instead of turning every test in this suite into a flake.
+        assert!(
+            timeout(Duration::from_millis(50), commands.recv())
+                .await
+                .is_err(),
+            "session establishment emitted a command against an empty clipboard;              this rig's guarantee that the channel starts clean no longer holds"
+        );
         Rig {
             clipboard,
             events,
