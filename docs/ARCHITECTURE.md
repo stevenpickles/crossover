@@ -367,6 +367,24 @@ origin + content-hash tracking of recently applied items, deduplication,
 bounded retry with observable failure, deterministic latest-wins conflict
 policy. Message flow is specified in [PROTOCOL.md](PROTOCOL.md) §5.
 
+**Bounded retry has two phases**
+([ADR 0005](adr/0005-clipboard-transaction-flow.md), addendum
+2026-09-01). A `Busy` install retries five times at 200 ms — the *fast*
+phase, sized for another application between `OpenClipboard` and
+`CloseClipboard` — and if the clipboard is still busy it **parks** rather
+than failing: retried once a second, and immediately on every local change
+notification, until a 20 s budget elapses. Only then does
+`ClipboardUnavailable` travel, so the wire contract is unchanged. The
+budget is set against the *origin's* 60 s `transfer_timeout`: a receiver
+still trying past that is answering a transaction nobody is listening to,
+and a test pins the relation. A parked install is outranked by a newer
+inbound item and by a local copy, both answered `Superseded` — an install
+that can live for twenty seconds must never overwrite content the user
+made in that window. The read side mirrors it: fast nudges, then a
+one-second revival cadence for 20 s, because the re-announce on reconnect
+*is* a read and cannot depend on a change notification that may never come.
+Every clock is still the driver's; the engine only decides.
+
 Each observed OS clipboard change becomes an immutable `ClipboardItem`
 (id, origin peer, sequence, timestamp, content type, length, hash, content).
 Contents are never logged; metadata is (FR-7.4).
@@ -433,7 +451,7 @@ of up to `MAX_CLIPBOARD_IMAGE_BYTES` (64 MiB) are simultaneously reachable:
 
 | Slot | Held while |
 |------|-----------|
-| `pending_write` | an item is being installed, including across the bounded `Busy` retry schedule |
+| `pending_write` | an item is being installed, including across both phases of the bounded `Busy` retry schedule (up to ~22 s if it parks) |
 | the inbound reassembly | a *newer* offer, accepted while that write is still retrying, streams in |
 | the retained outbound item | a concurrent local copy is offered and awaiting its answer |
 

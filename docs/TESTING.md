@@ -107,6 +107,21 @@ arrives after the input frame, and nothing is dropped" rather than as a
 number of milliseconds. Numeric latency belongs in §4's measurement, not in
 a gate.
 
+Injected clipboard contention must cover **both** retry phases
+([ADR 0005](adr/0005-clipboard-transaction-flow.md), addendum
+2026-09-01), because a hold the fast phase absorbs and a hold that
+outlives it are different faults and only the second one lost items on
+hardware. A contention scenario that never exceeds `max_attempts` proves
+the blip case and nothing else — so the hermetic gate
+(`stress::sustained_contention_still_delivers_every_item`) injects a hold
+past the fast budget on a fraction of its items and asserts the parked
+phase was reached at all. The read half needs the same treatment and one
+thing more:
+`a_reconnect_re_announce_survives_a_contended_clipboard`
+fails a reconnect's re-announce read for longer than
+the fast nudges *and never changes the clipboard again*, which is the only
+shape that catches a read waiting on a notification that will not come.
+
 Fault injection is the primary evidence for the reliability requirements
 (FR-6.x) and clipboard guarantees (FR-3.x).
 

@@ -172,9 +172,19 @@ What good looks like:
 
 - `applied` accounts for essentially every transaction; a handful of
   `superseded` is normal if both machines copied simultaneously.
-- **Zero** `clipboard_unavailable` in the absence of deliberate
-  contention; a few during it is the bounded-retry design working, and
-  each one is visible rather than silent.
+- **Zero** `clipboard_installs_failed` in the absence of deliberate
+  contention. This is the run report's clipboard-reliability number: it
+  counts inbound items the destination clipboard never took, which is
+  content the user lost, and it prints beside `applied` on the summary's
+  first clipboard line. A few during staged contention is the bounded-retry
+  design working, and each one is visible rather than silent.
+- `clipboard_installs_parked` is *not* a failure — it counts installs that
+  outlived the fast retry budget and went to the slower parked cadence
+  (ADR 0005, addendum 2026-09-01), most of which still land. Its line
+  prints only when it happened. A run with parked installs and zero failed
+  ones is the fix doing exactly its job; a rising ratio of failed to parked
+  says the 20 s budget is not enough for this machine and is worth
+  investigating rather than raising.
 - p50 latency in the low tens of milliseconds on a LAN; the max may
   spike when another application holds a clipboard.
 - Every disconnect is followed by a reconnect with no pairing.
@@ -185,7 +195,11 @@ What warrants investigation:
   bytes on B (this is release-blocking).
 - Sync traffic that continues when nobody is copying — the signature of
   a loop.
-- `clipboard_unavailable` at rest.
+- `clipboard_installs_failed` at rest.
+- Parked installs at rest, in any number: the fast budget covers everything
+  a healthy desktop does to its own clipboard, so parking at rest means
+  something on the machine is holding it for seconds at a time. Find out
+  what before deciding it is benign.
 - Latency growing steadily over the run (a leak or unbounded queue).
 
 Record the outcome in the phase's exit-criteria notes
