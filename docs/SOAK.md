@@ -213,6 +213,34 @@ If clipboard tests fail this way, check `Set-Clipboard` in PowerShell
 first — if that also fails, the machine is wedged and the test results
 mean nothing until the service is restarted.
 
+### Reading the holder from the log line (feature/162)
+
+Hardware evidence (2026-09-01, machine A) found the ordinary, briefer
+cousin of the above: at 5 of 8 peer reconnects, `OpenClipboard` failed for
+about a second with the same "Access is denied", but recovered on its own
+— routine contention (R-5), not a wedged service, and every such failure
+now names its holder in the log line:
+
+- `OpenClipboard failed (clipboard held elsewhere?): Access is denied.
+  (0x80070005); held by pid 1234 "SomeApp.exe" (window class "Foo")` — an
+  external application (Clipboard History, a password manager, an RDP
+  client are the usual suspects); nothing to fix in Crossover.
+- `…; held by this process (pid N, thread T, window class "...")` — the
+  contention is **internal**, most often the OLE virtual-file apartment
+  thread (`crossover-platform-windows::virtual_file`) racing the ordinary
+  text/image path's own open. Worth a closer look if it recurs, since nothing
+  external explains it.
+- `…; held by an unidentified owner (no window)` — the same shape this
+  section's wedged-service signature produces, but on a single transient
+  open rather than every process; if it does not clear within a few
+  retries, suspect the service as above.
+
+The prefix (`OpenClipboard failed (clipboard held elsewhere?)`) is
+unchanged and still what to `grep` for; the holder clause is appended
+after it.
+first — if that also fails, the machine is wedged and the test results
+mean nothing until the service is restarted.
+
 ## Phase 3 soak: remote mouse (two machines)
 
 This is the Phase 3 exit criterion that no single machine can show:

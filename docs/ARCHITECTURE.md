@@ -260,6 +260,20 @@ Guidelines:
     than reaching Win32. Type is judged before size, so an oversized JPEG
     is refused for being a JPEG: the durable answer, where "too big"
     invites a smaller retry that must also fail.
+  - **A contention failure names its holder** (FR-7.3; feature/162, from
+    2026-09-01 hardware evidence of `OpenClipboard` failing across ~1 s of
+    peer reconnects with no way to tell who held it). `Busy`'s `reason`
+    carries `GetOpenClipboardWindow` → `GetWindowThreadProcessId` → the
+    window's class name (`GetClassNameW`) and, for an external holder, the
+    process's own executable file name (`QueryFullProcessImageNameW`) —
+    never a window title or full path, both of which can carry document
+    or user content (FR-7.4). Whether the pid is this process's own
+    (`GetCurrentProcessId`) is the one bit that matters most: it separates
+    an external application from in-process contention such as the OLE
+    virtual-file apartment thread (`crossover-platform-windows::virtual_file`)
+    racing this same open. Every lookup degrades to "unidentified" on
+    failure rather than blocking or panicking, the same discipline
+    `LinkStateProbe` below holds to.
 - `LinkStateProbe` is a **diagnostic** capability, not an operational one: it
   is read on a failure path to label a log line and never gates, delays, or
   reorders anything (see §10). Its contract is therefore unusually strict —
