@@ -372,18 +372,32 @@ policy. Message flow is specified in [PROTOCOL.md](PROTOCOL.md) §5.
 2026-09-01). A `Busy` install retries five times at 200 ms — the *fast*
 phase, sized for another application between `OpenClipboard` and
 `CloseClipboard` — and if the clipboard is still busy it **parks** rather
-than failing: retried once a second, and immediately on every local change
-notification, until a 20 s budget elapses. Only then does
+than failing: retried once a second, and by the settle read that follows a
+local change, until a 20 s budget elapses. Only then does
 `ClipboardUnavailable` travel, so the wire contract is unchanged. The
 budget is set against the *origin's* 60 s `transfer_timeout`: a receiver
 still trying past that is answering a transaction nobody is listening to,
-and a test pins the relation. A parked install is outranked by a newer
-inbound item and by a local copy, both answered `Superseded` — an install
-that can live for twenty seconds must never overwrite content the user
-made in that window. The read side mirrors it: fast nudges, then a
-one-second revival cadence for 20 s, because the re-announce on reconnect
-*is* a read and cannot depend on a change notification that may never come.
-Every clock is still the driver's; the engine only decides.
+and a test pins the relation.
+
+A change notification deliberately does **not** retry a parked install —
+the *read* does. A notification usually means new content just landed, so
+writing on it would race the user, and the loop guard would then swallow
+the evidence. The read is the first moment anything knows what the
+clipboard holds: our own content or unchanged content frees the install to
+retry; genuinely new content supersedes it. A parked install is also
+superseded by a newer inbound item and by one that already matches this
+clipboard, and it is dropped uncounted when its session ends — an install
+that can live for twenty seconds must never overwrite content the user made
+in that window, nor land during a session that did not carry it. The
+reconnect re-announce is not a local copy, which is why
+`on_session_established` keeps the dedup hash and sets a re-announce flag
+rather than clearing it: "announce this anyway" and "this is new" are
+different statements.
+
+The read side mirrors the two phases: fast nudges, then a one-second
+revival cadence for 20 s, because the re-announce on reconnect *is* a read
+and cannot depend on a change notification that may never come. Every clock
+is still the driver's; the engine only decides.
 
 Each observed OS clipboard change becomes an immutable `ClipboardItem`
 (id, origin peer, sequence, timestamp, content type, length, hash, content).

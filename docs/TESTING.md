@@ -114,8 +114,11 @@ outlives it are different faults and only the second one lost items on
 hardware. A contention scenario that never exceeds `max_attempts` proves
 the blip case and nothing else — so the hermetic gate
 (`stress::sustained_contention_still_delivers_every_item`) injects a hold
-past the fast budget on a fraction of its items and asserts the parked
-phase was reached at all. The read half needs the same treatment and one
+past the fast budget on a fraction of its items and asserts, **from the
+engine's own `clipboard_installs_parked` counter**, that the parked phase
+was actually reached. That distinction is the point: a harness that
+asserts on its own bookkeeping proves the injection was scheduled, never
+that the code path it was aimed at ran. The read half needs the same treatment and one
 thing more:
 `a_reconnect_re_announce_survives_a_contended_clipboard`
 fails a reconnect's re-announce read for longer than

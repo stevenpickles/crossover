@@ -171,7 +171,13 @@ design working, not sync failing. Verify by *content*, never by count.
 What good looks like:
 
 - `applied` accounts for essentially every transaction; a handful of
-  `superseded` is normal if both machines copied simultaneously.
+  `superseded` is normal. It no longer means only "both machines copied at
+  once": since ADR 0005's 2026-09-01 addendum it also counts an **install
+  that never landed** and was outranked — by a newer item from the peer,
+  by a local copy made while it was parked, or by an item that already
+  matched this clipboard. Read it beside `installs parked`: supersessions
+  with no parked installs are the conflict race, supersessions with parked
+  installs are contention losing to the user, and both are healthy.
 - **Zero** `clipboard_installs_failed` in the absence of deliberate
   contention. This is the run report's clipboard-reliability number: it
   counts inbound items the destination clipboard never took, which is

@@ -105,23 +105,48 @@ something* for a second or two.
   what this ADR already specified, for the blip it already modelled.
 - **Parked phase** — entered when the fast phase is exhausted and the
   failure is still `Busy`. The install is *not* failed. It is retried on
-  the slower `park_delay` = **1 s** cadence, and immediately on **every
-  local change notification**, until `park_budget` = **20 s** elapses.
-  `Unavailable` and `UnsupportedType` are unchanged: neither is a
+  the slower `park_delay` = **1 s** cadence, and by the **settle read**
+  that follows a local change notification, until `park_budget` = **20 s**
+  elapses. `Unavailable` and `UnsupportedType` are unchanged: neither is a
   statement that will be different in a second.
 - Only when the parked budget runs out does `ClipboardUnavailable`
   travel. **No protocol change**: the verdicts, their meanings, and the
   requirement that a transaction closes only on the destination's
   `ClipboardApplied` are all exactly as before.
 
-The change notification is the *primary* revival and the slow timer is the
-backstop, in that order deliberately. A notification is the best evidence
-available that whoever held the clipboard has let go, and it usually
-arrives long before the next tick. Once a second is the cadence for the
-tick because the parked phase must be a good neighbour: re-taking the
-machine-global lock five times a second for twenty seconds is precisely
-how Crossover made other applications' clipboard calls fail in the
-two-machine soak ([SOAK.md](../SOAK.md), ADR 0006's context).
+Once a second is the cadence for the timer because the parked phase must be
+a good neighbour: re-taking the machine-global lock five times a second for
+twenty seconds is precisely how Crossover made other applications'
+clipboard calls fail in the two-machine soak ([SOAK.md](../SOAK.md), ADR
+0006's context).
+
+**The read revives it, and the notification deliberately does not.** The
+first design retried on the notification itself, on the reasoning that a
+notification is the best evidence available that whoever held the clipboard
+has let go. That reasoning is sound and the conclusion was wrong, because
+it ignores *why* the clipboard usually changes: on Windows a
+`WM_CLIPBOARDUPDATE` almost always means new content just landed. A parked
+install taking that moment would write over the copy the user made an
+instant earlier — and worse, silently: the settle read would then find our
+own content, recognize it through the applied-hash memory, suppress it as a
+loop, and report nothing at all. The user's copy would be gone with no
+diagnostic anywhere, which is a strictly worse fault than the one being
+fixed.
+
+So the notification only starts the settle clock (ADR 0006), and the
+**read** decides, because the read is the first moment anything knows what
+the clipboard actually holds:
+
+| What the read finds | What the parked install gets |
+|---|---|
+| Content we ourselves installed (loop-suppressed) | Retried now — the clipboard is free and holds nothing of the user's |
+| Content unchanged since we last looked | Retried now, same reasoning |
+| Genuinely new content | **Superseded** — the user outranks it |
+| Nothing readable | Left alone; its own timer decides |
+
+The cost is one settle window — 300 ms — with the 1 s parked timer as the
+backstop underneath. That is a small price for never guessing wrong about
+whose content is on the clipboard.
 
 ### The budget arithmetic, and whose deadline actually fixes it
 
@@ -162,12 +187,39 @@ questions an install that lived for 800 ms did not.
   this ADR's invariant is that **every transaction ends in a typed verdict
   within a bounded time**, and the addendum keeps it rather than
   stretching it.
-- **A local copy** supersedes it, and this is new. Reaching a fresh local
-  item means this machine's user put something on this machine's clipboard
-  that is neither a duplicate nor our own write. Installing a peer item
-  over it fifteen seconds later would destroy content the user just made —
-  a worse fault than the one being fixed. Inside the fast budget the
-  question does not arise, so only a *parked* install loses this way.
+- **A local copy** supersedes it, and this is new. A read that finds
+  content which is neither a duplicate nor our own write means this
+  machine's user put it there. Installing a peer item over it fifteen
+  seconds later would destroy content the user just made — a worse fault
+  than the one being fixed. Inside the fast budget the question does not
+  arise, so only a *parked* install loses this way.
+- **An item that already matches this clipboard** closes it. The echo
+  guard answers such an item `Applied` without writing anything, which is
+  correct — and an older install left pending behind that answer would
+  later write its own content over the clipboard both machines had just
+  agreed on, with its own-write notification loop-suppressed so nothing
+  noticed. Silent, permanent divergence from a path whose whole purpose is
+  agreement.
+- **The session ending** drops it, without a verdict and without counting
+  a failure. There is nobody to send a verdict to, and the outbound slot
+  beside it is cleared uncounted for the same reason. This one is not
+  about ranking: an install that can live for twenty seconds can outlive
+  its session, land during the *next* one, and overwrite whatever the user
+  did in between — answering a peer that stopped waiting long ago. The
+  content is not lost, because the peer re-announces on reconnect (ADR
+  0006, trigger 3) and the read revival below is what makes sure that
+  re-announcement is heard.
+
+**The reconnect re-read is not a local copy**, and saying so took a change
+of mechanism. `on_session_established` used to clear the dedup hash so the
+re-read would announce regardless — which threw away the one fact the rule
+above needs, making every reconnect's re-read of unchanged content
+indistinguishable from the user copying something. A parked install would
+therefore be superseded by the reconnect that was trying to deliver it: the
+2026-09-01 scenario, defeated by its own fix. The hash is now kept and a
+re-announce flag set beside it, so the read can say "announce this anyway"
+and "this is not new" at the same time, which are two different statements
+and always were.
 
 ### The read side has the same two phases, for the same reason
 
