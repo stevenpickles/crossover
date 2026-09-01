@@ -1187,10 +1187,28 @@ wastes a two-desk session.
 
 ### Setup
 
-The standing pair, unchanged from Phase 6/7: machine **A** (development
-machine, `192.168.1.151`, **two monitors**, mixed DPI) listens; machine
-**B** (`192.168.1.146`, one monitor) dials. Both under the background
-service (ADR 0011), which is how the pair actually runs.
+The standing pair from Phase 6/7, now on a different subnet and with a
+bigger desk (2026-09-01): machine **A** (development machine,
+`192.168.3.20`, **three monitors** — two `DELL U2723QE` panels, one of
+them portrait, beside the laptop's `Internal Display`, mixed DPI) listens;
+machine **B** (`192.168.3.10`, one monitor) dials. Both under the
+background service (ADR 0011), which is how the pair actually runs. B is
+not permanently on the LAN — it moves between offices and sleeps — so a
+session that drops and re-establishes every fifteen to ninety minutes is
+this pair's normal regime, not a fault to chase; A's log shows it as
+`session ended … os error 10054` followed ~12 s later by
+`session established`.
+
+Two consequences of that desk for the checks below. Wherever a check says
+"A's two monitors", read it as any adjacent pair of A's three. And the
+arrangement saved on both machines before this session (revision 12,
+drawn on B) places only **two** of A's screens — the third was added
+afterwards and is `unplaced` in the editor — so `edge: none of this
+machine's live screens matches the drawn arrangement` appears
+transiently at every dock, sleep, and wake on A. That is check 2.5's
+diagnosed behaviour, not a finding; **redraw the arrangement for the
+three-screen desk in Pass 1 before reading anything else**, and only then
+count entry-point warnings.
 
 Five things to do before starting, each of which has cost time when
 skipped:
