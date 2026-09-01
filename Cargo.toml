@@ -29,7 +29,7 @@ resolver = "3"
 # installs as an upgrade; leaving it at 0.1.0 would make every development
 # build a *pre-release of the version already installed* and therefore
 # un-upgradeable.
-version = "0.2.0"
+version = "0.3.0"
 # Nothing here is published to crates.io: this is one application in one
 # repository, and the crate split exists for internal boundaries
 # (docs/ARCHITECTURE.md §3), not distribution. Declaring it prevents an
