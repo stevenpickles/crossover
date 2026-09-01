@@ -1011,7 +1011,10 @@ fn place(
     // its own reference, and the local one is kept below so the object
     // outlives the placement.
     unsafe { OleSetClipboard(Some(&object)) }.map_err(|e| ClipboardError::Busy {
-        reason: format!("OleSetClipboard failed (clipboard held elsewhere?): {e}"),
+        reason: format!(
+            "OleSetClipboard failed (clipboard held elsewhere?): {e}; {}",
+            crate::clipboard::describe_clipboard_holder()
+        ),
     })?;
     tracing::debug!(
         spool_entry = %file.entry,

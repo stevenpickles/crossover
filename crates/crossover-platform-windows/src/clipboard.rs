@@ -113,29 +113,35 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossover_platform::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
     MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
 };
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::GlobalFree;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
     RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE, MSG, PostMessageW,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE,
+    CreateWindowExW, DestroyWindow, DispatchMessageW, GetClassNameW, GetMessageW,
+    GetWindowThreadProcessId, HWND_MESSAGE, MSG, PostMessageW, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE,
 };
-use windows::core::w;
+use windows::core::{PWSTR, w};
 
 /// Private message asking the pump thread to shut down.
 const WM_APP_SHUTDOWN: u32 = WM_APP + 1;
@@ -1060,6 +1066,153 @@ fn le_i32(blob: &[u8], at: usize) -> Option<i32> {
         .map(i32::from_le_bytes)
 }
 
+/// A clipboard holder identified well enough to name — the Win32 lookups
+/// in [`find_clipboard_holder`] populate this; [`format_holder`] renders
+/// it, kept separate so the rendering is unit-testable without a live
+/// window or process.
+struct ClipboardHolder {
+    pid: u32,
+    thread: u32,
+    /// Never the window title (FR-7.4): a title can carry document
+    /// content, a class name cannot.
+    window_class: String,
+    is_this_process: bool,
+    /// Never the full path (FR-7.4): a path can carry a username.
+    image_file_name: Option<String>,
+}
+
+/// Identify who currently holds the clipboard open, for the `Busy`
+/// diagnostic (FR-7.3) — hardware evidence (2026-09-01) showed a bare
+/// "held elsewhere?" leaves no way to tell an external holder (Clipboard
+/// History, a password manager, an RDP client) from contention inside this
+/// process (e.g. the OLE virtual-file apartment thread in
+/// `crate::virtual_file`).
+///
+/// Every lookup here is best-effort and degrades to "unidentified" on any
+/// failure — never panics, never blocks (no waits), and every buffer is
+/// fixed-size.
+pub(crate) fn describe_clipboard_holder() -> String {
+    format_holder(find_clipboard_holder())
+}
+
+/// The Win32 side of [`describe_clipboard_holder`]: who, if anyone
+/// identifiable, has the clipboard open right now.
+fn find_clipboard_holder() -> Option<ClipboardHolder> {
+    // SAFETY: a bare query of global clipboard state; touches no handle
+    // or buffer of our own.
+    let holder = match unsafe { GetOpenClipboardWindow() } {
+        Ok(hwnd) if !hwnd.is_invalid() => hwnd,
+        // No window is associated with the open — the common shape for
+        // `OpenClipboard(NULL)` (ours included), and also the signature
+        // docs/SOAK.md already documents for a wedged Clipboard User
+        // Service. Either way, there is nothing further to identify.
+        _ => return None,
+    };
+
+    let mut pid = 0u32;
+    // SAFETY: `holder` was just returned live by `GetOpenClipboardWindow`;
+    // the out-pointer is valid for the duration of this call.
+    let thread = unsafe { GetWindowThreadProcessId(holder, Some(&raw mut pid)) };
+    if pid == 0 {
+        return None;
+    }
+
+    let window_class = window_class_name(holder);
+    // SAFETY: a bare read of the calling process's own id.
+    let is_this_process = pid == unsafe { GetCurrentProcessId() };
+    // The single most important bit is `is_this_process`: it separates
+    // in-process contention from an external holder. An image name for
+    // our own process would say nothing that pid doesn't already.
+    let image_file_name = if is_this_process {
+        None
+    } else {
+        process_image_file_name(pid)
+    };
+
+    Some(ClipboardHolder {
+        pid,
+        thread,
+        window_class,
+        is_this_process,
+        image_file_name,
+    })
+}
+
+/// Render a holder lookup into the `Busy` diagnostic's trailing clause.
+/// Pure formatting — no Win32 calls — so this shape is covered by a plain
+/// unit test.
+fn format_holder(holder: Option<ClipboardHolder>) -> String {
+    let Some(holder) = holder else {
+        return "held by an unidentified owner (no window)".to_owned();
+    };
+    let ClipboardHolder {
+        pid,
+        thread,
+        window_class,
+        is_this_process,
+        image_file_name,
+    } = holder;
+    if is_this_process {
+        return format!(
+            "held by this process (pid {pid}, thread {thread}, window class \"{window_class}\")"
+        );
+    }
+    match image_file_name {
+        Some(name) => format!("held by pid {pid} \"{name}\" (window class \"{window_class}\")"),
+        None => format!("held by pid {pid} (window class \"{window_class}\")"),
+    }
+}
+
+/// A window's class name, bounded and best-effort — never the window
+/// title (FR-7.4). Any Win32 failure degrades to `"unknown"`.
+fn window_class_name(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 256];
+    // SAFETY: `hwnd` is a live window handle from the caller; `buffer` is
+    // a real, fixed-size allocation for the duration of the call.
+    let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    let Ok(len) = usize::try_from(len) else {
+        return "unknown".to_owned();
+    };
+    match buffer.get(..len) {
+        Some(units) if len > 0 => String::from_utf16_lossy(units),
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// A process's own executable **file name** (never the full path — a path
+/// can carry a username, FR-7.4), best-effort: any failure anywhere in
+/// this chain — the process not opening, the query failing, a name this
+/// build cannot decode — is `None` rather than propagated.
+fn process_image_file_name(pid: u32) -> Option<String> {
+    // SAFETY: `PROCESS_QUERY_LIMITED_INFORMATION` is read-only and
+    // available even for a process we do not own; the handle is closed
+    // below on every path out of this function.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buffer = [0u16; 260]; // MAX_PATH; a longer path is reported truncated, never overrun
+    let mut len = u32::try_from(buffer.len()).unwrap_or(0);
+    // SAFETY: `process` is the handle opened above, live for this call;
+    // `buffer`/`len` describe a real, sized allocation the API writes
+    // into and reports the written length back through.
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &raw mut len,
+        )
+    };
+    // SAFETY: closes the handle opened above, exactly once, regardless of
+    // whether the query succeeded.
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    queried.ok()?;
+    let path = String::from_utf16_lossy(buffer.get(..len as usize)?);
+    Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
 /// RAII for `OpenClipboard`/`CloseClipboard`. Open failure is `Busy`:
 /// another process holding the clipboard is routine contention (R-5).
 struct OpenGuard;
@@ -1070,7 +1223,10 @@ impl OpenGuard {
         // the calling thread; EmptyClipboard then assigns no owner, which
         // is correct for immediate (non-delayed) rendering.
         unsafe { OpenClipboard(None) }.map_err(|e| ClipboardError::Busy {
-            reason: format!("OpenClipboard failed (clipboard held elsewhere?): {e}"),
+            reason: format!(
+                "OpenClipboard failed (clipboard held elsewhere?): {e}; {}",
+                describe_clipboard_holder()
+            ),
         })?;
         Ok(Self)
     }
@@ -1207,6 +1363,57 @@ mod tests {
             super::DibProbe::Raw(blob) => Some(super::canonical_dib(blob)),
             super::DibProbe::Absent | super::DibProbe::TooLarge { .. } => None,
         })
+    }
+
+    /// The holder diagnostic's formatting, isolated from the Win32 lookups
+    /// that populate it (feature/162) — deterministic, no live clipboard
+    /// or window involved, covering every shape `format_holder` produces.
+    #[test]
+    fn format_holder_names_the_owner_or_says_unidentified() {
+        use super::{ClipboardHolder, format_holder};
+
+        assert_eq!(
+            format_holder(None),
+            "held by an unidentified owner (no window)"
+        );
+
+        assert_eq!(
+            format_holder(Some(ClipboardHolder {
+                pid: 4321,
+                thread: 9,
+                window_class: "Notepad".to_owned(),
+                is_this_process: false,
+                image_file_name: Some("notepad.exe".to_owned()),
+            })),
+            "held by pid 4321 \"notepad.exe\" (window class \"Notepad\")"
+        );
+
+        // A pid resolved but the image name lookup failed (protected
+        // process, race with exit, etc.) — degrades gracefully rather
+        // than dropping the pid it does have.
+        assert_eq!(
+            format_holder(Some(ClipboardHolder {
+                pid: 4321,
+                thread: 9,
+                window_class: "Notepad".to_owned(),
+                is_this_process: false,
+                image_file_name: None,
+            })),
+            "held by pid 4321 (window class \"Notepad\")"
+        );
+
+        // The case the feature exists for: our own process, not an
+        // external application.
+        assert_eq!(
+            format_holder(Some(ClipboardHolder {
+                pid: 1234,
+                thread: 42,
+                window_class: "CLIPBRDWNDCLASS".to_owned(),
+                is_this_process: true,
+                image_file_name: None,
+            })),
+            "held by this process (pid 1234, thread 42, window class \"CLIPBRDWNDCLASS\")"
+        );
     }
 
     /// JPEG has no Windows clipboard convention, and ADR 0014 forbids
@@ -1440,6 +1647,113 @@ mod tests {
             with_retry(|| clipboard.read_text()).unwrap().as_deref(),
             Some("after contention")
         );
+    }
+
+    /// The diagnostic's most important bit (feature/162): when the holder
+    /// is identifiable at all, it must say *this process*, not merely
+    /// "held elsewhere" — distinguishing in-process contention (the OLE
+    /// virtual-file apartment thread's shape) from a genuinely external
+    /// application. Unlike the test above, the holder thread opens with a
+    /// **real window** rather than `OpenClipboard(None)`: Win32 makes a
+    /// NULL-owner open invisible to `GetOpenClipboardWindow` (the
+    /// wedged-service signature docs/SOAK.md documents), so naming the
+    /// holder needs a window to name.
+    #[test]
+    fn contention_reason_names_this_process_when_a_window_is_identifiable() {
+        use windows::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+        use windows::core::w;
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+        with_retry(|| clipboard.write_text("before named contention")).unwrap();
+
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            // SAFETY: a message-only window from the prebuilt STATIC
+            // class, destroyed before this thread exits.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("crossover-holder-test"),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            };
+            let Ok(hwnd) = hwnd else {
+                holding_tx.send(false).ok();
+                return;
+            };
+
+            let mut acquired = false;
+            for _ in 0..20 {
+                // SAFETY: `hwnd` is the live window just created, kept
+                // alive for the rest of this closure.
+                if unsafe { OpenClipboard(Some(hwnd)) }.is_ok() {
+                    acquired = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            holding_tx.send(acquired).ok();
+            if acquired {
+                let _ = release_rx.recv();
+                // SAFETY: balances the successful open above.
+                unsafe {
+                    let _ = CloseClipboard();
+                }
+            }
+            // SAFETY: destroys the window this thread created; nothing
+            // else references it once the clipboard is closed.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        });
+
+        let held = holding_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("holder thread did not report");
+        if !held {
+            release_tx.send(()).ok();
+            holder.join().unwrap();
+            eprintln!("skipped: could not stage window-owned contention");
+            return;
+        }
+
+        // Same honest limitation as the test above: Win32 may admit
+        // another thread of this same process anyway, in which case there
+        // is no Busy reason to inspect.
+        match clipboard.write_text("during named contention") {
+            Err(ClipboardError::Busy { reason }) => {
+                // `GetClassNameW` reports the predefined "STATIC" class
+                // back as "Static" — the window's own canonical casing,
+                // not the name it was created with.
+                assert!(
+                    reason.contains("held by this process") && reason.contains("Static"),
+                    "reason must name this process and the holder window's class: {reason}"
+                );
+            }
+            Ok(()) => eprintln!(
+                "skipped: this thread's window-owned open admitted us, nothing to inspect"
+            ),
+            Err(other) => panic!("contention must classify as Busy, got {other:?}"),
+        }
+
+        release_tx.send(()).ok();
+        holder.join().unwrap();
+
+        with_retry(|| clipboard.write_text("after named contention")).unwrap();
     }
 
     /// Rapid replacement (FR-6.1): a burst of writes must leave the last
