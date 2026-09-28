@@ -7,13 +7,17 @@
 //! `crossover-platform-windows` does off Windows (docs/ARCHITECTURE.md §3,
 //! §4).
 //!
-//! This crate is the port's designated home for `unsafe` (framework FFI).
-//! It holds none yet: the first slice to call a framework relaxes the
-//! workspace's `unsafe_code = "forbid"` here, and from then every unsafe
-//! block carries a SAFETY comment and is exercised by tests on the
-//! `macos-latest` CI runners (NFR-6, docs/TESTING.md §1.6). What CI cannot
+//! This crate is the port's designated home for `unsafe` (framework FFI):
+//! every unsafe block carries a SAFETY comment and is exercised by tests on
+//! the `macos-latest` CI runners (NFR-6, docs/TESTING.md §1.6). What CI cannot
 //! reach — a permission prompt, the real pasteboard under a logged-in user,
 //! a moved cursor — is covered by manual checks on the lab Mac.
 //!
 //! The risks each implementation must answer are catalogued, before any of
 //! it exists, in docs/platform-risks-macos.md (M-1..M-10).
+
+#[cfg(target_os = "macos")]
+pub mod secure_storage;
+
+#[cfg(target_os = "macos")]
+pub use secure_storage::KeychainSecureStorage;

@@ -14,9 +14,22 @@ repository.workspace = true
 [dependencies]
 crossover-platform = { workspace = true }
 
-# The workspace policy, `unsafe_code = "forbid"` included, until the first
-# slice calls a framework: this crate will become the port's home for FFI
-# (ADR 0020) and relax that locally then, with the justification the
-# Windows crate carries — not before there is `unsafe` to justify.
-[lints]
-workspace = true
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { workspace = true, features = ["std", "CFBase", "CFData", "CFDictionary", "CFNumber", "CFString"] }
+objc2-security = { workspace = true, features = ["std", "SecItem", "SecBase"] }
+
+# The workspace forbids unsafe_code (NFR-6). This crate is the designated
+# exception for the macOS port (ADR 0020): framework FFI requires `unsafe`.
+# The relaxation is local and deliberate — unsafe stays minimized, isolated
+# here, documented with SAFETY comments, and covered by tests that run on
+# the macos-latest CI runners (docs/SPECIFICATION.md NFR-6,
+# docs/TESTING.md §1.6). The clippy tables mirror the workspace policy,
+# which cannot be partially inherited — the same shape as
+# crossover-platform-windows.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
