@@ -15,6 +15,9 @@ use crossover_platform::SecureStorage;
 /// `SecureStorage` backend arrives with the Linux port (docs/ROADMAP.md
 /// Phase 9.2), and pretending otherwise would violate the
 /// no-silent-plaintext-fallback contract.
+// One signature for every platform: on macOS the open itself cannot fail,
+// but on Windows and Linux it can, and callers handle one shape.
+#[cfg_attr(target_os = "macos", allow(clippy::unnecessary_wraps))]
 pub fn open_secure_storage() -> anyhow::Result<Box<dyn SecureStorage>> {
     #[cfg(windows)]
     {
