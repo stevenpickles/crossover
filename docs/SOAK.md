@@ -1331,10 +1331,12 @@ startup.
 3. Copy text on A; paste on the Mac. Copy different text on the Mac; paste
    on A. Unicode (accents, an emoji), a multi-line block, and a large block
    (tens of kilobytes) each way.
-4. Copy an image on the Mac, then copy text on A: the image is the user's
-   copy and is **not** replaced by a waiting peer item during a busy
-   window; the text simply travels to A's side as usual (images do not
-   travel yet — slice 3).
+4. Copy an image on the Mac: nothing travels to A (images arrive in
+   slice 3), and the Mac's log shows no error for it. Then copy text on A:
+   it arrives on the Mac as usual, replacing the image — a peer's copy
+   always may. (What an unreadable copy is protected from is a peer item
+   *stuck waiting on a busy clipboard*, which the engine tests cover; it
+   is not something to provoke by hand.)
 5. Set the Mac to *always deny* and copy on the Mac: the Mac's log names
    the setting (M-11) instead of going quiet. Set it back.
 6. From A's console, request control (`r`): A's request times out with its
