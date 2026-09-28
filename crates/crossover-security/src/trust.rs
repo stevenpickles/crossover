@@ -243,6 +243,21 @@ impl TrustedPeer {
         std::mem::replace(&mut self.permissions.file_receive, allowed)
     }
 
+    /// Grant or revoke sending our clipboard to this peer
+    /// (`clipboard_send`), returning the value it replaced. A local call
+    /// with an explicit value, like [`Self::set_file_receive`]; pairing sets
+    /// it on (`PeerPermissions::FULL`) and nothing on the wire changes it.
+    pub fn set_clipboard_send(&mut self, allowed: bool) -> bool {
+        std::mem::replace(&mut self.permissions.clipboard_send, allowed)
+    }
+
+    /// Grant or revoke this peer writing into our clipboard
+    /// (`clipboard_receive`), returning the value it replaced. As
+    /// [`Self::set_clipboard_send`].
+    pub fn set_clipboard_receive(&mut self, allowed: bool) -> bool {
+        std::mem::replace(&mut self.permissions.clipboard_receive, allowed)
+    }
+
     /// Known addresses for reconnection attempts.
     #[must_use]
     pub fn remembered_addresses(&self) -> &[String] {
@@ -514,6 +529,21 @@ impl TrustStore {
     pub fn set_file_receive(&mut self, peer_id: Uuid, allowed: bool) -> Option<bool> {
         let peer = self.peers.iter_mut().find(|p| p.peer_id == peer_id)?;
         Some(peer.set_file_receive(allowed))
+    }
+
+    /// Grant or revoke sending our clipboard to a peer, returning the value
+    /// it replaced — or `None` if no peer has that device UUID. Addressed
+    /// and persisted exactly as [`Self::set_file_receive`].
+    pub fn set_clipboard_send(&mut self, peer_id: Uuid, allowed: bool) -> Option<bool> {
+        let peer = self.peers.iter_mut().find(|p| p.peer_id == peer_id)?;
+        Some(peer.set_clipboard_send(allowed))
+    }
+
+    /// Grant or revoke a peer writing into our clipboard, returning the
+    /// value it replaced — or `None` if no peer has that device UUID.
+    pub fn set_clipboard_receive(&mut self, peer_id: Uuid, allowed: bool) -> Option<bool> {
+        let peer = self.peers.iter_mut().find(|p| p.peer_id == peer_id)?;
+        Some(peer.set_clipboard_receive(allowed))
     }
 
     /// Remove (revoke) a peer by device UUID, returning the removed record.
@@ -848,6 +878,51 @@ mod tests {
         const { assert!(!PeerPermissions::FULL.file_receive) };
         assert!(!PeerPermissions::default().file_receive);
         assert!(!peer(0xAA, "freshly-paired").may_receive_files());
+    }
+
+    /// The two clipboard directions are separate grants: withdrawing one
+    /// moves neither the other, nor `file_receive`, nor another peer — and
+    /// each survives a reload, since a running worker reads them from the
+    /// persisted store on its trust poll.
+    #[test]
+    fn clipboard_grants_are_independent_per_direction_and_survive_a_reload() {
+        let storage = InMemorySecureStorage::new();
+        let mut store = TrustStore::new();
+        let record = peer(0xAA, "desk");
+        let id = record.peer_id();
+        store.add_peer(record).unwrap();
+        store.add_peer(peer(0xBB, "bystander")).unwrap();
+        // Pairing grants both directions.
+        const { assert!(PeerPermissions::FULL.clipboard_send) };
+        const { assert!(PeerPermissions::FULL.clipboard_receive) };
+
+        assert_eq!(store.set_clipboard_receive(id, false), Some(true));
+        store.save(&storage).unwrap();
+        let reloaded = TrustStore::load(&storage).unwrap();
+        let permissions = reloaded.find_by_peer_id(id).unwrap().permissions();
+        assert!(!permissions.clipboard_receive);
+        assert!(permissions.clipboard_send, "the other direction moved");
+        assert!(!permissions.file_receive);
+        let bystander = reloaded
+            .find_by_fingerprint(fingerprint(0xBB))
+            .unwrap()
+            .permissions();
+        assert!(bystander.clipboard_send && bystander.clipboard_receive);
+
+        let mut store = reloaded;
+        assert_eq!(store.set_clipboard_send(id, false), Some(true));
+        assert_eq!(store.set_clipboard_receive(id, true), Some(false));
+        store.save(&storage).unwrap();
+        let permissions = TrustStore::load(&storage)
+            .unwrap()
+            .find_by_peer_id(id)
+            .unwrap()
+            .permissions();
+        assert!(!permissions.clipboard_send);
+        assert!(permissions.clipboard_receive);
+
+        assert_eq!(store.set_clipboard_send(Uuid::new_v4(), true), None);
+        assert_eq!(store.set_clipboard_receive(Uuid::new_v4(), true), None);
     }
 
     #[test]
