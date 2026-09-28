@@ -334,7 +334,8 @@ Rules specific to files:
   the receiver cannot honestly claim to already have one.
 - **Each refusal means something different**, and a sender may act on the
   difference: `NotPermitted` is a grant the user can give
-  (`crossover peers allow-files`); `UnsupportedType` is a receiver with no
+  (`crossover peers allow-files`, or `allow-clipboard --incoming` when the
+  peer's whole clipboard is refused); `UnsupportedType` is a receiver with no
   spool at all, which no permission will change; `InsufficientSpace` is
   this machine's free space or spool budget; `TooLarge` is the item's own
   ceiling; `NotReady` is a statement about now.

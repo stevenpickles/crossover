@@ -35,9 +35,9 @@ use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
 use crossover_protocol::hello::MessageType;
 
 use crate::clipboard::{
-    Action, BuiltBlob, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, FileSend,
-    InboundMessage, MIN_FREE_SPACE_MARGIN_BYTES, OutboundMessage, SpooledFile, TransferScope,
-    WriteFailure,
+    Action, BuiltBlob, ClipboardConfig, ClipboardEngine, ClipboardGrant, FileReceive, FileRefusal,
+    FileSend, InboundMessage, MIN_FREE_SPACE_MARGIN_BYTES, OutboundMessage, SpooledFile,
+    TransferScope, WriteFailure,
 };
 use crate::command::{FrameTarget, SessionCommand};
 use crate::metrics::Metrics;
@@ -184,6 +184,18 @@ pub enum SyncEvent {
     /// trust store. An event for the same reason its receiving twin is:
     /// both answers change while the process runs.
     FileSendPolicy(FileSend),
+    /// Whether this machine's text and image copies may be sent to the
+    /// peer, and whether the peer's items may reach this clipboard
+    /// (`clipboard_send`, `clipboard_receive`; docs/SECURITY.md §4), as the
+    /// application currently reads the trust store. One event for both,
+    /// because they are read from the same record at the same moment and
+    /// neither is clamped by anything this build lacks.
+    ClipboardGrants {
+        /// `clipboard_send`.
+        send: ClipboardGrant,
+        /// `clipboard_receive`.
+        receive: ClipboardGrant,
+    },
     /// The builder finished with a local selection: one blob, or a typed
     /// refusal (ADR 0015).
     ///
@@ -479,6 +491,11 @@ impl ClipboardSyncDriver {
                     FileSend::Unsupported
                 };
                 self.engine.set_file_send(policy);
+                Vec::new()
+            }
+            SyncEvent::ClipboardGrants { send, receive } => {
+                self.engine.set_clipboard_send(send);
+                self.engine.set_clipboard_receive(receive);
                 Vec::new()
             }
             SyncEvent::FileBlobBuilt { id, outcome } => match *outcome {
@@ -1340,7 +1357,7 @@ mod tests {
     };
     use crossover_platform::SpoolError;
 
-    use crate::clipboard::{ClipboardConfig, FileReceive, FileSend, RetryPolicy};
+    use crate::clipboard::{ClipboardConfig, ClipboardGrant, FileReceive, FileSend, RetryPolicy};
     use crate::metrics::Metrics;
 
     struct Rig {
@@ -1403,6 +1420,14 @@ mod tests {
         )
         .unwrap();
         tokio::spawn(driver.run());
+        // A paired peer holds both clipboard grants, and the application
+        // publishes them before the session — so does the rig.
+        events
+            .try_send(SyncEvent::ClipboardGrants {
+                send: ClipboardGrant::Allowed,
+                receive: ClipboardGrant::Allowed,
+            })
+            .expect("a fresh event channel cannot be full");
         events
             .try_send(SyncEvent::SessionEstablished)
             .expect("a fresh event channel cannot be full");
@@ -1613,6 +1638,14 @@ mod tests {
 
         // The peer arrives: the item is offered without the user copying
         // it again (ADR 0006 trigger 3).
+        // Published before the session, as the application does.
+        events
+            .send(SyncEvent::ClipboardGrants {
+                send: ClipboardGrant::Allowed,
+                receive: ClipboardGrant::Allowed,
+            })
+            .await
+            .unwrap();
         events.send(SyncEvent::SessionEstablished).await.unwrap();
         let command = timeout(Duration::from_secs(5), commands.recv())
             .await
@@ -2175,6 +2208,13 @@ mod tests {
         )
         .unwrap();
         tokio::spawn(driver.run());
+        events
+            .send(SyncEvent::ClipboardGrants {
+                send: ClipboardGrant::Allowed,
+                receive: ClipboardGrant::Allowed,
+            })
+            .await
+            .unwrap();
 
         let meta = ClipboardMeta {
             id: Uuid::new_v4(),

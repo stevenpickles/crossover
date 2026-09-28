@@ -13,8 +13,9 @@
 >    [ADR 0016](adr/0016-image-interchange-format.md) (image interchange);
 >    make the clipboard read tell an empty clipboard from an unreadable one
 >    (**done**, feature/169); enforce `clipboard_send` for text and images,
->    not only files. All three change the contract the ports implement, so
->    they land first.
+>    not only files (**done**, with `clipboard_receive` and the CLI to set
+>    both, feature/170). All three change the contract the ports implement,
+>    so they land first.
 > 2. **9.1 — macOS**, to full parity with Windows.
 > 3. **9.2 — Linux (Ubuntu 24.04)**, opening with the input-route spike
 >    ([platform-risks-linux.md](platform-risks-linux.md) L-1), then to full
@@ -913,7 +914,13 @@ implement, made once before there are three implementations of it:
    `Unreadable`, never `Empty`, when it cannot tell the two apart.
 3. **`clipboard_send` is enforced for text and images**, not only files
    (0.2.0 known limitation). Security is priority #1, and a permission the
-   ports inherit half-enforced would be inherited three times.
+   ports inherit half-enforced would be inherited three times. **Done**
+   (feature/170), wider than first scoped (maintainer decision,
+   2026-09-28): `clipboard_receive` was enforced nowhere either, and neither
+   grant could be changed by a user, so both directions are now enforced
+   and `crossover peers allow-clipboard` / `deny-clipboard` set them.
+   `keyboard` and `mouse` remain stored but unenforced — recorded in
+   SECURITY.md §4, not yet scheduled.
 
 **9.1 — macOS**, in this order, each validated before the next:
 

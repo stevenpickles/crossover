@@ -21,7 +21,8 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crossover_core::{
-    ClipboardConfig, ClipboardRetryPolicy, Metrics, SessionCommand, SyncEvent, clipboard_sync,
+    ClipboardConfig, ClipboardGrant, ClipboardRetryPolicy, Metrics, SessionCommand, SyncEvent,
+    clipboard_sync,
 };
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::InMemoryClipboard;
@@ -81,6 +82,14 @@ fn side(origin: u8) -> Side {
     )
     .unwrap();
     tokio::spawn(driver.run());
+    // Two paired peers: pairing grants both clipboard directions, and the
+    // application publishes them before any session — so does the gate.
+    events
+        .try_send(SyncEvent::ClipboardGrants {
+            send: ClipboardGrant::Allowed,
+            receive: ClipboardGrant::Allowed,
+        })
+        .expect("a fresh event channel cannot be full");
     Side {
         clipboard,
         events,

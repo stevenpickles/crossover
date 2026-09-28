@@ -541,8 +541,9 @@ pub enum DeclineReason {
     UnsupportedType,
     /// The receiver has not been granted the permission this item needs
     /// — `file_receive` for a file item, which is default-off and not
-    /// part of `PeerPermissions::FULL` (ADR 0015). Permanent for the
-    /// session, and deliberately distinct from
+    /// part of `PeerPermissions::FULL` (ADR 0015), or `clipboard_receive`
+    /// for any item at all, which pairing grants and the user can
+    /// withdraw. Permanent for the session, and deliberately distinct from
     /// [`DeclineReason::UnsupportedType`]: the type is understood, the
     /// user simply has not consented to it.
     NotPermitted,
@@ -1396,7 +1397,10 @@ pub enum ApplyResult {
     /// The destination clipboard stayed unavailable through the bounded
     /// retry budget (FR-3.4).
     ClipboardUnavailable,
-    /// The destination refused the content (validation failed locally).
+    /// The destination refused the content: validation failed locally, or
+    /// — for inline data, which has no offer to decline — the origin holds
+    /// no `clipboard_receive` grant there. An offered item refused for want
+    /// of that grant is declined `NotPermitted` instead.
     ContentRejected,
     /// A newer item (by the deterministic conflict order, FR-3.5) won the
     /// race; the destination kept the newer content. Closes the losing

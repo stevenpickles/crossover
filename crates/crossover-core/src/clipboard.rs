@@ -663,6 +663,28 @@ pub enum FileSend {
     Allowed,
 }
 
+/// Whether a clipboard direction is granted for the connected peer:
+/// `clipboard_send` for this machine's copies leaving it, and
+/// `clipboard_receive` for the peer's items reaching this clipboard
+/// (docs/SECURITY.md §4, T9).
+///
+/// Two states, unlike [`FileSend`], because there is only one reason to
+/// refuse: text and images need no negotiated feature and no spool. The
+/// engine is sans-io and holds no trust store, so the application supplies
+/// both grants and refreshes them as the store changes, exactly as it does
+/// the file policies. The default is the closed one, so an engine nobody
+/// has told anything sends and accepts nothing — the application publishes
+/// the grants before a session's first read (`crossover` `commands.rs`,
+/// `SessionFanout::established`), so a granted peer never meets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipboardGrant {
+    /// Not granted, or not yet known. The default.
+    #[default]
+    Denied,
+    /// Granted.
+    Allowed,
+}
+
 /// What the driver built from a local selection, minus the bytes.
 ///
 /// Everything a `crossover_platform::FileBlob` carries except its open
@@ -1075,6 +1097,14 @@ pub struct ClipboardEngine {
     /// Whether local files may be *sent* to the peer (ADR 0015). Supplied
     /// the same way and for the same reason, and closed by default.
     file_send: FileSend,
+    /// Whether this machine's text and image copies may be sent to the
+    /// peer (`clipboard_send`). Closed until the application says
+    /// otherwise.
+    clipboard_send: ClipboardGrant,
+    /// Whether the peer's items may reach this clipboard at all
+    /// (`clipboard_receive`) — every type, files included. Closed until
+    /// the application says otherwise.
+    clipboard_receive: ClipboardGrant,
     /// The spool root, for one purpose only: recognizing a `CF_HDROP`
     /// that points back into it, which must never be staged (ADR 0015
     /// loop prevention, SECURITY.md F13). Held as text and compared, never
@@ -1189,6 +1219,8 @@ impl ClipboardEngine {
             file: None,
             file_receive: FileReceive::default(),
             file_send: FileSend::default(),
+            clipboard_send: ClipboardGrant::default(),
+            clipboard_receive: ClipboardGrant::default(),
             spool_root: None,
             building: None,
             spooled: VecDeque::new(),
@@ -1414,6 +1446,19 @@ impl ClipboardEngine {
             self.note_offline_change();
             return superseded;
         }
+        // The peer may not be sent this machine's clipboard. The observation
+        // above stands exactly as it does offline — the hash is current, a
+        // parked install has had its answer — and nothing is minted.
+        if self.clipboard_send != ClipboardGrant::Allowed {
+            tracing::info!(
+                byte_count = bytes.len(),
+                content_type = ?content_type,
+                "local clipboard item not sent: the peer has no clipboard-send grant \
+                 (`crossover peers allow-clipboard`)"
+            );
+            self.record(Metrics::record_clipboard_send_denied);
+            return superseded;
+        }
 
         let sequence = self.next_sequence;
         self.next_sequence += 1;
@@ -1491,6 +1536,34 @@ impl ClipboardEngine {
             tracing::info!(policy = ?send, "file send policy changed");
         }
         self.file_send = send;
+    }
+
+    /// Set whether this machine's text and image copies may be sent to
+    /// the peer (`clipboard_send`, docs/SECURITY.md §4).
+    ///
+    /// Supplied by the application for the same reason the file policies
+    /// are, and re-supplied whenever the trust store changes, so a
+    /// withdrawn grant stops the *next* copy within one poll. A transfer
+    /// already streaming is left to finish, as it is for files: it is
+    /// bounded by its own deadline, and a peer that must lose everything
+    /// immediately is revoked, which ends the session. Granting again does
+    /// not send what is already on the clipboard; the next copy travels.
+    pub fn set_clipboard_send(&mut self, send: ClipboardGrant) {
+        if self.clipboard_send != send {
+            tracing::info!(policy = ?send, "clipboard send policy changed");
+        }
+        self.clipboard_send = send;
+    }
+
+    /// Set whether the peer's items may reach this clipboard at all
+    /// (`clipboard_receive`, docs/SECURITY.md §4). Checked at the offer,
+    /// and again at the install every inbound text or image passes
+    /// through, so a grant withdrawn mid-transfer still stops the write.
+    pub fn set_clipboard_receive(&mut self, receive: ClipboardGrant) {
+        if self.clipboard_receive != receive {
+            tracing::info!(policy = ?receive, "clipboard receive policy changed");
+        }
+        self.clipboard_receive = receive;
     }
 
     /// Tell the engine where the spool root is, so a copy of something
@@ -2827,6 +2900,13 @@ impl ClipboardEngine {
     }
 
     fn on_peer_offer(&mut self, offer: &ClipboardOffer) -> Vec<Action> {
+        // First, before the conflict rule: a peer that may not write here
+        // must not be able to displace this machine's own outbound item by
+        // offering a newer one.
+        if self.clipboard_receive != ClipboardGrant::Allowed {
+            self.log_receive_denied(offer.meta);
+            return decline(offer.meta.id, DeclineReason::NotPermitted);
+        }
         let mut actions = Vec::new();
         if let Some(reason) = self.conflict_verdict(offer.meta, &mut actions) {
             actions.push(Action::Send(OutboundMessage::Decline(ClipboardDecline {
@@ -3381,11 +3461,47 @@ impl ClipboardEngine {
         }
     }
 
+    /// Close an inbound item the peer may not write here: logged, counted,
+    /// and answered `ContentRejected` rather than left to the origin's
+    /// deadline (ADR 0005: every transaction ends in a typed verdict).
+    fn refuse_receive(&mut self, meta: ClipboardMeta) -> Vec<Action> {
+        self.log_receive_denied(meta);
+        vec![Action::Send(OutboundMessage::Applied(ClipboardApplied {
+            id: meta.id,
+            result: ApplyResult::ContentRejected,
+        }))]
+    }
+
+    /// Operator-visible, as the file-receive refusal is: a peer writing to
+    /// a clipboard that has not granted it is the event the permission
+    /// exists to make visible. One line per item, and items are user
+    /// copies, so the volume is the peer user's pace, not the link's.
+    fn log_receive_denied(&self, meta: ClipboardMeta) {
+        tracing::warn!(
+            clipboard_id = %meta.id,
+            origin_peer = %meta.origin,
+            byte_count = meta.content_length,
+            content_type = ?meta.content_type,
+            "refusing a peer clipboard item: this peer has no clipboard-receive grant \
+             (`crossover peers allow-clipboard`)"
+        );
+        self.record(Metrics::record_clipboard_receive_denied);
+    }
+
     /// The shared tail of every inbound item, whole or reassembled: the
     /// conflict rule, the loop guard, then an acknowledged install
     /// (FR-3.2 — `Applied` is sent only by [`Self::on_write_result`],
     /// after the destination clipboard actually took the content).
     fn install_inbound(&mut self, meta: ClipboardMeta, bytes: Vec<u8>) -> Vec<Action> {
+        // `clipboard_receive`, for every text and image — inline data, and a
+        // reassembly that completed after the grant was withdrawn (its offer
+        // was accepted under the old answer, and the write is what the
+        // permission is about). Before the conflict rule, as at the offer.
+        // Inline data has no offer to decline, so the transaction closes
+        // with the verdict for "the destination refused the content".
+        if self.clipboard_receive != ClipboardGrant::Allowed {
+            return self.refuse_receive(meta);
+        }
         let mut actions = Vec::new();
         if let Some(reason) = self.conflict_verdict(meta, &mut actions) {
             debug_assert_eq!(reason, DeclineReason::Superseded);
@@ -3791,9 +3907,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Action, BuiltBlob, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, FileSend,
-        InboundMessage, MAX_CONCURRENT_FILE_TRANSFERS, MAX_SPOOL_BYTES, MAX_SPOOL_ENTRIES,
-        OutboundMessage, RetryPolicy, SpooledFile, TransferScope, WriteFailure,
+        Action, BuiltBlob, ClipboardConfig, ClipboardEngine, ClipboardGrant, FileReceive,
+        FileRefusal, FileSend, InboundMessage, MAX_CONCURRENT_FILE_TRANSFERS, MAX_SPOOL_BYTES,
+        MAX_SPOOL_ENTRIES, OutboundMessage, RetryPolicy, SpooledFile, TransferScope, WriteFailure,
     };
     use crate::metrics::Metrics;
     use crossover_protocol::clipboard::MAX_CLIPBOARD_FILE_ENTRIES;
@@ -3826,8 +3942,21 @@ mod tests {
     /// *transmission* has to say a peer is there first. Tests about the
     /// offline rule itself build a bare engine instead and never call
     /// this.
-    fn connected(mut engine: ClipboardEngine) -> ClipboardEngine {
+    ///
+    /// The peer is a *paired* one, so it holds what pairing grants: both
+    /// clipboard directions (`PeerPermissions::FULL`). The application
+    /// publishes them before the session, and so does this.
+    fn connected(engine: ClipboardEngine) -> ClipboardEngine {
+        let mut engine = paired(engine);
         engine.on_session_established();
+        engine
+    }
+
+    /// Both clipboard grants, as pairing gives them — for tests that build
+    /// an engine without a session but still exchange items with a peer.
+    fn paired(mut engine: ClipboardEngine) -> ClipboardEngine {
+        engine.set_clipboard_send(ClipboardGrant::Allowed);
+        engine.set_clipboard_receive(ClipboardGrant::Allowed);
         engine
     }
 
@@ -4141,13 +4270,14 @@ mod tests {
             park_delay: std::time::Duration::from_millis(50),
             park_budget: Duration::ZERO,
         };
-        let mut e = ClipboardEngine::new(
+        let e = ClipboardEngine::new(
             Uuid::from_bytes([0xBB; 16]),
             ClipboardConfig {
                 retry: policy,
                 ..ClipboardConfig::new()
             },
         );
+        let mut e = paired(e);
         let item = ClipboardData::from_content(
             Uuid::new_v4(),
             Uuid::from_bytes([0xAA; 16]),
@@ -4322,7 +4452,7 @@ mod tests {
     #[test]
     fn a_parked_install_still_ends_in_a_verdict_when_its_budget_runs_out() {
         let metrics = Arc::new(Metrics::new());
-        let mut e = ClipboardEngine::with_metrics(
+        let e = ClipboardEngine::with_metrics(
             Uuid::from_bytes([0xBB; 16]),
             ClipboardConfig {
                 retry: RetryPolicy {
@@ -4333,6 +4463,7 @@ mod tests {
             },
             Some(Arc::clone(&metrics)),
         );
+        let mut e = paired(e);
         let id = inbound_text(&mut e, 0, "outlives the budget");
         park_the_install(&mut e, id);
 
@@ -4804,6 +4935,225 @@ mod tests {
         }
     }
 
+    // ---- clipboard grants (docs/SECURITY.md §4, T9) -------------------
+
+    /// A connected engine that records into `metrics`.
+    fn metered(metrics: &Arc<Metrics>) -> ClipboardEngine {
+        connected(ClipboardEngine::with_metrics(
+            Uuid::from_bytes([0xBB; 16]),
+            ClipboardConfig::new(),
+            Some(Arc::clone(metrics)),
+        ))
+    }
+
+    fn peer_text(sequence: u64, text: &str) -> ClipboardData {
+        ClipboardData::from_content(
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xAA; 16]),
+            sequence,
+            ContentType::Utf8Text,
+            text.as_bytes().to_vec(),
+        )
+    }
+
+    fn peer_image_meta(sequence: u64, bytes: &[u8]) -> ClipboardMeta {
+        ClipboardMeta {
+            id: Uuid::new_v4(),
+            origin: Uuid::from_bytes([0xAA; 16]),
+            sequence,
+            content_type: ContentType::Image(ImageFormat::Dib),
+            content_length: bytes.len() as u64,
+            content_hash: content_hash(bytes),
+        }
+    }
+
+    /// An engine nobody has told anything sends and accepts nothing. The
+    /// application publishes the grants before a session's first read, so
+    /// a paired peer never meets this; a wiring that forgets to is closed
+    /// rather than open.
+    #[test]
+    fn an_engine_with_no_grants_sends_and_accepts_nothing() {
+        let mut e = ClipboardEngine::new(Uuid::from_bytes([0xBB; 16]), ClipboardConfig::new());
+        e.on_session_established();
+
+        assert!(sent(&copy(&mut e, "mine")).is_empty());
+        let item = peer_text(0, "theirs");
+        let id = item.meta.id;
+        let actions = e.on_peer_message(InboundMessage::Data(item));
+        assert!(written(&actions).is_none(), "an ungranted item was written");
+        assert!(matches!(
+            sent(&actions).as_slice(),
+            [OutboundMessage::Applied(ClipboardApplied {
+                id: closed,
+                result: ApplyResult::ContentRejected,
+            })] if *closed == id
+        ));
+    }
+
+    /// Withdrawing `clipboard_send` keeps this machine's copies on this
+    /// machine — text and images alike. The copy is still *observed*, so
+    /// granting again does not resend it; the next copy travels.
+    #[test]
+    fn a_withdrawn_send_grant_keeps_copies_on_this_machine() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = metered(&metrics);
+        e.set_clipboard_send(ClipboardGrant::Denied);
+
+        assert!(
+            sent(&copy_image(&mut e, image_bytes(MAX_CHUNK_BYTES + 1))).is_empty(),
+            "an image left without a send grant"
+        );
+        assert!(
+            sent(&copy(&mut e, "stays here")).is_empty(),
+            "text left without a send grant"
+        );
+        assert_eq!(metrics.snapshot().clipboard_send_denied, 2);
+        assert_eq!(metrics.snapshot().clipboard_sent, 0);
+
+        e.set_clipboard_send(ClipboardGrant::Allowed);
+        assert!(
+            sent(&copy(&mut e, "stays here")).is_empty(),
+            "granting again resent a copy made while denied"
+        );
+        assert_eq!(sent(&copy(&mut e, "travels")).len(), 1);
+    }
+
+    /// A copy that may not travel is still the user's copy, and outranks a
+    /// parked peer install exactly as one that travels does — the origin is
+    /// told `Superseded`, and nothing else is sent.
+    #[test]
+    fn a_copy_that_may_not_travel_still_outranks_a_parked_install() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        let parked = inbound_text(&mut e, 0, "the peer's item");
+        park_the_install(&mut e, parked);
+        e.set_clipboard_send(ClipboardGrant::Denied);
+
+        let actions = copy(&mut e, "mine, and it stays here");
+        let messages = sent(&actions);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [OutboundMessage::Applied(ClipboardApplied {
+                    id,
+                    result: ApplyResult::Superseded,
+                })] if *id == parked
+            ),
+            "expected only the parked install's verdict: {messages:?}"
+        );
+        assert!(e.on_retry_due(parked).is_empty(), "a ghost install retried");
+    }
+
+    /// Withdrawing `clipboard_receive` stops the peer's inline items at the
+    /// door: nothing is written, and the transaction still closes with a
+    /// typed verdict rather than waiting out the origin's deadline.
+    #[test]
+    fn a_withdrawn_receive_grant_refuses_inline_data_without_writing() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = metered(&metrics);
+        e.set_clipboard_receive(ClipboardGrant::Denied);
+
+        let item = peer_text(0, "not for this clipboard");
+        let id = item.meta.id;
+        let actions = e.on_peer_message(InboundMessage::Data(item));
+        assert!(written(&actions).is_none(), "a refused item was written");
+        assert!(matches!(
+            sent(&actions).as_slice(),
+            [OutboundMessage::Applied(ClipboardApplied {
+                id: closed,
+                result: ApplyResult::ContentRejected,
+            })] if *closed == id
+        ));
+        assert_eq!(metrics.snapshot().clipboard_receive_denied, 1);
+        assert_eq!(metrics.snapshot().clipboard_applied, 0);
+    }
+
+    /// An offer is declined `NotPermitted` — and *before* the conflict
+    /// rule, so a peer that may not write here cannot displace this
+    /// machine's own outbound item by offering a newer one.
+    #[test]
+    fn a_refused_offer_cannot_displace_this_machines_outbound_item() {
+        let mut e = engine(0xBB);
+        let ours = offer_of(&copy_image(&mut e, image_bytes(MAX_CHUNK_BYTES * 2)));
+        e.set_clipboard_receive(ClipboardGrant::Denied);
+
+        let theirs = peer_image_meta(99, &image_bytes(MAX_CHUNK_BYTES + 5));
+        let actions = e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta: theirs,
+            descriptor: None,
+        }));
+        assert!(
+            matches!(
+                sent(&actions).as_slice(),
+                [OutboundMessage::Decline(ClipboardDecline {
+                    id,
+                    reason: DeclineReason::NotPermitted,
+                })] if *id == theirs.id
+            ),
+            "expected only a NotPermitted decline: {:?}",
+            sent(&actions)
+        );
+        // Our own item is still live: the peer's accept starts its stream.
+        let accepted =
+            e.on_peer_message(InboundMessage::Accept(ClipboardAccept { id: ours.meta.id }));
+        assert_eq!(chunk_of(&accepted).id, ours.meta.id);
+    }
+
+    /// Incoming covers files too: they reach this machine through its
+    /// clipboard, so a peer without `clipboard_receive` is refused even
+    /// where `file_receive` has been granted.
+    #[test]
+    fn a_withdrawn_receive_grant_refuses_files_whatever_file_receive_says() {
+        let mut e = granted(0xAA);
+        e.set_clipboard_receive(ClipboardGrant::Denied);
+
+        let meta = file_meta(b"a quarterly report", 1);
+        let actions = e.on_peer_message(InboundMessage::Offer(file_offer(meta, "report.pdf")));
+        assert!(matches!(
+            sent(&actions).as_slice(),
+            [OutboundMessage::Decline(ClipboardDecline {
+                id,
+                reason: DeclineReason::NotPermitted,
+            })] if *id == meta.id
+        ));
+    }
+
+    /// A grant withdrawn while an image is streaming in still stops the
+    /// write: the offer was accepted under the old answer, and the write is
+    /// what the permission is about.
+    #[test]
+    fn a_receive_grant_withdrawn_mid_transfer_still_stops_the_write() {
+        let mut e = engine(0xBB);
+        let bytes = image_bytes(MAX_CHUNK_BYTES * 2 + 3);
+        let meta = peer_image_meta(1, &bytes);
+        let accepted = e.on_peer_message(InboundMessage::Offer(ClipboardOffer {
+            meta,
+            descriptor: None,
+        }));
+        assert!(matches!(
+            sent(&accepted).as_slice(),
+            [OutboundMessage::Accept(_)]
+        ));
+
+        e.set_clipboard_receive(ClipboardGrant::Denied);
+        let mut actions = Vec::new();
+        for chunk in chunk_content(meta.id, &bytes).unwrap() {
+            actions.extend(e.on_peer_message(InboundMessage::Chunk(chunk)));
+        }
+        assert!(
+            written(&actions).is_none(),
+            "the withdrawn grant did not stop the write"
+        );
+        assert!(sent(&actions).iter().any(|m| matches!(
+            m,
+            OutboundMessage::Applied(ClipboardApplied {
+                id,
+                result: ApplyResult::ContentRejected,
+            }) if *id == meta.id
+        )));
+        assert!(e.reassembly.is_none(), "the buffer must be released");
+    }
+
     /// An install that has not landed belongs to the session that carried
     /// it. Left alive, a parked one can outlive the session, land during
     /// the *next* one, and overwrite whatever the user did in between —
@@ -5164,11 +5514,12 @@ mod tests {
     #[test]
     fn the_item_copied_while_alone_is_offered_when_a_peer_arrives() {
         let metrics = Arc::new(Metrics::new());
-        let mut e = ClipboardEngine::with_metrics(
+        let e = ClipboardEngine::with_metrics(
             Uuid::from_bytes([0xAA; 16]),
             ClipboardConfig::new(),
             Some(Arc::clone(&metrics)),
         );
+        let mut e = paired(e);
 
         assert!(copy(&mut e, "first while alone").is_empty());
         assert!(copy(&mut e, "last while alone").is_empty());
@@ -6784,7 +7135,7 @@ mod tests {
     /// first so the shell is never left holding one nothing can serve.
     #[test]
     fn an_unobserved_entry_is_swept_on_age_and_its_offer_withdrawn() {
-        let mut engine = ClipboardEngine::new(
+        let engine = ClipboardEngine::new(
             Uuid::from_bytes([0xAA; 16]),
             ClipboardConfig {
                 // Everything is instantly "old", which is the only way to
@@ -6793,6 +7144,7 @@ mod tests {
                 ..ClipboardConfig::new()
             },
         );
+        let mut engine = paired(engine);
         engine.set_file_receive(FileReceive::Allowed);
         let bytes = image_bytes(4096);
         let (_, _, entry) = receive_file(&mut engine, "doc.pdf", &bytes, 1);

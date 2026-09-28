@@ -27,8 +27,8 @@ mod testing;
 pub mod topology;
 
 pub use clipboard::{
-    ClipboardConfig, ClipboardEngine, FileReceive, FileSend, RetryPolicy as ClipboardRetryPolicy,
-    SpooledFile, TransferScope, WriteFailure,
+    ClipboardConfig, ClipboardEngine, ClipboardGrant, FileReceive, FileSend,
+    RetryPolicy as ClipboardRetryPolicy, SpooledFile, TransferScope, WriteFailure,
 };
 pub use clipboard_driver::{ClipboardSyncDriver, SyncEvent, clipboard_sync};
 pub use command::{FrameTarget, SessionCommand};
