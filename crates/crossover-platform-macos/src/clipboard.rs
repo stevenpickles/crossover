@@ -105,13 +105,18 @@ impl MacClipboard {
     fn observing(board: Board) -> Result<Self, ClipboardError> {
         let listener: Arc<Mutex<Option<ClipboardListener>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
+        // The baseline is taken here, before the thread exists, not by the
+        // thread when it is first scheduled: a change landing between
+        // construction and that first read would otherwise become the
+        // baseline and never be reported.
+        let baseline = autoreleasepool(|_| board.open().changeCount());
         let poller = {
             let board = board.clone();
             let listener = Arc::clone(&listener);
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("crossover-pasteboard-poll".to_owned())
-                .spawn(move || poll(&board, &listener, &stop))
+                .spawn(move || poll(&board, baseline, &listener, &stop))
                 .map_err(|error| ClipboardError::Unavailable {
                     reason: format!("starting the pasteboard poller: {error}"),
                 })?
@@ -138,8 +143,13 @@ impl Drop for MacClipboard {
 
 /// Sample the change counter until told to stop, raising the listener each
 /// time it moves.
-fn poll(board: &Board, listener: &Mutex<Option<ClipboardListener>>, stop: &AtomicBool) {
-    let mut last = autoreleasepool(|_| board.open().changeCount());
+fn poll(
+    board: &Board,
+    baseline: isize,
+    listener: &Mutex<Option<ClipboardListener>>,
+    stop: &AtomicBool,
+) {
+    let mut last = baseline;
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(POLL_INTERVAL);
         let now = autoreleasepool(|_| board.open().changeCount());
