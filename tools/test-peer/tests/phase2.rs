@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crossover_core::supervision::{KeepaliveConfig, SessionEvent, run_session};
 use crossover_core::{
-    ClipboardConfig, ClipboardRetryPolicy, LocalNode, OutboundSender, SessionCommand,
-    SessionListener, SessionOptions, SyncEvent, clipboard_sync, outbound_channel,
+    ClipboardConfig, ClipboardGrant, ClipboardRetryPolicy, LocalNode, OutboundSender,
+    SessionCommand, SessionListener, SessionOptions, SyncEvent, clipboard_sync, outbound_channel,
 };
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::{ClipboardFailure, ClipboardOp, InMemoryClipboard};
@@ -102,6 +102,14 @@ fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFl
     let sync_events_clone = sync_events.clone();
     let outbound_for_glue = session_outbound_tx.clone();
     tokio::spawn(async move {
+        // Grants first, as the application publishes them: a paired peer
+        // holds both clipboard directions.
+        let _ = sync_events_clone
+            .send(SyncEvent::ClipboardGrants {
+                send: ClipboardGrant::Allowed,
+                receive: ClipboardGrant::Allowed,
+            })
+            .await;
         let _ = sync_events_clone.send(SyncEvent::SessionEstablished).await;
         loop {
             tokio::select! {
