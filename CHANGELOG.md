@@ -12,6 +12,18 @@ Builds that are not tagged releases identify themselves as such —
 `0.2.0-dev.7.gabc1234` — and say where they came from. Run
 `crossover version` on any binary to see exactly what it is.
 
+## [Unreleased]
+
+### Changed
+
+- **The drawn topology has completed its two-machine soak.** 0.2.0 listed
+  this as a known limitation; an extended soak on the standing pair
+  (three monitors on one machine, mixed DPI) closed it with no meaningful
+  issues, and Phase 8 is closed
+  ([docs/ROADMAP.md](docs/ROADMAP.md), [docs/SOAK.md](docs/SOAK.md)). The
+  per-check figures were not recorded individually, and the soak entry says
+  so.
+
 ## [0.2.0] — 2026-09-01
 
 Two things the first release could not do. Files and folders now travel on

@@ -1314,6 +1314,27 @@ covered it. E-1 to E-6c are the single-machine editor checks and are *not*
 repeated here — run them first, on machine A, because a broken canvas
 wastes a two-desk session.
 
+### Outcome: passed (extended soak, closed 2026-09-28)
+
+The pair described under Setup below ran the drawn arrangement through an
+extended soak, and the maintainer reports **no meaningful issues**. That
+report is the sign-off, and it is recorded here as exactly that: the
+per-check figures the standing rule at the end of this section asks for —
+the measured 40 % arrival error, the count of span-boundary crossings, the
+disagreement's convergence time — were **not** written down check by check,
+unlike the Phase 6 and Phase 7 sessions above. The inert-while-`Returning`
+residual produced no reclaim problem in use, so route 1 stays
+unimplemented (see *Known residuals to watch*).
+
+**One environmental finding, open.** With A (Intel I225-LMvP 2.5 GbE,
+dock-attached) and B (10 GbE) cabled directly to each other, the session
+drops from time to time. Every drop recovered through the reconnect path
+with nothing left stuck, and the cause is not known — Phase 7 already saw
+A's dock-attached NIC flap on this same link (*Environmental: machine A's
+dock-attached NIC flaps*, above). Next: run the pair through a switch. If
+drops continue there, collect both machines' logs around a drop and read
+which side ended the session and why before calling it environmental.
+
 ### Setup
 
 The standing pair from Phase 6/7, now on a different subnet and with a
