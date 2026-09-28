@@ -1,0 +1,22 @@
+[package]
+name = "crossover-platform-macos"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The macOS port (Phase 9.1, ADR 0020). Every framework dependency is
+# `cfg(target_os = "macos")`-gated below as each slice adds it, so nothing
+# Apple-specific enters the Windows or Linux dependency graph and the crate
+# compiles everywhere as an empty shell.
+[dependencies]
+crossover-platform = { workspace = true }
+
+# The workspace policy, `unsafe_code = "forbid"` included, until the first
+# slice calls a framework: this crate will become the port's home for FFI
+# (ADR 0020) and relax that locally then, with the justification the
+# Windows crate carries — not before there is `unsafe` to justify.
+[lints]
+workspace = true

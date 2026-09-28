@@ -615,6 +615,7 @@ dependencies = [
  "clap",
  "crossover-core",
  "crossover-platform",
+ "crossover-platform-macos",
  "crossover-platform-windows",
  "crossover-protocol",
  "crossover-security",
@@ -668,6 +669,13 @@ version = "0.3.0"
 dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "crossover-platform-macos"
+version = "0.3.0"
+dependencies = [
+ "crossover-platform",
 ]
 
 [[package]]

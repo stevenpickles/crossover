@@ -5,6 +5,7 @@ members = [
     "apps/crossover-svc",
     "crates/crossover-core",
     "crates/crossover-platform",
+    "crates/crossover-platform-macos",
     "crates/crossover-platform-windows",
     "crates/crossover-protocol",
     "crates/crossover-security",
@@ -44,6 +45,7 @@ repository = "https://github.com/stevenpickles/crossover"
 [workspace.dependencies]
 crossover-core = { path = "crates/crossover-core" }
 crossover-platform = { path = "crates/crossover-platform" }
+crossover-platform-macos = { path = "crates/crossover-platform-macos" }
 crossover-platform-windows = { path = "crates/crossover-platform-windows" }
 crossover-protocol = { path = "crates/crossover-protocol" }
 crossover-security = { path = "crates/crossover-security" }
