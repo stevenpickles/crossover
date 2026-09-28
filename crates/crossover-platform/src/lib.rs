@@ -37,7 +37,9 @@ pub use input::{
     PointerEvent, SCROLL_UNITS_PER_DETENT, hid,
 };
 pub use link::{LinkState, LinkStateProbe, UnknownLinkStateProbe};
-pub use secure_storage::{SecureStorage, SecureStorageError};
+pub use secure_storage::{
+    MAX_STORAGE_KEY_BYTES, SecureStorage, SecureStorageError, validate_storage_key,
+};
 pub use service::{ServiceError, ServiceManager, ServiceStatus, UnsupportedServiceManager};
 pub use spool::{
     MAX_SPOOL_ENTRY_NAME_BYTES, MAX_SPOOL_ENUMERATED_OBJECTS, SpoolEntry, SpoolError, SpoolStorage,
