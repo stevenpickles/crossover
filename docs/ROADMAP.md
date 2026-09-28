@@ -11,9 +11,10 @@
 >
 > 1. **9.0 — Preconditions, on Windows.** Accept
 >    [ADR 0016](adr/0016-image-interchange-format.md) (image interchange);
->    make the clipboard read tell an empty clipboard from an unreadable one;
->    enforce `clipboard_send` for text and images, not only files. All three
->    change the contract the ports implement, so they land first.
+>    make the clipboard read tell an empty clipboard from an unreadable one
+>    (**done**, feature/169); enforce `clipboard_send` for text and images,
+>    not only files. All three change the contract the ports implement, so
+>    they land first.
 > 2. **9.1 — macOS**, to full parity with Windows.
 > 3. **9.2 — Linux (Ubuntu 24.04)**, opening with the input-route spike
 >    ([platform-risks-linux.md](platform-risks-linux.md) L-1), then to full
@@ -900,12 +901,16 @@ implement, made once before there are three implementations of it:
    produces one by converting its own local content, so no receiver ever
    decodes a peer's image. M-5 and L-9 agree `CF_DIB` does not travel;
    Windows ↔ Windows stays verbatim DIB.
-2. **The clipboard read tells *empty* from *unreadable*.** Today both
-   answer `Ok(None)`, so a parked install can overwrite a copy made in a
+2. **The clipboard read tells *empty* from *unreadable*.** Both used to
+   answer `Ok(None)`, so a parked install could overwrite a copy made in a
    format Crossover does not sync (0.2.0 known limitation;
    [ADR 0005](adr/0005-clipboard-transaction-flow.md)'s 2026-09-01
    addendum). It is a change to the `ClipboardProvider` contract, which is
-   exactly the trait each port writes.
+   exactly the trait each port writes. **Done** (feature/169): `read`
+   returns `ClipboardRead::{Content, Empty, Unreadable}`, an unreadable
+   copy supersedes a parked install, and either kind of nothing forgets the
+   local hash (ADR 0005's 2026-09-28 addendum). Each port must answer
+   `Unreadable`, never `Empty`, when it cannot tell the two apart.
 3. **`clipboard_send` is enforced for text and images**, not only files
    (0.2.0 known limitation). Security is priority #1, and a permission the
    ports inherit half-enforced would be inherited three times.
