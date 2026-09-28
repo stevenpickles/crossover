@@ -150,7 +150,10 @@ windows-core = "0.62"
 # crates to a family already in the tree. default-features = false on each
 # framework crate, with only the features a slice uses — the defaults enable
 # every class and function in the framework.
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false }
 objc2-core-foundation = { version = "0.3.2", default-features = false }
+objc2-foundation = { version = "0.3.2", default-features = false }
 objc2-security = { version = "0.3.2", default-features = false }
 windows = { version = "0.62", features = [
     # Wdk_*: NtCreateFile plus OBJECT_ATTRIBUTES, the only Win32 way to

@@ -677,6 +677,9 @@ fn setup_input_control(
     metrics: &Arc<Metrics>,
     no_cursor_mask: bool,
 ) -> anyhow::Result<InputControl> {
+    if !crate::storage::INPUT_AVAILABLE {
+        return Ok(input_unavailable());
+    }
     let local = DeviceId::from_bytes(*identity.device_id().as_bytes());
     let (capture, injector) = open_input()?;
     // Diagnostic switch: run without masking to isolate cursor behavior
@@ -730,6 +733,52 @@ fn setup_input_control(
         commands: control_commands,
         layout_publisher,
     })
+}
+
+/// The input control of a clipboard-only run, on a platform whose input
+/// port has not landed ([`crate::storage::INPUT_AVAILABLE`]).
+///
+/// No control driver. The session fan-out and the console still need
+/// somewhere to send control events, so a task drains them — and says so
+/// where a user would otherwise be left guessing: a peer's control request
+/// is logged (it goes unanswered and times out on the peer), and a console
+/// request is answered on the terminal. The command lane is empty; closing
+/// it only ends its own forwarder in [`merge_command_lanes`].
+fn input_unavailable() -> InputControl {
+    let (events, mut drained) = mpsc::channel::<InputControlEvent>(64);
+    tokio::spawn(async move {
+        while let Some(event) = drained.recv().await {
+            match event {
+                InputControlEvent::Frame { session, frame }
+                    if frame.message_type
+                        == crossover_protocol::hello::MessageType::ControlRequest.wire() =>
+                {
+                    tracing::warn!(
+                        %session,
+                        "control request from the peer not answered: input is not \
+                         implemented on this platform yet, so this run is clipboard-only"
+                    );
+                }
+                InputControlEvent::RequestControl | InputControlEvent::ReleaseControl => {
+                    println!(
+                        "Input is not implemented on this platform yet; this run shares \
+                         the clipboard only."
+                    );
+                }
+                _ => {}
+            }
+        }
+    });
+    tracing::warn!(
+        "clipboard-only run: input capture, injection and display enumeration are not \
+         implemented on this platform yet (docs/ROADMAP.md Phase 9.1)"
+    );
+    let (_no_commands, commands) = crossover_core::outbound::command_lanes();
+    InputControl {
+        events,
+        commands,
+        layout_publisher: None,
+    }
 }
 
 /// What [`setup_input_control`] hands back to the composition root: the

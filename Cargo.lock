@@ -676,7 +676,10 @@ name = "crossover-platform-macos"
 version = "0.3.0"
 dependencies = [
  "crossover-platform",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
  "objc2-security",
 ]
 

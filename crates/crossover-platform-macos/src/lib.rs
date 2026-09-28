@@ -17,7 +17,11 @@
 //! it exists, in docs/platform-risks-macos.md (M-1..M-10).
 
 #[cfg(target_os = "macos")]
+pub mod clipboard;
+#[cfg(target_os = "macos")]
 pub mod secure_storage;
 
+#[cfg(target_os = "macos")]
+pub use clipboard::MacClipboard;
 #[cfg(target_os = "macos")]
 pub use secure_storage::KeychainSecureStorage;

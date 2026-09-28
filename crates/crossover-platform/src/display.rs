@@ -342,6 +342,42 @@ pub trait DisplayInfo: Send + Sync {
     fn cursor_position(&self) -> Result<CursorPoint, DisplayError>;
 }
 
+/// The display backend of a platform whose port has not reached displays
+/// yet: every query answers [`DisplayError::Unavailable`].
+///
+/// Honest rather than empty, like [`crate::UnknownLinkStateProbe`]: a
+/// backend that reported *no monitors* would describe a desk with nothing
+/// on it, while one that cannot enumerate says so — and the topology code
+/// already treats "would not enumerate" as "state nothing to the peer"
+/// rather than as an empty desk (ADR 0018). With nothing stated, the peer
+/// derives no crossing into this machine, which is exactly right for a run
+/// that cannot take input. Keeping it here means an application needs no
+/// per-platform stub to stay buildable while a port is partway done.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnavailableDisplayInfo;
+
+impl UnavailableDisplayInfo {
+    fn unavailable() -> DisplayError {
+        DisplayError::Unavailable {
+            reason: "display enumeration is not implemented on this platform yet".to_owned(),
+        }
+    }
+}
+
+impl DisplayInfo for UnavailableDisplayInfo {
+    fn desktop_bounds(&self) -> Result<Screen, DisplayError> {
+        Err(Self::unavailable())
+    }
+
+    fn monitors(&self) -> Result<Vec<MonitorRect>, DisplayError> {
+        Err(Self::unavailable())
+    }
+
+    fn cursor_position(&self) -> Result<CursorPoint, DisplayError> {
+        Err(Self::unavailable())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CursorPoint, DisplayError, DisplayInfo, MonitorInfo, MonitorRect, Screen};
@@ -350,6 +386,19 @@ mod tests {
     /// labels. Both defaulted methods are inherited, which is the property
     /// under test — a port that can only enumerate rectangles still
     /// compiles and still answers every query.
+    /// Every query, the defaulted ones included, answers `Unavailable` —
+    /// never an empty list a caller could mistake for a desk with nothing
+    /// on it.
+    #[test]
+    fn the_unavailable_backend_never_reports_an_empty_desk() {
+        let display = super::UnavailableDisplayInfo;
+        assert!(display.desktop_bounds().is_err());
+        assert!(display.monitors().is_err());
+        assert!(display.monitor_layout().is_err());
+        assert!(display.monitor_descriptions().is_err());
+        assert!(display.cursor_position().is_err());
+    }
+
     struct GeometryOnly;
 
     fn rect(left: i32) -> MonitorRect {

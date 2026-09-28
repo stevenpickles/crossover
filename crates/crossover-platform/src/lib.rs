@@ -26,7 +26,7 @@ pub use clipboard::{
 pub use cursor::{CursorMask, CursorMaskError, NoopCursorMask};
 pub use display::{
     CursorPoint, DisplayError, DisplayInfo, MonitorDescription, MonitorInfo, MonitorRect,
-    PhysicalSizeMm, Screen,
+    PhysicalSizeMm, Screen, UnavailableDisplayInfo,
 };
 pub use file_blob::{
     BlobNaming, FileBlob, FileBlobBuilder, FileBlobRefusal, MAX_ARCHIVE_DEPTH,

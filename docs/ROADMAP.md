@@ -937,7 +937,14 @@ an empty, tri-OS-building crate wired into `crossover` (feature/172).
 **Identity in the Keychain** follows (feature/173): `SecureStorage` on
 macOS, one storage-key rule shared by every backend, and CodeQL's Rust
 analysis extended to a macOS runner. A Mac can pair and keep its identity
-and trust store; `crossover run` needs the clipboard slice next.
+and trust store. **The text clipboard** follows (feature/174): an
+`NSPasteboard` provider polling `changeCount`, text only, with anything else
+read as the user's (unreadable) copy; and `crossover run` on the Mac starts
+**clipboard-only** until the input slice lands (maintainer decision,
+2026-09-28 — no wire change, the peer's control requests time out). A new
+risk, M-11, was found building it: reading the general pasteboard is
+privacy-gated on current macOS. Hardware checks per slice are in
+[SOAK.md](SOAK.md)'s Phase 9.1 section.
 
 1. **Core:** identity in Keychain (M-8), text and image clipboard with a
    polled pasteboard (M-4, M-5 via ADR 0016), input capture and injection
