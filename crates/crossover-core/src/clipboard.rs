@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crossover_platform::{
-    BlobNaming, ClipboardContent, ClipboardImageFormat, FileBlob, FileBlobRefusal,
+    BlobNaming, ClipboardContent, ClipboardImageFormat, ClipboardRead, FileBlob, FileBlobRefusal,
 };
 use crossover_protocol::clipboard::{
     ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ChunkOutcome, ChunkPlan, ChunkReassembly, ChunkStream,
@@ -1025,7 +1025,18 @@ pub struct ClipboardEngine {
     next_sequence: u64,
     /// Hash of the last content this engine knows to be on the local
     /// clipboard (whatever its source) — outbound dedup.
+    ///
+    /// `None` once a read finds the clipboard empty or unreadable: the
+    /// content it named is demonstrably no longer there, and a stale hash
+    /// would answer a peer's offer of that content `AlreadyHave`, or its
+    /// install `Applied`, without anything reaching this clipboard (ADR
+    /// 0005, addendum 2026-09-28).
     current_local_hash: Option<[u8; 32]>,
+    /// Whether the last successful read found content this build cannot
+    /// represent. The only memory an unreadable copy leaves — it has no
+    /// hash — so a reconnect's re-read can tell "still the same
+    /// unreadable clipboard" from "the user just copied something".
+    local_unreadable: bool,
     /// The next read should announce whatever it finds even if dedup
     /// would suppress it — set by [`ClipboardEngine::on_session_established`]
     /// so peers converge after a gap (ADR 0006, trigger 3).
@@ -1169,6 +1180,7 @@ impl ClipboardEngine {
             config,
             next_sequence: 0,
             current_local_hash: None,
+            local_unreadable: false,
             reannounce_pending: false,
             applied_hashes: VecDeque::new(),
             outbound: None,
@@ -1294,20 +1306,34 @@ impl ClipboardEngine {
     /// - genuinely new content — this machine's user copied something, and
     ///   installing a peer item over it would destroy what they just made,
     ///   so the parked install is superseded;
-    /// - nothing readable — no evidence either way, so the parked install
-    ///   is left to its own timer. **Known residual** (ADR 0005, addendum
-    ///   2026-09-01): a copy in a format this build cannot render answers
-    ///   `None` too, and is indistinguishable from an empty clipboard
-    ///   here, so the parked install can still overwrite it. Fixing it
-    ///   means the provider separating `Empty` from `Unreadable`, which is
-    ///   a platform-trait change and its own branch.
-    pub fn on_local_read(&mut self, content: Option<ClipboardContent>) -> Vec<Action> {
+    /// - content this build cannot read ([`ClipboardRead::Unreadable`]) —
+    ///   still the user's copy, so the parked install is superseded
+    ///   exactly as for new readable content (ADR 0005, addendum
+    ///   2026-09-28), unless a reconnect's re-read finds the clipboard as
+    ///   unreadable as it last was ([`Self::on_local_unreadable`]);
+    /// - an empty clipboard — nothing anyone made is on it, so there is
+    ///   nothing to protect and the parked install is left to its timer.
+    ///
+    /// Either kind of nothing also forgets [`Self::current_local_hash`]:
+    /// whatever it named has left the clipboard.
+    pub fn on_local_read(&mut self, read: ClipboardRead) -> Vec<Action> {
         // Consumed whatever the read shows: the re-announcement had its
         // chance, and a flag left set would make the next ordinary read
         // behave like a reconnect.
         let reannouncing = std::mem::take(&mut self.reannounce_pending);
-        let Some(content) = content else {
-            return Vec::new(); // empty, or a format this build cannot read
+        let was_unreadable = std::mem::replace(
+            &mut self.local_unreadable,
+            matches!(read, ClipboardRead::Unreadable),
+        );
+        let content = match read {
+            ClipboardRead::Content(content) => content,
+            ClipboardRead::Empty => {
+                self.current_local_hash = None;
+                return Vec::new();
+            }
+            ClipboardRead::Unreadable => {
+                return self.on_local_unreadable(reannouncing, was_unreadable);
+            }
         };
         if let ClipboardContent::FileList(selection) = content {
             return self.on_local_file_list(selection, reannouncing);
@@ -1404,6 +1430,35 @@ impl ClipboardEngine {
         // it directly.
         superseded.extend(self.start_outbound(meta, bytes));
         superseded
+    }
+
+    /// The read found a copy this build cannot represent (ADR 0005,
+    /// addendum 2026-09-28).
+    ///
+    /// Nothing travels — there is nothing to send — but the copy is the
+    /// user's, and a parked install written over it would destroy it with
+    /// no diagnostic anywhere: the settle read would find our own content
+    /// and loop-suppress it. So it outranks a parked install exactly as
+    /// new readable content does.
+    ///
+    /// The one exception mirrors the readable path's "unchanged": a
+    /// reconnect's re-read that finds the clipboard as unreadable as the
+    /// last read left it is not the user copying something, and must not
+    /// cost the peer the item it is re-announcing — the 2026-09-01
+    /// scenario again, in a format with no hash to compare. Any *other*
+    /// read got here because the clipboard changed (a notification, or the
+    /// retry that continues one), and with no content to compare, a
+    /// changed-and-unreadable clipboard is taken to be a new copy. Wrong in
+    /// that direction costs a peer item, answered `Superseded` where the
+    /// origin can see it; wrong in the other costs the user's copy,
+    /// silently.
+    fn on_local_unreadable(&mut self, reannouncing: bool, was_unreadable: bool) -> Vec<Action> {
+        self.current_local_hash = None;
+        if reannouncing && was_unreadable {
+            return self.revive_parked_write();
+        }
+        tracing::debug!("local clipboard holds a format this build does not synchronize");
+        self.supersede_parked_write("a local copy in a format this build does not synchronize")
     }
 
     /// Set whether peer files may be received (ADR 0015).
@@ -2074,6 +2129,7 @@ impl ClipboardEngine {
                 drop(pending.content); // release the item buffer promptly
                 self.remember_applied(pending.meta.content_hash);
                 self.current_local_hash = Some(pending.meta.content_hash);
+                self.local_unreadable = false;
                 self.record(Metrics::record_clipboard_applied);
                 tracing::info!(
                     clipboard_id = %pending.meta.id,
@@ -3723,7 +3779,9 @@ mod tests {
 
     use uuid::Uuid;
 
-    use crossover_platform::{BlobNaming, ClipboardContent, ClipboardImageFormat, FileBlobRefusal};
+    use crossover_platform::{
+        BlobNaming, ClipboardContent, ClipboardImageFormat, ClipboardRead, FileBlobRefusal,
+    };
     use crossover_protocol::clipboard::{
         ApplyResult, CLIPBOARD_INLINE_MAX_BYTES, ClipboardAccept, ClipboardApplied, ClipboardChunk,
         ClipboardData, ClipboardDecline, ClipboardMeta, ClipboardOffer, ContentType, DeclineReason,
@@ -3798,7 +3856,7 @@ mod tests {
     fn copy_image(engine: &mut ClipboardEngine, bytes: Vec<u8>) -> Vec<Action> {
         engine.on_local_change();
         engine.on_settle_due();
-        engine.on_local_read(Some(snip(bytes)))
+        engine.on_local_read(ClipboardRead::Content(snip(bytes)))
     }
 
     fn offer_of(actions: &[Action]) -> ClipboardOffer {
@@ -3872,7 +3930,9 @@ mod tests {
             "a change should schedule a settle, not read now: {scheduled:?}"
         );
         assert_eq!(engine.on_settle_due(), vec![Action::ReadClipboard]);
-        engine.on_local_read(Some(ClipboardContent::Text(text.to_owned())))
+        engine.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
+            text.to_owned(),
+        )))
     }
 
     /// The text the engine asked to be written, whatever the action shape.
@@ -3975,18 +4035,25 @@ mod tests {
     #[test]
     fn oversized_and_empty_local_content_is_ignored_gracefully() {
         let mut e = engine(0xAA);
-        assert!(e.on_local_read(None).is_empty());
+        assert!(e.on_local_read(ClipboardRead::Empty).is_empty());
+        assert!(e.on_local_read(ClipboardRead::Unreadable).is_empty());
         let huge = "x".repeat(4 * 1024 * 1024 + 1);
         assert!(
-            e.on_local_read(Some(ClipboardContent::Text(huge)))
+            e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(huge)))
                 .is_empty()
         );
         // Per-type bounds since ADR 0014: an image past its own (much
         // larger) ceiling is refused by the same rule, not by the text one.
         let huge_image = vec![0u8; 64 * 1024 * 1024 + 1];
-        assert!(e.on_local_read(Some(snip(huge_image))).is_empty());
+        assert!(
+            e.on_local_read(ClipboardRead::Content(snip(huge_image)))
+                .is_empty()
+        );
         // And an empty image is not an image.
-        assert!(e.on_local_read(Some(snip(Vec::new()))).is_empty());
+        assert!(
+            e.on_local_read(ClipboardRead::Content(snip(Vec::new())))
+                .is_empty()
+        );
     }
 
     /// A local file/folder selection is observable (feature/133), but the
@@ -4007,7 +4074,7 @@ mod tests {
             std::path::PathBuf::from(r"C:\Users\test\photos"),
         ];
         assert!(
-            e.on_local_read(Some(ClipboardContent::FileList(paths)))
+            e.on_local_read(ClipboardRead::Content(ClipboardContent::FileList(paths)))
                 .is_empty(),
             "a file selection must not be walked with no sender to walk it"
         );
@@ -4054,7 +4121,9 @@ mod tests {
             [Action::ScheduleSettle { .. }]
         ));
         assert_eq!(receiver.on_settle_due(), vec![Action::ReadClipboard]);
-        let actions = receiver.on_local_read(Some(ClipboardContent::Text("from peer".to_owned())));
+        let actions = receiver.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
+            "from peer".to_owned(),
+        )));
         assert!(
             actions.is_empty(),
             "echoed an applied item back: {actions:?}"
@@ -4327,7 +4396,7 @@ mod tests {
             [Action::ScheduleSettle { .. }]
         ));
         assert_eq!(e.on_settle_due(), vec![Action::ReadClipboard]);
-        let read = e.on_local_read(Some(ClipboardContent::Text(
+        let read = e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
             "what was already here".to_owned(),
         )));
         assert!(
@@ -4363,7 +4432,9 @@ mod tests {
         let parked = inbound_text(&mut e, 1, "the peer's next item");
         park_the_install(&mut e, parked);
 
-        let read = e.on_local_read(Some(ClipboardContent::Text("installed earlier".to_owned())));
+        let read = e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
+            "installed earlier".to_owned(),
+        )));
         assert!(
             matches!(
                 read.as_slice(),
@@ -4437,7 +4508,9 @@ mod tests {
 
         // Only now, with genuinely new content in hand, does the parked
         // install lose — and it is told so.
-        let actions = e.on_local_read(Some(ClipboardContent::Text("mine".to_owned())));
+        let actions = e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
+            "mine".to_owned(),
+        )));
         let messages = sent(&actions);
         assert!(
             matches!(
@@ -4530,7 +4603,9 @@ mod tests {
         let established = e.on_session_established();
         assert_eq!(established.last(), Some(&Action::ReadClipboard));
 
-        let actions = e.on_local_read(Some(ClipboardContent::Text("already here".to_owned())));
+        let actions = e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
+            "already here".to_owned(),
+        )));
         let messages = sent(&actions);
         assert!(
             matches!(messages.as_slice(), [OutboundMessage::Data(_)]),
@@ -4557,7 +4632,7 @@ mod tests {
         park_the_install(&mut e, parked);
 
         e.on_session_established();
-        let actions = e.on_local_read(Some(ClipboardContent::Text(
+        let actions = e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
             "copied during the outage".to_owned(),
         )));
         let messages = sent(&actions);
@@ -4575,6 +4650,158 @@ mod tests {
             "new content copied during the gap should win: {messages:?}"
         );
         assert!(e.on_retry_due(parked).is_empty(), "a ghost install retried");
+    }
+
+    /// The residual ADR 0005's 2026-09-01 addendum left open, closed (its
+    /// 2026-09-28 addendum). A copy in a format this build does not
+    /// synchronize — an application's private format, RTF-only content —
+    /// is still the user's copy. It used to read as `None`, which the
+    /// engine could not tell from an empty clipboard, so the parked
+    /// install's timer wrote the peer's item over it with no diagnostic
+    /// anywhere. It must supersede the install exactly as a readable copy
+    /// does; the only difference is that nothing travels, because there
+    /// is nothing this build can send.
+    #[test]
+    fn an_unreadable_local_copy_supersedes_a_parked_install() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        let parked = inbound_text(&mut e, 0, "the peer's item");
+        park_the_install(&mut e, parked);
+
+        assert!(matches!(
+            e.on_local_change().as_slice(),
+            [Action::ScheduleSettle { .. }]
+        ));
+        assert_eq!(e.on_settle_due(), vec![Action::ReadClipboard]);
+        let actions = e.on_local_read(ClipboardRead::Unreadable);
+        let messages = sent(&actions);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [OutboundMessage::Applied(ClipboardApplied {
+                    id,
+                    result: ApplyResult::Superseded,
+                })] if *id == parked
+            ),
+            "an unreadable copy should close the parked install, and send nothing else: \
+             {messages:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::WriteClipboard { .. })),
+            "the peer's item was written over the user's unreadable copy: {actions:?}"
+        );
+        assert!(e.on_retry_due(parked).is_empty(), "a ghost install retried");
+        assert_eq!(metrics.snapshot().clipboard_superseded, 1);
+    }
+
+    /// An *empty* clipboard is the other half of what `None` used to mean,
+    /// and it is not the user's copy: nothing on it needs protecting, so
+    /// the parked install is left to its own timer, as before.
+    #[test]
+    fn an_empty_clipboard_leaves_a_parked_install_to_its_timer() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        let parked = inbound_text(&mut e, 0, "the peer's item");
+        park_the_install(&mut e, parked);
+
+        assert!(e.on_local_read(ClipboardRead::Empty).is_empty());
+        assert!(matches!(
+            e.on_retry_due(parked).as_slice(),
+            [Action::WriteClipboard { id, .. }] if *id == parked
+        ));
+        assert_eq!(metrics.snapshot().clipboard_superseded, 0);
+    }
+
+    /// The reconnect rule, for a clipboard with no hash to compare. A
+    /// re-read that finds the clipboard exactly as unreadable as the last
+    /// read left it is the re-announcement, not the user copying — the
+    /// 2026-09-01 scenario in a private format — and must not cost the
+    /// peer the item it is re-announcing.
+    #[test]
+    fn a_reconnect_re_read_of_the_same_unreadable_clipboard_spares_a_parked_install() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        // The last read, before the gap, found an unreadable copy.
+        assert!(e.on_local_read(ClipboardRead::Unreadable).is_empty());
+        e.on_session_lost();
+
+        let parked = inbound_text(&mut e, 9, "the peer's item");
+        park_the_install(&mut e, parked);
+
+        e.on_session_established();
+        let actions = e.on_local_read(ClipboardRead::Unreadable);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::WriteClipboard { id, .. }] if *id == parked
+            ),
+            "an unchanged unreadable clipboard should free the parked install: {actions:?}"
+        );
+        assert_eq!(metrics.snapshot().clipboard_superseded, 0);
+    }
+
+    /// And its other half: the last read found readable content, so an
+    /// unreadable clipboard at reconnect means the user copied something
+    /// during the gap. It is theirs, and it outranks the parked install.
+    #[test]
+    fn a_reconnect_re_read_that_finds_a_new_unreadable_copy_supersedes_a_parked_install() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = parking_engine(&metrics);
+        copy(&mut e, "readable, before the gap");
+        e.on_session_lost();
+
+        let parked = inbound_text(&mut e, 9, "the peer's item");
+        park_the_install(&mut e, parked);
+
+        e.on_session_established();
+        let actions = e.on_local_read(ClipboardRead::Unreadable);
+        let messages = sent(&actions);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [OutboundMessage::Applied(ClipboardApplied {
+                    id,
+                    result: ApplyResult::Superseded,
+                })] if *id == parked
+            ),
+            "a new unreadable copy made during the gap should win: {messages:?}"
+        );
+        assert!(e.on_retry_due(parked).is_empty(), "a ghost install retried");
+    }
+
+    /// The same blindness had a second, quieter consequence: the engine
+    /// kept believing the last *readable* content was still on the
+    /// clipboard after the user had replaced it. A peer item carrying that
+    /// content was then answered `Applied` by the echo guard without a
+    /// write — both machines agreeing on a clipboard this one no longer
+    /// showed. Either kind of nothing now forgets the hash, so the item is
+    /// actually installed.
+    #[test]
+    fn a_read_of_nothing_forgets_what_the_clipboard_held() {
+        for nothing in [ClipboardRead::Unreadable, ClipboardRead::Empty] {
+            let mut e = parking_engine(&Arc::new(Metrics::new()));
+            copy(&mut e, "shared");
+            e.on_session_lost();
+
+            assert!(e.on_local_read(nothing.clone()).is_empty());
+            // `inbound_text` asserts the engine asks for a write: the item
+            // is installed, not waved through as already present.
+            inbound_text(&mut e, 9, "shared");
+
+            // And a fresh local copy of the old content is new again, so it
+            // travels rather than being deduplicated against a clipboard
+            // that stopped holding it.
+            let mut again = parking_engine(&Arc::new(Metrics::new()));
+            copy(&mut again, "shared");
+            assert!(again.on_local_read(nothing.clone()).is_empty());
+            assert_eq!(
+                sent(&copy(&mut again, "shared")).len(),
+                1,
+                "re-copying content after {nothing:?} was deduplicated as unchanged"
+            );
+        }
     }
 
     /// An install that has not landed belongs to the session that carried
@@ -4676,7 +4903,7 @@ mod tests {
         park_the_install(&mut e, parked);
 
         // Layer 1 missed and our own spool selection came back.
-        let ours = e.on_local_read(Some(ClipboardContent::FileList(vec![
+        let ours = e.on_local_read(ClipboardRead::Content(ClipboardContent::FileList(vec![
             root.join("3f2a.bin"),
         ])));
         assert!(ours.is_empty(), "our own selection produced work: {ours:?}");
@@ -4693,9 +4920,9 @@ mod tests {
         // this build refuses to send: the refusal is about us, not about
         // what they copied.
         e.set_file_send(FileSend::Denied);
-        let theirs = e.on_local_read(Some(ClipboardContent::FileList(vec![elsewhere(
-            "report.pdf",
-        )])));
+        let theirs = e.on_local_read(ClipboardRead::Content(ClipboardContent::FileList(vec![
+            elsewhere("report.pdf"),
+        ])));
         assert!(
             matches!(
                 sent(&theirs).as_slice(),
@@ -4788,7 +5015,7 @@ mod tests {
                     let mut cycle = self.engine.on_local_change();
                     cycle.extend(
                         self.engine
-                            .on_local_read(Some(ClipboardContent::Text(text))),
+                            .on_local_read(ClipboardRead::Content(ClipboardContent::Text(text))),
                     );
                     self.drive(cycle, outbox);
                 }
@@ -4884,7 +5111,12 @@ mod tests {
         // The established reset cleared the dedup hash, so the same
         // content travels again for post-gap convergence.
         assert_eq!(
-            sent(&e.on_local_read(Some(ClipboardContent::Text("persistent".to_owned())))).len(),
+            sent(
+                &e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
+                    "persistent".to_owned()
+                )))
+            )
+            .len(),
             1
         );
     }
@@ -4945,7 +5177,9 @@ mod tests {
         // Establishing asks for the re-read, and the re-read offers the
         // current item — once, not twice.
         assert_eq!(e.on_session_established(), vec![Action::ReadClipboard]);
-        let actions = e.on_local_read(Some(ClipboardContent::Text("last while alone".to_owned())));
+        let actions = e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
+            "last while alone".to_owned(),
+        )));
         let msgs = sent(&actions);
         assert_eq!(msgs.len(), 1, "expected one offer, got {msgs:?}");
         let OutboundMessage::Data(data) = msgs[0] else {
@@ -5016,7 +5250,9 @@ mod tests {
         // The window elapses once: one read, then one send of whatever
         // the clipboard settled on.
         assert_eq!(e.on_settle_due(), vec![Action::ReadClipboard]);
-        let actions = e.on_local_read(Some(ClipboardContent::Text("settled content".to_owned())));
+        let actions = e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
+            "settled content".to_owned(),
+        )));
         let msgs = sent(&actions);
         assert_eq!(msgs.len(), 1);
         let OutboundMessage::Data(data) = msgs[0] else {
@@ -5037,7 +5273,12 @@ mod tests {
         // The escape hatch for callers who want no wait at all.
         assert_eq!(e.on_local_change(), vec![Action::ReadClipboard]);
         assert_eq!(
-            sent(&e.on_local_read(Some(ClipboardContent::Text("eager".to_owned())))).len(),
+            sent(
+                &e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
+                    "eager".to_owned()
+                )))
+            )
+            .len(),
             1
         );
     }
@@ -5087,7 +5328,9 @@ mod tests {
         // The provider's own-write notification is suppressed, not resent.
         e.on_local_change();
         e.on_settle_due();
-        e.on_local_read(Some(ClipboardContent::Text("from peer".to_owned())));
+        e.on_local_read(ClipboardRead::Content(ClipboardContent::Text(
+            "from peer".to_owned(),
+        )));
         let snap = metrics.snapshot();
         assert_eq!(snap.clipboard_loop_suppressed, 1);
         // No race occurred in this sequence.
@@ -6680,7 +6923,9 @@ mod tests {
     fn copy_files(engine: &mut ClipboardEngine, paths: &[&str]) -> Vec<Action> {
         engine.on_local_change();
         engine.on_settle_due();
-        engine.on_local_read(Some(ClipboardContent::FileList(selection(paths))))
+        engine.on_local_read(ClipboardRead::Content(ClipboardContent::FileList(
+            selection(paths),
+        )))
     }
 
     /// The one build the actions asked for.
@@ -7010,7 +7255,9 @@ mod tests {
         ];
         for path in inside {
             let actions =
-                engine.on_local_read(Some(ClipboardContent::FileList(vec![path.clone()])));
+                engine.on_local_read(ClipboardRead::Content(ClipboardContent::FileList(vec![
+                    path.clone(),
+                ])));
             assert!(
                 actions.is_empty(),
                 "{} was staged for sending: {actions:?}",
@@ -7025,12 +7272,16 @@ mod tests {
             .expect("the spool root has a parent")
             .join("spool-backup")
             .join("note.txt");
-        build_of(&engine.on_local_read(Some(ClipboardContent::FileList(vec![sibling]))));
+        build_of(
+            &engine.on_local_read(ClipboardRead::Content(ClipboardContent::FileList(vec![
+                sibling,
+            ]))),
+        );
 
         // One path inside the spool poisons the whole selection: one
         // clipboard item is one blob, so it cannot be sent minus that
         // entry without sending something the user did not select.
-        let mixed = engine.on_local_read(Some(ClipboardContent::FileList(vec![
+        let mixed = engine.on_local_read(ClipboardRead::Content(ClipboardContent::FileList(vec![
             elsewhere("report.pdf"),
             root.join("3f2a.bin"),
         ])));
