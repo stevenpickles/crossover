@@ -215,7 +215,10 @@ cross-platform interchange format**, and `CF_DIB` is the outlier.
 
 - **Threatens:** cross-platform image interop.
 - **Drafted once, for both platforms:**
-  [ADR 0016](adr/0016-image-interchange-format.md) (Proposed).
+  [ADR 0016](adr/0016-image-interchange-format.md) (Accepted 2026-09-28).
+  Its amendment permits a pure-Rust PNG codec here, for **local** content
+  only and fenced from the receive path, since Linux has no imaging API a
+  background service should depend on.
 
 ---
 
