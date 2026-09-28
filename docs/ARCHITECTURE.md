@@ -896,7 +896,9 @@ service's saved command line (ADR 0011) would otherwise flatten a drawn
 arrangement back to a side on every launch — the flags still win over an
 *implicit* layout, where there is nothing to lose ([ADR
 0018](adr/0018-drawn-display-topology.md)). (Config and logs live under
-`~/.crossover`; secrets stay DPAPI-encrypted under `%LOCALAPPDATA%\Crossover`.)
+`~/.crossover`; secrets stay DPAPI-encrypted under `%LOCALAPPDATA%\Crossover`
+on Windows, and in the login keychain under the service
+`com.crossover.secure-storage.v1` on macOS.)
 
 ```toml
 schema_version = 2

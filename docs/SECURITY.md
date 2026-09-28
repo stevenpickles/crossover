@@ -72,7 +72,12 @@ Each installation generates a persistent identity at first run (FR-1.1):
 - creation timestamp
 
 Storage: private key material goes through the `SecureStorage` platform
-trait — DPAPI or equivalent on Windows, Keychain/secret-service later.
+trait — DPAPI on Windows; on macOS a generic-password item in the user's
+login keychain ([ADR 0020](adr/0020-macos-platform-bindings.md)), whose
+access list binds to the signed binary (platform-risks-macos.md M-8), so a
+build the Keychain will not answer fails loudly rather than reading as a
+new device; the Secret Service on Linux later. Every backend applies the
+same storage-key rule (`validate_storage_key`).
 Identity survives restarts; regeneration is an explicit user action that
 invalidates existing pairings.
 
