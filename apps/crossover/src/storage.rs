@@ -9,10 +9,15 @@ use crossover_platform::SecureStorage;
 ///
 /// # Errors
 ///
-/// On Windows, if the per-user location cannot be determined. On other
-/// platforms, always — their `SecureStorage` backends arrive in Phase 7
-/// (docs/ROADMAP.md), and pretending otherwise would violate the
+/// On Windows, if the per-user location cannot be determined. On macOS,
+/// never at open — the Keychain is reached per call, and a locked or
+/// refusing keychain surfaces there (ADR 0020). On Linux, always: its
+/// `SecureStorage` backend arrives with the Linux port (docs/ROADMAP.md
+/// Phase 9.2), and pretending otherwise would violate the
 /// no-silent-plaintext-fallback contract.
+// One signature for every platform: on macOS the open itself cannot fail,
+// but on Windows and Linux it can, and callers handle one shape.
+#[cfg_attr(target_os = "macos", allow(clippy::unnecessary_wraps))]
 pub fn open_secure_storage() -> anyhow::Result<Box<dyn SecureStorage>> {
     #[cfg(windows)]
     {
@@ -21,11 +26,17 @@ pub fn open_secure_storage() -> anyhow::Result<Box<dyn SecureStorage>> {
             .context("locating per-user secure storage")?;
         Ok(Box::new(storage))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(
+            crossover_platform_macos::KeychainSecureStorage::for_current_user(),
+        ))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         anyhow::bail!(
             "secure storage is not implemented for this platform yet \
-             (Windows first; macOS/Linux arrive in Phase 7 — docs/ROADMAP.md)"
+             (the Linux port is Phase 9.2 — docs/ROADMAP.md)"
         )
     }
 }
@@ -53,7 +64,8 @@ pub fn open_link_state_probe() -> std::sync::Arc<dyn crossover_platform::LinkSta
 /// # Errors
 ///
 /// On Windows, if clipboard observation cannot be established. On other
-/// platforms, always — their providers arrive in Phase 7.
+/// platforms, always — their providers arrive with their ports
+/// (docs/ROADMAP.md Phase 9).
 pub fn open_clipboard_provider()
 -> anyhow::Result<std::sync::Arc<dyn crossover_platform::ClipboardProvider>> {
     #[cfg(windows)]
@@ -66,7 +78,7 @@ pub fn open_clipboard_provider()
     #[cfg(not(windows))]
     {
         anyhow::bail!(
-            "the clipboard is not implemented for this platform yet              (Windows first; macOS/Linux arrive in Phase 7 — docs/ROADMAP.md)"
+            "the clipboard is not implemented for this platform yet              (the macOS and Linux ports are Phase 9 — docs/ROADMAP.md)"
         )
     }
 }
@@ -237,7 +249,7 @@ pub fn open_display() -> anyhow::Result<std::sync::Arc<dyn crossover_platform::D
 /// Open the platform pointer-input capture and injector.
 ///
 /// Returned together because control transfer needs both, and both are
-/// Windows-only until Phase 7 (docs/ROADMAP.md). The capture provider
+/// Windows-only until the Phase 9 ports (docs/ROADMAP.md). The capture provider
 /// owns a pump thread from construction; it installs no hook until the
 /// control engine first grants control.
 ///

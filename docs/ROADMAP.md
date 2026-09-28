@@ -934,6 +934,10 @@ implement, made once before there are three implementations of it:
 ([ADR 0020](adr/0020-macos-platform-bindings.md) — the `objc2` family,
 `objc2-security` for the Keychain) and `crossover-platform-macos` exists as
 an empty, tri-OS-building crate wired into `crossover` (feature/172).
+**Identity in the Keychain** follows (feature/173): `SecureStorage` on
+macOS, one storage-key rule shared by every backend, and CodeQL's Rust
+analysis extended to a macOS runner. A Mac can pair and keep its identity
+and trust store; `crossover run` needs the clipboard slice next.
 
 1. **Core:** identity in Keychain (M-8), text and image clipboard with a
    polled pasteboard (M-4, M-5 via ADR 0016), input capture and injection

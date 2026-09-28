@@ -19,9 +19,48 @@ pub enum SecureStorageError {
     Backend { reason: String },
 }
 
+/// Longest accepted storage key, in bytes — on every backend.
+pub const MAX_STORAGE_KEY_BYTES: usize = 128;
+
+/// Check `key` against the one key contract every backend shares: 1 to
+/// [`MAX_STORAGE_KEY_BYTES`] bytes of `[A-Za-z0-9._-]`, starting
+/// alphanumeric.
+///
+/// Validated, never sanitized: a key the contract cannot represent
+/// literally is rejected outright — no traversal where a key becomes a file
+/// name, and no surprise collisions from escaping. One rule for all
+/// backends rather than each backend's own, so a key that works on Windows
+/// cannot fail on macOS (or the reverse) and surface as an identity that
+/// exists on one machine of a pair and not the other.
+///
+/// # Errors
+///
+/// [`SecureStorageError::Backend`] naming the rule the key broke.
+pub fn validate_storage_key(key: &str) -> Result<(), SecureStorageError> {
+    let starts_alphanumeric = key
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    let charset_ok = key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if key.is_empty() || key.len() > MAX_STORAGE_KEY_BYTES || !starts_alphanumeric || !charset_ok {
+        return Err(SecureStorageError::Backend {
+            reason: format!(
+                "invalid storage key {key:?}: keys are 1..={MAX_STORAGE_KEY_BYTES} bytes of \
+                 [A-Za-z0-9._-] starting alphanumeric"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Protects small secrets (private key material) at rest.
 ///
 /// Semantics implementations must uphold:
+///
+/// - Every key is checked with [`validate_storage_key`] before the backend
+///   touches anything.
 ///
 /// - `store` replaces any existing value under `key` atomically enough that
 ///   a concurrent `load` sees either the old or the new value, never a mix.
@@ -54,4 +93,38 @@ pub trait SecureStorage: Send + Sync {
     ///
     /// [`SecureStorageError::Backend`] if the platform backend fails.
     fn delete(&self, key: &str) -> Result<(), SecureStorageError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_STORAGE_KEY_BYTES, validate_storage_key};
+
+    /// The keys the application actually uses, and the boundary cases of
+    /// the one rule every backend applies.
+    #[test]
+    fn the_shared_key_rule_accepts_real_keys_and_rejects_everything_else() {
+        for key in [
+            "device-identity",
+            "trusted-peers",
+            "a",
+            "v1.key_2",
+            &"k".repeat(MAX_STORAGE_KEY_BYTES),
+        ] {
+            assert!(validate_storage_key(key).is_ok(), "{key:?} was rejected");
+        }
+        for key in [
+            "",
+            &"k".repeat(MAX_STORAGE_KEY_BYTES + 1),
+            ".hidden",
+            "-dash-first",
+            "../escape",
+            "a/b",
+            r"a\b",
+            "has space",
+            "nul\0byte",
+            "ünïcode",
+        ] {
+            assert!(validate_storage_key(key).is_err(), "{key:?} was accepted");
+        }
+    }
 }
