@@ -1,25 +1,24 @@
 # Crossover Roadmap
 
-> **Current phase: 9 — Cross-Platform Validation** (planned 2026-09-28;
-> no port work started.)
+> **Current phase: 9 — Cross-Platform Validation** (in progress; 9.0 done
+> 2026-09-28, no port work started.)
 >
 > **Last closed:** Phase 8 (Dynamic Display Topology), 2026-09-28 — the
 > drawn layout, shipped in [v0.2.0](../CHANGELOG.md) on 2026-09-01, passed
 > its extended two-machine soak. The record is in Phase 8's section below.
 >
+> **Done:** **9.0 — Preconditions, on Windows** (2026-09-28): the clipboard
+> read tells empty from unreadable (feature/169); both clipboard grants are
+> enforced and settable (feature/170); and
+> [ADR 0016](adr/0016-image-interchange-format.md) is accepted with an
+> amendment the ports must meet (feature/171).
+>
 > **Next, in order** (Phase 9's milestones, detailed below):
 >
-> 1. **9.0 — Preconditions, on Windows.** Accept
->    [ADR 0016](adr/0016-image-interchange-format.md) (image interchange);
->    make the clipboard read tell an empty clipboard from an unreadable one
->    (**done**, feature/169); enforce `clipboard_send` for text and images,
->    not only files (**done**, with `clipboard_receive` and the CLI to set
->    both, feature/170). All three change the contract the ports implement,
->    so they land first.
-> 2. **9.1 — macOS**, to full parity with Windows.
-> 3. **9.2 — Linux (Ubuntu 24.04)**, opening with the input-route spike
+> 1. **9.1 — macOS**, to full parity with Windows.
+> 2. **9.2 — Linux (Ubuntu 24.04)**, opening with the input-route spike
 >    ([platform-risks-linux.md](platform-risks-linux.md) L-1), then to full
->    parity.
+>    parity. The spike is research, not code, and may run alongside 9.1.
 >
 > **Open, not blocking:** dropouts on the directly-connected A ↔ B link
 > (being re-tested through a switch), and the Phase 7 follow-ups — both
@@ -882,7 +881,9 @@ It is kept finishable by milestones, not by trimming: each milestone is
 small enough to validate on its own, and the phase closes when all of them
 have.
 
-**Platforms and lab.** macOS on the one available Mac; Linux as **Ubuntu
+**Platforms and lab.** macOS on the one available Mac — **Apple Silicon,
+on the current macOS (26 or 27)**, so Intel Macs and older releases are not
+Phase 9 gates; Linux as **Ubuntu
 24.04 LTS on its default GNOME Wayland session** (other distributions and
 desktops follow later, and are not Phase 9 gates). The lab is two Windows
 machines, one Mac, and one Linux machine. `crossover-platform-macos` and
@@ -897,11 +898,17 @@ port must answer are written:
 **9.0 — Preconditions, on Windows.** Three changes to what the ports will
 implement, made once before there are three implementations of it:
 
-1. **Accept [ADR 0016](adr/0016-image-interchange-format.md)** (Proposed):
-   the receiver advertises the image formats it can install and the sender
+1. **Accept [ADR 0016](adr/0016-image-interchange-format.md)**: the
+   receiver advertises the image formats it can install and the sender
    produces one by converting its own local content, so no receiver ever
    decodes a peer's image. M-5 and L-9 agree `CF_DIB` does not travel;
-   Windows ↔ Windows stays verbatim DIB.
+   Windows ↔ Windows stays verbatim DIB. **Done** (2026-09-28), accepted
+   with four conditions the ports must meet: a sender produces the
+   receiver's canonical form, proven by a round-trip test (loop safety);
+   the format bits move the protocol version; Linux may use a pure-Rust PNG
+   codec fenced to local content; conversion runs off the driver loop,
+   bounded and refusable. No code lands with it — the first format bit
+   arrives with the macOS port.
 2. **The clipboard read tells *empty* from *unreadable*.** Both used to
    answer `Ok(None)`, so a parked install could overwrite a copy made in a
    format Crossover does not sync (0.2.0 known limitation;

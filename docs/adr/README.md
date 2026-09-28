@@ -66,15 +66,16 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0014](0014-chunked-rich-clipboard-transfer.md) | Chunked rich-clipboard transfer: images first, native format verbatim (Phase 7) | Accepted |
 | [0015](0015-spooled-virtual-file-paste.md) | Files/folders transfer: eager transfer to a bounded internal spool, pasted as a virtual file list, sender-zipped archives, per-peer permission (Phase 7) | Accepted |
 | [0017](0017-protocol-version-3.md) | Protocol v3: the file descriptor changes every offer's layout, so the version and its floor both move; no back-compatibility with v2 | Accepted |
-| [0016](0016-image-interchange-format.md) | Image interchange: the receiver names the format, the sender produces it; PNG is the baseline and receivers never decode (cross-platform) | Proposed |
+| [0016](0016-image-interchange-format.md) | Image interchange: the receiver names the format, the sender produces it; PNG is the baseline and receivers never decode (cross-platform); accepted with a 2026-09-28 amendment — canonical-form round trips, a protocol bump, a fenced local codec on Linux, conversion off the driver loop | Accepted |
 | [0018](0018-drawn-display-topology.md) | Display topology is a drawn layout in one shared coordinate space; edges derived from adjacency, protocol v4 (v5 and v6 by amendment), a `crossover-topology` crate (Phase 8) | Accepted (supersedes 0009's topology) |
 | [0019](0019-layout-editor-toolkit.md) | The layout editor is an egui/eframe application in its own on-demand, user-session binary, `apps/crossover-layout` (Phase 8) | Accepted |
 
 ## Known decisions awaiting an ADR
 
-None outstanding. One drafted decision is still open:
-[0016](0016-image-interchange-format.md) (image interchange format) is
-**Proposed**, and is a precondition for the Phase 9 ports.
+None outstanding, and no drafted decision is open:
+[0016](0016-image-interchange-format.md) (image interchange format), the
+last Phase 9 precondition, was accepted on 2026-09-28. The Linux input
+route (platform-risks-linux.md L-1) will need one once its spike has run.
 
 The layout editor's **UI toolkit** — the entry this section
 carried while Phase 8 was being designed — is decided in

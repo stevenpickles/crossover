@@ -104,9 +104,11 @@ implementations of the clipboard trait, not new protocol design").
   either peer is non-Windows (the protocol already has a PNG variant);
   convert at the receiving edge; or negotiate a format per session.
   Converting contradicts "verbatim"; negotiating adds protocol surface.
-- **Drafted:** [ADR 0016](adr/0016-image-interchange-format.md) (Proposed) —
-  PNG as the negotiated baseline, the sender converting from its own local
-  content so a receiver never decodes what a peer sent.
+- **Decided:** [ADR 0016](adr/0016-image-interchange-format.md) (Accepted
+  2026-09-28) — PNG as the negotiated baseline, the sender converting from
+  its own local content so a receiver never decodes what a peer sent, and
+  producing exactly the receiver's canonical form (a Windows-canonical DIB
+  for a Windows peer) so loop prevention's round trip holds.
 
 ## M-6 Cursor hiding may be application-scoped
 
