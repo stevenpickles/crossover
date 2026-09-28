@@ -17,6 +17,9 @@ crossover-platform = { workspace = true }
 # inside it), so the composition root can call platform hooks such as
 # `set_process_dpi_awareness` / `restore_system_cursors` unconditionally.
 crossover-platform-windows = { workspace = true }
+# The macOS port (ADR 0020), depended on for every target for the same
+# reason: off macOS it is an empty shell and pulls in no Apple framework.
+crossover-platform-macos = { workspace = true }
 crossover-protocol = { workspace = true }
 crossover-security = { workspace = true }
 # `config` for the `[layout]` section reader (ADR 0018, config schema v2):

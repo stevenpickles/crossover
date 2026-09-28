@@ -1,7 +1,7 @@
 # Crossover Roadmap
 
 > **Current phase: 9 — Cross-Platform Validation** (in progress; 9.0 done
-> 2026-09-28, no port work started.)
+> 2026-09-28, 9.1 macOS started the same day.)
 >
 > **Last closed:** Phase 8 (Dynamic Display Topology), 2026-09-28 — the
 > drawn layout, shipped in [v0.2.0](../CHANGELOG.md) on 2026-09-01, passed
@@ -929,7 +929,11 @@ implement, made once before there are three implementations of it:
    `keyboard` and `mouse` remain stored but unenforced — recorded in
    SECURITY.md §4, not yet scheduled.
 
-**9.1 — macOS**, in this order, each validated before the next:
+**9.1 — macOS**, in this order, each validated before the next. Started
+2026-09-28: the binding library is decided
+([ADR 0020](adr/0020-macos-platform-bindings.md) — the `objc2` family,
+`objc2-security` for the Keychain) and `crossover-platform-macos` exists as
+an empty, tri-OS-building crate wired into `crossover` (feature/172).
 
 1. **Core:** identity in Keychain (M-8), text and image clipboard with a
    polled pasteboard (M-4, M-5 via ADR 0016), input capture and injection
