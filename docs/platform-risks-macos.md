@@ -87,6 +87,12 @@ no native implementation on macOS — the port must **poll**.
 - **Note:** loop prevention (FR-3.3) currently leans on recognising our own
   writes by content hash; polling does not change that, but it does mean a
   write and its own observation are separated by up to one interval.
+- **Built (feature/174):** a thread samples `changeCount` every 200 ms and
+  raises the listener when it moves; a read happens only after that, inside
+  the engine's 300 ms settle window. Our own writes move the counter too,
+  which the trait already requires consumers to expect. Still to verify on
+  the lab Mac: the CPU cost at that cadence, and a read landing while
+  another application is mid-write.
 
 ## M-5 Image format: CF_DIB does not travel
 
@@ -181,6 +187,35 @@ which are neither HID usages nor Windows scan codes.
   keyboard reveals.
 - **Reuse:** the Windows port already maps scan codes to HID usages; the
   table's *shape* and its tests carry over even though its contents do not.
+
+## M-11 Reading the general pasteboard is privacy-gated
+
+Found while building the clipboard slice (2026-09-28), not in the original
+catalogue: current macOS gates **programmatic reads of the general
+pasteboard**. AppKit's own documentation of `NSPasteboardAccessBehavior`
+says the default is to *ask* on programmatic access; the first read raises
+a system alert, after which the application appears in System Settings
+where the user can choose ask, always allow, or always deny. Access that
+is user-originated and paste-related is always allowed — which is exactly
+what Crossover's reads are not: it reads because the clipboard changed, not
+because the user pressed paste. Other, named pasteboards are not gated.
+
+- **Threatens:** `ClipboardProvider::read`, and therefore everything the
+  Mac sends.
+- **The dangerous case is "always deny"**: a denied read answers as though
+  the pasteboard were empty, which would read as an empty clipboard and
+  sync nothing, with nothing logged. The provider therefore checks
+  `accessBehavior` before reading and turns a denial into an error that
+  names the setting, never `Empty`.
+- **What is not gated:** the `changeCount` the poller samples, and writes.
+  So a Mac can always *receive* the peer's clipboard; only sending depends
+  on the grant, and nothing is read until something has changed.
+- **Verify on the lab Mac:** what the first-read alert looks like for a
+  command-line binary and for a LaunchAgent; whether "Allow" in the alert
+  persists or only "Always Allow" in System Settings does; whether the alert
+  blocks the read or fails it; and whether reading `types` alone (which the
+  provider does to tell empty from unreadable) is gated. Tests never touch
+  the general pasteboard, so CI cannot answer any of this.
 
 ---
 

@@ -1294,6 +1294,54 @@ Crossover's backoff), no stuck input, no clipboard loops.
   before trusting a maximum. That check is what separated this run from the
   discarded one.
 
+## Phase 9.1 hardware checks: macOS (the lab Mac and machine A)
+
+The macOS port lands in slices (docs/ROADMAP.md Phase 9.1), and each slice
+carries what CI cannot check: a permission prompt, the real pasteboard
+under a logged-in user, a moved cursor. CI's `macos-latest` runners build
+and test everything else. Build on the Mac from the same commit as machine
+A, and record what each step *showed*, including prompts and their wording.
+
+### Slice 1 — identity in the Keychain (feature/173)
+
+1. On machine A: `crossover pair --listen`. On the Mac: `crossover pair
+   <A's address>`, and type the code shown on A.
+2. On the Mac: `crossover status` and `crossover peers` — A is listed, and
+   the Mac's device id is shown.
+3. Run `crossover status` again: the device id is unchanged (the identity
+   was loaded, not regenerated).
+4. **Rebuild** (`cargo build`) and run `crossover status` once more. This
+   is M-8's question: record whether macOS prompts to let the rebuilt
+   binary use the stored item, what the prompt says, and what happens if
+   it is refused — it must be an error naming a Keychain status, never a
+   new device id.
+
+### Slice 2 — the text clipboard, clipboard-only (feature/174)
+
+`crossover run` works on the Mac from this slice, **clipboard-only**: no
+input, no cursor, no screens stated to A. A logs `clipboard-only run` at
+startup.
+
+1. Machine A: `crossover run --listen` (or the service); the Mac:
+   `crossover run --connect <A's address>`. Both log `session established`.
+2. **M-11, first:** copy text on the Mac. Record the system alert, its
+   wording, and what each answer does. Then set Crossover to *Always
+   Allow* in System Settings → Privacy & Security → Paste from Other Apps
+   (the exact name may differ; record it) and continue.
+3. Copy text on A; paste on the Mac. Copy different text on the Mac; paste
+   on A. Unicode (accents, an emoji), a multi-line block, and a large block
+   (tens of kilobytes) each way.
+4. Copy an image on the Mac, then copy text on A: the image is the user's
+   copy and is **not** replaced by a waiting peer item during a busy
+   window; the text simply travels to A's side as usual (images do not
+   travel yet — slice 3).
+5. Set the Mac to *always deny* and copy on the Mac: the Mac's log names
+   the setting (M-11) instead of going quiet. Set it back.
+6. From A's console, request control (`r`): A's request times out with its
+   usual diagnostic, and the Mac logs that it cannot take input yet.
+7. Leave it running for an hour of normal use; count reconnects and any
+   copy that did not arrive.
+
 ## Phase 8 soak: the drawn display topology (two machines)
 
 These are the Phase 8 exit criteria, and the loop the phase exists to close:
