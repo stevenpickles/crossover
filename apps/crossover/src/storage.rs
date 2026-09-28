@@ -75,10 +75,18 @@ pub fn open_clipboard_provider()
             .context("starting clipboard observation")?;
         Ok(std::sync::Arc::new(provider))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        use anyhow::Context;
+        let provider = crossover_platform_macos::MacClipboard::new()
+            .context("starting clipboard observation")?;
+        Ok(std::sync::Arc::new(provider))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         anyhow::bail!(
-            "the clipboard is not implemented for this platform yet              (the macOS and Linux ports are Phase 9 — docs/ROADMAP.md)"
+            "the clipboard is not implemented for this platform yet \
+             (the Linux port is Phase 9.2 — docs/ROADMAP.md)"
         )
     }
 }
@@ -235,16 +243,44 @@ pub fn open_display() -> anyhow::Result<std::sync::Arc<dyn crossover_platform::D
 
 /// Open the platform display-info provider.
 ///
+/// On macOS, until its display slice lands (docs/ROADMAP.md Phase 9.1): a
+/// backend that answers every query "unavailable". Nothing is stated to
+/// the peer about this machine's screens, so the peer derives no crossing
+/// into it — the right shape for a clipboard-only run
+/// ([`INPUT_AVAILABLE`]).
+#[cfg(target_os = "macos")]
+// Infallible here, like the Windows provider; the `Result` matches the
+// other platforms' signature.
+#[allow(clippy::unnecessary_wraps)]
+pub fn open_display() -> anyhow::Result<std::sync::Arc<dyn crossover_platform::DisplayInfo>> {
+    Ok(std::sync::Arc::new(
+        crossover_platform::UnavailableDisplayInfo,
+    ))
+}
+
+/// Open the platform display-info provider.
+///
 /// # Errors
 ///
-/// Always, on non-Windows platforms (macOS/Linux arrive in later phases).
-#[cfg(not(windows))]
+/// Always, on Linux: its port is Phase 9.2 (docs/ROADMAP.md).
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn open_display() -> anyhow::Result<std::sync::Arc<dyn crossover_platform::DisplayInfo>> {
     anyhow::bail!(
         "display enumeration is not implemented for this platform yet \
-         (Windows first; macOS/Linux arrive in later phases — docs/ROADMAP.md)"
+         (the Linux port is Phase 9.2 — docs/ROADMAP.md)"
     )
 }
+
+/// Whether this platform can capture and inject input yet.
+///
+/// `false` on macOS until its input slice lands (docs/ROADMAP.md Phase
+/// 9.1): `crossover run` then starts **clipboard-only** — no control
+/// driver, no cursor mask, no screens stated to the peer — instead of
+/// refusing to start. A control request the peer sends goes unanswered and
+/// times out on the peer's side with its existing diagnostic, and this
+/// side logs why. Temporary by design (maintainer decision, 2026-09-28):
+/// it disappears with the input slice, and no wire change was made for it.
+pub const INPUT_AVAILABLE: bool = cfg!(windows);
 
 /// Open the platform pointer-input capture and injector.
 ///
