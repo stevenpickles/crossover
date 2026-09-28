@@ -184,6 +184,27 @@ pub fn peers_list() -> anyhow::Result<()> {
                 "not allowed"
             }
         );
+        // Both clipboard directions, always, for the same auditability
+        // reason — and worded as what flows where, because the stored names
+        // (`clipboard_send`, `clipboard_receive`) read backwards from the
+        // peer's side.
+        let permissions = peer.permissions();
+        println!(
+            "      clipboard in:   {}",
+            if permissions.clipboard_receive {
+                "allowed (its copies reach your clipboard)"
+            } else {
+                "DENIED (its copies and files are refused)"
+            }
+        );
+        println!(
+            "      clipboard out:  {}",
+            if permissions.clipboard_send {
+                "allowed (your copies are sent to it)"
+            } else {
+                "DENIED (your copies stay here)"
+            }
+        );
         if !peer.remembered_addresses().is_empty() {
             println!(
                 "      addresses:      {}",
@@ -197,6 +218,87 @@ pub fn peers_list() -> anyhow::Result<()> {
         "Let a peer send you files with `crossover peers allow-files <device-id>` \
          (`deny-files` to withdraw)."
     );
+    println!(
+        "Stop the clipboard with a peer with `crossover peers deny-clipboard <device-id> \
+         [--incoming] [--outgoing]` (`allow-clipboard` to restore)."
+    );
+    Ok(())
+}
+
+/// `crossover peers allow-clipboard <device-id>` / `peers deny-clipboard
+/// <device-id>`, each optionally narrowed with `--incoming` / `--outgoing`
+/// (docs/SECURITY.md §4, T9).
+///
+/// Local and explicit, like the file verbs: nothing on the wire reaches
+/// these flags. Pairing grants both, so this is how a user narrows a
+/// pairing, and how they undo that. A running worker picks the change up
+/// on its next trust poll, without a reconnect.
+pub fn peers_set_clipboard(
+    device_id: Uuid,
+    incoming: bool,
+    outgoing: bool,
+    allowed: bool,
+) -> anyhow::Result<()> {
+    let storage = open_secure_storage()?;
+    let mut store = TrustStore::load(&*storage).context("loading trust store")?;
+
+    let mut changed = false;
+    if incoming {
+        let Some(previous) = store.set_clipboard_receive(device_id, allowed) else {
+            anyhow::bail!(
+                "no trusted peer with device id {device_id}; `crossover peers` lists them"
+            );
+        };
+        changed |= previous != allowed;
+    }
+    if outgoing {
+        let Some(previous) = store.set_clipboard_send(device_id, allowed) else {
+            anyhow::bail!(
+                "no trusted peer with device id {device_id}; `crossover peers` lists them"
+            );
+        };
+        changed |= previous != allowed;
+    }
+    let name = store
+        .find_by_peer_id(device_id)
+        .map_or_else(String::new, |peer| peer.device_name().to_owned());
+    let which = match (incoming, outgoing) {
+        (true, true) => "in either direction",
+        (true, false) => "into your clipboard (incoming)",
+        _ => "out of your clipboard (outgoing)",
+    };
+
+    if !changed {
+        println!(
+            "Clipboard with \"{name}\" ({device_id}) {which} was already {}; nothing changed.",
+            if allowed { "allowed" } else { "denied" }
+        );
+        return Ok(());
+    }
+    store.save(&*storage).context("persisting trust store")?;
+    // The record of who may reach whose clipboard, and when, belongs in the
+    // log as well as on the terminal (NFR-3), as the file grant's does.
+    tracing::info!(
+        peer = %device_id,
+        clipboard_receive = incoming.then_some(allowed),
+        clipboard_send = outgoing.then_some(allowed),
+        "clipboard permission changed"
+    );
+    if allowed {
+        println!("Clipboard with \"{name}\" ({device_id}) is now allowed {which}.");
+    } else {
+        println!(
+            "Clipboard with \"{name}\" ({device_id}) is now denied {which}. A running \
+             Crossover applies this within a few seconds; content already delivered \
+             stays where it is."
+        );
+        if incoming {
+            println!(
+                "Incoming covers files too: they reach you through your clipboard, so \
+                 this peer's files are refused whatever `allow-files` says."
+            );
+        }
+    }
     Ok(())
 }
 
