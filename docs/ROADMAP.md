@@ -881,7 +881,9 @@ It is kept finishable by milestones, not by trimming: each milestone is
 small enough to validate on its own, and the phase closes when all of them
 have.
 
-**Platforms and lab.** macOS on the one available Mac; Linux as **Ubuntu
+**Platforms and lab.** macOS on the one available Mac — **Apple Silicon,
+on the current macOS (26 or 27)**, so Intel Macs and older releases are not
+Phase 9 gates; Linux as **Ubuntu
 24.04 LTS on its default GNOME Wayland session** (other distributions and
 desktops follow later, and are not Phase 9 gates). The lab is two Windows
 machines, one Mac, and one Linux machine. `crossover-platform-macos` and
