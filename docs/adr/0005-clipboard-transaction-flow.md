@@ -283,3 +283,59 @@ read.
   local copy that supersedes a parked install. Deliberately not done here,
   because it widens a platform trait that three backends implement, which
   is not a change to make inside a retry fix.
+
+## Addendum (2026-09-28): an unreadable copy is the user's copy
+
+The residual the 2026-09-01 addendum named is closed, in the direction it
+named. `ClipboardProvider::read` now returns a `ClipboardRead` —
+`Content`, `Empty`, or `Unreadable` — instead of `Option<ClipboardContent>`,
+so "nothing this build can send" is two answers again:
+
+| What the read finds | What the parked install gets |
+|---|---|
+| `Empty` — no formats at all | Left alone; its own timer decides. Nothing anyone made is on the clipboard, so nothing needs protecting |
+| `Unreadable` — formats present, none this build represents | **Superseded**, exactly as for genuinely new readable content. Nothing travels, because there is nothing to send |
+
+`Unreadable` includes an image or a file selection past its ceiling: it
+is refused before its bytes are copied, as before, but the user did copy
+it. And the trait says which way to err: a backend that cannot tell the
+two apart must answer `Unreadable`, because being wrong in that direction
+costs a peer item superseded where the origin can see it, and being wrong
+in the other costs the user's copy, silently. On Windows the distinction
+is `CountClipboardFormats` under the read's own single open, with its
+failure answering `Unreadable`.
+
+**The reconnect rule needed a memory with no hash in it.** The readable
+path spares a parked install when a reconnect's re-read finds content
+unchanged — the 2026-09-01 scenario. An unreadable clipboard has no hash
+to compare, so the engine keeps one bit: whether the last read was
+unreadable. A reconnect re-read that finds the clipboard unreadable again
+is treated as unchanged and spares the install; one that finds it
+unreadable after readable content supersedes it. Any other read reached
+the engine because the clipboard changed (a notification, or the retry
+that continues one), and with nothing to compare, a changed-and-unreadable
+clipboard is taken to be a new copy.
+
+**Either kind of nothing now forgets the local hash.** The 2026-09-01
+addendum recorded that `current_local_hash` survived an unreadable read,
+and called it "correct for dedup". It was worse than that: the same hash
+drives the echo guard and `AlreadyHave`, so a peer item carrying the old
+content was answered `Applied` — or its offer declined as already held —
+with nothing written, and the two machines agreed on a clipboard this one
+no longer showed. The hash is cleared on `Empty` and on `Unreadable`.
+
+**Our own virtual file list is kept away from the read on every path.**
+It is not content this build reads back, so the provider would report it
+`Unreadable`, and the engine would take our own object for the user's
+copy. The driver's F13 check (ADR 0015) used to guard the notification
+path and the busy-read retry separately and missed the reconnect re-read;
+it now sits in the one function every read passes through.
+
+**The one residual that remains** is the hash-free reconnect rule's own
+limit: an unreadable copy replaced by a *different* unreadable copy while
+the peer was away looks unchanged at reconnect, so the peer's
+re-announced item may be installed over it. It needs two private-format
+copies across a disconnection, with a parked install waiting at the
+moment of reconnect. A platform clipboard sequence number would close it
+and is not portable across the three backends, so it is recorded rather
+than built.

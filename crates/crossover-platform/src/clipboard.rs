@@ -172,6 +172,54 @@ impl ClipboardContent {
     }
 }
 
+/// What a successful [`ClipboardProvider::read`] found.
+///
+/// Three answers rather than `Option`, because "nothing to send" is two
+/// different facts about the user's clipboard and the engine must act on
+/// them differently (ADR 0005, addenda 2026-09-01 and 2026-09-28):
+///
+/// - an **empty** clipboard holds nothing anyone made, so nothing on it
+///   needs protecting;
+/// - an **unreadable** one holds something the user copied that this
+///   build does not synchronize — an application's private format,
+///   RTF-only content, an image or selection past its ceiling. It is
+///   still the user's copy, and a parked peer install written over it
+///   would destroy it silently.
+///
+/// Before this type both answered `Ok(None)`, and the engine had to treat
+/// them alike.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ClipboardRead {
+    /// Content this build represents.
+    Content(ClipboardContent),
+    /// The clipboard holds no formats at all.
+    #[default]
+    Empty,
+    /// The clipboard holds something, but nothing this build represents.
+    Unreadable,
+}
+
+impl ClipboardRead {
+    /// The content, if there was content — for callers to whom *empty*
+    /// and *unreadable* are both simply "nothing to use".
+    #[must_use]
+    pub fn into_content(self) -> Option<ClipboardContent> {
+        match self {
+            Self::Content(content) => Some(content),
+            Self::Empty | Self::Unreadable => None,
+        }
+    }
+
+    /// The content by reference, as [`Self::into_content`].
+    #[must_use]
+    pub fn content(&self) -> Option<&ClipboardContent> {
+        match self {
+            Self::Content(content) => Some(content),
+            Self::Empty | Self::Unreadable => None,
+        }
+    }
+}
+
 /// A change-notification callback.
 ///
 /// Deliberately carries **no data**: it signals "the clipboard changed",
@@ -185,9 +233,16 @@ pub type ClipboardListener = Box<dyn Fn() + Send + Sync>;
 ///
 /// Semantics implementations must uphold:
 ///
-/// - `read` returns `Ok(None)` when the clipboard is empty or holds no
-///   representation this build handles — absence is not an error, and a
-///   format the backend cannot yet read is absence, not failure.
+/// - `read` returns [`ClipboardRead::Empty`] when the clipboard holds no
+///   formats at all, and [`ClipboardRead::Unreadable`] when it holds
+///   something but no representation this build handles. Neither is an
+///   error — a format the backend cannot yet read is not a failure — but
+///   they are not the same answer, and a backend must not report one as
+///   the other: `Unreadable` is the user's copy, and the engine protects
+///   it (ADR 0005, addendum 2026-09-28). When a backend genuinely cannot
+///   tell, `Unreadable` is the safe answer — it costs at most a peer item
+///   superseded, observably, where `Empty` risks a user's copy
+///   overwritten, silently.
 /// - `write` replaces the clipboard contents. A content *type* the
 ///   backend cannot install is [`ClipboardError::Unavailable`] (a
 ///   permanent, non-retryable refusal), never a silent success.
@@ -204,19 +259,19 @@ pub type ClipboardListener = Box<dyn Fn() + Send + Sync>;
 /// - At most one listener is active; setting a new one replaces the old,
 ///   and `None` unsubscribes.
 pub trait ClipboardProvider: Send + Sync {
-    /// Read the current content, or `Ok(None)` if the clipboard is empty
-    /// or holds nothing this backend represents.
+    /// Read the current content, or say which kind of nothing was found:
+    /// [`ClipboardRead::Empty`] or [`ClipboardRead::Unreadable`].
     ///
     /// "Nothing this backend represents" includes an image larger than
     /// [`MAX_CLIPBOARD_IMAGE_BYTES`]: it is refused *before* its bytes are
-    /// copied, logged by size alone, and reported absent rather than
-    /// truncated (FR-3.6).
+    /// copied, logged by size alone, and reported `Unreadable` rather than
+    /// truncated (FR-3.6) — the user did copy something.
     ///
     /// # Errors
     ///
     /// [`ClipboardError::Busy`] under contention (retryable);
     /// [`ClipboardError::Unavailable`] on real failure.
-    fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError>;
+    fn read(&self) -> Result<ClipboardRead, ClipboardError>;
 
     /// Replace the clipboard contents with `content`.
     ///
@@ -238,7 +293,7 @@ pub trait ClipboardProvider: Send + Sync {
     ///
     /// As [`ClipboardProvider::read`].
     fn read_text(&self) -> Result<Option<String>, ClipboardError> {
-        Ok(match self.read()? {
+        Ok(match self.read()?.into_content() {
             Some(ClipboardContent::Text(text)) => Some(text),
             Some(ClipboardContent::Image { .. } | ClipboardContent::FileList(_)) | None => None,
         })

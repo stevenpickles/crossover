@@ -117,15 +117,17 @@ use std::path::{Path, PathBuf};
 
 use crossover_platform::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
-    MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
+    ClipboardRead, MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
 };
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::GlobalFree;
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, SetLastError, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::System::DataExchange::{
-    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
-    RemoveClipboardFormatListener, SetClipboardData,
+    AddClipboardFormatListener, CloseClipboard, CountClipboardFormats, EmptyClipboard,
+    GetClipboardData, GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
@@ -248,9 +250,12 @@ impl ClipboardProvider for WindowsClipboard {
     /// reads exactly as it always has.
     ///
     /// An image past [`MAX_CLIPBOARD_IMAGE_BYTES`], or a selection past
-    /// [`MAX_CLIPBOARD_FILE_ENTRIES`], reads as *absent* — the trait's
-    /// meaning for "nothing this backend represents" — refused before its
-    /// bytes (or its paths) are copied, never truncated (FR-3.6).
+    /// [`MAX_CLIPBOARD_FILE_ENTRIES`], reads as [`ClipboardRead::Unreadable`]
+    /// — the trait's meaning for "the user copied something this backend
+    /// does not represent" — refused before its bytes (or its paths) are
+    /// copied, never truncated (FR-3.6). So does any clipboard holding
+    /// formats but none of the three above; only a clipboard holding no
+    /// formats at all reads [`ClipboardRead::Empty`].
     ///
     /// A virtual file list this process itself placed (ADR 0015) never
     /// reaches here as `CF_HDROP` at all: the object we offer serves
@@ -262,7 +267,7 @@ impl ClipboardProvider for WindowsClipboard {
     ///
     /// All three probes happen inside one open, so the precedence above is
     /// decided from a single clipboard state ([`read_current`]).
-    fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+    fn read(&self) -> Result<ClipboardRead, ClipboardError> {
         read_current(MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_FILE_ENTRIES)
     }
 
@@ -327,7 +332,8 @@ impl ClipboardProvider for WindowsClipboard {
 fn read_current(
     max_image_bytes: usize,
     max_file_entries: u32,
-) -> Result<Option<ClipboardContent>, ClipboardError> {
+) -> Result<ClipboardRead, ClipboardError> {
+    let holds_formats;
     let mut raw_image = None;
     let mut oversized_image = None;
     let mut file_list = None;
@@ -337,6 +343,7 @@ fn read_current(
     // guard has dropped and the machine-global lock is free.
     let units = {
         let open = OpenGuard::open("read")?;
+        holds_formats = probe_holds_formats(&open);
         match probe_unicode_text(&open)? {
             Some(units) if !units.is_empty() => Some(units),
             empty_or_absent => {
@@ -378,17 +385,45 @@ fn read_current(
         );
     }
     if let Some(paths) = file_list {
-        return Ok(Some(ClipboardContent::FileList(paths)));
+        return Ok(ClipboardRead::Content(ClipboardContent::FileList(paths)));
     }
     if let Some(blob) = raw_image {
-        return Ok(Some(ClipboardContent::Image {
+        return Ok(ClipboardRead::Content(ClipboardContent::Image {
             format: ClipboardImageFormat::Dib,
             bytes: canonical_dib(blob),
         }));
     }
-    // An oversized file list or image is *absent*, which leaves an empty
-    // text representation beside it reading as it always has.
-    Ok(units.map(|units| ClipboardContent::Text(String::from_utf16_lossy(&units))))
+    // An oversized file list or image is not content, which leaves an
+    // empty text representation beside it reading as it always has.
+    if let Some(units) = units {
+        return Ok(ClipboardRead::Content(ClipboardContent::Text(
+            String::from_utf16_lossy(&units),
+        )));
+    }
+    Ok(if holds_formats {
+        ClipboardRead::Unreadable
+    } else {
+        ClipboardRead::Empty
+    })
+}
+
+/// Whether the already-open clipboard holds any format at all — the one
+/// fact that separates [`ClipboardRead::Empty`] from
+/// [`ClipboardRead::Unreadable`] (ADR 0005, addendum 2026-09-28).
+///
+/// `CountClipboardFormats` answers 0 both for an empty clipboard and for a
+/// failure, so the thread's last error is cleared first and read after.
+/// A failure answers `true`: when this backend cannot tell, the trait
+/// asks for `Unreadable`, which costs a peer item superseded observably
+/// rather than a user's copy overwritten silently.
+fn probe_holds_formats(_open: &OpenGuard) -> bool {
+    // SAFETY: SetLastError/GetLastError touch only this thread's error
+    // slot; CountClipboardFormats takes no arguments and reads the
+    // clipboard this thread holds open (caller's guard).
+    unsafe {
+        SetLastError(WIN32_ERROR(0));
+        CountClipboardFormats() != 0 || GetLastError() != WIN32_ERROR(0)
+    }
 }
 
 /// Probe `CF_UNICODETEXT` on the already-open clipboard, yielding its
@@ -1483,7 +1518,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use crossover_platform::{ClipboardError, ClipboardProvider};
+    use crossover_platform::{ClipboardError, ClipboardProvider, ClipboardRead};
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+    use windows::core::w;
 
     use super::WindowsClipboard;
 
@@ -2058,7 +2095,7 @@ mod tests {
             bytes: dib(16, 16),
         };
         with_retry(|| clipboard.write(&image)).unwrap();
-        let read_back = with_retry(|| clipboard.read()).unwrap();
+        let read_back = with_retry(|| clipboard.read()).unwrap().into_content();
         assert!(
             read_back.as_ref() == Some(&image),
             "the image did not survive the clipboard verbatim (read back {:?} bytes)",
@@ -2117,7 +2154,7 @@ mod tests {
         // once. An unstable length would loop on the second hop instead
         // of the first.
         for attempt in 1..=2 {
-            match with_retry(|| clipboard.read()).unwrap() {
+            match with_retry(|| clipboard.read()).unwrap().into_content() {
                 Some(ClipboardContent::Image {
                     format: ClipboardImageFormat::Dib,
                     bytes: read_back,
@@ -2167,7 +2204,7 @@ mod tests {
         })
         .unwrap();
 
-        match with_retry(|| clipboard.read()).unwrap() {
+        match with_retry(|| clipboard.read()).unwrap().into_content() {
             Some(ClipboardContent::Text(read_back)) => assert_eq!(read_back, text),
             other => panic!(
                 "mixed content must read as text, got {:?}",
@@ -2211,7 +2248,7 @@ mod tests {
         })
         .unwrap();
 
-        match with_retry(|| clipboard.read()).unwrap() {
+        match with_retry(|| clipboard.read()).unwrap().into_content() {
             Some(ClipboardContent::Image { bytes, .. }) => assert_eq!(bytes, picture),
             other => panic!(
                 "empty text must not mask an image, got {:?}",
@@ -2230,7 +2267,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             with_retry(|| clipboard.read()).unwrap(),
-            Some(ClipboardContent::Text(String::new()))
+            ClipboardRead::Content(ClipboardContent::Text(String::new()))
         );
     }
 
@@ -2240,7 +2277,7 @@ mod tests {
     /// truncated. The ceiling is a parameter so the refusal is provable
     /// without putting a 64 MiB item on a live desktop's clipboard.
     #[test]
-    fn an_image_over_the_ceiling_reads_as_absent_rather_than_truncated() {
+    fn an_image_over_the_ceiling_reads_as_unreadable_rather_than_truncated() {
         let _serial = clipboard_lock();
         let clipboard = WindowsClipboard::new().unwrap();
 
@@ -2265,7 +2302,17 @@ mod tests {
             Some(picture.len())
         );
         // And the trait-level read agrees with the ceiling it applies.
-        assert!(with_retry(|| clipboard.read()).unwrap().is_some());
+        assert!(with_retry(|| clipboard.read()).unwrap().content().is_some());
+        // Under a ceiling below the item, the whole read is unreadable —
+        // the user's copy, not an empty clipboard.
+        assert_eq!(
+            with_retry(|| super::read_current(
+                picture.len() - 1,
+                crossover_platform::MAX_CLIPBOARD_FILE_ENTRIES
+            ))
+            .unwrap(),
+            ClipboardRead::Unreadable
+        );
     }
 
     /// PNG installs verbatim under the registered `"PNG"` format —
@@ -2748,7 +2795,7 @@ mod tests {
         set_hdrop(&paths);
 
         let clipboard = WindowsClipboard::new().unwrap();
-        match with_retry(|| clipboard.read()).unwrap() {
+        match with_retry(|| clipboard.read()).unwrap().into_content() {
             Some(ClipboardContent::FileList(observed)) => {
                 assert_eq!(
                     observed,
@@ -2765,10 +2812,12 @@ mod tests {
     }
 
     /// A selection past [`crossover_platform::MAX_CLIPBOARD_FILE_ENTRIES`]
-    /// reads as absent — refused before a single path is queried, never
-    /// truncated to the first N (FR-3.6, NFR-1).
+    /// reads as unreadable — refused before a single path is queried, never
+    /// truncated to the first N (FR-3.6, NFR-1) — and not as empty: the
+    /// user did copy something, and the engine protects it (ADR 0005,
+    /// addendum 2026-09-28).
     #[test]
-    fn a_selection_over_the_entry_ceiling_reads_as_absent() {
+    fn a_selection_over_the_entry_ceiling_reads_as_unreadable() {
         let _serial = clipboard_lock();
         let too_many: Vec<String> = (0..=crossover_platform::MAX_CLIPBOARD_FILE_ENTRIES)
             .map(|i| format!(r"C:\overflow\{i}.txt"))
@@ -2777,7 +2826,44 @@ mod tests {
         set_hdrop(&refs);
 
         let clipboard = WindowsClipboard::new().unwrap();
-        assert_eq!(with_retry(|| clipboard.read()).unwrap(), None);
+        assert_eq!(
+            with_retry(|| clipboard.read()).unwrap(),
+            ClipboardRead::Unreadable
+        );
+    }
+
+    /// A clipboard holding no formats at all is the one answer that reads
+    /// [`ClipboardRead::Empty`] (ADR 0005, addendum 2026-09-28).
+    #[test]
+    fn an_emptied_clipboard_reads_as_empty() {
+        let _serial = clipboard_lock();
+        with_retry(|| super::install_formats(&[])).unwrap();
+
+        let clipboard = WindowsClipboard::new().unwrap();
+        assert_eq!(
+            with_retry(|| clipboard.read()).unwrap(),
+            ClipboardRead::Empty
+        );
+    }
+
+    /// The residual this distinction exists to close: a copy made only in
+    /// a format this build does not synchronize — an application's private
+    /// format — is the user's content, and reads as
+    /// [`ClipboardRead::Unreadable`], never as [`ClipboardRead::Empty`].
+    #[test]
+    fn a_private_format_only_copy_reads_as_unreadable_not_empty() {
+        let _serial = clipboard_lock();
+        // SAFETY: registers (or looks up) a named format; no other effect.
+        let private = unsafe { RegisterClipboardFormatW(w!("Crossover.Test.PrivateFormat")) };
+        assert_ne!(private, 0, "registering the test format failed");
+        with_retry(|| super::install_formats(&[(private, b"application-private bytes")])).unwrap();
+
+        let clipboard = WindowsClipboard::new().unwrap();
+        assert_eq!(
+            with_retry(|| clipboard.read()).unwrap(),
+            ClipboardRead::Unreadable
+        );
+        assert_eq!(with_retry(|| clipboard.read_text()).unwrap(), None);
     }
 
     /// `ClipboardContent::FileList` is a local observation, not something
@@ -2819,7 +2905,7 @@ mod tests {
         let _serial = clipboard_lock();
         let clipboard = WindowsClipboard::new().unwrap();
 
-        let first = with_retry(|| clipboard.read()).unwrap();
+        let first = with_retry(|| clipboard.read()).unwrap().into_content();
         let Some(ClipboardContent::Image {
             format: ClipboardImageFormat::Dib,
             bytes,
@@ -2830,7 +2916,7 @@ mod tests {
         assert!(bytes.len() <= super::MAX_CLIPBOARD_IMAGE_BYTES);
         eprintln!("snip read as {} bytes of CF_DIB", bytes.len());
 
-        let again = with_retry(|| clipboard.read()).unwrap();
+        let again = with_retry(|| clipboard.read()).unwrap().into_content();
         assert!(
             again
                 == Some(ClipboardContent::Image {

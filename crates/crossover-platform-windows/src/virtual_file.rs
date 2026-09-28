@@ -1571,7 +1571,7 @@ mod tests {
         for attempt in 0..20 {
             match clipboard.read() {
                 Ok(read) => {
-                    content = read;
+                    content = read.into_content();
                     break;
                 }
                 Err(ClipboardError::Busy { .. }) if attempt < 19 => {

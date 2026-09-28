@@ -446,18 +446,9 @@ impl ClipboardSyncDriver {
                 self.reset_read_backoff();
                 self.on_local_change()
             }
-            SyncEvent::ReadRetryDue => {
-                if self.clipboard_holds_our_file_offer() {
-                    // Nothing to look for, and looking would be the F13
-                    // loop: the retry chain ends here rather than
-                    // rendering our own offer back into the engine. A real
-                    // change re-arms everything.
-                    tracing::debug!("read retry skipped; the clipboard holds our own file list");
-                    Vec::new()
-                } else {
-                    vec![Action::ReadClipboard]
-                }
-            }
+            // Guarded against our own file list where every read is:
+            // [`Self::read_clipboard`].
+            SyncEvent::ReadRetryDue => vec![Action::ReadClipboard],
             SyncEvent::SpoolSweepDue => self.engine.on_spool_sweep_due(),
             SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
             SyncEvent::TransferTimeout { scope, generation } => {
@@ -696,11 +687,25 @@ impl ClipboardSyncDriver {
     /// Read the provider and feed the result back, absorbing contention
     /// with the bounded nudge cycle the soak forced (see
     /// [`MAX_CONSECUTIVE_BUSY_READS`]).
+    ///
+    /// Every read passes through here, so this is where the F13 guard
+    /// holds for all of them — the settle read, the busy-read retry, and
+    /// the reconnect re-read alike. Our own virtual file list is not
+    /// content this build reads back, so the provider would answer
+    /// [`crossover_platform::ClipboardRead::Unreadable`] for it, and the engine takes that as a
+    /// user's copy (ADR 0005, addendum 2026-09-28): it would forget what
+    /// the clipboard holds and supersede a parked install on the strength
+    /// of our own object. Skipping the read ends a retry chain too; a real
+    /// change re-arms everything.
     fn read_clipboard(&mut self) -> Vec<Action> {
+        if self.clipboard_holds_our_file_offer() {
+            tracing::debug!("clipboard read skipped; the clipboard holds our own file list");
+            return Vec::new();
+        }
         match self.provider.read() {
-            Ok(content) => {
+            Ok(read) => {
                 self.reset_read_backoff();
-                self.engine.on_local_read(content)
+                self.engine.on_local_read(read)
             }
             Err(ClipboardError::Busy { reason }) => {
                 self.busy_reads += 1;
@@ -873,10 +878,12 @@ impl ClipboardSyncDriver {
     ///
     /// Its own function because the guard has to hold on **every** path
     /// that reaches a read, not only the notification path.
-    /// [`SyncEvent::ReadRetryDue`] is the second one, and it went straight
+    /// [`SyncEvent::ReadRetryDue`] was the second one, and it went straight
     /// to the provider — which would render our own offer back into the
     /// engine, the very loop the guard exists to prevent, reachable
-    /// whenever a contended read overlapped an outgoing file.
+    /// whenever a contended read overlapped an outgoing file. The reconnect
+    /// re-read was the third. All of them now meet it in
+    /// [`Self::read_clipboard`], the one place a read happens.
     fn clipboard_holds_our_file_offer(&self) -> bool {
         self.virtual_files
             .as_ref()
@@ -1432,6 +1439,69 @@ mod tests {
             commands,
             metrics,
         }
+    }
+
+    /// Drop and re-establish the session, and give the driver time to take
+    /// the establishment read it schedules.
+    async fn reconnect(rig: &mut Rig) {
+        rig.events.send(SyncEvent::SessionLost).await.unwrap();
+        rig.events
+            .send(SyncEvent::SessionEstablished)
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), rig.commands.recv())
+                .await
+                .is_err(),
+            "a reconnect against this clipboard should send nothing"
+        );
+    }
+
+    /// F13 on the path it used to miss. The reconnect re-read went
+    /// straight to the provider, and our own virtual file list — not
+    /// content this build reads back — would come back `Unreadable`,
+    /// which the engine now takes for a user's copy (ADR 0005, addendum
+    /// 2026-09-28): it would forget what the clipboard holds and could
+    /// supersede a parked install on the strength of our own object.
+    ///
+    /// Whether a read happened is observed through an injected failure a
+    /// read would consume — and the second half proves that observation
+    /// is real, by letting a read happen once the clipboard moves on.
+    #[tokio::test]
+    async fn a_reconnect_does_not_read_our_own_file_list_back() {
+        use crossover_platform::{ClipboardProvider, VirtualFile};
+
+        let files = Arc::new(FakeVirtualFiles::new());
+        let mut rig = rig_with_spool(
+            None,
+            Some(Arc::clone(&files) as Arc<dyn VirtualFileClipboard>),
+        )
+        .await;
+        files
+            .offer(&VirtualFile {
+                entry: "00000000-0000-0000-0000-000000000001.bin".to_owned(),
+                file_name: "delivered.pdf".to_owned(),
+                byte_len: 16,
+            })
+            .unwrap();
+        rig.clipboard
+            .fail_next(ClipboardOp::Read, ClipboardFailure::Unavailable, 1);
+
+        reconnect(&mut rig).await;
+        assert!(
+            rig.clipboard.read().is_err(),
+            "the reconnect read the clipboard while it held our own file list"
+        );
+
+        // Control: with our object gone, the same reconnect does read.
+        files.moved_on();
+        rig.clipboard
+            .fail_next(ClipboardOp::Read, ClipboardFailure::Unavailable, 1);
+        reconnect(&mut rig).await;
+        assert!(
+            rig.clipboard.read().is_ok(),
+            "the reconnect never read the clipboard, so the check above proves nothing"
+        );
     }
 
     async fn next_command(rig: &mut Rig) -> SessionCommand {

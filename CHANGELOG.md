@@ -24,6 +24,25 @@ Builds that are not tagged releases identify themselves as such —
   per-check figures were not recorded individually, and the soak entry says
   so.
 
+### Fixed
+
+- **A copy Crossover cannot read is no longer overwritten by a waiting peer
+  item.** 0.2.0 listed this as a known limitation: copying something in a
+  format Crossover does not sync — an application's private format,
+  RTF-only content, an image past the size cap — read the same as an empty
+  clipboard, so a peer item waiting out a busy clipboard was written over
+  it about a second later, with nothing logged. The clipboard read now
+  tells *empty* from *unreadable*, and an unreadable copy outranks a
+  waiting peer item exactly as any other local copy does; the peer is told
+  its item was `Superseded`
+  ([ADR 0005](docs/adr/0005-clipboard-transaction-flow.md)'s 2026-09-28
+  addendum).
+- **A peer item is no longer waved through as already present after the
+  clipboard moved on.** After an unreadable copy (or an emptied
+  clipboard), Crossover still believed the last content it could read was
+  on the clipboard, so the peer sending that same content again was
+  answered as applied without anything being written. It is now installed.
+
 ## [0.2.0] — 2026-09-01
 
 Two things the first release could not do. Files and folders now travel on
