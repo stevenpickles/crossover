@@ -17,9 +17,10 @@ larger workstation, without weakening the security boundary between them.
 > from an arrangement drawn in `crossover layout`, run unattended as a
 > background service, and synchronize the clipboard in both directions —
 > **text, images, and files and folders** — all validated on two machines
-> over a wired link. The drawn topology has not yet completed its
-> two-machine soak. macOS and Linux come later (Phase 9). The
-> [roadmap](docs/ROADMAP.md) carries the authoritative current-phase marker.
+> over a wired link, and the drawn topology through an extended two-machine
+> soak. **Next is Phase 9: macOS and Linux**, to full parity with Windows.
+> The [roadmap](docs/ROADMAP.md) carries the authoritative current-phase
+> marker.
 
 ## What it does
 
@@ -48,7 +49,8 @@ larger workstation, without weakening the security boundary between them.
 - Send permission for **text and images** — `clipboard_send` is enforced for
   files only; text and images still travel without consulting it
 - macOS and Linux — the platform boundary exists and the core compiles on
-  all three, but only the Windows implementations are written (Phase 9)
+  all three, but only the Windows implementations are written. That is
+  Phase 9, which starts next: macOS first, then Linux (Ubuntu 24.04)
 - Rearranging screens on a machine that holds no drawn arrangement takes one
   restart before an arrangement adopted from the peer drives the cursor
   ([ADR 0018](docs/adr/0018-drawn-display-topology.md))

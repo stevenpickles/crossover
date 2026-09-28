@@ -295,7 +295,7 @@ release and after any change to the editor.
 E-7 is the interesting one, and it is deliberately **the soak's job** rather
 than this file's: it needs two machines, two desks' worth of real monitors,
 and a link, which is exactly what [SOAK.md](SOAK.md) is for and where the
-Phase 8 exit criteria are signed off. It is listed here so a release
+Phase 8 exit criteria were signed off (2026-09-28). It is listed here so a release
 checklist run on a single machine knows it has *not* covered it.
 
 ## 4. Performance measurement
