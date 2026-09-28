@@ -8,9 +8,10 @@
 #
 # Expected yield is honestly modest: Rust's type system already prevents
 # most of what CodeQL hunts for, and Crossover forbids `unsafe` outside
-# one crate. The value concentrates in three places worth the CI minutes:
-# the Win32 FFI in crossover-platform-windows, where our safety argument
-# rests on hand-written SAFETY comments; the workflows themselves, where
+# the platform crates. The value concentrates in three places worth the
+# CI minutes: the FFI in crossover-platform-windows and
+# crossover-platform-macos, where our safety argument rests on
+# hand-written SAFETY comments; the workflows themselves, where
 # script injection is a real class of supply-chain bug; and the soak
 # report script.
 #
@@ -34,7 +35,7 @@ permissions:
 
 jobs:
   analyze:
-    name: analyze (${{ matrix.language }})
+    name: analyze (${{ matrix.name || matrix.language }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -48,6 +49,13 @@ jobs:
           # analyses: the Windows crate is the reason this job exists.
           - language: rust
             runner: windows-latest
+          # And the macOS port's FFI (ADR 0020), which off macOS compiles
+          # to an empty shell and would never be analysed. Its own name and
+          # category, so the Windows analysis keeps its alert history.
+          - language: rust
+            runner: macos-latest
+            name: rust, macos
+            category_suffix: /macos
           - language: actions
             runner: ubuntu-latest
           - language: python
@@ -79,4 +87,4 @@ jobs:
       - name: Analyze
         uses: github/codeql-action/analyze@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
         with:
-          category: /language:${{ matrix.language }}
+          category: /language:${{ matrix.language }}${{ matrix.category_suffix }}
