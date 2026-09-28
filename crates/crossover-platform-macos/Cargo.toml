@@ -15,7 +15,10 @@ repository.workspace = true
 crossover-platform = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true, features = ["std", "NSPasteboard"] }
 objc2-core-foundation = { workspace = true, features = ["std", "CFBase", "CFData", "CFDictionary", "CFNumber", "CFString"] }
+objc2-foundation = { workspace = true, features = ["std", "NSArray", "NSData", "NSString"] }
 objc2-security = { workspace = true, features = ["std", "SecItem", "SecBase"] }
 
 # The workspace forbids unsafe_code (NFR-6). This crate is the designated
