@@ -46,8 +46,8 @@ larger workstation, without weakening the security boundary between them.
 
 ## What it does not do yet
 
-- Send permission for **text and images** — `clipboard_send` is enforced for
-  files only; text and images still travel without consulting it
+- Per-peer **keyboard and mouse** permissions — they are stored, and shown,
+  but not enforced: a trusted peer can drive input
 - macOS and Linux — the platform boundary exists and the core compiles on
   all three, but only the Windows implementations are written. That is
   Phase 9, which starts next: macOS first, then Linux (Ubuntu 24.04)
@@ -112,6 +112,18 @@ crossover peers allow-files <id>      # deny-files to withdraw
 
 File transfer is **off by default** for every peer and is the only way a peer
 can cause a write to your disk. Files are capped at 256 MiB.
+
+The clipboard itself is on for a paired peer, in both directions, and you can
+narrow it:
+
+```powershell
+crossover peers deny-clipboard <id>              # nothing either way
+crossover peers deny-clipboard <id> --incoming   # keep its copies (and files) out
+crossover peers deny-clipboard <id> --outgoing   # keep your copies here
+crossover peers allow-clipboard <id>             # restore; takes the same flags
+```
+
+A running Crossover applies the change within a few seconds.
 
 ## Documentation
 

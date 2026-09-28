@@ -112,9 +112,18 @@ addresses.
 
 - Permissions model: per-peer flags (`keyboard`, `mouse`, `clipboard_send`,
   `clipboard_receive`, and — with Phase 7 file transfer — `file_receive`).
-  Initial implementation may default paired peers to full capability for the
-  *input and clipboard* flags, but the data model supports granular permissions
-  so they can be enforced later without migration. That default-on latitude
+  Pairing defaults a peer to full capability for the *input and clipboard*
+  flags, and the data model supports granular permissions so each can be
+  enforced without migration. **The clipboard flags are enforced** (Phase 9.0):
+  `clipboard_send` gates this machine's text, images and files leaving it,
+  and `clipboard_receive` gates every peer item — text, images and files —
+  reaching its clipboard, judged before the conflict rule and again at the
+  install, so a grant withdrawn mid-transfer still stops the write. Both
+  reach a running worker on its trust-store poll, fail closed when the store
+  will not load, and are judged over every live peer, because the clipboard
+  engine cannot attribute an item to one peer. **`keyboard` and `mouse` are
+  not yet enforced**: stored and shown, but a trusted peer can still drive
+  input. That default-on latitude
   **stops at the filesystem**: `file_receive` defaults to **off** for every
   peer, existing records included, and only an explicit user grant turns it on
   (invariant 8, §7). A trust store written before file transfer existed reads
@@ -131,7 +140,10 @@ addresses.
 - `crossover peers` lists the store, including each peer's file permission;
   `crossover peers remove <device-id>` revokes trust entirely, and
   `crossover peers allow-files <device-id>` / `deny-files <device-id>` grant and
-  withdraw `file_receive` (a `show` subcommand can come later). Removal revokes
+  withdraw `file_receive`, and `crossover peers allow-clipboard` /
+  `deny-clipboard <device-id> [--incoming] [--outgoing]` grant and withdraw
+  `clipboard_receive` (incoming) and `clipboard_send` (outgoing), both when
+  neither is named (a `show` subcommand can come later). Removal revokes
   authorization immediately (FR-1.4): future connections are rejected (the
   store is re-read on every accept/attempt), and active sessions from that
   identity are terminated within the running process's trust-store poll
@@ -168,7 +180,7 @@ table:
 | T6 | Stale/revoked peer credential reconnecting | Trust store is the authority; revocation is immediate (§4) |
 | T7 | Stolen trust store (without private key) | Store contains no secrets usable for impersonation (§4) |
 | T8 | Input injection before authorization completes | Input/clipboard handlers unreachable until session `ESTABLISHED` (state machine, [ARCHITECTURE.md](ARCHITECTURE.md) §5.3) |
-| T9 | Clipboard exfiltration by unauthorized peer | Same as T8, plus per-peer clipboard permissions (§4) |
+| T9 | Clipboard exfiltration by unauthorized peer | Same as T8, plus per-peer clipboard permissions, enforced in both directions (`clipboard_send`, `clipboard_receive`; §4) |
 | T10 | Secrets leaking via logs/diagnostics | Invariant 6; log-content tests in CI |
 | T11 | Compromise of the high-integrity worker yields local admin | Escalation gated behind install (admin) + a trusted-peer session; bounded/validated parsing (NFR-1) and the T8/T9 authorization gates still contain untrusted input; SYSTEM stays unreachable (the service links no network code, ADR 0011). The worker runs high-integrity for admin users so it can drive elevated windows ([ADR 0012](adr/0012-elevated-worker-integrity.md)) |
 | T12 | Peer-supplied filename escapes into a path (separator, `..`, drive/UNC prefix, reserved device name) and reaches the shell through the file descriptor | F4 bare-name validation on the receiver, reject-not-repair, **before** the data object is constructed; F3 keeps every create inside the spool, where names are ours and not the peer's (§7) |
@@ -230,8 +242,9 @@ the artifact. `FILE_CLIPBOARD` is advertised: the application computes
 `FileSend` the same way it computes `file_receive`'s policy — negotiated
 feature set, then trust-store grant, re-published on the same revocation
 poll — so a conforming peer can actually reach both halves.
-`clipboard_send` is the first permission this codebase enforces anywhere;
-text and images still travel without checking it (§4).
+`clipboard_send` was the first permission this codebase enforced; since
+Phase 9.0 it covers text and images as well, and `clipboard_receive` is
+enforced alongside it (§4).
 
 The whole path — offer, blob build, chunked send, spool, verify,
 virtual-file paste — was validated on two machines over a direct wired link

@@ -14,6 +14,31 @@ Builds that are not tagged releases identify themselves as such —
 
 ## [Unreleased]
 
+### Added
+
+- **`crossover peers allow-clipboard` / `deny-clipboard`.** Pairing lets
+  clipboard content flow both ways, and until now nothing could narrow that.
+  `deny-clipboard <device-id>` stops it in both directions; `--incoming`
+  keeps the peer's copies — and its files, which reach you through your
+  clipboard — out, and `--outgoing` keeps your copies on your machine.
+  `crossover peers` shows both directions for every peer, allowed or not. A
+  running Crossover applies a change within one trust-store poll, without a
+  reconnect.
+
+### Security
+
+- **Both clipboard permissions are enforced.** 0.2.0 enforced
+  `clipboard_send` for files only, and `clipboard_receive` nowhere, so
+  per-peer clipboard permissions — a mitigation `docs/SECURITY.md` names for
+  clipboard exfiltration (T9) — held in the store and were not consulted.
+  Now a copy the peer may not be sent stays on this machine (still observed,
+  so it still outranks a waiting peer item), and an item the peer may not
+  write here is refused — declined `NotPermitted` at the offer, answered
+  `ContentRejected` for inline text — before the conflict rule can let it
+  displace this machine's own copy. Both fail closed: no live peer, an
+  unknown peer, or an unreadable trust store grants nothing. Defaults are
+  unchanged, so a pair nobody has restricted behaves exactly as before.
+
 ### Changed
 
 - **The drawn topology has completed its two-machine soak.** 0.2.0 listed
