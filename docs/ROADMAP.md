@@ -960,9 +960,14 @@ privacy-gated on current macOS. Hardware checks per slice are in
 2. **Files:** ADR 0015's virtual-file paste is a Windows mechanism; the
    macOS equivalent needs its own design, recorded by ADR before it is
    built, with the same guardrails (spool, validated names, caps,
-   explicit-paste-only materialization).
+   explicit-paste-only materialization). Drafted as
+   [ADR 0023](adr/0023-macos-file-paste.md) (Proposed, 2026-09-29): a
+   spooled file offered by URL, quarantine as origin marking, and a list
+   of what the lab Mac must show before it is accepted.
 3. **Unattended operation** under launchd (M-9) — including how the
-   Accessibility and Keychain grants survive it (M-1, M-8).
+   Accessibility and Keychain grants survive it (M-1, M-8). Drafted as
+   [ADR 0022](adr/0022-macos-unattended-launch-agent.md) (Proposed,
+   2026-09-29): a per-user LaunchAgent, no launcher.
 4. **The layout editor** on macOS.
 
 **9.2 — Linux (Ubuntu 24.04)**, in this order:
