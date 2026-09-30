@@ -241,6 +241,27 @@ pub fn open_display() -> anyhow::Result<std::sync::Arc<dyn crossover_platform::D
     ))
 }
 
+/// Open the platform's image converter (ADR 0016): what turns this
+/// machine's own clipboard image into a format a peer installs. `None`
+/// where there is none yet, which the clipboard driver answers by refusing
+/// such an image observably.
+#[must_use]
+// One signature for every platform: always `Some` on Windows today, `None`
+// where there is no converter yet.
+#[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
+pub fn open_image_converter() -> Option<std::sync::Arc<dyn crossover_platform::ImageConverter>> {
+    #[cfg(windows)]
+    {
+        Some(std::sync::Arc::new(
+            crossover_platform_windows::WicImageConverter,
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// Open the platform display-info provider.
 ///
 /// On macOS, until its display slice lands (docs/ROADMAP.md Phase 9.1): a

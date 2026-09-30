@@ -29,6 +29,8 @@ pub mod edid;
 #[cfg(windows)]
 pub mod file_blob;
 #[cfg(windows)]
+pub mod image_convert;
+#[cfg(windows)]
 pub mod input;
 #[cfg(windows)]
 pub mod keymap;
@@ -69,6 +71,8 @@ pub use cursor::{WindowsCursorMask, restore_system_cursors};
 pub use display::WindowsDisplayInfo;
 #[cfg(windows)]
 pub use file_blob::WindowsFileBlobBuilder;
+#[cfg(windows)]
+pub use image_convert::WicImageConverter;
 
 /// Restore the default system cursors — a no-op off Windows, where there is
 /// no cursor masking. Called on shutdown so a quit never leaves the cursor

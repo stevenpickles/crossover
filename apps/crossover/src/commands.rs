@@ -41,8 +41,9 @@ use crossover_topology::{DeviceId, Layout};
 use crate::config::LayoutSource;
 use crate::console::{self, ConsoleCommand};
 use crate::storage::{
-    open_clipboard_provider, open_cursor_mask, open_display, open_file_blob_builder, open_input,
-    open_secure_storage, open_service_manager, open_spool, open_virtual_files,
+    open_clipboard_provider, open_cursor_mask, open_display, open_file_blob_builder,
+    open_image_converter, open_input, open_secure_storage, open_service_manager, open_spool,
+    open_virtual_files,
 };
 use crate::topology_state::{TopologyStateWriter, initial_state, watch_own_display};
 use crate::topology_sync::{TopologyEvent, TopologyHandle, TopologyInputs, TopologySync};
@@ -835,6 +836,10 @@ fn setup_clipboard_sync(
         Some(Arc::clone(metrics)),
     )
     .context("starting clipboard sync")?;
+    let driver = match open_image_converter() {
+        Some(converter) => driver.with_image_converter(converter),
+        None => driver,
+    };
     tokio::spawn(driver.run());
     Ok((events, commands, file_paste_ready, advertised))
 }

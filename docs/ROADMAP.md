@@ -966,8 +966,12 @@ protocol moves to v7 with it. **Conversion** follows (feature/181): an
 image the peer cannot install goes to an `ImageConverter` off the driver
 loop — this machine's own content, never a peer's — and is minted as the
 converted bytes, re-judged against session, grant and formats when it
-returns, and made stale by any newer copy. The Windows WIC PNG encoder that
-plugs into it is next, then the macOS image slice.
+returns, and made stale by any newer copy. **The Windows encoder**
+(feature/182): the Windows Imaging Component turns this machine's own
+`CF_DIB` into PNG for a peer that installs only PNG — deterministic for the
+same input, so the receiver's dedup still recognises a re-sent image. The
+Windows half of ADR 0016 is complete; the macOS image slice, which needs
+the lab Mac, is next.
 
 1. **Core:** identity in Keychain (M-8), text and image clipboard with a
    polled pasteboard (M-4, M-5 via ADR 0016), input capture and injection

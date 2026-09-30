@@ -74,29 +74,9 @@ pub fn dib_logical_len(blob: &[u8]) -> Option<usize> {
         return None;
     }
 
-    // What sits between the header and the pixels. At <= 8 bpp that is a
-    // palette (biClrUsed entries, or the full 2^bpp when it is zero); at
-    // higher depths it is the bit-field masks, plus any optimization
-    // palette biClrUsed still claims. Over-counting here is safe: the
-    // total simply fails the length check below and the blob stays whole.
-    let table = if bit_count <= 8 {
-        let entries = if clr_used == 0 {
-            1u64 << bit_count
-        } else {
-            clr_used
-        };
-        if entries > 256 {
-            return None;
-        }
-        entries * 4
-    } else {
-        let masks = match compression {
-            BI_BITFIELDS => 12,
-            BI_ALPHABITFIELDS => 16,
-            _ => 0,
-        };
-        masks + clr_used * 4
-    };
+    // Over-counting the table is safe: the total simply fails the length
+    // check below and the blob stays whole.
+    let table = table_len(bit_count, compression, clr_used)?;
 
     let pixels = match compression {
         BI_RGB | BI_BITFIELDS | BI_ALPHABITFIELDS => {
@@ -128,6 +108,54 @@ pub fn dib_logical_len(blob: &[u8]) -> Option<usize> {
     // A blob shorter than its own header claims is either malformed or
     // beyond this model; either way, hand it back untouched.
     (total <= blob.len()).then_some(total)
+}
+
+/// Where a `BITMAPINFOHEADER` DIB's pixel data begins: the header plus
+/// whatever sits between it and the pixels — the rule `dib_logical_len`
+/// uses, shared rather than restated. `None` for anything that function
+/// would not trust.
+///
+/// Used to wrap this machine's own clipboard DIB as a BMP file for the
+/// imaging component to read (the file header must say where the pixels
+/// start); never applied to a peer's bytes beyond the arithmetic
+/// `canonical_dib` already does.
+#[must_use]
+pub fn dib_pixel_offset(blob: &[u8]) -> Option<u32> {
+    dib_logical_len(blob)?;
+    let bit_count = le_u16(blob, 14)?;
+    let compression = le_u32(blob, 16)?;
+    let clr_used = u64::from(le_u32(blob, 32)?);
+    let offset = u64::from(BITMAPINFOHEADER_BYTES).checked_add(table_len(
+        bit_count,
+        compression,
+        clr_used,
+    )?)?;
+    u32::try_from(offset).ok()
+}
+
+/// What sits between the header and the pixels. At <= 8 bpp that is a
+/// palette (biClrUsed entries, or the full 2^bpp when it is zero); at
+/// higher depths it is the bit-field masks, plus any optimization palette
+/// biClrUsed still claims.
+fn table_len(bit_count: u16, compression: u32, clr_used: u64) -> Option<u64> {
+    Some(if bit_count <= 8 {
+        let entries = if clr_used == 0 {
+            1u64 << bit_count
+        } else {
+            clr_used
+        };
+        if entries > 256 {
+            return None;
+        }
+        entries * 4
+    } else {
+        let masks = match compression {
+            BI_BITFIELDS => 12,
+            BI_ALPHABITFIELDS => 16,
+            _ => 0,
+        };
+        masks + clr_used.checked_mul(4)?
+    })
 }
 
 /// Little-endian field readers. Bounds-checked, so a truncated blob is
