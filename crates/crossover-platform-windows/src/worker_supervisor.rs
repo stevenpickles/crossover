@@ -33,6 +33,13 @@ pub struct WorkerSupervisorConfig {
     /// A worker that ran at least this long before crashing is treated as
     /// having been healthy, so the backoff streak resets.
     pub healthy_run_ms: u64,
+    /// How long to wait before relaunching a worker the *system* terminated
+    /// ([`WorkerExit::TerminatedBySystem`]). Windows ends a session's
+    /// processes at logoff before the service hears the logoff itself; this
+    /// is the window in which that notification lands and cancels the
+    /// relaunch, instead of the relaunch landing in a session that is going
+    /// away.
+    pub system_termination_settle_ms: u64,
 }
 
 impl Default for WorkerSupervisorConfig {
@@ -43,6 +50,7 @@ impl Default for WorkerSupervisorConfig {
             base_backoff_ms: 1_000,
             max_backoff_ms: 30_000,
             healthy_run_ms: 10_000,
+            system_termination_settle_ms: 5_000,
         }
     }
 }
@@ -62,6 +70,37 @@ pub enum StopReason {
     /// The active console session changed while the worker was running in the
     /// previous one (fast user switch).
     SessionChanged,
+}
+
+/// How the worker process ended, classified from its exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerExit {
+    /// Exit code 0: the worker chose to stop.
+    Clean,
+    /// The system ended it (`DBG_TERMINATE_PROCESS`, `0x40010004`): at
+    /// logoff Windows terminates the session's processes this way, before
+    /// the service is told about the logoff. Neither a crash nor a choice,
+    /// and not counted toward crash backoff — it was mislabelled a crash in
+    /// the supervision log until the 2026-08-20 session found it.
+    TerminatedBySystem,
+    /// Anything else: a crash, relaunched after backoff.
+    Crashed,
+}
+
+impl WorkerExit {
+    /// `DBG_TERMINATE_PROCESS`, the code Windows gives processes it ends at
+    /// session teardown.
+    pub const DBG_TERMINATE_PROCESS: u32 = 0x4001_0004;
+
+    /// Classify a process exit code.
+    #[must_use]
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            0 => Self::Clean,
+            Self::DBG_TERMINATE_PROCESS => Self::TerminatedBySystem,
+            _ => Self::Crashed,
+        }
+    }
 }
 
 /// What the driver should do next. Exactly one action per [`WorkerSupervisor::poll`];
@@ -147,9 +186,9 @@ impl WorkerSupervisor {
         // (it detects the session mismatch), keeping the stop path in one place.
     }
 
-    /// Record that the worker process exited. `crashed` is true for any
-    /// non-success exit. Ignored unless a worker was considered running.
-    pub fn note_worker_exited(&mut self, crashed: bool, now_ms: u64) {
+    /// Record that the worker process exited, and how. Ignored unless a
+    /// worker was considered running.
+    pub fn note_worker_exited(&mut self, exit: WorkerExit, now_ms: u64) {
         // During a stop, an exit just clears the worker; `poll` drives the
         // terminal transition, and backoff is irrelevant.
         if self.stopping {
@@ -166,10 +205,23 @@ impl WorkerSupervisor {
         let Worker::Running { since_ms, .. } = self.worker else {
             return;
         };
-        if !crashed {
-            self.consecutive_crashes = 0;
-            self.worker = Worker::Quiescent;
-            return;
+        match exit {
+            WorkerExit::Clean => {
+                self.consecutive_crashes = 0;
+                self.worker = Worker::Quiescent;
+                return;
+            }
+            // Not a crash, and no penalty: wait out the settle window, in
+            // which the logoff that usually caused this arrives and
+            // `note_active_session` turns the wait back into Idle with no
+            // session to launch into. If no logoff comes, relaunch.
+            WorkerExit::TerminatedBySystem => {
+                self.worker = Worker::Backoff {
+                    resume_at_ms: now_ms.saturating_add(self.config.system_termination_settle_ms),
+                };
+                return;
+            }
+            WorkerExit::Crashed => {}
         }
         let ran_ms = now_ms.saturating_sub(since_ms);
         self.consecutive_crashes = if ran_ms >= self.config.healthy_run_ms {
@@ -280,7 +332,9 @@ impl WorkerSupervisor {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionId, StopReason, WorkerAction, WorkerSupervisor, WorkerSupervisorConfig};
+    use super::{
+        SessionId, StopReason, WorkerAction, WorkerExit, WorkerSupervisor, WorkerSupervisorConfig,
+    };
 
     const SESSION: SessionId = 1;
     const OTHER_SESSION: SessionId = 2;
@@ -290,6 +344,7 @@ mod tests {
             base_backoff_ms: 1_000,
             max_backoff_ms: 8_000,
             healthy_run_ms: 10_000,
+            system_termination_settle_ms: 3_000,
         }
     }
 
@@ -317,7 +372,7 @@ mod tests {
         assert_eq!(sup.poll(0), WorkerAction::Launch(SESSION));
 
         // Crash after a short run -> first backoff = base (1_000).
-        sup.note_worker_exited(true, 500);
+        sup.note_worker_exited(WorkerExit::Crashed, 500);
         assert_eq!(sup.wake_deadline(), Some(1_500));
         assert_eq!(sup.poll(1_000), WorkerAction::Idle); // too early
         assert_eq!(sup.poll(1_500), WorkerAction::Launch(SESSION)); // due
@@ -333,7 +388,7 @@ mod tests {
         for delay in expected {
             assert_eq!(sup.poll(now), WorkerAction::Launch(SESSION));
             // Crash immediately (unhealthy run) so the streak escalates.
-            sup.note_worker_exited(true, now);
+            sup.note_worker_exited(WorkerExit::Crashed, now);
             assert_eq!(sup.wake_deadline(), Some(now + delay));
             now += delay;
         }
@@ -346,16 +401,16 @@ mod tests {
         assert_eq!(sup.poll(0), WorkerAction::Launch(SESSION));
 
         // Two quick crashes escalate to a 2_000 backoff...
-        sup.note_worker_exited(true, 100);
+        sup.note_worker_exited(WorkerExit::Crashed, 100);
         assert_eq!(sup.wake_deadline(), Some(1_100));
         assert_eq!(sup.poll(1_100), WorkerAction::Launch(SESSION));
-        sup.note_worker_exited(true, 1_200);
+        sup.note_worker_exited(WorkerExit::Crashed, 1_200);
         assert_eq!(sup.wake_deadline(), Some(3_200)); // base * 2
 
         // ...then a launch that runs past the healthy threshold before crashing
         // resets the streak, so the next backoff is base again.
         assert_eq!(sup.poll(3_200), WorkerAction::Launch(SESSION));
-        sup.note_worker_exited(true, 3_200 + 10_000);
+        sup.note_worker_exited(WorkerExit::Crashed, 3_200 + 10_000);
         assert_eq!(sup.wake_deadline(), Some(3_200 + 10_000 + 1_000));
     }
 
@@ -366,7 +421,7 @@ mod tests {
         assert_eq!(sup.poll(0), WorkerAction::Launch(SESSION));
 
         // User quit it deliberately: do not relaunch, and no timer is pending.
-        sup.note_worker_exited(false, 5_000);
+        sup.note_worker_exited(WorkerExit::Clean, 5_000);
         assert_eq!(sup.poll(6_000), WorkerAction::Idle);
         assert_eq!(sup.wake_deadline(), None);
 
@@ -387,7 +442,7 @@ mod tests {
             sup.poll(1_000),
             WorkerAction::StopWorker(StopReason::Logoff)
         );
-        sup.note_worker_exited(false, 1_000);
+        sup.note_worker_exited(WorkerExit::Clean, 1_000);
         assert_eq!(sup.poll(1_100), WorkerAction::Idle);
 
         // Next logon relaunches.
@@ -407,7 +462,7 @@ mod tests {
             sup.poll(1_000),
             WorkerAction::StopWorker(StopReason::SessionChanged)
         );
-        sup.note_worker_exited(false, 1_000);
+        sup.note_worker_exited(WorkerExit::Clean, 1_000);
         assert_eq!(sup.poll(1_100), WorkerAction::Launch(OTHER_SESSION));
     }
 
@@ -435,7 +490,7 @@ mod tests {
             sup.poll(1_000),
             WorkerAction::StopWorker(StopReason::ServiceStopping)
         );
-        sup.note_worker_exited(false, 1_000);
+        sup.note_worker_exited(WorkerExit::Clean, 1_000);
         assert_eq!(sup.poll(1_100), WorkerAction::Stopped);
     }
 
@@ -453,9 +508,58 @@ mod tests {
         let mut sup = WorkerSupervisor::new(config());
         sup.note_active_session(Some(SESSION));
         assert_eq!(sup.poll(0), WorkerAction::Launch(SESSION));
-        sup.note_worker_exited(true, 100); // now backing off
+        sup.note_worker_exited(WorkerExit::Crashed, 100); // now backing off
         sup.request_stop();
         assert_eq!(sup.poll(200), WorkerAction::Stopped);
         assert_eq!(sup.wake_deadline(), None);
+    }
+
+    #[test]
+    fn exit_codes_are_classified_by_what_ended_the_worker() {
+        assert_eq!(WorkerExit::from_code(0), WorkerExit::Clean);
+        assert_eq!(
+            WorkerExit::from_code(0x4001_0004),
+            WorkerExit::TerminatedBySystem
+        );
+        assert_eq!(WorkerExit::from_code(1), WorkerExit::Crashed);
+        assert_eq!(WorkerExit::from_code(0xC000_0005), WorkerExit::Crashed);
+    }
+
+    /// The Phase 7 follow-up: at logoff Windows terminates the worker
+    /// before the service hears the logoff. That exit is not a crash, and
+    /// the logoff arriving inside the settle window means nothing is
+    /// relaunched into a session that is going away.
+    #[test]
+    fn a_system_termination_followed_by_logoff_relaunches_nothing() {
+        let mut sup = WorkerSupervisor::new(config());
+        sup.note_active_session(Some(SESSION));
+        assert_eq!(sup.poll(0), WorkerAction::Launch(SESSION));
+
+        sup.note_worker_exited(WorkerExit::TerminatedBySystem, 60_000);
+        // Not relaunched straight away, while the logoff is still in flight.
+        assert_eq!(sup.poll(60_000), WorkerAction::Idle);
+        assert_eq!(sup.wake_deadline(), Some(63_000));
+
+        sup.note_active_session(None);
+        assert_eq!(sup.poll(63_000), WorkerAction::Idle);
+        assert_eq!(sup.poll(120_000), WorkerAction::Idle);
+    }
+
+    /// If no logoff follows, the worker comes back after the settle window —
+    /// and a system termination costs no crash backoff.
+    #[test]
+    fn a_system_termination_without_logoff_relaunches_after_the_settle_window() {
+        let mut sup = WorkerSupervisor::new(config());
+        sup.note_active_session(Some(SESSION));
+        assert_eq!(sup.poll(0), WorkerAction::Launch(SESSION));
+
+        sup.note_worker_exited(WorkerExit::TerminatedBySystem, 100);
+        assert_eq!(sup.poll(2_000), WorkerAction::Idle);
+        assert_eq!(sup.poll(3_100), WorkerAction::Launch(SESSION));
+
+        // A real crash straight after still starts at the base backoff: the
+        // system termination did not count toward the streak.
+        sup.note_worker_exited(WorkerExit::Crashed, 3_200);
+        assert_eq!(sup.wake_deadline(), Some(4_200));
     }
 }

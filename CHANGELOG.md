@@ -51,6 +51,13 @@ Builds that are not tagged releases identify themselves as such —
 
 ### Fixed
 
+- **Logging off no longer reads as a worker crash.** Windows ends the
+  worker at logoff with exit code `0x40010004` before the service hears
+  about the logoff; the service logged that as `crashed=true`, counted it
+  toward crash backoff, and relaunched into the session that was going
+  away. It is now classified as a system termination: not a crash, and
+  relaunched only after a short settle window in which the logoff cancels
+  it.
 - **A copy Crossover cannot read is no longer overwritten by a waiting peer
   item.** 0.2.0 listed this as a known limitation: copying something in a
   format Crossover does not sync — an application's private format,
