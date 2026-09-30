@@ -21,8 +21,9 @@
 >    parity. The spike is research, not code, and may run alongside 9.1.
 >
 > **Open, not blocking:** dropouts on the directly-connected A ↔ B link
-> (being re-tested through a switch), and the Phase 7 follow-ups — both
-> listed under the phases that found them.
+> (being re-tested through a switch), and Phase 7's one remaining
+> follow-up, a ~72 ms tail in the interactive lane — both listed under the
+> phases that found them.
 >
 > Keep this marker short: what the current phase is, what is next, what is
 > open. The history of how a phase was built and closed belongs in that
@@ -408,11 +409,16 @@ Small follow-ups carried out of the phase, none of them blocking:
   scheduling/queueing stall to investigate, not bulk head-of-line blocking.
 - **The service relaunches the worker into a dying session at logoff**,
   because it acts on the session-change notification before the `Logoff`
-  stop reason arrives. Cosmetic: the relaunch fails harmlessly.
+  stop reason arrives. Cosmetic: the relaunch fails harmlessly. **Closed
+  2026-09-29** (feature/177): a system-terminated worker now waits a short
+  settle window before relaunching, and the logoff that lands inside it
+  cancels the relaunch.
 - **Exit code `0x40010004` (`DBG_TERMINATE_PROCESS`) is labelled
   `crashed=true`** in the supervision log, when at logoff it is Windows
   terminating the worker deliberately. Cosmetic: it misleads whoever reads
-  the log next (docs/SOAK.md, 2026-08-20 session).
+  the log next (docs/SOAK.md, 2026-08-20 session). **Closed 2026-09-29**
+  (feature/177): exits are classified clean, crashed, or terminated by the
+  system; only a crash is logged `crashed=true` or costs backoff.
 
 ### How the phase was built and closed
 

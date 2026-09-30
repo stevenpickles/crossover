@@ -17,6 +17,10 @@ pub mod clipboard;
 pub mod cursor;
 #[cfg(windows)]
 pub mod display;
+// Pure DIB header arithmetic, deliberately not Windows-gated so the fuzz
+// harness can build it on Linux: the one image computation that
+// peer-originated bytes reach (ADR 0016's 2026-09-28 amendment).
+pub mod dib;
 // Pure EDID parsing (ADR 0018), deliberately not Windows-gated so the
 // bytes-in/size-out half is compiled and unit-tested on every CI OS even
 // though only the Windows backend can fetch the bytes — the same reasoning
