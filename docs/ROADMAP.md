@@ -962,8 +962,12 @@ privacy-gated on current macOS. Hardware checks per slice are in
 (feature/179): each machine advertises the image formats its clipboard can
 install, read from its peer's own `Hello` rather than the intersection;
 an image the peer cannot install is refused observably at the sender; the
-protocol moves to v7 with it. Conversion to a format the peer does take
-follows (the WIC PNG encoder on Windows), then the macOS image slice.
+protocol moves to v7 with it. **Conversion** follows (feature/181): an
+image the peer cannot install goes to an `ImageConverter` off the driver
+loop — this machine's own content, never a peer's — and is minted as the
+converted bytes, re-judged against session, grant and formats when it
+returns, and made stale by any newer copy. The Windows WIC PNG encoder that
+plugs into it is next, then the macOS image slice.
 
 1. **Core:** identity in Keychain (M-8), text and image clipboard with a
    polled pasteboard (M-4, M-5 via ADR 0016), input capture and injection
