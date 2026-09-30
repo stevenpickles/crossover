@@ -70,6 +70,8 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0018](0018-drawn-display-topology.md) | Display topology is a drawn layout in one shared coordinate space; edges derived from adjacency, protocol v4 (v5 and v6 by amendment), a `crossover-topology` crate (Phase 8) | Accepted (supersedes 0009's topology) |
 | [0019](0019-layout-editor-toolkit.md) | The layout editor is an egui/eframe application in its own on-demand, user-session binary, `apps/crossover-layout` (Phase 8) | Accepted |
 | [0020](0020-macos-platform-bindings.md) | macOS platform bindings: the `objc2` family (0.6 / 0.3, the generation winit already resolves), `objc2-security` for the Keychain, in a new `crossover-platform-macos` crate that is the port's only home for `unsafe` (Phase 9.1) | Accepted |
+| [0022](0022-macos-unattended-launch-agent.md) | macOS unattended operation: a per-user LaunchAgent running `crossover run`, supervised by launchd's own keys — no launcher, no daemon, nothing as root (Phase 9.1) | Proposed |
+| [0023](0023-macos-file-paste.md) | macOS file paste: a verified spool entry offered as a `public.file-url` under its validated name, every ADR 0015 guardrail unchanged, quarantine as origin marking (Phase 9.1) | Proposed |
 
 ## Known decisions awaiting an ADR
 
