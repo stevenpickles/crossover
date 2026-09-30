@@ -263,6 +263,15 @@ impl ClipboardProvider for InMemoryClipboard {
         lock(&self.state).listener = listener;
         Ok(())
     }
+
+    /// Every format: the fake stores whatever it is given.
+    fn installable_image_formats(&self) -> &'static [ClipboardImageFormat] {
+        &[
+            ClipboardImageFormat::Dib,
+            ClipboardImageFormat::Png,
+            ClipboardImageFormat::Jpeg,
+        ]
+    }
 }
 
 /// In-memory [`InputCapture`], driven by the test rather than a mouse.

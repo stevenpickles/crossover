@@ -244,6 +244,7 @@ pub struct Metrics {
     clipboard_files_sent: AtomicU64,
     clipboard_files_send_refused: AtomicU64,
     clipboard_send_denied: AtomicU64,
+    clipboard_image_format_refused: AtomicU64,
     clipboard_receive_denied: AtomicU64,
     clipboard_files_send_failed: AtomicU64,
     clipboard_file_sent_bytes: AtomicU64,
@@ -487,6 +488,12 @@ impl Metrics {
     pub fn record_clipboard_send_denied(&self) {
         self.clipboard_send_denied.fetch_add(1, Ordering::Relaxed);
     }
+    /// A local image was not sent because no live peer can install its
+    /// format (ADR 0016).
+    pub fn record_clipboard_image_format_refused(&self) {
+        self.clipboard_image_format_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
     /// A peer item was refused because the peer holds no
     /// `clipboard_receive` grant — nothing it sent reached this clipboard.
     pub fn record_clipboard_receive_denied(&self) {
@@ -677,6 +684,7 @@ impl Metrics {
             clipboard_files_sent: load(&self.clipboard_files_sent),
             clipboard_files_send_refused: load(&self.clipboard_files_send_refused),
             clipboard_send_denied: load(&self.clipboard_send_denied),
+            clipboard_image_format_refused: load(&self.clipboard_image_format_refused),
             clipboard_receive_denied: load(&self.clipboard_receive_denied),
             clipboard_files_send_failed: load(&self.clipboard_files_send_failed),
             clipboard_file_sent_bytes: load(&self.clipboard_file_sent_bytes),
@@ -818,6 +826,8 @@ pub struct Report {
     pub clipboard_files_send_refused: u64,
     /// Local text/image copies not sent for want of `clipboard_send`.
     pub clipboard_send_denied: u64,
+    /// Local images not sent because no peer can install their format.
+    pub clipboard_image_format_refused: u64,
     /// Peer items refused for want of `clipboard_receive`.
     pub clipboard_receive_denied: u64,
     /// Outbound file transactions that started and did not deliver.
@@ -931,6 +941,7 @@ impl Report {
             clipboard_files_sent = self.clipboard_files_sent,
             clipboard_files_send_refused = self.clipboard_files_send_refused,
             clipboard_send_denied = self.clipboard_send_denied,
+            clipboard_image_format_refused = self.clipboard_image_format_refused,
             clipboard_receive_denied = self.clipboard_receive_denied,
             clipboard_files_send_failed = self.clipboard_files_send_failed,
             clipboard_file_sent_bytes = self.clipboard_file_sent_bytes,
@@ -1062,6 +1073,13 @@ impl Report {
                 f,
                 "                {} copies not sent (no clipboard-send grant),                  {} peer items refused (no clipboard-receive grant)",
                 self.clipboard_send_denied, self.clipboard_receive_denied,
+            )?;
+        }
+        if self.clipboard_image_format_refused > 0 {
+            writeln!(
+                f,
+                "                {} images not sent (no peer can install their format)",
+                self.clipboard_image_format_refused,
             )?;
         }
         if self.clipboard_installs_parked > 0 {

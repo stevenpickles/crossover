@@ -32,7 +32,7 @@ use crossover_platform::{
 };
 use crossover_protocol::RawFrame;
 use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::hello::{FeatureFlags, MessageType};
 
 use crate::clipboard::{
     Action, BuiltBlob, ClipboardConfig, ClipboardEngine, ClipboardGrant, FileReceive, FileRefusal,
@@ -196,6 +196,10 @@ pub enum SyncEvent {
         /// `clipboard_receive`.
         receive: ClipboardGrant,
     },
+    /// The image formats every live peer can install (ADR 0016), as the
+    /// application reads them from each session's negotiated features. An
+    /// event for the same reason the grants are: sessions come and go.
+    PeerImageFormats(FeatureFlags),
     /// The builder finished with a local selection: one blob, or a typed
     /// refusal (ADR 0015).
     ///
@@ -496,6 +500,10 @@ impl ClipboardSyncDriver {
             SyncEvent::ClipboardGrants { send, receive } => {
                 self.engine.set_clipboard_send(send);
                 self.engine.set_clipboard_receive(receive);
+                Vec::new()
+            }
+            SyncEvent::PeerImageFormats(formats) => {
+                self.engine.set_peer_image_formats(formats);
                 Vec::new()
             }
             SyncEvent::FileBlobBuilt { id, outcome } => match *outcome {
@@ -1349,7 +1357,7 @@ mod tests {
         ApplyResult, ClipboardApplied, ClipboardData, ClipboardDecline, ClipboardMeta,
         ClipboardOffer, ContentType, DeclineReason, FileDescriptor, chunk_content, content_hash,
     };
-    use crossover_protocol::hello::MessageType;
+    use crossover_protocol::hello::{FeatureFlags, MessageType};
 
     use super::{
         BusyWarnOnce, EVENT_CHANNEL_CAPACITY, MAX_DEFERRED_EVENTS, SessionCommand, SyncEvent,
@@ -1427,6 +1435,9 @@ mod tests {
                 send: ClipboardGrant::Allowed,
                 receive: ClipboardGrant::Allowed,
             })
+            .expect("a fresh event channel cannot be full");
+        events
+            .try_send(SyncEvent::PeerImageFormats(FeatureFlags::IMAGE_FORMATS))
             .expect("a fresh event channel cannot be full");
         events
             .try_send(SyncEvent::SessionEstablished)
@@ -1644,6 +1655,10 @@ mod tests {
                 send: ClipboardGrant::Allowed,
                 receive: ClipboardGrant::Allowed,
             })
+            .await
+            .unwrap();
+        events
+            .send(SyncEvent::PeerImageFormats(FeatureFlags::IMAGE_FORMATS))
             .await
             .unwrap();
         events.send(SyncEvent::SessionEstablished).await.unwrap();
@@ -2213,6 +2228,10 @@ mod tests {
                 send: ClipboardGrant::Allowed,
                 receive: ClipboardGrant::Allowed,
             })
+            .await
+            .unwrap();
+        events
+            .send(SyncEvent::PeerImageFormats(FeatureFlags::IMAGE_FORMATS))
             .await
             .unwrap();
 

@@ -230,6 +230,20 @@ target type's ceiling after. A conversion that fails, or produces nothing
 the receiver advertises, is an observable refusal (FR-3.6) — logged,
 counted, and never a silent drop.
 
+### Implementation note (feature/179): the install bits are directional
+
+Built as decided, with one detail the decision left implicit. Every other
+capability bit is symmetric, and a session's capability set was the
+intersection of the two `Hello`s. The image-format bits cannot be: they say
+what the advertiser can *install*, and a sender needs its peer's list, not
+the part both share. A Mac that installs only PNG and a Windows machine
+that installs DIB and PNG would intersect to {PNG}, and the Mac would send
+Windows a format it does not prefer. `FeatureFlags::negotiate` therefore
+intersects the symmetric bits and takes the install bits from the peer, so
+`SessionInfo::features` stays "what may be sent to this peer"
+(docs/PROTOCOL.md §3.1). The protocol version moves to 7 with it, as
+condition 2 required.
+
 ### What this makes explicit about "never decodes"
 
 The receive path installs bytes and checks their length; it parses nothing.
