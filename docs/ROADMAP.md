@@ -13,6 +13,13 @@
 > [ADR 0016](adr/0016-image-interchange-format.md) is accepted with an
 > amendment the ports must meet (feature/171).
 >
+> **While the lab Mac is unavailable** (from 2026-09-29, maintainer):
+> the macOS slices wait for their hardware checks (SOAK.md, Phase 9.1)
+> rather than stacking unverified work, and what needs no Mac proceeds —
+> the Windows half of ADR 0016, the security backlog, and the designs for
+> the later macOS slices. A deliberate deviation from "each validated
+> before the next", recorded rather than drifted into.
+>
 > **Next, in order** (Phase 9's milestones, detailed below):
 >
 > 1. **9.1 — macOS**, to full parity with Windows.
@@ -945,6 +952,12 @@ read as the user's (unreadable) copy; and `crossover run` on the Mac starts
 risk, M-11, was found building it: reading the general pasteboard is
 privacy-gated on current macOS. Hardware checks per slice are in
 [SOAK.md](SOAK.md)'s Phase 9.1 section.
+**Image-format negotiation**, the Windows half of ADR 0016's first part
+(feature/179): each machine advertises the image formats its clipboard can
+install, read from its peer's own `Hello` rather than the intersection;
+an image the peer cannot install is refused observably at the sender; the
+protocol moves to v7 with it. Conversion to a format the peer does take
+follows (the WIC PNG encoder on Windows), then the macOS image slice.
 
 1. **Core:** identity in Keychain (M-8), text and image clipboard with a
    polled pasteboard (M-4, M-5 via ADR 0016), input capture and injection

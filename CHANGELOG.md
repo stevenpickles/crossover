@@ -14,6 +14,10 @@ Builds that are not tagged releases identify themselves as such —
 
 ## [Unreleased]
 
+**Protocol version 7, floor 7: upgrade both machines together.** A pair
+with one 0.2.0 machine is refused cleanly at the handshake, naming both
+version ranges.
+
 ### Added
 
 - **`crossover peers allow-clipboard` / `deny-clipboard`.** Pairing lets
@@ -24,6 +28,14 @@ Builds that are not tagged releases identify themselves as such —
   `crossover peers` shows both directions for every peer, allowed or not. A
   running Crossover applies a change within one trust-store poll, without a
   reconnect.
+
+- **Each machine says which image formats it can install**, and an image
+  is sent only in a format its receiver named (ADR 0016). Between two
+  Windows machines nothing changes — both install the DIB format images
+  already travel in — but a machine that cannot install a format is no
+  longer sent it: the sender logs why and counts it instead. This is what
+  lets a Mac, which does not install Windows' DIB format, join image sync
+  when its image support lands.
 
 ### Security
 
