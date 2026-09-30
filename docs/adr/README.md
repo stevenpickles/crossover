@@ -70,10 +70,11 @@ What becomes easier, what becomes harder, what risks are accepted.
 | [0018](0018-drawn-display-topology.md) | Display topology is a drawn layout in one shared coordinate space; edges derived from adjacency, protocol v4 (v5 and v6 by amendment), a `crossover-topology` crate (Phase 8) | Accepted (supersedes 0009's topology) |
 | [0019](0019-layout-editor-toolkit.md) | The layout editor is an egui/eframe application in its own on-demand, user-session binary, `apps/crossover-layout` (Phase 8) | Accepted |
 | [0020](0020-macos-platform-bindings.md) | macOS platform bindings: the `objc2` family (0.6 / 0.3, the generation winit already resolves), `objc2-security` for the Keychain, in a new `crossover-platform-macos` crate that is the port's only home for `unsafe` (Phase 9.1) | Accepted |
+| [0021](0021-input-permissions-guard-the-controlled-machine.md) | Input permissions guard the machine being controlled: `keyboard`/`mouse` on this machine's record of a peer decide whether that peer may drive this machine; denied with a new `DenyReason::NotPermitted` in the same protocol version as ADR 0016's format bits | Proposed |
 
 ## Known decisions awaiting an ADR
 
-None outstanding, and no drafted decision is open:
+None outstanding. One drafted decision is open: [0021](0021-input-permissions-guard-the-controlled-machine.md) (input permissions) is **Proposed**, awaiting the maintainer.
 [0016](0016-image-interchange-format.md) (image interchange format), the
 last Phase 9 precondition, was accepted on 2026-09-28. The Linux input
 route (platform-risks-linux.md L-1) will need one once its spike has run.
