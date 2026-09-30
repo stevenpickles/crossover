@@ -283,6 +283,17 @@ pub trait ClipboardProvider: Send + Sync {
     /// able to tell the origin the truth (FR-3.2, NFR-3).
     fn write(&self, content: &ClipboardContent) -> Result<(), ClipboardError>;
 
+    /// The image formats [`ClipboardProvider::write`] can install, which is
+    /// exactly what the application advertises in its `Hello` (ADR 0016).
+    ///
+    /// A promise to a peer, so it must be true: a format listed here is one
+    /// `write` installs rather than refuses. Defaulted to none, so a backend
+    /// that has not reached images is sent none — which is correct, not a
+    /// limitation to paper over.
+    fn installable_image_formats(&self) -> &'static [ClipboardImageFormat] {
+        &[]
+    }
+
     /// Read the current text content, or `Ok(None)` if the clipboard is
     /// empty or holds no text.
     ///

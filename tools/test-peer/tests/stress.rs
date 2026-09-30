@@ -28,7 +28,7 @@ use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::InMemoryClipboard;
 use crossover_protocol::RawFrame;
 use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied, ClipboardData};
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::hello::{FeatureFlags, MessageType};
 
 /// Exit criteria minimum (docs/ROADMAP.md Phase 2).
 const DEFAULT_UPDATES: usize = 10_000;
@@ -89,6 +89,9 @@ fn side(origin: u8) -> Side {
             send: ClipboardGrant::Allowed,
             receive: ClipboardGrant::Allowed,
         })
+        .expect("a fresh event channel cannot be full");
+    events
+        .try_send(SyncEvent::PeerImageFormats(FeatureFlags::IMAGE_FORMATS))
         .expect("a fresh event channel cannot be full");
     Side {
         clipboard,

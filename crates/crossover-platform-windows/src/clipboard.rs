@@ -310,6 +310,14 @@ impl ClipboardProvider for WindowsClipboard {
         *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = listener;
         Ok(())
     }
+
+    /// `CF_DIB`, and the registered `"PNG"` format — the two [`write`]
+    /// installs. Not JPEG: [`write`] refuses it (ADR 0014).
+    ///
+    /// [`write`]: ClipboardProvider::write
+    fn installable_image_formats(&self) -> &'static [ClipboardImageFormat] {
+        &[ClipboardImageFormat::Dib, ClipboardImageFormat::Png]
+    }
 }
 
 /// Decide text-versus-file-list-versus-image from **one** clipboard state.
@@ -2826,6 +2834,32 @@ mod tests {
         set_hdrop(&refs);
 
         let clipboard = WindowsClipboard::new().unwrap();
+        assert_eq!(
+            with_retry(|| clipboard.read()).unwrap(),
+            ClipboardRead::Unreadable
+        );
+    }
+
+    /// Loop safety for a PNG a peer sends (ADR 0016's amendment): Windows
+    /// installs it under the registered `"PNG"` format, which this reader
+    /// never reads and Windows never synthesizes into `CF_DIB`. The read
+    /// that follows our own write therefore sees the clipboard as
+    /// unreadable — never as content to send back — so a received PNG
+    /// cannot echo, whatever its bytes.
+    #[test]
+    fn an_installed_png_reads_back_as_unreadable_and_cannot_echo() {
+        use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+        let png = b"\x89PNG\r\n\x1a\n not a real image, and it need not be".to_vec();
+        with_retry(|| {
+            clipboard.write(&ClipboardContent::Image {
+                format: ClipboardImageFormat::Png,
+                bytes: png.clone(),
+            })
+        })
+        .unwrap();
         assert_eq!(
             with_retry(|| clipboard.read()).unwrap(),
             ClipboardRead::Unreadable

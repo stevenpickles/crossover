@@ -801,8 +801,18 @@ struct InputControl {
 fn setup_clipboard_sync(
     device: Uuid,
     metrics: &Arc<Metrics>,
-) -> anyhow::Result<(mpsc::Sender<SyncEvent>, CommandReceiver, bool)> {
+) -> anyhow::Result<(mpsc::Sender<SyncEvent>, CommandReceiver, bool, FeatureFlags)> {
     let provider = open_clipboard_provider()?;
+    // What this machine advertises: every symmetric capability, plus the
+    // image formats this clipboard backend can actually install (ADR
+    // 0016). A promise to the peer, so it is read from the backend rather
+    // than assumed from the platform.
+    let advertised = FeatureFlags::ADVERTISED.with_image_formats(
+        provider
+            .installable_image_formats()
+            .iter()
+            .map(|format| wire_image_format(*format)),
+    );
     // The spool is opened (and swept) once per run. `None` means this run
     // cannot receive files — never a fallback to an unprotected directory,
     // which would void the guarantee the spool exists to make.
@@ -826,7 +836,40 @@ fn setup_clipboard_sync(
     )
     .context("starting clipboard sync")?;
     tokio::spawn(driver.run());
-    Ok((events, commands, file_paste_ready))
+    Ok((events, commands, file_paste_ready, advertised))
+}
+
+/// The wire name of a platform image format.
+fn wire_image_format(
+    format: crossover_platform::ClipboardImageFormat,
+) -> crossover_protocol::clipboard::ImageFormat {
+    use crossover_platform::ClipboardImageFormat as Platform;
+    use crossover_protocol::clipboard::ImageFormat as Wire;
+    match format {
+        Platform::Dib => Wire::Dib,
+        Platform::Png => Wire::Png,
+        Platform::Jpeg => Wire::Jpeg,
+    }
+}
+
+/// The image formats every live peer can install (ADR 0016): the install
+/// bits each session's negotiated features carry from its peer's own
+/// `Hello`, shared by all of them — the clipboard engine sends one item to
+/// everyone, so it may use only a format they all take. A session without
+/// chunked transfer takes no image at all.
+fn peer_image_formats(live: &[(SpkiFingerprint, FeatureFlags)]) -> FeatureFlags {
+    if live.is_empty() {
+        return FeatureFlags::NONE;
+    }
+    live.iter()
+        .fold(FeatureFlags::IMAGE_FORMATS, |shared, (_, features)| {
+            let installs = if features.contains(FeatureFlags::CHUNKED_CLIPBOARD) {
+                features.0 & FeatureFlags::IMAGE_FORMATS.0
+            } else {
+                0
+            };
+            FeatureFlags(shared.0 & installs)
+        })
 }
 
 /// What `apply_config_changes` needs to know about `config.toml` as of the
@@ -1123,7 +1166,7 @@ pub async fn run(
 
     // Clipboard sync: one driver for the peer relationship; sessions of
     // either role feed it and carry its frames.
-    let (sync_events, sync_commands, file_paste_ready) =
+    let (sync_events, sync_commands, file_paste_ready, advertised) =
         setup_clipboard_sync(identity.device_id(), &metrics)?;
 
     // Input control: capture/inject, the transfer engine, cursor masking,
@@ -1171,9 +1214,8 @@ pub async fn run(
     };
     let commands = merge_command_lanes([sync_commands, control_commands, topology_commands]);
 
-    // How a disconnect finds out whether the local wire went down (the
-    // `local_link` field on session-end and connect-failure records).
-    let link_probe = crate::storage::open_link_state_probe();
+    // One set of establishment options for both roles.
+    let session_options = session_options(&metrics, advertised);
 
     // Outbound role: supervised session with automatic reconnect.
     let (handle, events) = start_outbound(
@@ -1181,8 +1223,7 @@ pub async fn run(
         &identity,
         &certified,
         &store,
-        &metrics,
-        &link_probe,
+        &session_options,
     );
 
     spawn_command_mux(Arc::clone(&registry), commands, Some(Arc::clone(&metrics)));
@@ -1211,7 +1252,7 @@ pub async fn run(
             &fanout,
             &registry,
             &metrics,
-            &link_probe,
+            &session_options,
         ) => {}
         () = outbound_event_loop(
             events,
@@ -1354,8 +1395,7 @@ fn start_outbound(
     identity: &DeviceIdentity,
     certified: &CertifiedIdentity,
     store: &TrustStore,
-    metrics: &Arc<Metrics>,
-    link_probe: &Arc<dyn crossover_platform::LinkStateProbe>,
+    session_options: &SessionOptions,
 ) -> (
     Option<Arc<crossover_core::supervision::SupervisorHandle>>,
     Option<mpsc::Receiver<SessionEvent>>,
@@ -1364,9 +1404,10 @@ fn start_outbound(
         return (None, None);
     };
     println!("Maintaining an outbound session to {addr}.");
-    let mut supervisor_config = SupervisorConfig::default();
-    supervisor_config.session.metrics = Some(Arc::clone(metrics));
-    supervisor_config.session.link_probe = Some(Arc::clone(link_probe));
+    let supervisor_config = SupervisorConfig {
+        session: session_options.clone(),
+        ..SupervisorConfig::default()
+    };
     let (handle, events) = supervise_outbound(
         addr.clone(),
         identity.clone(),
@@ -1375,6 +1416,19 @@ fn start_outbound(
         supervisor_config,
     );
     (Some(Arc::new(handle)), Some(events))
+}
+
+/// The establishment options both roles share: the metrics they count
+/// into, how a disconnect finds out whether the local wire went down (the
+/// `local_link` field on session-end and connect-failure records), and what
+/// this machine advertises (ADR 0016).
+fn session_options(metrics: &Arc<Metrics>, advertised: FeatureFlags) -> SessionOptions {
+    SessionOptions {
+        metrics: Some(Arc::clone(metrics)),
+        link_probe: Some(crate::storage::open_link_state_probe()),
+        advertised_features: advertised,
+        ..SessionOptions::default()
+    }
 }
 
 /// Which driver an inbound frame belongs to — the inbound counterpart of
@@ -1557,6 +1611,11 @@ impl SessionFanout {
             .sync
             .send(SyncEvent::ClipboardGrants { send, receive })
             .await;
+        // What every live peer can install travels with the grants, and
+        // for the same reason: the reconnect re-announcement is judged
+        // against it (ADR 0016).
+        let formats = peer_image_formats(&live_peer_sessions(&self.registry));
+        let _ = self.sync.send(SyncEvent::PeerImageFormats(formats)).await;
     }
 
     /// Tell the clipboard driver what the trust store and the negotiated
@@ -2740,18 +2799,14 @@ async fn listener_loop(
     fanout: &SessionFanout,
     registry: &SessionRegistry,
     metrics: &Arc<Metrics>,
-    link_probe: &Arc<dyn crossover_platform::LinkStateProbe>,
+    // The same options the outbound role establishes with: the inbound
+    // role needs the same link diagnostic — a dropped local wire ends both
+    // directions at once, and the listener's log was just as misleading
+    // during the incident — and advertises the same capabilities.
+    options: &SessionOptions,
 ) {
     let Some(listener) = listener else {
         return std::future::pending().await;
-    };
-    let options = SessionOptions {
-        metrics: Some(Arc::clone(metrics)),
-        // The inbound role needs the same diagnostic as the outbound one:
-        // a dropped local wire ends both directions at once, and the
-        // listener's log was just as misleading during the incident.
-        link_probe: Some(Arc::clone(link_probe)),
-        ..SessionOptions::default()
     };
     let keepalive = KeepaliveConfig::default();
     loop {
@@ -2770,7 +2825,7 @@ async fn listener_loop(
             certified,
             trust: &trust,
         };
-        match listener.accept(&local, &options).await {
+        match listener.accept(&local, options).await {
             Ok(session) => {
                 let info = session.info().clone();
                 println!(
@@ -3848,12 +3903,21 @@ mod tests {
                 }
             )
         });
+        let formats = order
+            .iter()
+            .position(|event| matches!(event, SyncEvent::PeerImageFormats(_)));
         let established = order
             .iter()
             .position(|event| matches!(event, SyncEvent::SessionEstablished));
         assert!(
             matches!((grants, established), (Some(g), Some(e)) if g < e),
             "the grants must precede the session announcement: {order:?}"
+        );
+        // And what the peer can install, judged by the same re-read (ADR
+        // 0016).
+        assert!(
+            matches!((formats, established), (Some(f), Some(e)) if f < e),
+            "the peer's image formats must precede the session announcement: {order:?}"
         );
     }
 
@@ -4400,6 +4464,41 @@ mod tests {
         assert_eq!(
             file_send_policy(&storage, &[(fingerprint(1), negotiated)]),
             FileSend::Denied
+        );
+    }
+
+    /// ADR 0016's formats, combined across live peers: each session's
+    /// install bits (which `FeatureFlags::negotiate` takes from the peer),
+    /// shared by all of them, and nothing from a session without chunked
+    /// transfer.
+    #[test]
+    fn peer_image_formats_are_what_every_live_peer_can_install() {
+        use crossover_protocol::clipboard::ImageFormat;
+        use crossover_protocol::hello::FeatureFlags;
+
+        use super::peer_image_formats;
+
+        let fp = |fill: u8| crossover_security::SpkiFingerprint::from([fill; 32]);
+        let windows =
+            FeatureFlags::ADVERTISED.with_image_formats([ImageFormat::Dib, ImageFormat::Png]);
+        let mac = FeatureFlags::ADVERTISED.with_image_formats([ImageFormat::Png]);
+        let no_chunks = FeatureFlags::NONE.with_image_formats([ImageFormat::Png]);
+
+        assert_eq!(peer_image_formats(&[]), FeatureFlags::NONE);
+        let one = peer_image_formats(&[(fp(1), windows)]);
+        assert!(one.can_install_image(ImageFormat::Dib) && one.can_install_image(ImageFormat::Png));
+        assert!(
+            !one.contains(FeatureFlags::CHUNKED_CLIPBOARD),
+            "only install bits are published"
+        );
+
+        let both = peer_image_formats(&[(fp(1), windows), (fp(2), mac)]);
+        assert!(!both.can_install_image(ImageFormat::Dib));
+        assert!(both.can_install_image(ImageFormat::Png));
+
+        assert_eq!(
+            peer_image_formats(&[(fp(3), no_chunks)]),
+            FeatureFlags::NONE
         );
     }
 

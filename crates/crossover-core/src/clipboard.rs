@@ -48,7 +48,7 @@ use crossover_protocol::clipboard::{
     ClipboardMeta, ClipboardOffer, ContentType, DeclineReason, FileDescriptor, ImageFormat,
     MAX_CLIPBOARD_FILE_ENTRIES, StreamOutcome, content_hash,
 };
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::hello::{FeatureFlags, MessageType};
 
 use crate::file_blob::wire_file_name;
 use crate::metrics::Metrics;
@@ -1105,6 +1105,11 @@ pub struct ClipboardEngine {
     /// (`clipboard_receive`) — every type, files included. Closed until
     /// the application says otherwise.
     clipboard_receive: ClipboardGrant,
+    /// The image formats every live peer can install (ADR 0016): only the
+    /// `FeatureFlags::IMAGE_*` bits, read from each peer's own `Hello`.
+    /// None until the application says otherwise, so no image leaves in a
+    /// format nobody said they could take.
+    peer_image_formats: FeatureFlags,
     /// The spool root, for one purpose only: recognizing a `CF_HDROP`
     /// that points back into it, which must never be staged (ADR 0015
     /// loop prevention, SECURITY.md F13). Held as text and compared, never
@@ -1221,6 +1226,7 @@ impl ClipboardEngine {
             file_send: FileSend::default(),
             clipboard_send: ClipboardGrant::default(),
             clipboard_receive: ClipboardGrant::default(),
+            peer_image_formats: FeatureFlags::NONE,
             spool_root: None,
             building: None,
             spooled: VecDeque::new(),
@@ -1459,6 +1465,23 @@ impl ClipboardEngine {
             self.record(Metrics::record_clipboard_send_denied);
             return superseded;
         }
+        // An image travels only in a format its receiver said it can
+        // install (ADR 0016). Refused here, observably, rather than sent and
+        // refused there: the receiver would install nothing, and the user
+        // copying would never learn why. Converting to a format the peer
+        // does take is the sender's job and arrives with the converter.
+        if let ContentType::Image(format) = content_type
+            && !self.peer_image_formats.can_install_image(format)
+        {
+            tracing::info!(
+                byte_count = bytes.len(),
+                format = ?format,
+                peer_installs = ?self.peer_image_formats,
+                "local image not sent: the peer cannot install this format (ADR 0016)"
+            );
+            self.record(Metrics::record_clipboard_image_format_refused);
+            return superseded;
+        }
 
         let sequence = self.next_sequence;
         self.next_sequence += 1;
@@ -1553,6 +1576,21 @@ impl ClipboardEngine {
             tracing::info!(policy = ?send, "clipboard send policy changed");
         }
         self.clipboard_send = send;
+    }
+
+    /// Set which image formats every live peer can install (ADR 0016).
+    ///
+    /// Only the install bits are kept. Supplied by the application from
+    /// each session's negotiated features — which carry the *peer's*
+    /// install bits (`FeatureFlags::negotiate`) — and re-supplied whenever
+    /// a session comes or goes. With more than one peer it is the formats
+    /// they all share, for the session-agnostic reason the grants are.
+    pub fn set_peer_image_formats(&mut self, formats: FeatureFlags) {
+        let formats = FeatureFlags(formats.0 & FeatureFlags::IMAGE_FORMATS.0);
+        if self.peer_image_formats != formats {
+            tracing::info!(formats = ?formats, "peer image formats changed");
+        }
+        self.peer_image_formats = formats;
     }
 
     /// Set whether the peer's items may reach this clipboard at all
@@ -3913,6 +3951,7 @@ mod tests {
     };
     use crate::metrics::Metrics;
     use crossover_protocol::clipboard::MAX_CLIPBOARD_FILE_ENTRIES;
+    use crossover_protocol::hello::FeatureFlags;
 
     /// The one deadline the actions asked for, as `(scope, generation)`.
     fn timeout_of(actions: &[Action]) -> (TransferScope, u64) {
@@ -3957,6 +3996,9 @@ mod tests {
     fn paired(mut engine: ClipboardEngine) -> ClipboardEngine {
         engine.set_clipboard_send(ClipboardGrant::Allowed);
         engine.set_clipboard_receive(ClipboardGrant::Allowed);
+        // And a peer that can install every image format, so image tests
+        // exercise the transfer; the format rule has tests of its own.
+        engine.set_peer_image_formats(FeatureFlags::IMAGE_FORMATS);
         engine
     }
 
@@ -4988,6 +5030,47 @@ mod tests {
                 result: ApplyResult::ContentRejected,
             })] if *closed == id
         ));
+    }
+
+    /// ADR 0016: an image travels only in a format its receiver said it
+    /// can install. A local DIB offered to a peer that installs only PNG
+    /// is refused here, observably, rather than sent to be refused there;
+    /// text is unaffected, and a peer that installs DIB gets it verbatim.
+    #[test]
+    fn an_image_travels_only_in_a_format_the_peer_can_install() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = metered(&metrics);
+        e.set_peer_image_formats(FeatureFlags::IMAGE_PNG);
+
+        let refused = copy_image(&mut e, image_bytes(MAX_CHUNK_BYTES + 1));
+        assert!(
+            sent(&refused).is_empty(),
+            "an image left in a format the peer cannot install"
+        );
+        assert_eq!(metrics.snapshot().clipboard_image_format_refused, 1);
+        assert_eq!(sent(&copy(&mut e, "text is not an image")).len(), 1);
+
+        e.set_peer_image_formats(FeatureFlags(
+            FeatureFlags::IMAGE_DIB.0 | FeatureFlags::IMAGE_PNG.0,
+        ));
+        let offered = copy_image(&mut e, image_bytes(MAX_CHUNK_BYTES + 7));
+        assert!(matches!(
+            offer_of(&offered).meta.content_type,
+            ContentType::Image(ImageFormat::Dib)
+        ));
+    }
+
+    /// Only install bits are kept: a policy that happened to carry other
+    /// capability bits cannot widen what images may be sent.
+    #[test]
+    fn peer_image_formats_keep_only_the_install_bits() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = metered(&metrics);
+        e.set_peer_image_formats(FeatureFlags(
+            FeatureFlags::CHUNKED_CLIPBOARD.0 | FeatureFlags::FILE_CLIPBOARD.0,
+        ));
+        assert!(sent(&copy_image(&mut e, image_bytes(MAX_CHUNK_BYTES + 1))).is_empty());
+        assert_eq!(metrics.snapshot().clipboard_image_format_refused, 1);
     }
 
     /// Withdrawing `clipboard_send` keeps this machine's copies on this
