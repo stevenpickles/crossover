@@ -65,11 +65,18 @@ fn side(origin: u8) -> Side {
             retry: ClipboardRetryPolicy {
                 max_attempts: 5,
                 delay: Duration::from_millis(1),
-                // Compressed like the fast phase above, for the same
-                // reason: the gate measures throughput, and the parked
-                // phase is only reached under injected contention.
+                // The cadence is compressed like the fast phase above, for
+                // the same reason: the gate measures throughput, and the
+                // parked phase is only reached under injected contention.
                 park_delay: Duration::from_millis(1),
-                park_budget: Duration::from_millis(50),
+                // The budget is not compressed, because it is wall-clock
+                // time and the contention test asserts that injected
+                // busyness is *absorbed*, not absorbed within a deadline a
+                // loaded CI runner may miss: 50 ms failed once on a macOS
+                // runner (item 294, eight injected busy writes). A generous
+                // budget costs the happy path nothing — an item completes
+                // the moment a write succeeds — and it is still bounded.
+                park_budget: Duration::from_secs(10),
             },
             // The gate measures transaction throughput, not the debounce
             // (ADR 0006 has its own tests). Zero means transmit eagerly:
