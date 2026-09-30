@@ -220,6 +220,58 @@ impl ClipboardRead {
     }
 }
 
+/// Why an image could not be converted (ADR 0016).
+#[non_exhaustive]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ImageConvertError {
+    /// This converter does not produce `to` from `from`.
+    #[error("converting {from:?} to {to:?} is not supported here")]
+    Unsupported {
+        /// The source format.
+        from: ClipboardImageFormat,
+        /// The requested format.
+        to: ClipboardImageFormat,
+    },
+    /// The conversion was attempted and failed. `reason` is diagnostic
+    /// text; it never carries image content (FR-7.4).
+    #[error("image conversion failed: {reason}")]
+    Failed {
+        /// Diagnostic detail.
+        reason: String,
+    },
+}
+
+/// Converts **this machine's own** clipboard image into another format
+/// (ADR 0016 and its 2026-09-28 amendment).
+///
+/// The sender converts so the receiver never has to: nothing that came
+/// from a peer is ever handed to an implementation of this trait, which is
+/// what keeps an image decoder off the path that parses hostile input. The
+/// input is what the local operating system just gave this process.
+///
+/// **Blocking, possibly for hundreds of milliseconds.** Callers run it off
+/// the clipboard driver's loop, as the file blob builder is run.
+///
+/// An implementation must produce the *canonical* form of `to` — exactly
+/// what the receiving platform's own reader returns for that format —
+/// or the receiver's loop prevention, which compares hashes across its
+/// own write and read-back, would see its install as a new copy.
+pub trait ImageConverter: Send + Sync {
+    /// Convert `bytes`, an image in `from`, into `to`.
+    ///
+    /// # Errors
+    ///
+    /// [`ImageConvertError::Unsupported`] for a pair this converter does
+    /// not handle; [`ImageConvertError::Failed`] when the conversion was
+    /// attempted and did not produce an image.
+    fn convert(
+        &self,
+        from: ClipboardImageFormat,
+        to: ClipboardImageFormat,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, ImageConvertError>;
+}
+
 /// A change-notification callback.
 ///
 /// Deliberately carries **no data**: it signals "the clipboard changed",

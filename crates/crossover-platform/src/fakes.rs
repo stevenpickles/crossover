@@ -274,6 +274,58 @@ impl ClipboardProvider for InMemoryClipboard {
     }
 }
 
+/// A scriptable [`crate::ImageConverter`]: "converts" by tagging the input
+/// with the target format, so a test can tell a converted item from a
+/// verbatim one byte for byte, and can make the next conversion fail.
+#[derive(Debug, Default)]
+pub struct FakeImageConverter {
+    fail_next: Mutex<Option<crate::ImageConvertError>>,
+    conversions: Mutex<u32>,
+}
+
+impl FakeImageConverter {
+    /// A converter that succeeds.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What converting `bytes` to `to` produces: a tag naming the format,
+    /// then the input.
+    #[must_use]
+    pub fn converted(to: ClipboardImageFormat, bytes: &[u8]) -> Vec<u8> {
+        let mut out = format!("converted-to-{to:?}:").into_bytes();
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// Fail the next conversion with `error`.
+    pub fn fail_next(&self, error: crate::ImageConvertError) {
+        *lock(&self.fail_next) = Some(error);
+    }
+
+    /// How many conversions ran, failures included.
+    #[must_use]
+    pub fn conversions(&self) -> u32 {
+        *lock(&self.conversions)
+    }
+}
+
+impl crate::ImageConverter for FakeImageConverter {
+    fn convert(
+        &self,
+        _from: ClipboardImageFormat,
+        to: ClipboardImageFormat,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, crate::ImageConvertError> {
+        *lock(&self.conversions) += 1;
+        if let Some(error) = lock(&self.fail_next).take() {
+            return Err(error);
+        }
+        Ok(Self::converted(to, bytes))
+    }
+}
+
 /// In-memory [`InputCapture`], driven by the test rather than a mouse.
 ///
 /// The real implementation suppresses local input as a side effect of

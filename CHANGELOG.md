@@ -36,6 +36,11 @@ version ranges.
   longer sent it: the sender logs why and counts it instead. This is what
   lets a Mac, which does not install Windows' DIB format, join image sync
   when its image support lands.
+- **Windows converts an image for a peer that installs only PNG.** The
+  image is this machine's own clipboard content, encoded to PNG with the
+  Windows Imaging Component off the sync loop, so a large screenshot does
+  not delay anything else. Nothing a peer sends is ever decoded: the
+  sender converts, the receiver installs bytes as they are (ADR 0016).
 
 ### Security
 

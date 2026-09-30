@@ -566,6 +566,22 @@ pub enum Action {
     /// **Blocking, and long.** The driver must not run it on the
     /// clipboard listener's thread or on the loop that has to keep
     /// answering events (ADR 0015, "Threading").
+    /// Convert a local image into a format the peer can install, then call
+    /// [`ClipboardEngine::on_image_converted`] with the result (ADR 0016).
+    ///
+    /// **Blocking**: the driver runs it off its loop, as it runs
+    /// [`Action::BuildFileBlob`]. The bytes are this machine's own
+    /// clipboard content, never a peer's.
+    ConvertImage {
+        /// The id the answer must carry; a stale one is ignored.
+        id: Uuid,
+        /// The format the local clipboard gave.
+        from: ImageFormat,
+        /// The format every live peer can install.
+        to: ImageFormat,
+        /// The local image.
+        bytes: Vec<u8>,
+    },
     BuildFileBlob {
         /// Transaction id the reply — and the blob — must reference.
         id: Uuid,
@@ -1037,6 +1053,14 @@ struct PendingWrite {
     retry_armed: bool,
 }
 
+/// A local image out for conversion (ADR 0016).
+#[derive(Debug)]
+struct PendingConversion {
+    id: Uuid,
+    to: ImageFormat,
+    started: Instant,
+}
+
 /// The sans-io clipboard engine. One instance per peer session scope.
 #[derive(Debug)]
 pub struct ClipboardEngine {
@@ -1110,6 +1134,9 @@ pub struct ClipboardEngine {
     /// None until the application says otherwise, so no image leaves in a
     /// format nobody said they could take.
     peer_image_formats: FeatureFlags,
+    /// A local image being converted for the peer, if any. Replaced by a
+    /// newer local copy, which is what makes a late answer for it stale.
+    converting: Option<PendingConversion>,
     /// The spool root, for one purpose only: recognizing a `CF_HDROP`
     /// that points back into it, which must never be staged (ADR 0015
     /// loop prevention, SECURITY.md F13). Held as text and compared, never
@@ -1227,6 +1254,7 @@ impl ClipboardEngine {
             clipboard_send: ClipboardGrant::default(),
             clipboard_receive: ClipboardGrant::default(),
             peer_image_formats: FeatureFlags::NONE,
+            converting: None,
             spool_root: None,
             building: None,
             spooled: VecDeque::new(),
@@ -1367,6 +1395,7 @@ impl ClipboardEngine {
             ClipboardRead::Content(content) => content,
             ClipboardRead::Empty => {
                 self.current_local_hash = None;
+                self.cancel_conversion("the clipboard was emptied");
                 return Vec::new();
             }
             ClipboardRead::Unreadable => {
@@ -1374,6 +1403,7 @@ impl ClipboardEngine {
             }
         };
         if let ClipboardContent::FileList(selection) = content {
+            self.cancel_conversion("superseded by a newer local copy");
             return self.on_local_file_list(selection, reannouncing);
         }
         let Some((content_type, bytes)) = into_wire(content) else {
@@ -1414,6 +1444,10 @@ impl ClipboardEngine {
             return self.revive_parked_write();
         }
         self.current_local_hash = Some(hash);
+        // A newer copy — or a re-announcement that will start its own —
+        // makes any conversion in flight stale: sent late, an older image
+        // would land after whatever the user copied since.
+        self.cancel_conversion("superseded by a newer local copy");
 
         // Only content that is genuinely new to this machine outranks a
         // parked install. A reconnect's re-announcement of what was
@@ -1466,23 +1500,37 @@ impl ClipboardEngine {
             return superseded;
         }
         // An image travels only in a format its receiver said it can
-        // install (ADR 0016). Refused here, observably, rather than sent and
-        // refused there: the receiver would install nothing, and the user
-        // copying would never learn why. Converting to a format the peer
-        // does take is the sender's job and arrives with the converter.
+        // install (ADR 0016). The sender converts — its own content, never
+        // a peer's — and if no format the peer takes can be produced, the
+        // image is refused here, observably, rather than sent and refused
+        // there where the user copying would never learn why.
         if let ContentType::Image(format) = content_type
             && !self.peer_image_formats.can_install_image(format)
         {
-            tracing::info!(
-                byte_count = bytes.len(),
-                format = ?format,
-                peer_installs = ?self.peer_image_formats,
-                "local image not sent: the peer cannot install this format (ADR 0016)"
-            );
-            self.record(Metrics::record_clipboard_image_format_refused);
+            let Some(to) = self.conversion_target(format) else {
+                tracing::info!(
+                    byte_count = bytes.len(),
+                    format = ?format,
+                    peer_installs = ?self.peer_image_formats,
+                    "local image not sent: the peer cannot install this format, and there is \
+                     no format it does install to convert it to (ADR 0016)"
+                );
+                self.record(Metrics::record_clipboard_image_format_refused);
+                return superseded;
+            };
+            superseded.extend(self.start_conversion(format, to, bytes));
             return superseded;
         }
 
+        // The read only happens after the clipboard has settled, so
+        // whatever we just read is the content worth sending: transmit
+        // it directly.
+        superseded.extend(self.mint(content_type, bytes, hash));
+        superseded
+    }
+
+    /// Stamp a new local item and start sending it.
+    fn mint(&mut self, content_type: ContentType, bytes: Vec<u8>, hash: [u8; 32]) -> Vec<Action> {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
         let meta = ClipboardMeta {
@@ -1493,11 +1541,124 @@ impl ClipboardEngine {
             content_length: bytes.len() as u64,
             content_hash: hash,
         };
-        // The read only happens after the clipboard has settled, so
-        // whatever we just read is the content worth sending: transmit
-        // it directly.
-        superseded.extend(self.start_outbound(meta, bytes));
-        superseded
+        self.start_outbound(meta, bytes)
+    }
+
+    /// The format to convert a local `from` image to, if every live peer
+    /// installs one: PNG first, ADR 0016's baseline, then DIB. Never JPEG,
+    /// which is carried verbatim or not at all.
+    fn conversion_target(&self, from: ImageFormat) -> Option<ImageFormat> {
+        [ImageFormat::Png, ImageFormat::Dib]
+            .into_iter()
+            .find(|to| *to != from && self.peer_image_formats.can_install_image(*to))
+    }
+
+    /// Hand a local image to the converter, replacing any conversion in
+    /// flight.
+    fn start_conversion(
+        &mut self,
+        from: ImageFormat,
+        to: ImageFormat,
+        bytes: Vec<u8>,
+    ) -> Vec<Action> {
+        let id = Uuid::new_v4();
+        tracing::debug!(
+            clipboard_id = %id,
+            byte_count = bytes.len(),
+            from = ?from,
+            to = ?to,
+            "converting a local image for the peer (ADR 0016)"
+        );
+        self.converting = Some(PendingConversion {
+            id,
+            to,
+            started: Instant::now(),
+        });
+        vec![Action::ConvertImage {
+            id,
+            from,
+            to,
+            bytes,
+        }]
+    }
+
+    /// Forget a conversion in flight; its answer, when it comes, is stale.
+    fn cancel_conversion(&mut self, why: &str) {
+        if let Some(conversion) = self.converting.take() {
+            tracing::debug!(
+                clipboard_id = %conversion.id,
+                reason = why,
+                "image conversion abandoned"
+            );
+        }
+    }
+
+    /// The converter answered (ADR 0016).
+    ///
+    /// Everything a local item is judged on is judged again here, because
+    /// time passed while the conversion ran: the session may have gone,
+    /// the send grant may have been withdrawn, and the peers' formats may
+    /// have changed. The converted bytes are this machine's own content in
+    /// a new format, so they are hashed and minted as any local item is.
+    pub fn on_image_converted(&mut self, id: Uuid, result: Result<Vec<u8>, String>) -> Vec<Action> {
+        let Some(conversion) = self.converting.take_if(|c| c.id == id) else {
+            tracing::debug!(clipboard_id = %id, "answer for a conversion no longer wanted; ignoring");
+            return Vec::new();
+        };
+        let elapsed = elapsed_ms(conversion.started);
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                tracing::warn!(
+                    clipboard_id = %id,
+                    to = ?conversion.to,
+                    elapsed_ms = elapsed,
+                    error = %reason,
+                    "local image not sent: converting it for the peer failed (ADR 0016)"
+                );
+                self.record(Metrics::record_clipboard_image_format_refused);
+                return Vec::new();
+            }
+        };
+        let content_type = ContentType::Image(conversion.to);
+        let max = content_type.max_content_bytes();
+        if bytes.is_empty() || bytes.len() as u64 > max {
+            tracing::warn!(
+                clipboard_id = %id,
+                byte_count = bytes.len(),
+                max,
+                "local image not sent: the converted image is empty or over the maximum"
+            );
+            self.record(Metrics::record_clipboard_image_format_refused);
+            return Vec::new();
+        }
+        if !self.has_live_session() {
+            tracing::debug!(clipboard_id = %id, "converted image has no peer to go to; dropped");
+            return Vec::new();
+        }
+        if self.clipboard_send != ClipboardGrant::Allowed {
+            self.record(Metrics::record_clipboard_send_denied);
+            return Vec::new();
+        }
+        if !self.peer_image_formats.can_install_image(conversion.to) {
+            tracing::info!(
+                clipboard_id = %id,
+                to = ?conversion.to,
+                "local image not sent: the peers changed while it was converting"
+            );
+            self.record(Metrics::record_clipboard_image_format_refused);
+            return Vec::new();
+        }
+        tracing::debug!(
+            clipboard_id = %id,
+            to = ?conversion.to,
+            byte_count = bytes.len(),
+            elapsed_ms = elapsed,
+            "local image converted for the peer"
+        );
+        self.record(Metrics::record_clipboard_image_converted);
+        let hash = content_hash(&bytes);
+        self.mint(content_type, bytes, hash)
     }
 
     /// The read found a copy this build cannot represent (ADR 0005,
@@ -1522,6 +1683,7 @@ impl ClipboardEngine {
     /// silently.
     fn on_local_unreadable(&mut self, reannouncing: bool, was_unreadable: bool) -> Vec<Action> {
         self.current_local_hash = None;
+        self.cancel_conversion("superseded by a newer local copy");
         if reannouncing && was_unreadable {
             return self.revive_parked_write();
         }
@@ -3852,7 +4014,7 @@ const fn wire_format(format: ClipboardImageFormat) -> ImageFormat {
 }
 
 /// Protocol image tag → platform image tag. See [`wire_format`].
-const fn platform_format(format: ImageFormat) -> ClipboardImageFormat {
+pub(crate) const fn platform_format(format: ImageFormat) -> ClipboardImageFormat {
     match format {
         ImageFormat::Dib => ClipboardImageFormat::Dib,
         ImageFormat::Png => ClipboardImageFormat::Png,
@@ -5033,19 +5195,20 @@ mod tests {
     }
 
     /// ADR 0016: an image travels only in a format its receiver said it
-    /// can install. A local DIB offered to a peer that installs only PNG
-    /// is refused here, observably, rather than sent to be refused there;
-    /// text is unaffected, and a peer that installs DIB gets it verbatim.
+    /// can install. A peer that installs neither the local format nor any
+    /// format this side converts to — JPEG only, which is never a
+    /// conversion target — is refused here, observably; text is
+    /// unaffected, and a peer that installs DIB gets it verbatim.
     #[test]
     fn an_image_travels_only_in_a_format_the_peer_can_install() {
         let metrics = Arc::new(Metrics::new());
         let mut e = metered(&metrics);
-        e.set_peer_image_formats(FeatureFlags::IMAGE_PNG);
+        e.set_peer_image_formats(FeatureFlags::IMAGE_JPEG);
 
         let refused = copy_image(&mut e, image_bytes(MAX_CHUNK_BYTES + 1));
         assert!(
-            sent(&refused).is_empty(),
-            "an image left in a format the peer cannot install"
+            refused.is_empty(),
+            "nothing is sent or converted: {refused:?}"
         );
         assert_eq!(metrics.snapshot().clipboard_image_format_refused, 1);
         assert_eq!(sent(&copy(&mut e, "text is not an image")).len(), 1);
@@ -5058,6 +5221,101 @@ mod tests {
             offer_of(&offered).meta.content_type,
             ContentType::Image(ImageFormat::Dib)
         ));
+    }
+
+    /// The conversion a PNG-only peer needs (ADR 0016): the local DIB goes
+    /// to the converter, off the loop, and what comes back is minted and
+    /// offered as a PNG — hashed and sized as the converted bytes, since
+    /// those are what travel.
+    #[test]
+    fn an_image_the_peer_cannot_install_is_converted_then_offered() {
+        let metrics = Arc::new(Metrics::new());
+        let mut e = metered(&metrics);
+        e.set_peer_image_formats(FeatureFlags::IMAGE_PNG);
+
+        let local = image_bytes(MAX_CHUNK_BYTES + 1);
+        let actions = copy_image(&mut e, local.clone());
+        let [
+            Action::ConvertImage {
+                id,
+                from,
+                to,
+                bytes,
+            },
+        ] = actions.as_slice()
+        else {
+            panic!("expected one conversion and nothing sent: {actions:?}");
+        };
+        assert_eq!((*from, *to), (ImageFormat::Dib, ImageFormat::Png));
+        assert_eq!(bytes, &local);
+
+        let png = b"a converted image, whatever its bytes".to_vec();
+        let offer = offer_of(&e.on_image_converted(*id, Ok(png.clone())));
+        assert_eq!(
+            offer.meta.content_type,
+            ContentType::Image(ImageFormat::Png)
+        );
+        assert_eq!(offer.meta.content_length, png.len() as u64);
+        assert_eq!(offer.meta.content_hash, content_hash(&png));
+        assert_eq!(metrics.snapshot().clipboard_images_converted, 1);
+    }
+
+    /// A newer copy makes a conversion in flight stale: sent late, the
+    /// older image would land after the text the user copied since.
+    #[test]
+    fn a_newer_copy_makes_a_conversion_in_flight_stale() {
+        let mut e = metered(&Arc::new(Metrics::new()));
+        e.set_peer_image_formats(FeatureFlags::IMAGE_PNG);
+        let actions = copy_image(&mut e, image_bytes(MAX_CHUNK_BYTES + 1));
+        let [Action::ConvertImage { id, .. }] = actions.as_slice() else {
+            panic!("expected a conversion: {actions:?}");
+        };
+        let stale = *id;
+
+        assert_eq!(sent(&copy(&mut e, "copied while it converted")).len(), 1);
+        assert!(
+            e.on_image_converted(stale, Ok(b"too late".to_vec()))
+                .is_empty(),
+            "a stale conversion was sent after a newer copy"
+        );
+    }
+
+    /// Every way a conversion can end without an image is observable, and
+    /// time passing while it ran is judged again: a failed conversion, a
+    /// withdrawn send grant, and a lost session all send nothing.
+    #[test]
+    fn a_conversion_that_cannot_be_sent_is_refused_observably() {
+        let start = |e: &mut ClipboardEngine| -> Uuid {
+            let actions = copy_image(e, image_bytes(MAX_CHUNK_BYTES + 1));
+            let [Action::ConvertImage { id, .. }] = actions.as_slice() else {
+                panic!("expected a conversion: {actions:?}");
+            };
+            *id
+        };
+
+        let metrics = Arc::new(Metrics::new());
+        let mut e = metered(&metrics);
+        e.set_peer_image_formats(FeatureFlags::IMAGE_PNG);
+        let id = start(&mut e);
+        assert!(
+            e.on_image_converted(id, Err("encoder refused".to_owned()))
+                .is_empty()
+        );
+        assert_eq!(metrics.snapshot().clipboard_image_format_refused, 1);
+
+        let metrics = Arc::new(Metrics::new());
+        let mut e = metered(&metrics);
+        e.set_peer_image_formats(FeatureFlags::IMAGE_PNG);
+        let id = start(&mut e);
+        e.set_clipboard_send(ClipboardGrant::Denied);
+        assert!(e.on_image_converted(id, Ok(b"png".to_vec())).is_empty());
+        assert_eq!(metrics.snapshot().clipboard_send_denied, 1);
+
+        let mut e = metered(&Arc::new(Metrics::new()));
+        e.set_peer_image_formats(FeatureFlags::IMAGE_PNG);
+        let id = start(&mut e);
+        e.on_session_lost();
+        assert!(e.on_image_converted(id, Ok(b"png".to_vec())).is_empty());
     }
 
     /// Only install bits are kept: a policy that happened to carry other
