@@ -221,12 +221,49 @@ impl FeatureFlags {
     /// virtual-file paste mechanism.
     pub const FILE_CLIPBOARD: Self = Self(1 << 1);
 
-    /// Every bit this protocol version defines.
-    pub const ALL: Self = Self(Self::CHUNKED_CLIPBOARD.0 | Self::FILE_CLIPBOARD.0);
-
-    /// What **this build** advertises in its `Hello`.
+    /// Bit 2 — this side can **install** an `ImageFormat::Dib` image on
+    /// its clipboard (ADR 0016).
     ///
-    /// [`FeatureFlags::ALL`] since ADR 0015's final slice (feature/136):
+    /// The image-format bits are *install* capabilities, and so, unlike
+    /// every other bit, directional: they describe what the advertiser can
+    /// receive, and a sender reads them from its **peer's** `Hello`, not
+    /// from the intersection. A Mac that can install only PNG and a
+    /// Windows machine that can install DIB and PNG intersect to {PNG},
+    /// which would make the Mac send Windows a format it does not prefer;
+    /// what the Mac needs is Windows' own list. [`FeatureFlags::negotiate`]
+    /// combines the two kinds accordingly.
+    pub const IMAGE_DIB: Self = Self(1 << 2);
+
+    /// Bit 3 — this side can install an `ImageFormat::Png` image. ADR
+    /// 0016's baseline: every implementation that can install images at
+    /// all advertises it.
+    pub const IMAGE_PNG: Self = Self(1 << 3);
+
+    /// Bit 4 — this side can install an `ImageFormat::Jpeg` image,
+    /// verbatim. Never a conversion target (ADR 0016).
+    pub const IMAGE_JPEG: Self = Self(1 << 4);
+
+    /// Every install-capability bit. Directional; see
+    /// [`FeatureFlags::IMAGE_DIB`].
+    pub const IMAGE_FORMATS: Self =
+        Self(Self::IMAGE_DIB.0 | Self::IMAGE_PNG.0 | Self::IMAGE_JPEG.0);
+
+    /// Every bit this protocol version defines.
+    pub const ALL: Self =
+        Self(Self::CHUNKED_CLIPBOARD.0 | Self::FILE_CLIPBOARD.0 | Self::IMAGE_FORMATS.0);
+
+    /// What **this build** advertises in its `Hello`, before its clipboard
+    /// backend adds the image formats it can install.
+    ///
+    /// Every symmetric capability, and no install bit: which image formats
+    /// a machine can install is a property of its clipboard backend, not
+    /// of the protocol, so the application adds them from
+    /// `ClipboardProvider::installable_image_formats` (ADR 0016). A build
+    /// whose backend installs no images — the text-only first macOS slice
+    /// — therefore advertises none, and is sent none.
+    ///
+    /// The symmetric bits have been all of them since ADR 0015's final
+    /// slice (feature/136):
     /// every layer beneath *both* bits is now real. Bit 0 has carried
     /// chunked images since ADR 0014's platform slice — offered, streamed,
     /// reassembled, verified and installed, with
@@ -242,7 +279,7 @@ impl FeatureFlags {
     /// *intersection* of the two advertisements, so a peer that predates
     /// the bit negotiates it away and is sent nothing new
     /// (docs/PROTOCOL.md §3.1).
-    pub const ADVERTISED: Self = Self::ALL;
+    pub const ADVERTISED: Self = Self(Self::CHUNKED_CLIPBOARD.0 | Self::FILE_CLIPBOARD.0);
 
     /// Whether every bit in `feature` is set. `NONE` is contained by
     /// everything, so base-protocol capabilities never need a bit.
@@ -251,11 +288,45 @@ impl FeatureFlags {
         self.0 & feature.0 == feature.0
     }
 
-    /// The features active on a session: the intersection, because a
-    /// capability is usable only if both sides have it.
+    /// What this side may **send** on a session.
+    ///
+    /// For the symmetric capabilities, the intersection: a message type or
+    /// content type is usable only if both sides implement it. For the
+    /// install capabilities ([`FeatureFlags::IMAGE_FORMATS`]), the peer's
+    /// own bits, whatever this side can install: they say what the peer can
+    /// receive, which is the only question a sender asks (ADR 0016).
     #[must_use]
     pub const fn negotiate(local: Self, peer: Self) -> Self {
-        Self(local.0 & peer.0)
+        let symmetric = local.0 & peer.0 & !Self::IMAGE_FORMATS.0;
+        let installable = peer.0 & Self::IMAGE_FORMATS.0;
+        Self(symmetric | installable)
+    }
+
+    /// The install bit for one image format.
+    #[must_use]
+    pub const fn image_format(format: crate::clipboard::ImageFormat) -> Self {
+        match format {
+            crate::clipboard::ImageFormat::Dib => Self::IMAGE_DIB,
+            crate::clipboard::ImageFormat::Png => Self::IMAGE_PNG,
+            crate::clipboard::ImageFormat::Jpeg => Self::IMAGE_JPEG,
+        }
+    }
+
+    /// These flags plus the install bits for `formats`.
+    #[must_use]
+    pub fn with_image_formats(
+        self,
+        formats: impl IntoIterator<Item = crate::clipboard::ImageFormat>,
+    ) -> Self {
+        formats.into_iter().fold(self, |flags, format| {
+            Self(flags.0 | Self::image_format(format).0)
+        })
+    }
+
+    /// Whether these flags say an image of `format` can be installed.
+    #[must_use]
+    pub const fn can_install_image(self, format: crate::clipboard::ImageFormat) -> bool {
+        self.contains(Self::image_format(format))
     }
 }
 
@@ -408,7 +479,12 @@ mod tests {
     /// ever had to be withdrawn.
     #[test]
     fn this_build_advertises_both_clipboard_feature_bits() {
-        assert_eq!(FeatureFlags::ADVERTISED, FeatureFlags::ALL);
+        // Every symmetric bit, and no install bit: those come from the
+        // clipboard backend at run time (ADR 0016).
+        assert_eq!(
+            FeatureFlags::ADVERTISED,
+            FeatureFlags(FeatureFlags::ALL.0 & !FeatureFlags::IMAGE_FORMATS.0)
+        );
         assert!(FeatureFlags::ADVERTISED.contains(FeatureFlags::CHUNKED_CLIPBOARD));
         assert!(FeatureFlags::ADVERTISED.contains(FeatureFlags::FILE_CLIPBOARD));
         // And a peer that has never heard of either still gets nothing: the
@@ -417,6 +493,38 @@ mod tests {
             FeatureFlags::negotiate(FeatureFlags::ADVERTISED, FeatureFlags::NONE),
             FeatureFlags::NONE
         );
+    }
+
+    /// ADR 0016's install bits are directional. What a side may send is
+    /// the intersection of the symmetric capabilities plus the *peer's*
+    /// install bits — never its own, and never only the shared ones.
+    #[test]
+    fn install_bits_come_from_the_peer_and_symmetric_bits_from_both() {
+        use crate::clipboard::ImageFormat;
+
+        let windows =
+            FeatureFlags::ADVERTISED.with_image_formats([ImageFormat::Dib, ImageFormat::Png]);
+        let mac = FeatureFlags::ADVERTISED.with_image_formats([ImageFormat::Png]);
+
+        // The Mac, sending to Windows, sees what Windows can install —
+        // DIB included, which the intersection would have hidden.
+        let mac_sends = FeatureFlags::negotiate(mac, windows);
+        assert!(mac_sends.can_install_image(ImageFormat::Dib));
+        assert!(mac_sends.can_install_image(ImageFormat::Png));
+        // Windows, sending to the Mac, sees only what the Mac can install.
+        let windows_sends = FeatureFlags::negotiate(windows, mac);
+        assert!(!windows_sends.can_install_image(ImageFormat::Dib));
+        assert!(windows_sends.can_install_image(ImageFormat::Png));
+        // Symmetric capabilities are still the intersection.
+        let text_only = FeatureFlags::NONE.with_image_formats([ImageFormat::Png]);
+        let sends = FeatureFlags::negotiate(windows, text_only);
+        assert!(!sends.contains(FeatureFlags::CHUNKED_CLIPBOARD));
+        assert!(!sends.contains(FeatureFlags::FILE_CLIPBOARD));
+        // A peer that installs nothing is sent no image, whatever this side
+        // can install itself.
+        let silent = FeatureFlags::negotiate(windows, FeatureFlags::ADVERTISED);
+        assert!(!silent.can_install_image(ImageFormat::Dib));
+        assert!(!silent.can_install_image(ImageFormat::Png));
     }
 
     #[test]

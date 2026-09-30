@@ -251,7 +251,12 @@ impl ContentType {
     pub const fn required_feature(self) -> FeatureFlags {
         match self {
             Self::Utf8Text => FeatureFlags::NONE,
-            Self::Image(_) => FeatureFlags::CHUNKED_CLIPBOARD,
+            // Chunked transfer, and the peer's install bit for this
+            // format (ADR 0016): an image the peer cannot install is not
+            // sent, rather than sent and refused.
+            Self::Image(format) => FeatureFlags(
+                FeatureFlags::CHUNKED_CLIPBOARD.0 | FeatureFlags::image_format(format).0,
+            ),
             // A separate bit from images, and necessarily so: an ADR 0014
             // peer advertises CHUNKED_CLIPBOARD and has no `File`
             // discriminant, so sending it one is fatal to its session
@@ -2206,7 +2211,15 @@ mod tests {
         });
 
         assert!(!image.negotiated_by(FeatureFlags::NONE));
-        assert!(image.negotiated_by(FeatureFlags::CHUNKED_CLIPBOARD));
+        // Chunked transfer alone is not enough since ADR 0016: the peer
+        // must also be able to install this image's format.
+        assert!(!image.negotiated_by(FeatureFlags::CHUNKED_CLIPBOARD));
+        assert!(image.negotiated_by(FeatureFlags(
+            FeatureFlags::CHUNKED_CLIPBOARD.0 | FeatureFlags::IMAGE_DIB.0
+        )));
+        assert!(!image.negotiated_by(FeatureFlags(
+            FeatureFlags::CHUNKED_CLIPBOARD.0 | FeatureFlags::IMAGE_PNG.0
+        )));
         assert!(image.negotiated_by(FeatureFlags::ALL));
         // The base protocol's types need no bit at all.
         assert!(text.negotiated_by(FeatureFlags::NONE));
