@@ -20,11 +20,11 @@ use crossover_core::supervision::{
     supervise_outbound,
 };
 use crossover_core::{
-    ClipboardConfig, ControlConfig, ControlNotice, CrossingKind, CrossingMap, EdgeCrossing,
-    EdgeDetectDriver, FileReceive, FileSend, FrameTarget, InputControlEvent, LiveLayout, LocalNode,
-    Metrics, OutboundSender, SeamlessInputs, SessionCommand, SessionListener, SessionOptions,
-    SyncEvent, clipboard_sync, edge_detect, implicit_crossing_source, input_control,
-    live_crossing_source, outbound_channel,
+    ClipboardConfig, ClipboardGrant, ControlConfig, ControlNotice, CrossingKind, CrossingMap,
+    EdgeCrossing, EdgeDetectDriver, FileReceive, FileSend, FrameTarget, InputControlEvent,
+    InputGrant, LiveLayout, LocalNode, Metrics, OutboundSender, SeamlessInputs, SessionCommand,
+    SessionListener, SessionOptions, SyncEvent, clipboard_sync, edge_detect,
+    implicit_crossing_source, input_control, live_crossing_source, outbound_channel,
 };
 use crossover_platform::DisplayInfo;
 use crossover_platform::SecureStorage;
@@ -34,15 +34,16 @@ use crossover_protocol::hello::{FeatureFlags, MessageType};
 use crossover_protocol::input::{InputBatch, WireInputEvent};
 use crossover_security::pairing::{PairedPeer, PairingCode, PairingIdentity};
 use crossover_security::{
-    CertifiedIdentity, DeviceIdentity, SpkiFingerprint, TrustStore, TrustedPeer,
+    CertifiedIdentity, DeviceIdentity, PeerPermissions, SpkiFingerprint, TrustStore, TrustedPeer,
 };
 use crossover_topology::{DeviceId, Layout};
 
 use crate::config::LayoutSource;
 use crate::console::{self, ConsoleCommand};
 use crate::storage::{
-    open_clipboard_provider, open_cursor_mask, open_display, open_file_blob_builder, open_input,
-    open_secure_storage, open_service_manager, open_spool, open_virtual_files,
+    open_clipboard_provider, open_cursor_mask, open_display, open_file_blob_builder,
+    open_image_converter, open_input, open_secure_storage, open_service_manager, open_spool,
+    open_virtual_files,
 };
 use crate::topology_state::{TopologyStateWriter, initial_state, watch_own_display};
 use crate::topology_sync::{TopologyEvent, TopologyHandle, TopologyInputs, TopologySync};
@@ -184,6 +185,35 @@ pub fn peers_list() -> anyhow::Result<()> {
                 "not allowed"
             }
         );
+        // Both clipboard directions, always, for the same auditability
+        // reason — and worded as what flows where, because the stored names
+        // (`clipboard_send`, `clipboard_receive`) read backwards from the
+        // peer's side.
+        let permissions = peer.permissions();
+        println!(
+            "      clipboard in:   {}",
+            if permissions.clipboard_receive {
+                "allowed (its copies reach your clipboard)"
+            } else {
+                "DENIED (its copies and files are refused)"
+            }
+        );
+        println!(
+            "      clipboard out:  {}",
+            if permissions.clipboard_send {
+                "allowed (your copies are sent to it)"
+            } else {
+                "DENIED (your copies stay here)"
+            }
+        );
+        // What the peer may do to *this* machine's input (ADR 0021), for
+        // every peer, granted or not.
+        let allowed = |granted: bool| if granted { "allowed" } else { "DENIED" };
+        println!(
+            "      input here:     keyboard {}, mouse {}",
+            allowed(permissions.keyboard),
+            allowed(permissions.mouse)
+        );
         if !peer.remembered_addresses().is_empty() {
             println!(
                 "      addresses:      {}",
@@ -197,6 +227,156 @@ pub fn peers_list() -> anyhow::Result<()> {
         "Let a peer send you files with `crossover peers allow-files <device-id>` \
          (`deny-files` to withdraw)."
     );
+    println!(
+        "Stop the clipboard with a peer with `crossover peers deny-clipboard <device-id> \
+         [--incoming] [--outgoing]` (`allow-clipboard` to restore)."
+    );
+    println!(
+        "Stop a peer driving this machine with `crossover peers deny-input <device-id> \
+         [--keyboard] [--mouse]` (`allow-input` to restore)."
+    );
+    Ok(())
+}
+
+/// `crossover peers allow-input <device-id>` / `peers deny-input
+/// <device-id>`, each optionally narrowed with `--keyboard` / `--mouse`
+/// (ADR 0021).
+///
+/// Local and explicit: nothing on the wire reaches these flags. A running
+/// worker applies a change on its next trust poll — to a peer controlling
+/// this machine at that moment, too: losing both kinds ends its control,
+/// and losing one releases whatever of that kind it holds down.
+pub fn peers_set_input(
+    device_id: Uuid,
+    keyboard: bool,
+    mouse: bool,
+    allowed: bool,
+) -> anyhow::Result<()> {
+    let storage = open_secure_storage()?;
+    let mut store = TrustStore::load(&*storage).context("loading trust store")?;
+    let unknown = || {
+        anyhow::anyhow!("no trusted peer with device id {device_id}; `crossover peers` lists them")
+    };
+
+    let mut changed = false;
+    if keyboard {
+        let previous = store.set_keyboard(device_id, allowed).ok_or_else(unknown)?;
+        changed |= previous != allowed;
+    }
+    if mouse {
+        let previous = store.set_mouse(device_id, allowed).ok_or_else(unknown)?;
+        changed |= previous != allowed;
+    }
+    let name = store
+        .find_by_peer_id(device_id)
+        .map_or_else(String::new, |peer| peer.device_name().to_owned());
+    let which = match (keyboard, mouse) {
+        (true, true) => "the keyboard and the pointer",
+        (true, false) => "the keyboard",
+        _ => "the pointer",
+    };
+
+    if !changed {
+        println!(
+            "\"{name}\" ({device_id}) was already {} {which} on this machine; nothing changed.",
+            if allowed { "allowed" } else { "denied" }
+        );
+        return Ok(());
+    }
+    store.save(&*storage).context("persisting trust store")?;
+    // Who may drive this machine, and since when, belongs in the log as
+    // well as on the terminal (NFR-3).
+    tracing::info!(
+        peer = %device_id,
+        keyboard = keyboard.then_some(allowed),
+        mouse = mouse.then_some(allowed),
+        "input permission changed"
+    );
+    if allowed {
+        println!("\"{name}\" ({device_id}) may now use {which} on this machine.");
+    } else {
+        println!(
+            "\"{name}\" ({device_id}) may no longer use {which} on this machine. A running \
+             Crossover applies this within a few seconds, including to control in progress."
+        );
+    }
+    Ok(())
+}
+
+/// `crossover peers allow-clipboard <device-id>` / `peers deny-clipboard
+/// <device-id>`, each optionally narrowed with `--incoming` / `--outgoing`
+/// (docs/SECURITY.md §4, T9).
+///
+/// Local and explicit, like the file verbs: nothing on the wire reaches
+/// these flags. Pairing grants both, so this is how a user narrows a
+/// pairing, and how they undo that. A running worker picks the change up
+/// on its next trust poll, without a reconnect.
+pub fn peers_set_clipboard(
+    device_id: Uuid,
+    incoming: bool,
+    outgoing: bool,
+    allowed: bool,
+) -> anyhow::Result<()> {
+    let storage = open_secure_storage()?;
+    let mut store = TrustStore::load(&*storage).context("loading trust store")?;
+
+    let mut changed = false;
+    if incoming {
+        let Some(previous) = store.set_clipboard_receive(device_id, allowed) else {
+            anyhow::bail!(
+                "no trusted peer with device id {device_id}; `crossover peers` lists them"
+            );
+        };
+        changed |= previous != allowed;
+    }
+    if outgoing {
+        let Some(previous) = store.set_clipboard_send(device_id, allowed) else {
+            anyhow::bail!(
+                "no trusted peer with device id {device_id}; `crossover peers` lists them"
+            );
+        };
+        changed |= previous != allowed;
+    }
+    let name = store
+        .find_by_peer_id(device_id)
+        .map_or_else(String::new, |peer| peer.device_name().to_owned());
+    let which = match (incoming, outgoing) {
+        (true, true) => "in either direction",
+        (true, false) => "into your clipboard (incoming)",
+        _ => "out of your clipboard (outgoing)",
+    };
+
+    if !changed {
+        println!(
+            "Clipboard with \"{name}\" ({device_id}) {which} was already {}; nothing changed.",
+            if allowed { "allowed" } else { "denied" }
+        );
+        return Ok(());
+    }
+    store.save(&*storage).context("persisting trust store")?;
+    // The record of who may reach whose clipboard, and when, belongs in the
+    // log as well as on the terminal (NFR-3), as the file grant's does.
+    tracing::info!(
+        peer = %device_id,
+        clipboard_receive = incoming.then_some(allowed),
+        clipboard_send = outgoing.then_some(allowed),
+        "clipboard permission changed"
+    );
+    if allowed {
+        println!("Clipboard with \"{name}\" ({device_id}) is now allowed {which}.");
+    } else {
+        println!(
+            "Clipboard with \"{name}\" ({device_id}) is now denied {which}. A running \
+             Crossover applies this within a few seconds; content already delivered \
+             stays where it is."
+        );
+        if incoming {
+            println!(
+                "Incoming covers files too: they reach you through your clipboard, so \
+                 this peer's files are refused whatever `allow-files` says."
+            );
+        }
+    }
     Ok(())
 }
 
@@ -575,6 +755,9 @@ fn setup_input_control(
     metrics: &Arc<Metrics>,
     no_cursor_mask: bool,
 ) -> anyhow::Result<InputControl> {
+    if !crate::storage::INPUT_AVAILABLE {
+        return Ok(input_unavailable());
+    }
     let local = DeviceId::from_bytes(*identity.device_id().as_bytes());
     let (capture, injector) = open_input()?;
     // Diagnostic switch: run without masking to isolate cursor behavior
@@ -630,6 +813,52 @@ fn setup_input_control(
     })
 }
 
+/// The input control of a clipboard-only run, on a platform whose input
+/// port has not landed ([`crate::storage::INPUT_AVAILABLE`]).
+///
+/// No control driver. The session fan-out and the console still need
+/// somewhere to send control events, so a task drains them — and says so
+/// where a user would otherwise be left guessing: a peer's control request
+/// is logged (it goes unanswered and times out on the peer), and a console
+/// request is answered on the terminal. The command lane is empty; closing
+/// it only ends its own forwarder in [`merge_command_lanes`].
+fn input_unavailable() -> InputControl {
+    let (events, mut drained) = mpsc::channel::<InputControlEvent>(64);
+    tokio::spawn(async move {
+        while let Some(event) = drained.recv().await {
+            match event {
+                InputControlEvent::Frame { session, frame }
+                    if frame.message_type
+                        == crossover_protocol::hello::MessageType::ControlRequest.wire() =>
+                {
+                    tracing::warn!(
+                        %session,
+                        "control request from the peer not answered: input is not \
+                         implemented on this platform yet, so this run is clipboard-only"
+                    );
+                }
+                InputControlEvent::RequestControl | InputControlEvent::ReleaseControl => {
+                    println!(
+                        "Input is not implemented on this platform yet; this run shares \
+                         the clipboard only."
+                    );
+                }
+                _ => {}
+            }
+        }
+    });
+    tracing::warn!(
+        "clipboard-only run: input capture, injection and display enumeration are not \
+         implemented on this platform yet (docs/ROADMAP.md Phase 9.1)"
+    );
+    let (_no_commands, commands) = crossover_core::outbound::command_lanes();
+    InputControl {
+        events,
+        commands,
+        layout_publisher: None,
+    }
+}
+
 /// What [`setup_input_control`] hands back to the composition root: the
 /// control driver's two ends, plus the seam an adopted arrangement is
 /// published through (ADR 0018).
@@ -650,8 +879,18 @@ struct InputControl {
 fn setup_clipboard_sync(
     device: Uuid,
     metrics: &Arc<Metrics>,
-) -> anyhow::Result<(mpsc::Sender<SyncEvent>, CommandReceiver, bool)> {
+) -> anyhow::Result<(mpsc::Sender<SyncEvent>, CommandReceiver, bool, FeatureFlags)> {
     let provider = open_clipboard_provider()?;
+    // What this machine advertises: every symmetric capability, plus the
+    // image formats this clipboard backend can actually install (ADR
+    // 0016). A promise to the peer, so it is read from the backend rather
+    // than assumed from the platform.
+    let advertised = FeatureFlags::ADVERTISED.with_image_formats(
+        provider
+            .installable_image_formats()
+            .iter()
+            .map(|format| wire_image_format(*format)),
+    );
     // The spool is opened (and swept) once per run. `None` means this run
     // cannot receive files — never a fallback to an unprotected directory,
     // which would void the guarantee the spool exists to make.
@@ -674,8 +913,45 @@ fn setup_clipboard_sync(
         Some(Arc::clone(metrics)),
     )
     .context("starting clipboard sync")?;
+    let driver = match open_image_converter() {
+        Some(converter) => driver.with_image_converter(converter),
+        None => driver,
+    };
     tokio::spawn(driver.run());
-    Ok((events, commands, file_paste_ready))
+    Ok((events, commands, file_paste_ready, advertised))
+}
+
+/// The wire name of a platform image format.
+fn wire_image_format(
+    format: crossover_platform::ClipboardImageFormat,
+) -> crossover_protocol::clipboard::ImageFormat {
+    use crossover_platform::ClipboardImageFormat as Platform;
+    use crossover_protocol::clipboard::ImageFormat as Wire;
+    match format {
+        Platform::Dib => Wire::Dib,
+        Platform::Png => Wire::Png,
+        Platform::Jpeg => Wire::Jpeg,
+    }
+}
+
+/// The image formats every live peer can install (ADR 0016): the install
+/// bits each session's negotiated features carry from its peer's own
+/// `Hello`, shared by all of them — the clipboard engine sends one item to
+/// everyone, so it may use only a format they all take. A session without
+/// chunked transfer takes no image at all.
+fn peer_image_formats(live: &[(SpkiFingerprint, FeatureFlags)]) -> FeatureFlags {
+    if live.is_empty() {
+        return FeatureFlags::NONE;
+    }
+    live.iter()
+        .fold(FeatureFlags::IMAGE_FORMATS, |shared, (_, features)| {
+            let installs = if features.contains(FeatureFlags::CHUNKED_CLIPBOARD) {
+                features.0 & FeatureFlags::IMAGE_FORMATS.0
+            } else {
+                0
+            };
+            FeatureFlags(shared.0 & installs)
+        })
 }
 
 /// What `apply_config_changes` needs to know about `config.toml` as of the
@@ -972,7 +1248,7 @@ pub async fn run(
 
     // Clipboard sync: one driver for the peer relationship; sessions of
     // either role feed it and carry its frames.
-    let (sync_events, sync_commands, file_paste_ready) =
+    let (sync_events, sync_commands, file_paste_ready, advertised) =
         setup_clipboard_sync(identity.device_id(), &metrics)?;
 
     // Input control: capture/inject, the transfer engine, cursor masking,
@@ -1008,7 +1284,6 @@ pub async fn run(
 
     // Session lifecycle and frames fan out to every driver; every driver's
     // commands merge back into the two priority lanes (ADR 0013).
-    let policy_events = sync_events.clone();
     let fanout = SessionFanout {
         sync: sync_events,
         control: control_events.clone(),
@@ -1020,9 +1295,8 @@ pub async fn run(
     };
     let commands = merge_command_lanes([sync_commands, control_commands, topology_commands]);
 
-    // How a disconnect finds out whether the local wire went down (the
-    // `local_link` field on session-end and connect-failure records).
-    let link_probe = crate::storage::open_link_state_probe();
+    // One set of establishment options for both roles.
+    let session_options = session_options(&metrics, advertised);
 
     // Outbound role: supervised session with automatic reconnect.
     let (handle, events) = start_outbound(
@@ -1030,8 +1304,7 @@ pub async fn run(
         &identity,
         &certified,
         &store,
-        &metrics,
-        &link_probe,
+        &session_options,
     );
 
     spawn_command_mux(Arc::clone(&registry), commands, Some(Arc::clone(&metrics)));
@@ -1060,7 +1333,7 @@ pub async fn run(
             &fanout,
             &registry,
             &metrics,
-            &link_probe,
+            &session_options,
         ) => {}
         () = outbound_event_loop(
             events,
@@ -1072,7 +1345,7 @@ pub async fn run(
         ) => {}
         // Act on trust-store edits made while this run is up: revocation
         // (ADR 0010) and the file-receive grant (ADR 0015).
-        () = apply_trust_changes(&storage, &registry, &policy_events, file_paste_ready) => {}
+        () = apply_trust_changes(&fanout) => {}
         // Re-read config.toml for a changed [layout] and drive the state
         // file's heartbeat (ADR 0018). A changed, valid, explicit layout
         // is offered to the layout-sync hub, which decides whether it is
@@ -1203,8 +1476,7 @@ fn start_outbound(
     identity: &DeviceIdentity,
     certified: &CertifiedIdentity,
     store: &TrustStore,
-    metrics: &Arc<Metrics>,
-    link_probe: &Arc<dyn crossover_platform::LinkStateProbe>,
+    session_options: &SessionOptions,
 ) -> (
     Option<Arc<crossover_core::supervision::SupervisorHandle>>,
     Option<mpsc::Receiver<SessionEvent>>,
@@ -1213,9 +1485,10 @@ fn start_outbound(
         return (None, None);
     };
     println!("Maintaining an outbound session to {addr}.");
-    let mut supervisor_config = SupervisorConfig::default();
-    supervisor_config.session.metrics = Some(Arc::clone(metrics));
-    supervisor_config.session.link_probe = Some(Arc::clone(link_probe));
+    let supervisor_config = SupervisorConfig {
+        session: session_options.clone(),
+        ..SupervisorConfig::default()
+    };
     let (handle, events) = supervise_outbound(
         addr.clone(),
         identity.clone(),
@@ -1224,6 +1497,19 @@ fn start_outbound(
         supervisor_config,
     );
     (Some(Arc::new(handle)), Some(events))
+}
+
+/// The establishment options both roles share: the metrics they count
+/// into, how a disconnect finds out whether the local wire went down (the
+/// `local_link` field on session-end and connect-failure records), and what
+/// this machine advertises (ADR 0016).
+fn session_options(metrics: &Arc<Metrics>, advertised: FeatureFlags) -> SessionOptions {
+    SessionOptions {
+        metrics: Some(Arc::clone(metrics)),
+        link_probe: Some(crate::storage::open_link_state_probe()),
+        advertised_features: advertised,
+        ..SessionOptions::default()
+    }
 }
 
 /// Which driver an inbound frame belongs to — the inbound counterpart of
@@ -1354,6 +1640,22 @@ impl SessionFanout {
     /// it is in hand.
     async fn established(&self, info: &crossover_core::SessionInfo) {
         let session = info.session_id;
+        // Before the fan-out, not after: `SessionEstablished` makes the
+        // clipboard driver re-read and re-announce, and that read is judged
+        // against these grants. Published afterwards, a granted peer's
+        // reconnect would meet the engine's closed default and its
+        // re-announcement would be refused. The session is already in the
+        // registry, so the grants include it.
+        self.publish_clipboard_grants().await;
+        // The input grant for this session's peer, before the control
+        // driver hears of the session, for the reason the clipboard grants
+        // go first: nothing about the session may be judged against a
+        // closed default it was never meant to meet (ADR 0021).
+        let grant = input_grant(&*self.storage, info.peer_fingerprint);
+        let _ = self
+            .control
+            .send(InputControlEvent::InputGrant { session, grant })
+            .await;
         self.fan_out(
             SyncEvent::SessionEstablished,
             InputControlEvent::SessionEstablished { session },
@@ -1386,7 +1688,24 @@ impl SessionFanout {
             .topology
             .send(TopologyEvent::SessionLost { session })
             .await;
+        self.publish_clipboard_grants().await;
         self.publish_file_policy().await;
+    }
+
+    /// Tell the clipboard driver what the trust store currently grants for
+    /// text and images in each direction (docs/SECURITY.md §4).
+    async fn publish_clipboard_grants(&self) {
+        let live = live_peer_fingerprints(&self.registry);
+        let (send, receive) = clipboard_grants(&*self.storage, &live);
+        let _ = self
+            .sync
+            .send(SyncEvent::ClipboardGrants { send, receive })
+            .await;
+        // What every live peer can install travels with the grants, and
+        // for the same reason: the reconnect re-announcement is judged
+        // against it (ADR 0016).
+        let formats = peer_image_formats(&live_peer_sessions(&self.registry));
+        let _ = self.sync.send(SyncEvent::PeerImageFormats(formats)).await;
     }
 
     /// Tell the clipboard driver what the trust store and the negotiated
@@ -1889,6 +2208,21 @@ fn describe_notice(notice: ControlNotice) -> String {
              neither machine now controls the other."
                 .to_owned()
         }
+        ControlNotice::PeerRequestNotPermitted => {
+            "The peer asked to control this machine and was refused: it holds no input \
+             grant here (`crossover peers allow-input`)."
+                .to_owned()
+        }
+        ControlNotice::PeerInputFiltered => {
+            "The peer sent input of a kind it is not granted on this machine; it was \
+             dropped (`crossover peers` shows its grants)."
+                .to_owned()
+        }
+        ControlNotice::PeerControlNotPermitted => {
+            "The peer's control of this machine ended: its input grant was withdrawn; \
+             input released."
+                .to_owned()
+        }
     }
 }
 
@@ -2076,6 +2410,66 @@ fn live_peer_sessions(registry: &SessionRegistry) -> Vec<(SpkiFingerprint, Featu
         .collect()
 }
 
+/// What the trust store grants for text and images right now:
+/// `(clipboard_send, clipboard_receive)` (docs/SECURITY.md §4, T9).
+///
+/// Judged over **all** live peers, for the reason [`file_receive_policy`]
+/// is: the engine is session-agnostic, so a grant it cannot attribute to
+/// one peer must hold for every peer it might reach. No live peer, or a
+/// store that will not load, is `Denied` both ways — a transient read
+/// failure must never *open* a clipboard to a peer. Both grants default
+/// **on** at pairing (`PeerPermissions::FULL`), so for a pair nobody has
+/// restricted this is `Allowed` both ways, as it always behaved.
+fn clipboard_grants(
+    storage: &dyn SecureStorage,
+    live: &[SpkiFingerprint],
+) -> (ClipboardGrant, ClipboardGrant) {
+    const CLOSED: (ClipboardGrant, ClipboardGrant) =
+        (ClipboardGrant::Denied, ClipboardGrant::Denied);
+    if live.is_empty() {
+        return CLOSED;
+    }
+    let Ok(trust) = TrustStore::load(storage) else {
+        return CLOSED;
+    };
+    let grant = |allowed: fn(&PeerPermissions) -> bool| {
+        let granted = live.iter().all(|fingerprint| {
+            trust
+                .find_by_fingerprint(*fingerprint)
+                .is_some_and(|peer| allowed(&peer.permissions()))
+        });
+        if granted {
+            ClipboardGrant::Allowed
+        } else {
+            ClipboardGrant::Denied
+        }
+    };
+    (
+        grant(|permissions| permissions.clipboard_send),
+        grant(|permissions| permissions.clipboard_receive),
+    )
+}
+
+/// What `fingerprint`'s peer may do to this machine's input (ADR 0021):
+/// the `keyboard` and `mouse` flags on this machine's record of it. Judged
+/// for one peer, because the control engine knows which session asks —
+/// unlike the clipboard grants, which must hold for every live peer. An
+/// unknown peer, or a store that will not load, grants nothing.
+fn input_grant(storage: &dyn SecureStorage, fingerprint: SpkiFingerprint) -> InputGrant {
+    let Ok(trust) = TrustStore::load(storage) else {
+        return InputGrant::default();
+    };
+    trust
+        .find_by_fingerprint(fingerprint)
+        .map_or_else(InputGrant::default, |peer| {
+            let permissions = peer.permissions();
+            InputGrant {
+                keyboard: permissions.keyboard,
+                mouse: permissions.mouse,
+            }
+        })
+}
+
 /// Whether peer files may be received right now (ADR 0015).
 ///
 /// Fail-closed at every step, and deliberately judged over **all** live
@@ -2195,12 +2589,18 @@ fn terminate_on_revocation(route: &SessionRoute) {
 /// poll, and without waiting for a reconnect.
 ///
 /// Never returns — runs as a branch of the foreground select.
-async fn apply_trust_changes(
-    storage: &Arc<dyn SecureStorage>,
-    registry: &SessionRegistry,
-    sync: &mpsc::Sender<SyncEvent>,
-    spool_open: bool,
-) {
+async fn apply_trust_changes(fanout: &SessionFanout) {
+    // The fan-out already holds everything the poll needs: the store, the
+    // live sessions, and the two drivers' channels the policies go to.
+    let SessionFanout {
+        storage,
+        registry,
+        sync,
+        control,
+        spool_open,
+        ..
+    } = fanout;
+    let spool_open = *spool_open;
     let mut ticker = tokio::time::interval(REVOCATION_POLL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -2233,6 +2633,23 @@ async fn apply_trust_changes(
                 &**storage, &sessions,
             )))
             .await;
+        let (send, receive) = clipboard_grants(&**storage, &fingerprints);
+        let _ = sync
+            .send(SyncEvent::ClipboardGrants { send, receive })
+            .await;
+        // Each live session's input grant, judged for its own peer: a
+        // withdrawn grant reaches a peer controlling this machine within one
+        // poll, and the engine gives the grant up or releases what it held
+        // (ADR 0021).
+        for (session, fingerprint) in &live {
+            let grant = input_grant(&**storage, *fingerprint);
+            let _ = control
+                .send(InputControlEvent::InputGrant {
+                    session: *session,
+                    grant,
+                })
+                .await;
+        }
         for id in revoked_session_ids(&live, &trust) {
             // Remove and terminate under the same intent; the session's own
             // teardown also removes by id (a harmless no-op) and fans out
@@ -2526,18 +2943,14 @@ async fn listener_loop(
     fanout: &SessionFanout,
     registry: &SessionRegistry,
     metrics: &Arc<Metrics>,
-    link_probe: &Arc<dyn crossover_platform::LinkStateProbe>,
+    // The same options the outbound role establishes with: the inbound
+    // role needs the same link diagnostic — a dropped local wire ends both
+    // directions at once, and the listener's log was just as misleading
+    // during the incident — and advertises the same capabilities.
+    options: &SessionOptions,
 ) {
     let Some(listener) = listener else {
         return std::future::pending().await;
-    };
-    let options = SessionOptions {
-        metrics: Some(Arc::clone(metrics)),
-        // The inbound role needs the same diagnostic as the outbound one:
-        // a dropped local wire ends both directions at once, and the
-        // listener's log was just as misleading during the incident.
-        link_probe: Some(Arc::clone(link_probe)),
-        ..SessionOptions::default()
     };
     let keepalive = KeepaliveConfig::default();
     loop {
@@ -2556,7 +2969,7 @@ async fn listener_loop(
             certified,
             trust: &trust,
         };
-        match listener.accept(&local, &options).await {
+        match listener.accept(&local, options).await {
             Ok(session) => {
                 let info = session.info().clone();
                 println!(
@@ -3554,6 +3967,127 @@ mod tests {
         lost.abort();
     }
 
+    /// The clipboard grants must reach the driver *before*
+    /// `SessionEstablished` does. Establishment makes the driver re-read and
+    /// re-announce the clipboard, and that read is judged against the
+    /// grants: announced first, a paired peer's reconnect would meet the
+    /// engine's closed default and its re-announcement would be refused —
+    /// on every reconnect, and silently.
+    #[tokio::test]
+    async fn a_new_session_publishes_clipboard_grants_before_announcing_itself() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::time::Instant;
+
+        use crossover_core::{
+            ClipboardGrant, InputControlEvent, InputGrant, SessionInfo, SyncEvent,
+        };
+        use crossover_platform::fakes::InMemorySecureStorage;
+        use crossover_protocol::hello::{FeatureFlags, OsFamily};
+        use crossover_security::{SpkiFingerprint, TrustStore, TrustedPeer};
+
+        use super::{FrameSink, SessionFanout, SessionRoute};
+
+        let peer = Uuid::from_bytes([1; 16]);
+        let fingerprint = SpkiFingerprint::from([1; 32]);
+        let storage = InMemorySecureStorage::new();
+        let mut trust = TrustStore::default();
+        trust
+            .add_peer(TrustedPeer::new(peer, "paired", fingerprint).unwrap())
+            .unwrap();
+        trust.save(&storage).unwrap();
+
+        // Registered before `established` runs, as the accept and dial
+        // paths both do.
+        let session = Uuid::from_bytes([0x66; 16]);
+        let (sink, _outbound) = outbound_channel();
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::from([(
+            session,
+            SessionRoute {
+                sink: FrameSink::Inbound(sink),
+                kill: None,
+                peer_fingerprint: fingerprint,
+                features: FeatureFlags::NONE,
+                established_at: Instant::now(),
+            },
+        )])));
+        let (sync, mut sync_rx) = tokio::sync::mpsc::channel(16);
+        let (control, mut control_rx) = tokio::sync::mpsc::channel(16);
+        let (topology, _topology_rx) = tokio::sync::mpsc::channel(16);
+        let fanout = SessionFanout {
+            sync,
+            control,
+            topology,
+            metrics: None,
+            storage: Arc::new(storage),
+            registry,
+            spool_open: false,
+        };
+
+        fanout
+            .established(&SessionInfo {
+                session_id: session,
+                peer_fingerprint: fingerprint,
+                peer_device_id: peer,
+                peer_device_name: "paired".to_owned(),
+                peer_os: OsFamily::Windows,
+                protocol_version: crossover_protocol::PROTOCOL_VERSION,
+                features: FeatureFlags::NONE,
+            })
+            .await;
+
+        let mut order = Vec::new();
+        while let Ok(event) = sync_rx.try_recv() {
+            order.push(event);
+        }
+        let grants = order.iter().position(|event| {
+            matches!(
+                event,
+                SyncEvent::ClipboardGrants {
+                    send: ClipboardGrant::Allowed,
+                    receive: ClipboardGrant::Allowed,
+                }
+            )
+        });
+        let formats = order
+            .iter()
+            .position(|event| matches!(event, SyncEvent::PeerImageFormats(_)));
+        let established = order
+            .iter()
+            .position(|event| matches!(event, SyncEvent::SessionEstablished));
+        assert!(
+            matches!((grants, established), (Some(g), Some(e)) if g < e),
+            "the grants must precede the session announcement: {order:?}"
+        );
+        // And what the peer can install, judged by the same re-read (ADR
+        // 0016).
+        assert!(
+            matches!((formats, established), (Some(f), Some(e)) if f < e),
+            "the peer's image formats must precede the session announcement: {order:?}"
+        );
+
+        // And on the control driver's channel, the session's input grant
+        // precedes its announcement (ADR 0021) — what pairing grants, both
+        // kinds, for this paired peer.
+        let mut control_order = Vec::new();
+        while let Ok(event) = control_rx.try_recv() {
+            control_order.push(event);
+        }
+        let input = control_order.iter().position(|event| {
+            matches!(
+                event,
+                InputControlEvent::InputGrant { session: s, grant } if *s == session && *grant == InputGrant::FULL
+            )
+        });
+        let announced = control_order
+            .iter()
+            .position(|event| matches!(event, InputControlEvent::SessionEstablished { .. }));
+        assert!(
+            matches!((input, announced), (Some(g), Some(e)) if g < e),
+            "the input grant must precede the session announcement: {control_order:?}"
+        );
+    }
+
     /// A stand-in fanout over shallow channels, for the inbound-routing
     /// tests. Nothing in them touches the trust store or the registry, so
     /// both are empty.
@@ -4097,6 +4631,148 @@ mod tests {
         assert_eq!(
             file_send_policy(&storage, &[(fingerprint(1), negotiated)]),
             FileSend::Denied
+        );
+    }
+
+    /// ADR 0021's grant, judged for one peer: what pairing grants is both
+    /// kinds, each kind follows its own flag, and an unknown peer or an
+    /// unreadable store grants nothing.
+    #[test]
+    fn the_input_grant_follows_this_peers_record_and_fails_closed() {
+        use crossover_core::InputGrant;
+        use crossover_platform::fakes::InMemorySecureStorage;
+        use crossover_security::{SpkiFingerprint, TrustStore, TrustedPeer};
+
+        use super::input_grant;
+
+        let storage = InMemorySecureStorage::new();
+        let id = Uuid::from_bytes([1; 16]);
+        let fingerprint = SpkiFingerprint::from([1; 32]);
+        let mut trust = TrustStore::default();
+        trust
+            .add_peer(TrustedPeer::new(id, "paired", fingerprint).unwrap())
+            .unwrap();
+        trust.save(&storage).unwrap();
+        assert_eq!(input_grant(&storage, fingerprint), InputGrant::FULL);
+
+        trust.set_keyboard(id, false).unwrap();
+        trust.save(&storage).unwrap();
+        assert_eq!(
+            input_grant(&storage, fingerprint),
+            InputGrant {
+                keyboard: false,
+                mouse: true,
+            }
+        );
+
+        assert_eq!(
+            input_grant(&storage, SpkiFingerprint::from([9; 32])),
+            InputGrant::default()
+        );
+        assert_eq!(
+            input_grant(&InMemorySecureStorage::new(), fingerprint),
+            InputGrant::default()
+        );
+    }
+
+    /// ADR 0016's formats, combined across live peers: each session's
+    /// install bits (which `FeatureFlags::negotiate` takes from the peer),
+    /// shared by all of them, and nothing from a session without chunked
+    /// transfer.
+    #[test]
+    fn peer_image_formats_are_what_every_live_peer_can_install() {
+        use crossover_protocol::clipboard::ImageFormat;
+        use crossover_protocol::hello::FeatureFlags;
+
+        use super::peer_image_formats;
+
+        let fp = |fill: u8| crossover_security::SpkiFingerprint::from([fill; 32]);
+        let windows =
+            FeatureFlags::ADVERTISED.with_image_formats([ImageFormat::Dib, ImageFormat::Png]);
+        let mac = FeatureFlags::ADVERTISED.with_image_formats([ImageFormat::Png]);
+        let no_chunks = FeatureFlags::NONE.with_image_formats([ImageFormat::Png]);
+
+        assert_eq!(peer_image_formats(&[]), FeatureFlags::NONE);
+        let one = peer_image_formats(&[(fp(1), windows)]);
+        assert!(one.can_install_image(ImageFormat::Dib) && one.can_install_image(ImageFormat::Png));
+        assert!(
+            !one.contains(FeatureFlags::CHUNKED_CLIPBOARD),
+            "only install bits are published"
+        );
+
+        let both = peer_image_formats(&[(fp(1), windows), (fp(2), mac)]);
+        assert!(!both.can_install_image(ImageFormat::Dib));
+        assert!(both.can_install_image(ImageFormat::Png));
+
+        assert_eq!(
+            peer_image_formats(&[(fp(3), no_chunks)]),
+            FeatureFlags::NONE
+        );
+    }
+
+    /// The text-and-image grants the engine is given (docs/SECURITY.md §4,
+    /// T9): what pairing grants is both directions, each direction is read
+    /// independently, and every uncertain answer — nobody connected, a peer
+    /// the store does not know, a store that will not load — is closed.
+    #[test]
+    fn clipboard_grants_follow_the_store_per_direction_and_fail_closed() {
+        use crossover_core::ClipboardGrant::{Allowed, Denied};
+        use crossover_platform::fakes::InMemorySecureStorage;
+        use crossover_security::{TrustStore, TrustedPeer};
+
+        use super::clipboard_grants;
+
+        fn fingerprint(fill: u8) -> crossover_security::SpkiFingerprint {
+            crossover_security::SpkiFingerprint::from([fill; 32])
+        }
+
+        let storage = InMemorySecureStorage::new();
+        let id = Uuid::from_bytes([1; 16]);
+        let mut trust = TrustStore::default();
+        trust
+            .add_peer(TrustedPeer::new(id, "paired", fingerprint(1)).unwrap())
+            .unwrap();
+        trust.save(&storage).unwrap();
+
+        // Nobody connected: nothing to grant.
+        assert_eq!(clipboard_grants(&storage, &[]), (Denied, Denied));
+        // What pairing grants: both directions.
+        assert_eq!(
+            clipboard_grants(&storage, &[fingerprint(1)]),
+            (Allowed, Allowed)
+        );
+
+        // `deny-clipboard --incoming`: only the receive grant closes.
+        trust.set_clipboard_receive(id, false).unwrap();
+        trust.save(&storage).unwrap();
+        assert_eq!(
+            clipboard_grants(&storage, &[fingerprint(1)]),
+            (Allowed, Denied)
+        );
+
+        // `deny-clipboard --outgoing` as well, then `allow-clipboard
+        // --incoming`: the directions move independently.
+        trust.set_clipboard_send(id, false).unwrap();
+        trust.set_clipboard_receive(id, true).unwrap();
+        trust.save(&storage).unwrap();
+        assert_eq!(
+            clipboard_grants(&storage, &[fingerprint(1)]),
+            (Denied, Allowed)
+        );
+
+        // An unknown fingerprint closes the door for the known peer beside
+        // it, as the file policies do: the engine cannot address one peer.
+        trust.set_clipboard_send(id, true).unwrap();
+        trust.save(&storage).unwrap();
+        assert_eq!(
+            clipboard_grants(&storage, &[fingerprint(1), fingerprint(9)]),
+            (Denied, Denied)
+        );
+
+        // A store that will not load never opens a clipboard.
+        assert_eq!(
+            clipboard_grants(&InMemorySecureStorage::new(), &[fingerprint(1)]),
+            (Denied, Denied)
         );
     }
 }

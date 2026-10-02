@@ -90,9 +90,16 @@ Hello
 `supported_features` is a bitmask, `FeatureFlags` in `crossover-protocol`.
 Rules, all of them deliberate:
 
-- **A feature is active only if both sides advertise it.** The session's
-  capability set is the *intersection* of the two `Hello`s
-  (`FeatureFlags::negotiate`), carried on `SessionInfo::features`.
+- **A symmetric feature is active only if both sides advertise it.**
+  For those bits the session's capability set is the *intersection* of the
+  two `Hello`s (`FeatureFlags::negotiate`), carried on
+  `SessionInfo::features`.
+- **Install bits are directional** (bits 2–4, since v7). They say which
+  image formats the advertiser can *install*, so what a side may send is
+  the peer's own install bits, not the intersection: a peer that installs
+  DIB and PNG is sent either, even by a side that can install only PNG
+  itself. `FeatureFlags::negotiate` combines the two kinds, so
+  `SessionInfo::features` is always "what may be sent to this peer".
 - **Unknown bits are ignored, never an error.** A future peer advertising
   bits this build does not know simply never activates them — the
   intersection drops them.
@@ -112,6 +119,18 @@ Rules, all of them deliberate:
 |-----|------|---------|
 | 0 | `CHUNKED_CLIPBOARD` | The peer can receive `ContentType::Image` items offered and streamed as `ClipboardChunk` messages, reassemble them, and install the result (ADR 0014) |
 | 1 | `FILE_CLIPBOARD` | The peer can receive `ContentType::File` items — an offer carrying a `FileDescriptor`, then the blob as `ClipboardChunk` messages — spool the result, and offer it to its own clipboard as a virtual file (ADR 0015) |
+| 2 | `IMAGE_DIB` | The advertiser can install `ImageFormat::Dib` on its clipboard (ADR 0016; directional) |
+| 3 | `IMAGE_PNG` | The advertiser can install `ImageFormat::Png` — ADR 0016's baseline for any build that installs images (directional) |
+| 4 | `IMAGE_JPEG` | The advertiser can install `ImageFormat::Jpeg` verbatim; never a conversion target (directional) |
+
+An image is sent only in a format its receiver advertised: an image's
+required capability is `CHUNKED_CLIPBOARD` plus the install bit for its
+format, and the clipboard engine refuses, observably, a local image no live
+peer can install rather than letting the send gate discover it. Which bits
+a build advertises comes from its clipboard backend
+(`ClipboardProvider::installable_image_formats`), not from the protocol:
+Windows advertises DIB and PNG, and a backend that installs no images
+advertises none.
 
 Bit 1 is deliberately **not** a widening of bit 0. A peer that implements
 ADR 0014 and not ADR 0015 advertises bit 0 and has no `File` discriminant,
@@ -202,6 +221,17 @@ read it as trailing data and fail the payload (§7, fatal). Both ends of the
 range move to 6. The same two facts pull the same two ways: a size is
 **proportion-only and never identity**, so nothing about crossing changes,
 and the byte is on the wire regardless.
+
+v6 → **v7** ([ADR 0016](adr/0016-image-interchange-format.md) and its
+2026-09-28 amendment) is the first bump with no change of shape at all:
+the install bits ride the `u64` that already travels. What changes is what
+an *empty* image set means. A v6 build advertises no install bits, and a v7
+sender reads that as "installs no images" and sends it none — silently from
+the user's side. So the rule applies to meaning as well as bytes: both ends
+of the range move to 7, and a mixed pair is refused at `Hello` instead of
+losing images without a word. v7 also appends `DenyReason::NotPermitted`
+(ADR 0021) — a change of shape, which v7 absorbs because it had not yet
+shipped.
 
 ## 4. Message classes
 
@@ -334,7 +364,8 @@ Rules specific to files:
   the receiver cannot honestly claim to already have one.
 - **Each refusal means something different**, and a sender may act on the
   difference: `NotPermitted` is a grant the user can give
-  (`crossover peers allow-files`); `UnsupportedType` is a receiver with no
+  (`crossover peers allow-files`, or `allow-clipboard --incoming` when the
+  peer's whole clipboard is refused); `UnsupportedType` is a receiver with no
   spool at all, which no permission will change; `InsufficientSpace` is
   this machine's free space or spool budget; `TooLarge` is the item's own
   ceiling; `NotReady` is a statement about now.
@@ -474,6 +505,9 @@ A -> B   ControlRelease   { entry }                    // relationship ends
 
 Rules, all fail-closed:
 
+- A peer the destination's user has not granted input answers `Denied`
+  with `NotPermitted`, ahead of every rule below (ADR 0021; appended in v7).
+  A granted peer's batches are applied only for the kinds it is granted.
 - Exactly one control relationship may exist (FR-5.1). A peer that is
   controlling, requesting, or already controlled answers `Denied` with the
   reason — so simultaneous requests from both sides deterministically

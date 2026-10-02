@@ -10,16 +10,18 @@ larger workstation, without weakening the security boundary between them.
 
 **Move. Type. Copy. Paste.**
 
-> **Status: v0.2.0 — text, images, files and folders, and a screen
-> arrangement you draw.** Two Windows machines pair with a typed one-time
-> code, hold a mutually authenticated TLS 1.3 session with automatic
+> **Status: v0.3.0 — text, images, files and folders, a screen
+> arrangement you draw, and per-peer control of clipboard and input.** Two
+> Windows machines pair with a typed one-time code, hold a mutually authenticated TLS 1.3 session with automatic
 > reconnection, share one keyboard and mouse across screen edges derived
 > from an arrangement drawn in `crossover layout`, run unattended as a
 > background service, and synchronize the clipboard in both directions —
 > **text, images, and files and folders** — all validated on two machines
-> over a wired link. The drawn topology has not yet completed its
-> two-machine soak. macOS and Linux come later (Phase 9). The
-> [roadmap](docs/ROADMAP.md) carries the authoritative current-phase marker.
+> over a wired link, and the drawn topology through an extended two-machine
+> soak. **Phase 9, macOS and Linux to full parity with Windows, is under
+> way**: a Mac built from source pairs and shares text today.
+> The [roadmap](docs/ROADMAP.md) carries the authoritative current-phase
+> marker.
 
 ## What it does
 
@@ -45,10 +47,9 @@ larger workstation, without weakening the security boundary between them.
 
 ## What it does not do yet
 
-- Send permission for **text and images** — `clipboard_send` is enforced for
-  files only; text and images still travel without consulting it
 - macOS and Linux — the platform boundary exists and the core compiles on
-  all three, but only the Windows implementations are written (Phase 9)
+  all three, but only the Windows implementations are written. That is
+  Phase 9, which starts next: macOS first, then Linux (Ubuntu 24.04)
 - Rearranging screens on a machine that holds no drawn arrangement takes one
   restart before an arrangement adopted from the peer drives the cursor
   ([ADR 0018](docs/adr/0018-drawn-display-topology.md))
@@ -81,7 +82,7 @@ crossover version --json   # the same, for scripts
 crossover -V               # just the version string
 ```
 
-A build that is not a tagged release says so — `0.2.0-dev.7.gabc1234.dirty`
+A build that is not a tagged release says so — `0.3.0-dev.7.gabc1234.dirty`
 names the commit it came from and admits to uncommitted edits.
 
 ## Arranging your screens
@@ -110,6 +111,27 @@ crossover peers allow-files <id>      # deny-files to withdraw
 
 File transfer is **off by default** for every peer and is the only way a peer
 can cause a write to your disk. Files are capped at 256 MiB.
+
+The clipboard itself is on for a paired peer, in both directions, and you can
+narrow it:
+
+```powershell
+crossover peers deny-clipboard <id>              # nothing either way
+crossover peers deny-clipboard <id> --incoming   # keep its copies (and files) out
+crossover peers deny-clipboard <id> --outgoing   # keep your copies here
+crossover peers allow-clipboard <id>             # restore; takes the same flags
+```
+
+A running Crossover applies the change within a few seconds.
+
+So is input — a paired peer may type and point on this machine — and you can
+narrow that too, even while it is in control:
+
+```powershell
+crossover peers deny-input <id>                  # it may not drive this machine
+crossover peers deny-input <id> --keyboard       # it may point but not type
+crossover peers allow-input <id>                 # restore; takes the same flags
+```
 
 ## Documentation
 

@@ -1,0 +1,38 @@
+[package]
+name = "crossover-platform-macos"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The macOS port (Phase 9.1, ADR 0020). Every framework dependency is
+# `cfg(target_os = "macos")`-gated below as each slice adds it, so nothing
+# Apple-specific enters the Windows or Linux dependency graph and the crate
+# compiles everywhere as an empty shell.
+[dependencies]
+crossover-platform = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true, features = ["std", "NSPasteboard"] }
+objc2-core-foundation = { workspace = true, features = ["std", "CFBase", "CFData", "CFDictionary", "CFNumber", "CFString"] }
+objc2-foundation = { workspace = true, features = ["std", "NSArray", "NSData", "NSString"] }
+objc2-security = { workspace = true, features = ["std", "SecItem", "SecBase"] }
+
+# The workspace forbids unsafe_code (NFR-6). This crate is the designated
+# exception for the macOS port (ADR 0020): framework FFI requires `unsafe`.
+# The relaxation is local and deliberate — unsafe stays minimized, isolated
+# here, documented with SAFETY comments, and covered by tests that run on
+# the macos-latest CI runners (docs/SPECIFICATION.md NFR-6,
+# docs/TESTING.md §1.6). The clippy tables mirror the workspace policy,
+# which cannot be partially inherited — the same shape as
+# crossover-platform-windows.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"

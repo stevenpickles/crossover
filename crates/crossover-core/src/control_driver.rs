@@ -132,6 +132,15 @@ pub enum InputControlEvent {
         /// Which request the timer guarded.
         request_id: u64,
     },
+    /// What `session`'s peer may do to this machine's input (ADR 0021), as
+    /// the application reads its trust store. Published before the session
+    /// is announced and on every trust-store poll.
+    InputGrant {
+        /// The session it applies to.
+        session: Uuid,
+        /// What is granted.
+        grant: crate::control::InputGrant,
+    },
 }
 
 /// The control driver. Create with [`input_control`], then spawn
@@ -471,6 +480,9 @@ impl InputControlDriver {
                     session,
                     request_id,
                 },
+                InputControlEvent::InputGrant { session, grant } => {
+                    ControlEvent::InputGrant { session, grant }
+                }
                 InputControlEvent::Frame { session, frame } => {
                     match InboundControl::decode(frame.message_type, &frame.payload) {
                         // The engine authorizes per session; it decides
@@ -1432,6 +1444,15 @@ mod tests {
 
     /// Bring a rig to the controlling state: request, grant, capture on.
     async fn make_controlling(rig: &mut Rig) {
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -1633,6 +1654,15 @@ mod tests {
     #[tokio::test]
     async fn a_return_hides_the_controlled_cursor_and_re_entry_shows_it() {
         let mut rig = rig();
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -1696,6 +1726,15 @@ mod tests {
     async fn local_input_wakes_a_hidden_cursor() {
         let mut rig = rig();
         rig.capture.set_last_input_tick(1000);
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -1744,6 +1783,15 @@ mod tests {
     async fn local_input_reclaims_the_peers_grant() {
         let mut rig = rig();
         rig.capture.set_last_input_tick(1000);
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -1806,6 +1854,15 @@ mod tests {
     #[tokio::test]
     async fn granted_peer_input_is_injected_and_released_on_disconnect() {
         let mut rig = rig();
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -1878,6 +1935,15 @@ mod tests {
     #[tokio::test]
     async fn malformed_control_payload_terminates_the_session() {
         let mut rig = rig();
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -1920,6 +1986,15 @@ mod tests {
     #[tokio::test]
     async fn failed_capture_start_releases_the_grant() {
         let mut rig = rig();
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -1966,6 +2041,15 @@ mod tests {
     #[tokio::test]
     async fn request_timeout_reverts_and_notifies() {
         let mut rig = rig();
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -1985,6 +2069,15 @@ mod tests {
     #[tokio::test]
     async fn peer_release_after_hand_back_finds_nothing_held() {
         let mut rig = rig();
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -2071,6 +2164,15 @@ mod tests {
         let mut rig = rig();
         // SESSION establishes and takes control: the machine IS being
         // driven by it.
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -2171,6 +2273,15 @@ mod tests {
     #[tokio::test]
     async fn a_second_peers_control_request_is_denied() {
         let mut rig = rig();
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -2191,7 +2302,16 @@ mod tests {
         let _grant = next_command(&mut rig).await;
         assert_eq!(next_notice(&mut rig).await, ControlNotice::PeerTookControl);
 
-        // A second peer establishes and requests control.
+        // A second peer establishes and requests control — trusted and
+        // granted input like the first, because what is under test is the
+        // single-holder rule, not the grant (ADR 0021).
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: OTHER_SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished {
                 session: OTHER_SESSION,
@@ -2238,6 +2358,15 @@ mod tests {
     #[tokio::test]
     async fn granted_keyboard_input_reaches_the_injector() {
         let mut rig = rig();
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -2352,6 +2481,15 @@ mod tests {
     async fn a_secure_desktop_releases_the_controlling_peer() {
         let mut rig = rig();
         // A peer takes control of this machine.
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -2692,6 +2830,15 @@ mod tests {
     #[tokio::test]
     async fn a_drawn_grant_places_the_cursor_on_the_named_monitor() {
         let mut rig = drawn_rig(false);
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -2742,6 +2889,15 @@ mod tests {
     async fn a_drawn_seam_sends_a_fully_addressed_entry_point() {
         tokio::time::pause();
         let mut rig = drawn_rig(true);
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -2798,6 +2954,15 @@ mod tests {
     #[tokio::test]
     async fn an_edge_request_places_the_cursor_on_grant() {
         let mut rig = rig();
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -2840,6 +3005,15 @@ mod tests {
     /// entered at mid-height so the cursor is placed on the linked column —
     /// exactly where a real transfer leaves it.
     async fn peer_takes_control_across_the_edge(rig: &mut Rig) {
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -3000,6 +3174,15 @@ mod tests {
     async fn a_crossing_detected_under_a_superseded_mode_is_dropped() {
         tokio::time::pause();
         let mut rig = rig();
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await
@@ -3064,6 +3247,15 @@ mod tests {
     async fn the_edge_mode_follows_the_control_state() {
         let mut rig = rig();
         // A session appears: now there is somewhere to cross to.
+        // A paired peer holds both input kinds (ADR 0021), published
+        // before the session as the application does.
+        rig.events
+            .send(InputControlEvent::InputGrant {
+                session: SESSION,
+                grant: crate::control::InputGrant::FULL,
+            })
+            .await
+            .unwrap();
         rig.events
             .send(InputControlEvent::SessionEstablished { session: SESSION })
             .await

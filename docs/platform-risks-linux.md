@@ -17,30 +17,66 @@ The traits a port must satisfy are in `crossover-platform`:
 
 ---
 
-## L-1 Wayland may make global input capture impossible, by design
+## L-1 Wayland gives an ordinary client no global input — the route has to be chosen
 
 This is the risk that decides the shape of the whole port, so it is first.
 
 Under **X11**, a client can capture and inject globally: `XTEST` for
-injection, `XInput2`/`XRecord` for capture. Under **Wayland**, that is
-deliberately prohibited — a client cannot see or synthesise input outside
-its own surfaces. The sanctioned routes are compositor-mediated
-(`xdg-desktop-portal`, the RemoteDesktop and InputCapture interfaces,
-`libei`), and support varies by compositor and version.
+injection, `XInput2`/`XRecord` for capture, `XQueryPointer` for the cursor.
+Under **Wayland** there is no separate display server to hook: the
+compositor *is* the display server, and it hands a client only the input
+aimed at that client's own surfaces, and no global pointer position. That
+is deliberate — it is what stops one application keylogging another — so it
+is not something to switch off. It is not a wall either: there are several
+routes around it, each with a cost, and **the port's first job is to
+choose one on evidence.**
 
-- **Threatens:** `InputCapture`, `InputInjector` — the entire input half of
-  the product.
-- **Consequence, stated plainly:** a first Linux port may have to be **X11
-  only**, with Wayland behind a documented limitation. That is a legitimate
-  outcome, but it should be a decision with a reason attached, not something
-  discovered halfway through.
-- **Verify first, before any other Linux work:** on current GNOME and KDE
-  Wayland sessions, whether the portal route can (a) capture input globally,
-  (b) inject it, and (c) do both without a per-session user consent dialog
-  that would break unattended operation (the Phase 6 property).
-- **Note:** an XWayland fallback does not rescue this. XWayland isolates X
-  clients from native Wayland surfaces, so capture there sees a subset of
-  the desktop — which would be worse than an honest refusal.
+The routes, as they are understood before any of them has been run here:
+
+1. **Portals and `libei`** — `xdg-desktop-portal`'s RemoteDesktop interface
+   (injection) and InputCapture interface (capture, including capture that
+   begins when the pointer reaches a screen edge). The sanctioned route, and
+   designed for exactly this class of tool. Support depends on the
+   compositor and its version; the user is asked for consent, and whether
+   that consent can be remembered across logins is the open question.
+2. **Beneath the compositor** — read the kernel's `evdev` devices for
+   capture and write through `uinput` for injection. Works under any
+   compositor, X11 or Wayland, and needs `root` or `input`-group access (L-3).
+   The kernel reports *motion*, not *screen position*, so on its own this
+   route has no cursor position for edge crossing (L-6) and no cursor hide
+   (L-7).
+3. **Inside the compositor** — a GNOME Shell extension (or KWin script) can
+   read the real pointer position and hide the cursor, which is exactly the
+   gap route 2 leaves. Compositor-specific, and extensions break across
+   GNOME releases, so it is a complement, not a foundation.
+4. **X11 session** ("Ubuntu on Xorg" at the login screen) — the safety net
+   if 1–3 fail the requirements below; a documented limitation, not a plan.
+
+An XWayland fallback does not help: XWayland isolates X clients from native
+Wayland surfaces, so capture there sees a subset of the desktop — which
+would be worse than an honest refusal.
+
+- **Threatens:** `InputCapture`, `InputInjector`, `DisplayInfo`,
+  `CursorMask` — the entire input half of the product.
+- **Target:** Ubuntu 24.04 LTS on its default GNOME Wayland session
+  (maintainer decision, 2026-09-28). Other desktops follow the same
+  evaluation later; KDE is not a Phase 9 gate.
+- **Requirements the chosen route must meet** (maintainer, 2026-09-28) —
+  all three, not a subset:
+  1. **Capture, inject, and track** the cursor's position across the
+     desktop — the full `InputCapture` / `InputInjector` / `DisplayInfo`
+     contract, so seamless edge crossing works as it does on Windows.
+  2. **Survive unattended startup** — the Phase 6 property: after a reboot
+     and login, Crossover works with no consent dialog to click through.
+  3. **Whatever privilege that takes** — privilege is accepted as a cost,
+     but it is a *recorded* cost: the route is decided by ADR, and the
+     capability it grants (a writable `uinput` or readable `evdev` is
+     system-wide input synthesis or observation) goes into
+     [SECURITY.md](SECURITY.md)'s threat model before it ships.
+- **Verify first, before any other Linux work:** a spike on the Ubuntu
+  24.04 machine that tries routes 1, then 2 + 3, against those three
+  requirements and records what each actually did. Its outcome is the
+  input-route ADR.
 
 ## L-2 The X11 clipboard is an ownership protocol, not a buffer
 
@@ -135,8 +171,10 @@ position outside their surfaces.
 
 - **Threatens:** `DisplayInfo`, and with it ADR 0009's edge crossing, which
   is defined in desktop coordinates.
-- **Consequence:** under Wayland, seamless edge transfer may be
-  unimplementable by the same mechanism even if input capture is solved.
+- **Consequence:** under Wayland, seamless edge transfer needs the pointer
+  position from somewhere other than the client API — the portal's
+  capture barriers or a compositor-side helper (L-1 routes 1 and 3). The
+  requirement stands; only the source is open.
 - **Verify:** what the portal route exposes about geometry, and whether
   fractional scaling reports a coordinate space consistent with the one
   injected events land in.
@@ -177,16 +215,23 @@ cross-platform interchange format**, and `CF_DIB` is the outlier.
 
 - **Threatens:** cross-platform image interop.
 - **Drafted once, for both platforms:**
-  [ADR 0016](adr/0016-image-interchange-format.md) (Proposed).
+  [ADR 0016](adr/0016-image-interchange-format.md) (Accepted 2026-09-28).
+  Its amendment permits a pure-Rust PNG codec here, for **local** content
+  only and fenced from the receive path, since Linux has no imaging API a
+  background service should depend on.
 
 ---
 
 ## The order this suggests
 
-L-1 is not one risk among nine; it decides whether the others matter. A
-Wayland session that cannot capture input makes L-6 and L-7 moot and turns
-the port into "X11 today, Wayland when the portals are ready".
+L-1 is not one risk among nine; it decides how the others are answered.
+The route it picks settles where the cursor position comes from (L-6),
+whether a cursor hide exists (L-7), which key-code mapping is needed (L-8),
+and what privilege the install asks for (L-3) — and the unattended
+requirement ties it to L-4 and L-5 as well.
 
-**Verify L-1 before writing any Linux code**, on current GNOME and KDE. The
-answer determines whether Phase 9's Linux half is a port or a research
-project, and that is worth knowing before a crate exists.
+**Spike L-1 before writing any Linux code**, on Ubuntu 24.04's GNOME
+Wayland session, against the three requirements recorded there, and record
+the chosen route as an ADR. That is the first Linux milestone of
+[ROADMAP.md](ROADMAP.md) Phase 9, and it is worth knowing before a crate
+exists.

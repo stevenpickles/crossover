@@ -28,16 +28,16 @@ use uuid::Uuid;
 
 use crossover_platform::{
     ClipboardContent, ClipboardError, ClipboardProvider, FileBlob, FileBlobBuilder,
-    FileBlobRefusal, SpoolError, SpoolStorage, VirtualFile, VirtualFileClipboard,
+    FileBlobRefusal, ImageConverter, SpoolError, SpoolStorage, VirtualFile, VirtualFileClipboard,
 };
 use crossover_protocol::RawFrame;
 use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied};
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::hello::{FeatureFlags, MessageType};
 
 use crate::clipboard::{
-    Action, BuiltBlob, ClipboardConfig, ClipboardEngine, FileReceive, FileRefusal, FileSend,
-    InboundMessage, MIN_FREE_SPACE_MARGIN_BYTES, OutboundMessage, SpooledFile, TransferScope,
-    WriteFailure,
+    Action, BuiltBlob, ClipboardConfig, ClipboardEngine, ClipboardGrant, FileReceive, FileRefusal,
+    FileSend, InboundMessage, MIN_FREE_SPACE_MARGIN_BYTES, OutboundMessage, SpooledFile,
+    TransferScope, WriteFailure, platform_format,
 };
 use crate::command::{FrameTarget, SessionCommand};
 use crate::metrics::Metrics;
@@ -184,6 +184,31 @@ pub enum SyncEvent {
     /// trust store. An event for the same reason its receiving twin is:
     /// both answers change while the process runs.
     FileSendPolicy(FileSend),
+    /// Whether this machine's text and image copies may be sent to the
+    /// peer, and whether the peer's items may reach this clipboard
+    /// (`clipboard_send`, `clipboard_receive`; docs/SECURITY.md §4), as the
+    /// application currently reads the trust store. One event for both,
+    /// because they are read from the same record at the same moment and
+    /// neither is clamped by anything this build lacks.
+    ClipboardGrants {
+        /// `clipboard_send`.
+        send: ClipboardGrant,
+        /// `clipboard_receive`.
+        receive: ClipboardGrant,
+    },
+    /// The image formats every live peer can install (ADR 0016), as the
+    /// application reads them from each session's negotiated features. An
+    /// event for the same reason the grants are: sessions come and go.
+    PeerImageFormats(FeatureFlags),
+    /// The converter answered for a local image (ADR 0016). An event
+    /// rather than a return value because conversion runs off the loop.
+    ImageConverted {
+        /// The conversion's id.
+        id: Uuid,
+        /// The converted bytes, or why there are none — diagnostic text,
+        /// never image content.
+        result: Result<Vec<u8>, String>,
+    },
     /// The builder finished with a local selection: one blob, or a typed
     /// refusal (ADR 0015).
     ///
@@ -256,6 +281,11 @@ pub struct ClipboardSyncDriver {
     /// degraded mode either: the engine is told file send is unsupported
     /// and every selection is refused observably.
     blob_builder: Option<Arc<dyn FileBlobBuilder>>,
+    /// Converts a local image into a format the peer installs (ADR 0016),
+    /// or `None` where this build has none — every conversion then answers
+    /// "unsupported" and the image is refused observably. Set with
+    /// [`ClipboardSyncDriver::with_image_converter`] before running.
+    image_converter: Option<Arc<dyn ImageConverter>>,
     /// The blob of the selection in flight, keyed by transaction. One at
     /// a time, structurally — a second build replaces it, and dropping it
     /// is what deletes the sender's temporary artifact.
@@ -348,6 +378,7 @@ pub fn clipboard_sync(
         file_write: None,
         virtual_files,
         blob_builder,
+        image_converter: None,
         file_blob: None,
         events_rx,
         events_tx: events_tx.clone(),
@@ -365,6 +396,15 @@ pub fn clipboard_sync(
 }
 
 impl ClipboardSyncDriver {
+    /// Convert local images with `converter` when the peer cannot install
+    /// their format (ADR 0016). Set before [`Self::run`]; without one,
+    /// such an image is refused observably.
+    #[must_use]
+    pub fn with_image_converter(mut self, converter: Arc<dyn ImageConverter>) -> Self {
+        self.image_converter = Some(converter);
+        self
+    }
+
     /// Record into the metrics sink if one is attached; a no-op otherwise.
     fn record(&self, f: impl FnOnce(&Metrics)) {
         if let Some(metrics) = &self.metrics {
@@ -446,18 +486,9 @@ impl ClipboardSyncDriver {
                 self.reset_read_backoff();
                 self.on_local_change()
             }
-            SyncEvent::ReadRetryDue => {
-                if self.clipboard_holds_our_file_offer() {
-                    // Nothing to look for, and looking would be the F13
-                    // loop: the retry chain ends here rather than
-                    // rendering our own offer back into the engine. A real
-                    // change re-arms everything.
-                    tracing::debug!("read retry skipped; the clipboard holds our own file list");
-                    Vec::new()
-                } else {
-                    vec![Action::ReadClipboard]
-                }
-            }
+            // Guarded against our own file list where every read is:
+            // [`Self::read_clipboard`].
+            SyncEvent::ReadRetryDue => vec![Action::ReadClipboard],
             SyncEvent::SpoolSweepDue => self.engine.on_spool_sweep_due(),
             SyncEvent::RetryDue(id) => self.engine.on_retry_due(id),
             SyncEvent::TransferTimeout { scope, generation } => {
@@ -490,6 +521,16 @@ impl ClipboardSyncDriver {
                 self.engine.set_file_send(policy);
                 Vec::new()
             }
+            SyncEvent::ClipboardGrants { send, receive } => {
+                self.engine.set_clipboard_send(send);
+                self.engine.set_clipboard_receive(receive);
+                Vec::new()
+            }
+            SyncEvent::PeerImageFormats(formats) => {
+                self.engine.set_peer_image_formats(formats);
+                Vec::new()
+            }
+            SyncEvent::ImageConverted { id, result } => self.engine.on_image_converted(id, result),
             SyncEvent::FileBlobBuilt { id, outcome } => match *outcome {
                 Ok(blob) => {
                     // Held here for the whole transaction: the engine gets
@@ -696,11 +737,25 @@ impl ClipboardSyncDriver {
     /// Read the provider and feed the result back, absorbing contention
     /// with the bounded nudge cycle the soak forced (see
     /// [`MAX_CONSECUTIVE_BUSY_READS`]).
+    ///
+    /// Every read passes through here, so this is where the F13 guard
+    /// holds for all of them — the settle read, the busy-read retry, and
+    /// the reconnect re-read alike. Our own virtual file list is not
+    /// content this build reads back, so the provider would answer
+    /// [`crossover_platform::ClipboardRead::Unreadable`] for it, and the engine takes that as a
+    /// user's copy (ADR 0005, addendum 2026-09-28): it would forget what
+    /// the clipboard holds and supersede a parked install on the strength
+    /// of our own object. Skipping the read ends a retry chain too; a real
+    /// change re-arms everything.
     fn read_clipboard(&mut self) -> Vec<Action> {
+        if self.clipboard_holds_our_file_offer() {
+            tracing::debug!("clipboard read skipped; the clipboard holds our own file list");
+            return Vec::new();
+        }
         match self.provider.read() {
-            Ok(content) => {
+            Ok(read) => {
                 self.reset_read_backoff();
-                self.engine.on_local_read(content)
+                self.engine.on_local_read(read)
             }
             Err(ClipboardError::Busy { reason }) => {
                 self.busy_reads += 1;
@@ -873,10 +928,12 @@ impl ClipboardSyncDriver {
     ///
     /// Its own function because the guard has to hold on **every** path
     /// that reaches a read, not only the notification path.
-    /// [`SyncEvent::ReadRetryDue`] is the second one, and it went straight
+    /// [`SyncEvent::ReadRetryDue`] was the second one, and it went straight
     /// to the provider — which would render our own offer back into the
     /// engine, the very loop the guard exists to prevent, reachable
-    /// whenever a contended read overlapped an outgoing file.
+    /// whenever a contended read overlapped an outgoing file. The reconnect
+    /// re-read was the third. All of them now meet it in
+    /// [`Self::read_clipboard`], the one place a read happens.
     fn clipboard_holds_our_file_offer(&self) -> bool {
         self.virtual_files
             .as_ref()
@@ -1130,6 +1187,35 @@ impl ClipboardSyncDriver {
         }
     }
 
+    /// Convert a local image on a blocking thread (ADR 0016), for the
+    /// reason [`Self::build_file_blob`] runs there: encoding a large image
+    /// is hundreds of milliseconds, and the loop must keep answering.
+    fn convert_image(
+        &mut self,
+        id: Uuid,
+        from: crossover_protocol::clipboard::ImageFormat,
+        to: crossover_protocol::clipboard::ImageFormat,
+        bytes: Vec<u8>,
+    ) -> Vec<Action> {
+        let Some(converter) = self.image_converter.clone() else {
+            // Answered rather than ignored, so the engine's pending
+            // conversion resolves — observably — instead of hanging until
+            // the next copy replaces it.
+            return self
+                .engine
+                .on_image_converted(id, Err("this build has no image converter".to_owned()));
+        };
+        let notify = self.events_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = converter
+                .convert(platform_format(from), platform_format(to), &bytes)
+                .map_err(|error| error.to_string());
+            // Blocking send for the reason `build_file_blob` gives.
+            let _ = notify.blocking_send(SyncEvent::ImageConverted { id, result });
+        });
+        Vec::new()
+    }
+
     /// Pack a local selection on a blocking thread (ADR 0015).
     ///
     /// Spawned rather than awaited inline, and the reason is the same one
@@ -1284,6 +1370,15 @@ impl ClipboardSyncDriver {
                 let more = self.build_file_blob(id, selection);
                 self.pending.extend(more);
             }
+            Action::ConvertImage {
+                id,
+                from,
+                to,
+                bytes,
+            } => {
+                let more = self.convert_image(id, from, to, bytes);
+                self.pending.extend(more);
+            }
             Action::SendFileChunk {
                 id,
                 index,
@@ -1325,7 +1420,7 @@ mod tests {
         ApplyResult, ClipboardApplied, ClipboardData, ClipboardDecline, ClipboardMeta,
         ClipboardOffer, ContentType, DeclineReason, FileDescriptor, chunk_content, content_hash,
     };
-    use crossover_protocol::hello::MessageType;
+    use crossover_protocol::hello::{FeatureFlags, MessageType};
 
     use super::{
         BusyWarnOnce, EVENT_CHANNEL_CAPACITY, MAX_DEFERRED_EVENTS, SessionCommand, SyncEvent,
@@ -1333,7 +1428,7 @@ mod tests {
     };
     use crossover_platform::SpoolError;
 
-    use crate::clipboard::{ClipboardConfig, FileReceive, FileSend, RetryPolicy};
+    use crate::clipboard::{ClipboardConfig, ClipboardGrant, FileReceive, FileSend, RetryPolicy};
     use crate::metrics::Metrics;
 
     struct Rig {
@@ -1396,6 +1491,17 @@ mod tests {
         )
         .unwrap();
         tokio::spawn(driver.run());
+        // A paired peer holds both clipboard grants, and the application
+        // publishes them before the session — so does the rig.
+        events
+            .try_send(SyncEvent::ClipboardGrants {
+                send: ClipboardGrant::Allowed,
+                receive: ClipboardGrant::Allowed,
+            })
+            .expect("a fresh event channel cannot be full");
+        events
+            .try_send(SyncEvent::PeerImageFormats(FeatureFlags::IMAGE_FORMATS))
+            .expect("a fresh event channel cannot be full");
         events
             .try_send(SyncEvent::SessionEstablished)
             .expect("a fresh event channel cannot be full");
@@ -1432,6 +1538,165 @@ mod tests {
             commands,
             metrics,
         }
+    }
+
+    /// Drop and re-establish the session, and give the driver time to take
+    /// the establishment read it schedules.
+    async fn reconnect(rig: &mut Rig) {
+        rig.events.send(SyncEvent::SessionLost).await.unwrap();
+        rig.events
+            .send(SyncEvent::SessionEstablished)
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), rig.commands.recv())
+                .await
+                .is_err(),
+            "a reconnect against this clipboard should send nothing"
+        );
+    }
+
+    /// F13 on the path it used to miss. The reconnect re-read went
+    /// straight to the provider, and our own virtual file list — not
+    /// content this build reads back — would come back `Unreadable`,
+    /// which the engine now takes for a user's copy (ADR 0005, addendum
+    /// 2026-09-28): it would forget what the clipboard holds and could
+    /// supersede a parked install on the strength of our own object.
+    ///
+    /// Whether a read happened is observed through an injected failure a
+    /// read would consume — and the second half proves that observation
+    /// is real, by letting a read happen once the clipboard moves on.
+    #[tokio::test]
+    async fn a_reconnect_does_not_read_our_own_file_list_back() {
+        use crossover_platform::{ClipboardProvider, VirtualFile};
+
+        let files = Arc::new(FakeVirtualFiles::new());
+        let mut rig = rig_with_spool(
+            None,
+            Some(Arc::clone(&files) as Arc<dyn VirtualFileClipboard>),
+        )
+        .await;
+        files
+            .offer(&VirtualFile {
+                entry: "00000000-0000-0000-0000-000000000001.bin".to_owned(),
+                file_name: "delivered.pdf".to_owned(),
+                byte_len: 16,
+            })
+            .unwrap();
+        rig.clipboard
+            .fail_next(ClipboardOp::Read, ClipboardFailure::Unavailable, 1);
+
+        reconnect(&mut rig).await;
+        assert!(
+            rig.clipboard.read().is_err(),
+            "the reconnect read the clipboard while it held our own file list"
+        );
+
+        // Control: with our object gone, the same reconnect does read.
+        files.moved_on();
+        rig.clipboard
+            .fail_next(ClipboardOp::Read, ClipboardFailure::Unavailable, 1);
+        reconnect(&mut rig).await;
+        assert!(
+            rig.clipboard.read().is_ok(),
+            "the reconnect never read the clipboard, so the check above proves nothing"
+        );
+    }
+
+    /// A driver with a paired, connected peer that installs only PNG, and
+    /// optionally a converter (ADR 0016).
+    async fn png_only_peer(
+        converter: Option<Arc<crossover_platform::fakes::FakeImageConverter>>,
+    ) -> (
+        Arc<InMemoryClipboard>,
+        crate::outbound::CommandReceiver,
+        mpsc::Sender<SyncEvent>,
+    ) {
+        let clipboard = Arc::new(InMemoryClipboard::new());
+        let (driver, events, commands) = clipboard_sync(
+            Arc::clone(&clipboard) as Arc<dyn crossover_platform::ClipboardProvider>,
+            None,
+            None,
+            None,
+            Uuid::from_bytes([0xAA; 16]),
+            ClipboardConfig {
+                transmit_debounce: Duration::from_millis(5),
+                ..ClipboardConfig::new()
+            },
+            None,
+        )
+        .unwrap();
+        let driver = match converter {
+            Some(converter) => driver
+                .with_image_converter(converter as Arc<dyn crossover_platform::ImageConverter>),
+            None => driver,
+        };
+        tokio::spawn(driver.run());
+        for event in [
+            SyncEvent::ClipboardGrants {
+                send: ClipboardGrant::Allowed,
+                receive: ClipboardGrant::Allowed,
+            },
+            SyncEvent::PeerImageFormats(FeatureFlags::IMAGE_PNG),
+            SyncEvent::SessionEstablished,
+        ] {
+            events.send(event).await.unwrap();
+        }
+        (clipboard, commands, events)
+    }
+
+    /// End to end through the driver (ADR 0016): a local DIB for a peer
+    /// that installs only PNG is converted off the loop and offered as a
+    /// PNG carrying exactly the converter's bytes.
+    #[tokio::test]
+    async fn a_local_image_is_converted_for_a_peer_that_installs_only_png() {
+        use crossover_platform::ClipboardImageFormat;
+        use crossover_platform::fakes::FakeImageConverter;
+        use crossover_protocol::clipboard::ImageFormat;
+
+        let converter = Arc::new(FakeImageConverter::new());
+        let (clipboard, mut commands, _events) = png_only_peer(Some(Arc::clone(&converter))).await;
+        let local = vec![0x5A; 70_000];
+        clipboard.set_image_locally(ClipboardImageFormat::Dib, local.clone());
+
+        let command = timeout(Duration::from_secs(5), commands.recv())
+            .await
+            .expect("the converted image was never offered")
+            .expect("command channel closed");
+        let SessionCommand::SendFrame { payload, .. } = command else {
+            panic!("expected SendFrame");
+        };
+        let offer = ClipboardOffer::decode_payload(&payload).unwrap();
+        let expected_png = FakeImageConverter::converted(ClipboardImageFormat::Png, &local);
+        assert_eq!(
+            offer.meta.content_type,
+            ContentType::Image(ImageFormat::Png)
+        );
+        assert_eq!(offer.meta.content_length, expected_png.len() as u64);
+        assert_eq!(offer.meta.content_hash, content_hash(&expected_png));
+        assert_eq!(converter.conversions(), 1);
+    }
+
+    /// Without a converter the same image is refused, observably, and the
+    /// driver keeps working: the text copied next is what reaches the wire.
+    #[tokio::test]
+    async fn without_a_converter_the_image_is_refused_and_text_still_flows() {
+        use crossover_platform::ClipboardImageFormat;
+
+        let (clipboard, mut commands, _events) = png_only_peer(None).await;
+        clipboard.set_image_locally(ClipboardImageFormat::Dib, vec![0x5A; 70_000]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        clipboard.set_text_locally("after the refused image");
+
+        let command = timeout(Duration::from_secs(5), commands.recv())
+            .await
+            .expect("nothing reached the wire")
+            .expect("command channel closed");
+        let SessionCommand::SendFrame { payload, .. } = command else {
+            panic!("expected SendFrame");
+        };
+        let data = ClipboardData::decode_payload(&payload).unwrap();
+        assert_eq!(data.content, b"after the refused image");
     }
 
     async fn next_command(rig: &mut Rig) -> SessionCommand {
@@ -1543,6 +1808,18 @@ mod tests {
 
         // The peer arrives: the item is offered without the user copying
         // it again (ADR 0006 trigger 3).
+        // Published before the session, as the application does.
+        events
+            .send(SyncEvent::ClipboardGrants {
+                send: ClipboardGrant::Allowed,
+                receive: ClipboardGrant::Allowed,
+            })
+            .await
+            .unwrap();
+        events
+            .send(SyncEvent::PeerImageFormats(FeatureFlags::IMAGE_FORMATS))
+            .await
+            .unwrap();
         events.send(SyncEvent::SessionEstablished).await.unwrap();
         let command = timeout(Duration::from_secs(5), commands.recv())
             .await
@@ -2105,6 +2382,17 @@ mod tests {
         )
         .unwrap();
         tokio::spawn(driver.run());
+        events
+            .send(SyncEvent::ClipboardGrants {
+                send: ClipboardGrant::Allowed,
+                receive: ClipboardGrant::Allowed,
+            })
+            .await
+            .unwrap();
+        events
+            .send(SyncEvent::PeerImageFormats(FeatureFlags::IMAGE_FORMATS))
+            .await
+            .unwrap();
 
         let meta = ClipboardMeta {
             id: Uuid::new_v4(),

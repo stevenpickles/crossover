@@ -17,6 +17,11 @@ libfuzzer-sys = "0.4"
 [dependencies.crossover-protocol]
 path = "../crates/crossover-protocol"
 
+# Only for its `dib` module, which is deliberately not Windows-gated: on
+# Linux the rest of the crate is an empty shell, so this adds no Win32.
+[dependencies.crossover-platform-windows]
+path = "../crates/crossover-platform-windows"
+
 [[bin]]
 name = "frame_decoder"
 path = "fuzz_targets/frame_decoder.rs"
@@ -97,6 +102,13 @@ bench = false
 [[bin]]
 name = "layout_sync"
 path = "fuzz_targets/layout_sync.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canonical_dib"
+path = "fuzz_targets/canonical_dib.rs"
 test = false
 doc = false
 bench = false

@@ -44,7 +44,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
-use crate::worker_supervisor::{WorkerAction, WorkerSupervisor, WorkerSupervisorConfig};
+use crate::worker_supervisor::{
+    WorkerAction, WorkerExit, WorkerSupervisor, WorkerSupervisorConfig,
+};
 
 /// Service key name; must match what [`crate::service::WindowsServiceManager`]
 /// registers.
@@ -234,7 +236,7 @@ fn supervise() {
                     if let Some(handle) = child.take() {
                         stop_child(&handle);
                     }
-                    supervisor.note_worker_exited(false, now_ms());
+                    supervisor.note_worker_exited(WorkerExit::Clean, now_ms());
                 }
                 WorkerAction::Idle => break,
                 WorkerAction::Stopped => {
@@ -274,10 +276,14 @@ fn supervise() {
         let exit_code = child.as_ref().and_then(child_exit_code);
         if let Some(code) = exit_code {
             child = None;
-            let crashed = code != 0;
+            let exit = WorkerExit::from_code(code);
             let exit_code_hex = format!("{code:#010x}");
-            tracing::info!(exit_code = code, %exit_code_hex, crashed, "worker exited");
-            supervisor.note_worker_exited(crashed, now_ms());
+            // `crashed` stays in the record for the log readers that key on
+            // it, now true only for an actual crash; `exit` says which of
+            // the three it was.
+            let crashed = exit == WorkerExit::Crashed;
+            tracing::info!(exit_code = code, %exit_code_hex, ?exit, crashed, "worker exited");
+            supervisor.note_worker_exited(exit, now_ms());
         }
     }
 }

@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crossover_core::supervision::{KeepaliveConfig, SessionEvent, run_session};
 use crossover_core::{
-    ClipboardConfig, ClipboardRetryPolicy, LocalNode, OutboundSender, SessionCommand,
-    SessionListener, SessionOptions, SyncEvent, clipboard_sync, outbound_channel,
+    ClipboardConfig, ClipboardGrant, ClipboardRetryPolicy, LocalNode, OutboundSender,
+    SessionCommand, SessionListener, SessionOptions, SyncEvent, clipboard_sync, outbound_channel,
 };
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::{ClipboardFailure, ClipboardOp, InMemoryClipboard};
@@ -37,7 +37,12 @@ struct AppSide {
     _shutdown: watch::Sender<bool>,
 }
 
-fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFlags) -> AppSide {
+fn spawn_app_side(
+    listener: SessionListener,
+    node: TestNode,
+    features: FeatureFlags,
+    peer_features: FeatureFlags,
+) -> AppSide {
     let clipboard = Arc::new(InMemoryClipboard::new());
     let (driver, sync_events, mut sync_commands) = clipboard_sync(
         Arc::clone(&clipboard) as Arc<dyn ClipboardProvider>,
@@ -77,12 +82,12 @@ fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFl
             trust: &trust,
         };
         let options = SessionOptions {
-            // What this side promises the peer. Production reads
-            // `FeatureFlags::ADVERTISED` (now `ALL`, since ADR 0014's
-            // platform slice); the suites below set it explicitly so each
-            // test states the negotiation it depends on rather than
-            // inheriting whatever the constant currently says
-            // (PROTOCOL.md §3.1).
+            // What this side promises the peer. Production advertises
+            // `FeatureFlags::ADVERTISED` plus the image formats its
+            // clipboard backend installs (ADR 0016); the suites below set
+            // it explicitly so each test states the negotiation it depends
+            // on rather than inheriting whatever the constant currently
+            // says (PROTOCOL.md §3.1).
             advertised_features: features,
             ..SessionOptions::default()
         };
@@ -102,6 +107,26 @@ fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFl
     let sync_events_clone = sync_events.clone();
     let outbound_for_glue = session_outbound_tx.clone();
     tokio::spawn(async move {
+        // Grants first, as the application publishes them: a paired peer
+        // holds both clipboard directions.
+        let _ = sync_events_clone
+            .send(SyncEvent::ClipboardGrants {
+                send: ClipboardGrant::Allowed,
+                receive: ClipboardGrant::Allowed,
+            })
+            .await;
+        // What the peer can install, as the application derives it: the
+        // install bits the negotiation takes from the peer's `Hello`, and
+        // none without chunked transfer (ADR 0016).
+        let sends = FeatureFlags::negotiate(features, peer_features);
+        let formats = if sends.contains(FeatureFlags::CHUNKED_CLIPBOARD) {
+            FeatureFlags(sends.0 & FeatureFlags::IMAGE_FORMATS.0)
+        } else {
+            FeatureFlags::NONE
+        };
+        let _ = sync_events_clone
+            .send(SyncEvent::PeerImageFormats(formats))
+            .await;
         let _ = sync_events_clone.send(SyncEvent::SessionEstablished).await;
         loop {
             tokio::select! {
@@ -132,6 +157,12 @@ fn spawn_app_side(listener: SessionListener, node: TestNode, features: FeatureFl
     }
 }
 
+/// A peer that can take images: chunked transfer, and the DIB format this
+/// side's images are copied in (ADR 0016).
+fn image_peer() -> FeatureFlags {
+    FeatureFlags(FeatureFlags::CHUNKED_CLIPBOARD.0 | FeatureFlags::IMAGE_DIB.0)
+}
+
 async fn connected_pair() -> (AppSide, TestConnection) {
     connected_pair_with(FeatureFlags::ADVERTISED, FeatureFlags::NONE).await
 }
@@ -151,7 +182,7 @@ async fn connected_pair_with(
 
     let mut peer_hello = peer.hello();
     peer_hello.supported_features = peer_features;
-    let side = spawn_app_side(listener, app, app_features);
+    let side = spawn_app_side(listener, app, app_features, peer_features);
     let mut conn = TestConnection::connect(addr, &peer).await.unwrap();
     conn.send_hello(&peer_hello).await.unwrap();
     let _app_hello = conn.expect_hello().await.unwrap();
@@ -391,8 +422,7 @@ fn image_meta(origin: u8, sequence: u64, bytes: &[u8]) -> ClipboardMeta {
 async fn an_offered_image_round_trips_over_a_real_session() {
     use crossover_platform::{ClipboardContent, ClipboardImageFormat};
 
-    let (side, mut conn) =
-        connected_pair_with(FeatureFlags::ALL, FeatureFlags::CHUNKED_CLIPBOARD).await;
+    let (side, mut conn) = connected_pair_with(FeatureFlags::ALL, image_peer()).await;
 
     let bytes = snip_bytes(MAX_CHUNK_BYTES * 3 + 17);
     let meta = image_meta(0xBB, 0, &bytes);
@@ -448,8 +478,7 @@ async fn an_offered_image_round_trips_over_a_real_session() {
 async fn a_local_image_is_offered_and_streamed_to_the_peer() {
     use crossover_platform::ClipboardImageFormat;
 
-    let (side, mut conn) =
-        connected_pair_with(FeatureFlags::ALL, FeatureFlags::CHUNKED_CLIPBOARD).await;
+    let (side, mut conn) = connected_pair_with(FeatureFlags::ALL, image_peer()).await;
 
     let bytes = snip_bytes(MAX_CHUNK_BYTES * 2 + 5);
     side.clipboard
@@ -515,8 +544,7 @@ async fn a_local_image_is_offered_and_streamed_to_the_peer() {
 async fn an_image_that_already_matches_is_declined_with_no_bytes_behind_it() {
     use crossover_platform::ClipboardImageFormat;
 
-    let (side, mut conn) =
-        connected_pair_with(FeatureFlags::ALL, FeatureFlags::CHUNKED_CLIPBOARD).await;
+    let (side, mut conn) = connected_pair_with(FeatureFlags::ALL, image_peer()).await;
 
     // Pay the full cost once: the app copies a snip and streams it out.
     let bytes = snip_bytes(MAX_CHUNK_BYTES * 2 + 5);
@@ -625,8 +653,10 @@ async fn an_un_negotiated_image_never_reaches_the_wire_and_text_still_flows() {
 async fn two_default_builds_negotiate_image_transfer_with_no_overrides() {
     use crossover_platform::ClipboardImageFormat;
 
-    let (side, mut conn) =
-        connected_pair_with(FeatureFlags::ADVERTISED, FeatureFlags::ADVERTISED).await;
+    // What a shipped Windows build advertises: every symmetric bit, plus
+    // the formats its clipboard backend installs (ADR 0016).
+    let shipped = FeatureFlags::ADVERTISED.with_image_formats([ImageFormat::Dib, ImageFormat::Png]);
+    let (side, mut conn) = connected_pair_with(shipped, shipped).await;
 
     let bytes = snip_bytes(MAX_CHUNK_BYTES + 9);
     side.clipboard

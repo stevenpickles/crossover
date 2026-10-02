@@ -13,7 +13,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 
-use crossover_platform::{SecureStorage, SecureStorageError};
+use crossover_platform::{SecureStorage, SecureStorageError, validate_storage_key};
 use windows::Win32::Foundation::LocalFree;
 use windows::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
@@ -25,9 +25,6 @@ use windows::core::PCWSTR;
 /// DPAPI with no entropy cannot accidentally decrypt our blobs (and vice
 /// versa). Versioned with the storage layout.
 const APP_ENTROPY: &[u8] = b"crossover-secure-storage-v1";
-
-/// Longest accepted storage key, in bytes.
-const MAX_KEY_BYTES: usize = 128;
 
 /// File-per-key DPAPI store rooted at a directory.
 #[derive(Debug)]
@@ -62,7 +59,9 @@ impl DpapiSecureStorage {
     }
 
     fn path_for(&self, key: &str) -> Result<PathBuf, SecureStorageError> {
-        validate_key(key)?;
+        // Keys become file names here, one reason the shared rule rejects
+        // rather than escapes.
+        validate_storage_key(key)?;
         Ok(self.root.join(format!("{key}.bin")))
     }
 }
@@ -106,28 +105,6 @@ impl SecureStorage for DpapiSecureStorage {
             Err(e) => Err(backend("deleting secure storage file", &e)),
         }
     }
-}
-
-/// Keys become file names, so they are validated, never sanitized: a key
-/// the contract cannot represent literally is rejected outright (no
-/// traversal, no reserved names, no surprise collisions from escaping).
-fn validate_key(key: &str) -> Result<(), SecureStorageError> {
-    let starts_alphanumeric = key
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric());
-    let charset_ok = key
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    if key.is_empty() || key.len() > MAX_KEY_BYTES || !starts_alphanumeric || !charset_ok {
-        return Err(SecureStorageError::Backend {
-            reason: format!(
-                "invalid storage key {key:?}: keys are 1..={MAX_KEY_BYTES} bytes of \
-                 [A-Za-z0-9._-] starting alphanumeric"
-            ),
-        });
-    }
-    Ok(())
 }
 
 fn backend(context: &str, error: &dyn std::fmt::Display) -> SecureStorageError {

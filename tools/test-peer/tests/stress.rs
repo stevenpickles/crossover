@@ -21,13 +21,14 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crossover_core::{
-    ClipboardConfig, ClipboardRetryPolicy, Metrics, SessionCommand, SyncEvent, clipboard_sync,
+    ClipboardConfig, ClipboardGrant, ClipboardRetryPolicy, Metrics, SessionCommand, SyncEvent,
+    clipboard_sync,
 };
 use crossover_platform::ClipboardProvider;
 use crossover_platform::fakes::InMemoryClipboard;
 use crossover_protocol::RawFrame;
 use crossover_protocol::clipboard::{ApplyResult, ClipboardApplied, ClipboardData};
-use crossover_protocol::hello::MessageType;
+use crossover_protocol::hello::{FeatureFlags, MessageType};
 
 /// Exit criteria minimum (docs/ROADMAP.md Phase 2).
 const DEFAULT_UPDATES: usize = 10_000;
@@ -64,11 +65,18 @@ fn side(origin: u8) -> Side {
             retry: ClipboardRetryPolicy {
                 max_attempts: 5,
                 delay: Duration::from_millis(1),
-                // Compressed like the fast phase above, for the same
-                // reason: the gate measures throughput, and the parked
-                // phase is only reached under injected contention.
+                // The cadence is compressed like the fast phase above, for
+                // the same reason: the gate measures throughput, and the
+                // parked phase is only reached under injected contention.
                 park_delay: Duration::from_millis(1),
-                park_budget: Duration::from_millis(50),
+                // The budget is not compressed, because it is wall-clock
+                // time and the contention test asserts that injected
+                // busyness is *absorbed*, not absorbed within a deadline a
+                // loaded CI runner may miss: 50 ms failed once on a macOS
+                // runner (item 294, eight injected busy writes). A generous
+                // budget costs the happy path nothing — an item completes
+                // the moment a write succeeds — and it is still bounded.
+                park_budget: Duration::from_secs(10),
             },
             // The gate measures transaction throughput, not the debounce
             // (ADR 0006 has its own tests). Zero means transmit eagerly:
@@ -81,6 +89,17 @@ fn side(origin: u8) -> Side {
     )
     .unwrap();
     tokio::spawn(driver.run());
+    // Two paired peers: pairing grants both clipboard directions, and the
+    // application publishes them before any session — so does the gate.
+    events
+        .try_send(SyncEvent::ClipboardGrants {
+            send: ClipboardGrant::Allowed,
+            receive: ClipboardGrant::Allowed,
+        })
+        .expect("a fresh event channel cannot be full");
+    events
+        .try_send(SyncEvent::PeerImageFormats(FeatureFlags::IMAGE_FORMATS))
+        .expect("a fresh event channel cannot be full");
     Side {
         clipboard,
         events,

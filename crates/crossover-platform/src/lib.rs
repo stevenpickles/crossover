@@ -21,12 +21,13 @@ pub mod virtual_file;
 
 pub use clipboard::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
-    MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
+    ClipboardRead, ImageConvertError, ImageConverter, MAX_CLIPBOARD_FILE_ENTRIES,
+    MAX_CLIPBOARD_IMAGE_BYTES,
 };
 pub use cursor::{CursorMask, CursorMaskError, NoopCursorMask};
 pub use display::{
     CursorPoint, DisplayError, DisplayInfo, MonitorDescription, MonitorInfo, MonitorRect,
-    PhysicalSizeMm, Screen,
+    PhysicalSizeMm, Screen, UnavailableDisplayInfo,
 };
 pub use file_blob::{
     BlobNaming, FileBlob, FileBlobBuilder, FileBlobRefusal, MAX_ARCHIVE_DEPTH,
@@ -37,7 +38,9 @@ pub use input::{
     PointerEvent, SCROLL_UNITS_PER_DETENT, hid,
 };
 pub use link::{LinkState, LinkStateProbe, UnknownLinkStateProbe};
-pub use secure_storage::{SecureStorage, SecureStorageError};
+pub use secure_storage::{
+    MAX_STORAGE_KEY_BYTES, SecureStorage, SecureStorageError, validate_storage_key,
+};
 pub use service::{ServiceError, ServiceManager, ServiceStatus, UnsupportedServiceManager};
 pub use spool::{
     MAX_SPOOL_ENTRY_NAME_BYTES, MAX_SPOOL_ENUMERATED_OBJECTS, SpoolEntry, SpoolError, SpoolStorage,

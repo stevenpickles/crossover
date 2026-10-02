@@ -157,7 +157,7 @@ struct PairArgs {
     bind: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq, Subcommand)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
 enum PeersAction {
     /// Revoke a trusted peer by device id (`crossover peers` lists them).
     Remove {
@@ -175,6 +175,88 @@ enum PeersAction {
         /// The peer's device id (UUID).
         device_id: Uuid,
     },
+    /// Let clipboard text and images flow with a trusted peer again. Both
+    /// directions unless one is named; pairing grants both.
+    AllowClipboard {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+        #[command(flatten)]
+        directions: ClipboardDirections,
+    },
+    /// Stop clipboard text and images flowing with a trusted peer. Both
+    /// directions unless one is named. `--incoming` also stops the peer's
+    /// files, which reach you through your clipboard.
+    DenyClipboard {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+        #[command(flatten)]
+        directions: ClipboardDirections,
+    },
+    /// Let a trusted peer drive this machine's keyboard and pointer again.
+    /// Both unless one is named; pairing grants both (ADR 0021).
+    AllowInput {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+        #[command(flatten)]
+        kinds: InputKinds,
+    },
+    /// Stop a trusted peer driving this machine's keyboard and pointer.
+    /// Both unless one is named. Takes effect within seconds, including on
+    /// a peer controlling this machine right now.
+    DenyInput {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+        #[command(flatten)]
+        kinds: InputKinds,
+    },
+}
+
+/// Which kinds of input a grant verb acts on (ADR 0021). Neither flag
+/// means both: the common intent is "this peer and my machine", and naming
+/// a kind is the refinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Args)]
+struct InputKinds {
+    /// Typing on this machine (`keyboard`).
+    #[arg(long)]
+    keyboard: bool,
+    /// Moving and clicking the pointer on this machine (`mouse`).
+    #[arg(long)]
+    mouse: bool,
+}
+
+impl InputKinds {
+    /// `(keyboard, mouse)`, with "neither named" meaning both.
+    fn resolve(self) -> (bool, bool) {
+        if self.keyboard || self.mouse {
+            (self.keyboard, self.mouse)
+        } else {
+            (true, true)
+        }
+    }
+}
+
+/// Which clipboard directions a grant verb acts on. Neither flag means
+/// both: the common intent is "this peer and my clipboard", and naming a
+/// direction is the refinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Args)]
+struct ClipboardDirections {
+    /// The peer's copies reaching your clipboard (`clipboard_receive`).
+    #[arg(long)]
+    incoming: bool,
+    /// Your copies being sent to the peer (`clipboard_send`).
+    #[arg(long)]
+    outgoing: bool,
+}
+
+impl ClipboardDirections {
+    /// `(incoming, outgoing)`, with "neither named" meaning both.
+    fn resolve(self) -> (bool, bool) {
+        if self.incoming || self.outgoing {
+            (self.incoming, self.outgoing)
+        } else {
+            (true, true)
+        }
+    }
 }
 
 #[tokio::main]
@@ -265,6 +347,43 @@ fn protocol_fields() -> [(&'static str, build_info::Value); 2] {
             build_info::Value::Num(u64::from(supported.min)),
         ),
     ]
+}
+
+/// `crossover peers` and its verbs: listing, revocation, and the per-peer
+/// grants (files, and the clipboard in each direction).
+fn dispatch_peers(action: Option<PeersAction>) -> anyhow::Result<()> {
+    match action {
+        None => commands::peers_list(),
+        Some(PeersAction::Remove { device_id }) => commands::peers_remove(device_id),
+        Some(PeersAction::AllowFiles { device_id }) => {
+            commands::peers_set_file_receive(device_id, true)
+        }
+        Some(PeersAction::DenyFiles { device_id }) => {
+            commands::peers_set_file_receive(device_id, false)
+        }
+        Some(PeersAction::AllowClipboard {
+            device_id,
+            directions,
+        }) => {
+            let (incoming, outgoing) = directions.resolve();
+            commands::peers_set_clipboard(device_id, incoming, outgoing, true)
+        }
+        Some(PeersAction::DenyClipboard {
+            device_id,
+            directions,
+        }) => {
+            let (incoming, outgoing) = directions.resolve();
+            commands::peers_set_clipboard(device_id, incoming, outgoing, false)
+        }
+        Some(PeersAction::AllowInput { device_id, kinds }) => {
+            let (keyboard, mouse) = kinds.resolve();
+            commands::peers_set_input(device_id, keyboard, mouse, true)
+        }
+        Some(PeersAction::DenyInput { device_id, kinds }) => {
+            let (keyboard, mouse) = kinds.resolve();
+            commands::peers_set_input(device_id, keyboard, mouse, false)
+        }
+    }
 }
 
 /// Route the parsed command to its handler. Separate from `main` so every
@@ -359,16 +478,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 None => commands::pair_listen(&device_name, args.bind).await,
             }
         }
-        Command::Peers { action } => match action {
-            None => commands::peers_list(),
-            Some(PeersAction::Remove { device_id }) => commands::peers_remove(device_id),
-            Some(PeersAction::AllowFiles { device_id }) => {
-                commands::peers_set_file_receive(device_id, true)
-            }
-            Some(PeersAction::DenyFiles { device_id }) => {
-                commands::peers_set_file_receive(device_id, false)
-            }
-        },
+        Command::Peers { action } => dispatch_peers(action),
         Command::Status => commands::status(&storage::resolve_device_name(cli.name)),
         Command::Config => commands::config_show(),
         Command::Version { json } => {
@@ -587,6 +697,100 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn clipboard_permission_verbs_name_one_peer_and_default_to_both_directions() {
+        let id: Uuid = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8".parse().unwrap();
+        let id_text = id.to_string();
+        let parse = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Peers {
+                action: Some(action),
+            } = cli.command
+            else {
+                panic!("expected a peers action for {args:?}");
+            };
+            action
+        };
+        let directions = |action: PeersAction| match action {
+            PeersAction::AllowClipboard {
+                device_id,
+                directions,
+            }
+            | PeersAction::DenyClipboard {
+                device_id,
+                directions,
+            } => {
+                assert_eq!(device_id, id);
+                directions.resolve()
+            }
+            other => panic!("expected a clipboard verb, got {other:?}"),
+        };
+
+        for verb in ["allow-clipboard", "deny-clipboard"] {
+            assert_eq!(
+                directions(parse(&["crossover", "peers", verb, &id_text])),
+                (true, true),
+                "{verb} with no direction must act on both"
+            );
+            assert_eq!(
+                directions(parse(&["crossover", "peers", verb, &id_text, "--incoming"])),
+                (true, false)
+            );
+            assert_eq!(
+                directions(parse(&["crossover", "peers", verb, &id_text, "--outgoing"])),
+                (false, true)
+            );
+            assert_eq!(
+                directions(parse(&[
+                    "crossover",
+                    "peers",
+                    verb,
+                    &id_text,
+                    "--incoming",
+                    "--outgoing",
+                ])),
+                (true, true)
+            );
+            // One peer, by device id, as the file verbs require.
+            assert!(Cli::try_parse_from(["crossover", "peers", verb]).is_err());
+            assert!(Cli::try_parse_from(["crossover", "peers", verb, "all"]).is_err());
+        }
+    }
+
+    #[test]
+    fn input_permission_verbs_name_one_peer_and_default_to_both_kinds() {
+        let id: Uuid = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8".parse().unwrap();
+        let id_text = id.to_string();
+        let kinds = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Peers {
+                action:
+                    Some(
+                        PeersAction::AllowInput { device_id, kinds }
+                        | PeersAction::DenyInput { device_id, kinds },
+                    ),
+            } = cli.command
+            else {
+                panic!("expected an input verb for {args:?}");
+            };
+            assert_eq!(device_id, id);
+            kinds.resolve()
+        };
+        for verb in ["allow-input", "deny-input"] {
+            assert_eq!(kinds(&["crossover", "peers", verb, &id_text]), (true, true));
+            assert_eq!(
+                kinds(&["crossover", "peers", verb, &id_text, "--keyboard"]),
+                (true, false)
+            );
+            assert_eq!(
+                kinds(&["crossover", "peers", verb, &id_text, "--mouse"]),
+                (false, true)
+            );
+            assert!(Cli::try_parse_from(["crossover", "peers", verb]).is_err());
+            assert!(Cli::try_parse_from(["crossover", "peers", verb, "all"]).is_err());
+        }
     }
 
     #[test]

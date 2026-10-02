@@ -251,7 +251,12 @@ impl ContentType {
     pub const fn required_feature(self) -> FeatureFlags {
         match self {
             Self::Utf8Text => FeatureFlags::NONE,
-            Self::Image(_) => FeatureFlags::CHUNKED_CLIPBOARD,
+            // Chunked transfer, and the peer's install bit for this
+            // format (ADR 0016): an image the peer cannot install is not
+            // sent, rather than sent and refused.
+            Self::Image(format) => FeatureFlags(
+                FeatureFlags::CHUNKED_CLIPBOARD.0 | FeatureFlags::image_format(format).0,
+            ),
             // A separate bit from images, and necessarily so: an ADR 0014
             // peer advertises CHUNKED_CLIPBOARD and has no `File`
             // discriminant, so sending it one is fatal to its session
@@ -541,8 +546,9 @@ pub enum DeclineReason {
     UnsupportedType,
     /// The receiver has not been granted the permission this item needs
     /// — `file_receive` for a file item, which is default-off and not
-    /// part of `PeerPermissions::FULL` (ADR 0015). Permanent for the
-    /// session, and deliberately distinct from
+    /// part of `PeerPermissions::FULL` (ADR 0015), or `clipboard_receive`
+    /// for any item at all, which pairing grants and the user can
+    /// withdraw. Permanent for the session, and deliberately distinct from
     /// [`DeclineReason::UnsupportedType`]: the type is understood, the
     /// user simply has not consented to it.
     NotPermitted,
@@ -1396,7 +1402,10 @@ pub enum ApplyResult {
     /// The destination clipboard stayed unavailable through the bounded
     /// retry budget (FR-3.4).
     ClipboardUnavailable,
-    /// The destination refused the content (validation failed locally).
+    /// The destination refused the content: validation failed locally, or
+    /// — for inline data, which has no offer to decline — the origin holds
+    /// no `clipboard_receive` grant there. An offered item refused for want
+    /// of that grant is declined `NotPermitted` instead.
     ContentRejected,
     /// A newer item (by the deterministic conflict order, FR-3.5) won the
     /// race; the destination kept the newer content. Closes the losing
@@ -2202,7 +2211,15 @@ mod tests {
         });
 
         assert!(!image.negotiated_by(FeatureFlags::NONE));
-        assert!(image.negotiated_by(FeatureFlags::CHUNKED_CLIPBOARD));
+        // Chunked transfer alone is not enough since ADR 0016: the peer
+        // must also be able to install this image's format.
+        assert!(!image.negotiated_by(FeatureFlags::CHUNKED_CLIPBOARD));
+        assert!(image.negotiated_by(FeatureFlags(
+            FeatureFlags::CHUNKED_CLIPBOARD.0 | FeatureFlags::IMAGE_DIB.0
+        )));
+        assert!(!image.negotiated_by(FeatureFlags(
+            FeatureFlags::CHUNKED_CLIPBOARD.0 | FeatureFlags::IMAGE_PNG.0
+        )));
         assert!(image.negotiated_by(FeatureFlags::ALL));
         // The base protocol's types need no bit at all.
         assert!(text.negotiated_by(FeatureFlags::NONE));

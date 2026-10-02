@@ -90,6 +90,7 @@ crossover/
                                     #   TLS configuration
         crossover-platform/         # platform trait definitions (no OS deps)
         crossover-platform-windows/ # Win32 implementations
+        crossover-platform-macos/   # macOS implementations (objc2; ADR 0020)
         crossover-topology/         # the drawn layout model and its validation,
                                     #   plus (behind the non-default `config`
                                     #   feature) the [layout] config writer and
@@ -138,7 +139,8 @@ only when a boundary proves real:
 | `crossover-network` | `crossover-core::net` (+ app wiring) | A second transport (e.g., QUIC) or reuse outside the app appears |
 | `crossover-config` | `apps/crossover` | Config is needed by tools/test-peer independently |
 | `crossover-telemetry` | `tracing` usage throughout | Local metrics grow beyond counters and spans |
-| `crossover-platform-macos` / `-linux` | not created | The corresponding port begins (Phase 9) |
+| `crossover-platform-macos` | **created** 2026-09-28 ([ADR 0020](adr/0020-macos-platform-bindings.md)) | The macOS port began (Phase 9.1) |
+| `crossover-platform-linux` | not created | The Linux port begins (Phase 9.2), after the L-1 input-route spike |
 
 Creating or dissolving a crate is an ADR-level decision. The compile-time
 firewall that matters from day one is the **platform boundary** and the
@@ -894,7 +896,9 @@ service's saved command line (ADR 0011) would otherwise flatten a drawn
 arrangement back to a side on every launch — the flags still win over an
 *implicit* layout, where there is nothing to lose ([ADR
 0018](adr/0018-drawn-display-topology.md)). (Config and logs live under
-`~/.crossover`; secrets stay DPAPI-encrypted under `%LOCALAPPDATA%\Crossover`.)
+`~/.crossover`; secrets stay DPAPI-encrypted under `%LOCALAPPDATA%\Crossover`
+on Windows, and in the login keychain under the service
+`com.crossover.secure-storage.v1` on macOS.)
 
 ```toml
 schema_version = 2

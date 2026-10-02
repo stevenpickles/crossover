@@ -33,7 +33,7 @@
 //! Fail-closed rules (FR-2.3): an `InputBatch` from a session that holds
 //! no grant, or with a non-increasing sequence, terminates that session.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crossover_protocol::hello::MessageType;
@@ -97,6 +97,46 @@ struct Controlled {
     applied_sequence: u64,
     /// What this machine has applied for that peer (FR-4.3, FR-4.4).
     applied_state: InputState,
+    /// Whether this grant has already reported input dropped for a kind
+    /// the peer is not granted — once per grant, never per event.
+    filter_noticed: bool,
+}
+
+/// What a peer may do to this machine's input (ADR 0021): the `keyboard`
+/// and `mouse` flags on this machine's record of that peer.
+///
+/// Supplied per session by the application, which holds the trust store;
+/// absent means none, so a session nobody has said anything about cannot
+/// drive this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InputGrant {
+    /// The peer may inject keystrokes here.
+    pub keyboard: bool,
+    /// The peer may move and click the pointer here.
+    pub mouse: bool,
+}
+
+impl InputGrant {
+    /// Both kinds — what pairing grants.
+    pub const FULL: Self = Self {
+        keyboard: true,
+        mouse: true,
+    };
+
+    /// Whether the grant permits anything at all.
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.keyboard || self.mouse
+    }
+
+    /// Whether the grant permits `event`'s kind.
+    #[must_use]
+    pub const fn permits(self, event: &InputEvent) -> bool {
+        match event {
+            InputEvent::Key(_) => self.keyboard,
+            InputEvent::Pointer(_) => self.mouse,
+        }
+    }
 }
 
 /// Everything that can happen to the engine. Session-scoped variants
@@ -175,6 +215,15 @@ pub enum ControlEvent {
         session: Uuid,
         /// The message.
         message: InboundControl,
+    },
+    /// What `session`'s peer may do to this machine's input (ADR 0021),
+    /// published before the session is announced and again whenever the
+    /// trust store changes.
+    InputGrant {
+        /// The session it applies to.
+        session: Uuid,
+        /// What is granted.
+        grant: InputGrant,
     },
 }
 
@@ -325,6 +374,15 @@ pub enum ControlNotice {
     /// input here — the machine came to rest in neutral and its input was
     /// released locally (ADR 0009).
     PeerControlReclaimedLocally,
+    /// A peer asked to control this machine and holds no input grant here,
+    /// so it was refused `NotPermitted` (ADR 0021).
+    PeerRequestNotPermitted,
+    /// A peer controlling this machine sent input of a kind it is not
+    /// granted, which was dropped — reported once per grant (ADR 0021).
+    PeerInputFiltered,
+    /// A peer's control of this machine ended because its input grant was
+    /// withdrawn; its input was released locally (ADR 0021).
+    PeerControlNotPermitted,
 }
 
 /// What the engine asks the driver to do. Order within the returned
@@ -405,6 +463,9 @@ pub struct ControlEngine {
     /// the session (ADR 0009). Cleared when that session re-negotiates,
     /// is lost, or a new grant is taken.
     recently_released: Option<Uuid>,
+    /// What each session's peer may do to this machine's input (ADR 0021).
+    /// A session absent here is granted nothing.
+    input_grants: BTreeMap<Uuid, InputGrant>,
 }
 
 impl ControlEngine {
@@ -420,6 +481,7 @@ impl ControlEngine {
             send_sequence: 0,
             sent_state: InputState::new(),
             recently_released: None,
+            input_grants: BTreeMap::new(),
         }
     }
 
@@ -459,6 +521,59 @@ impl ControlEngine {
                 request_id,
             } => self.on_request_timeout(session, request_id),
             ControlEvent::Peer { session, message } => self.on_peer(session, message),
+            ControlEvent::InputGrant { session, grant } => self.on_input_grant(session, grant),
+        }
+    }
+
+    /// The input grant `session`'s peer holds here.
+    fn grant_for(&self, session: Uuid) -> InputGrant {
+        self.input_grants.get(&session).copied().unwrap_or_default()
+    }
+
+    /// A session's input grant changed (ADR 0021). If that session controls
+    /// this machine, the change takes effect at once: losing both kinds
+    /// gives up its grant exactly as the escape chord does, and losing one
+    /// releases whatever of that kind it holds down, so nothing it can no
+    /// longer touch is left pressed (FR-4.4).
+    fn on_input_grant(&mut self, session: Uuid, grant: InputGrant) -> Vec<ControlAction> {
+        let previous = self.input_grants.insert(session, grant).unwrap_or_default();
+        if previous == grant {
+            return Vec::new();
+        }
+        if self
+            .controlled
+            .as_ref()
+            .is_none_or(|controlled| controlled.session != session)
+        {
+            return Vec::new();
+        }
+        if !grant.any() {
+            return self.relinquish_controlled(ControlNotice::PeerControlNotPermitted);
+        }
+        let controlled = self.controlled.as_mut().expect("checked just above");
+        let mut releases: Vec<InputEvent> = Vec::new();
+        if previous.mouse && !grant.mouse {
+            releases.extend(
+                controlled
+                    .applied_state
+                    .release_all()
+                    .into_iter()
+                    .map(InputEvent::Pointer),
+            );
+        }
+        if previous.keyboard && !grant.keyboard {
+            releases.extend(
+                controlled
+                    .applied_state
+                    .release_all_keys()
+                    .into_iter()
+                    .map(InputEvent::Key),
+            );
+        }
+        if releases.is_empty() {
+            Vec::new()
+        } else {
+            vec![ControlAction::Inject(releases)]
         }
     }
 
@@ -629,6 +744,7 @@ impl ControlEngine {
 
     fn on_session_lost(&mut self, session: Uuid) -> Vec<ControlAction> {
         self.established.remove(&session);
+        self.input_grants.remove(&session);
         if self.recently_released == Some(session) {
             self.recently_released = None; // dead: no in-flight grace to keep
         }
@@ -783,6 +899,17 @@ impl ControlEngine {
                 }),
             }]
         };
+        // First, ahead of every state rule: a peer this machine's user has
+        // not granted input here is refused, and told so (ADR 0021). Stated
+        // whatever this machine is doing, because the answer does not
+        // depend on it.
+        if !self.grant_for(session).any() {
+            let mut actions = deny(DenyReason::NotPermitted);
+            actions.push(ControlAction::Notify(
+                ControlNotice::PeerRequestNotPermitted,
+            ));
+            return actions;
+        }
         // One peer controls this machine at a time (single desktop), and
         // *which* peer is the security boundary: a request from a session
         // other than the grant holder is denied, always (FR-2.3).
@@ -847,6 +974,7 @@ impl ControlEngine {
             session,
             applied_sequence: 0,
             applied_state: InputState::new(),
+            filter_noticed: false,
         });
         let mut actions = vec![ControlAction::Send {
             session,
@@ -972,6 +1100,7 @@ impl ControlEngine {
     }
 
     fn on_peer_batch(&mut self, session: Uuid, batch: &InputBatch) -> Vec<ControlAction> {
+        let grant = self.grant_for(session);
         // Complete mediation (FR-2.3, FR-5.1): inject only for the one
         // session that holds the grant. Input from any other session —
         // even while this machine is legitimately controlled by someone
@@ -1008,9 +1137,28 @@ impl ControlEngine {
         // chord keeps its ordering (ADR 0008). The applied-state belief
         // tracks both, so `ReleaseAllInput` can synthesize releases for a
         // held key or modifier just as it does for a button (FR-4.4).
-        let events: Vec<InputEvent> = batch.events.iter().map(from_wire).collect();
-        controlled.applied_state.apply_inputs(&events);
-        vec![ControlAction::Inject(events)]
+        //
+        // Only the kinds this peer is granted are applied (ADR 0021). A
+        // dropped event is never applied, so it is never part of the held
+        // belief and can never be left stuck; the drop is reported once per
+        // grant, not per event.
+        let all = batch.events.len();
+        let events: Vec<InputEvent> = batch
+            .events
+            .iter()
+            .map(from_wire)
+            .filter(|event| grant.permits(event))
+            .collect();
+        let mut actions = Vec::new();
+        if events.len() < all && !controlled.filter_noticed {
+            controlled.filter_noticed = true;
+            actions.push(ControlAction::Notify(ControlNotice::PeerInputFiltered));
+        }
+        if !events.is_empty() {
+            controlled.applied_state.apply_inputs(&events);
+            actions.push(ControlAction::Inject(events));
+        }
+        actions
     }
 
     fn on_peer_release_all(&mut self, session: Uuid) -> Vec<ControlAction> {
@@ -1175,7 +1323,7 @@ mod tests {
 
     use super::{
         ControlAction, ControlConfig, ControlEndReason, ControlEngine, ControlEvent, ControlNotice,
-        InboundControl, OutboundControl, RequestBlocked,
+        InboundControl, InputGrant, OutboundControl, RequestBlocked,
     };
     use crate::crossing::CrossTarget;
     use crate::edge_driver::DetectedCrossing;
@@ -1208,8 +1356,19 @@ mod tests {
         ControlEvent::Peer { session, message }
     }
 
+    /// An engine with [`SESSION`] established, its peer holding what
+    /// pairing grants — both input kinds (ADR 0021) — published before the
+    /// session, as the application does.
     fn established_engine() -> ControlEngine {
         let mut engine = ControlEngine::new(ControlConfig::default());
+        assert!(
+            engine
+                .handle(ControlEvent::InputGrant {
+                    session: SESSION,
+                    grant: InputGrant::FULL,
+                })
+                .is_empty()
+        );
         let actions = engine.handle(ControlEvent::SessionEstablished { session: SESSION });
         assert!(actions.is_empty());
         engine
@@ -1496,6 +1655,12 @@ mod tests {
         // *which* peer is the security boundary: a second trusted session
         // cannot displace the grant holder (FR-2.3).
         let mut engine = controlled_engine();
+        // A second *trusted* peer, granted input like the first: what is
+        // under test is the single-holder rule, not the grant.
+        let _ = engine.handle(ControlEvent::InputGrant {
+            session: OTHER,
+            grant: InputGrant::FULL,
+        });
         let _ = engine.handle(ControlEvent::SessionEstablished { session: OTHER });
         let actions = engine.handle(peer_from(
             OTHER,
@@ -1736,6 +1901,203 @@ mod tests {
     }
 
     // ---- controlled: injection, sequencing, release (FR-4.4) ----
+
+    // ---- input grants (ADR 0021) ----------------------------------------
+
+    /// An engine with [`SESSION`] established and its peer holding `grant`.
+    fn engine_granted(grant: InputGrant) -> ControlEngine {
+        let mut engine = ControlEngine::new(ControlConfig::default());
+        let _ = engine.handle(ControlEvent::InputGrant {
+            session: SESSION,
+            grant,
+        });
+        let _ = engine.handle(ControlEvent::SessionEstablished { session: SESSION });
+        engine
+    }
+
+    fn request(request_id: u64) -> ControlEvent {
+        peer(InboundControl::Request(ControlRequest {
+            request_id,
+            entry: None,
+        }))
+    }
+
+    fn batch(sequence: u64, events: Vec<WireInputEvent>) -> ControlEvent {
+        peer(InboundControl::Batch(InputBatch { sequence, events }))
+    }
+
+    fn wire_key(key: u16, pressed: bool) -> WireInputEvent {
+        WireInputEvent::Key {
+            key,
+            pressed,
+            repeat: false,
+            text: None,
+        }
+    }
+
+    fn wire_left(pressed: bool) -> WireInputEvent {
+        WireInputEvent::Button {
+            button: WireButton::Left,
+            pressed,
+        }
+    }
+
+    /// A peer this machine's user has not granted input is refused, and
+    /// told why — `NotPermitted`, not a timeout and not `Busy` — and this
+    /// side reports it. No grant is taken.
+    #[test]
+    fn a_peer_with_no_input_grant_is_refused_not_permitted() {
+        let mut engine = engine_granted(InputGrant::default());
+        let actions = engine.handle(request(7));
+        assert_eq!(
+            actions,
+            vec![
+                send(OutboundControl::Response(ControlResponse {
+                    request_id: 7,
+                    verdict: ControlVerdict::Denied(DenyReason::NotPermitted),
+                })),
+                ControlAction::Notify(ControlNotice::PeerRequestNotPermitted),
+            ]
+        );
+        assert!(!engine.is_controlled());
+    }
+
+    /// A session nobody has published a grant for is granted nothing —
+    /// fail closed, and a lost session's grant does not outlive it.
+    #[test]
+    fn an_unpublished_or_lost_grant_grants_nothing() {
+        let mut engine = ControlEngine::new(ControlConfig::default());
+        let _ = engine.handle(ControlEvent::SessionEstablished { session: SESSION });
+        assert!(!granted(&engine.handle(request(1))));
+
+        let mut engine = established_engine();
+        let _ = engine.handle(ControlEvent::SessionLost { session: SESSION });
+        let _ = engine.handle(ControlEvent::SessionEstablished { session: SESSION });
+        assert!(!granted(&engine.handle(request(2))));
+    }
+
+    /// "May point but not type": a keyboard-only grant takes control, its
+    /// keys are injected, its pointer events are dropped — reported once
+    /// per grant, never per event — and a dropped press is never part of
+    /// the held belief, so it can never be left stuck.
+    #[test]
+    fn a_grant_carries_only_the_kinds_it_permits() {
+        let mut engine = engine_granted(InputGrant {
+            keyboard: true,
+            mouse: false,
+        });
+        assert!(granted(&engine.handle(request(1))));
+
+        let actions = engine.handle(batch(
+            1,
+            vec![
+                WireInputEvent::Motion { dx: 3, dy: 4 },
+                wire_left(true),
+                wire_key(hid::LEFT_SHIFT, true),
+            ],
+        ));
+        assert_eq!(
+            actions,
+            vec![
+                ControlAction::Notify(ControlNotice::PeerInputFiltered),
+                ControlAction::Inject(vec![InputEvent::Key(KeyEvent {
+                    key: hid::LEFT_SHIFT,
+                    pressed: true,
+                    repeat: false,
+                    text: None,
+                })]),
+            ]
+        );
+        // Filtered again, but not reported again.
+        assert!(engine.handle(batch(2, vec![wire_left(false)])).is_empty());
+        // Nothing pointer-shaped was ever held: a hand-back releases only
+        // the key.
+        let released = engine.handle(peer(InboundControl::ReleaseAll(ReleaseAllInput {
+            after_sequence: 2,
+        })));
+        assert_eq!(
+            released,
+            vec![ControlAction::Inject(vec![InputEvent::Key(
+                KeyEvent::release(hid::LEFT_SHIFT)
+            )])]
+        );
+    }
+
+    /// Withdrawing both kinds from a peer controlling this machine ends its
+    /// control at once, as the escape chord would: everything it held is
+    /// released, it is told, and this side reports why.
+    #[test]
+    fn withdrawing_every_kind_mid_control_releases_and_hands_back() {
+        let mut engine = controlled_engine();
+        let _ = engine.handle(batch(
+            1,
+            vec![wire_left(true), wire_key(hid::LEFT_SHIFT, true)],
+        ));
+
+        let actions = engine.handle(ControlEvent::InputGrant {
+            session: SESSION,
+            grant: InputGrant::default(),
+        });
+        assert_eq!(
+            actions,
+            vec![
+                ControlAction::Inject(vec![
+                    InputEvent::Pointer(PointerEvent::Button {
+                        button: PointerButton::Left,
+                        pressed: false,
+                    }),
+                    InputEvent::Key(KeyEvent::release(hid::LEFT_SHIFT)),
+                ]),
+                send(OutboundControl::Release(ControlRelease { entry: None })),
+                ControlAction::Notify(ControlNotice::PeerControlNotPermitted),
+            ]
+        );
+        assert!(!engine.is_controlled());
+    }
+
+    /// Withdrawing one kind keeps control but releases what that kind held
+    /// down, and stops it from then on.
+    #[test]
+    fn withdrawing_one_kind_releases_only_what_it_held() {
+        let mut engine = controlled_engine();
+        let _ = engine.handle(batch(
+            1,
+            vec![wire_left(true), wire_key(hid::LEFT_SHIFT, true)],
+        ));
+
+        let actions = engine.handle(ControlEvent::InputGrant {
+            session: SESSION,
+            grant: InputGrant {
+                keyboard: false,
+                mouse: true,
+            },
+        });
+        assert_eq!(
+            actions,
+            vec![ControlAction::Inject(vec![InputEvent::Key(
+                KeyEvent::release(hid::LEFT_SHIFT)
+            )])]
+        );
+        assert!(
+            engine.is_controlled(),
+            "losing one kind must not end control"
+        );
+
+        // Keys are dropped from now on; the pointer still works.
+        let actions = engine.handle(batch(
+            2,
+            vec![wire_key(hid::LEFT_SHIFT, true), wire_left(false)],
+        ));
+        assert!(actions.contains(&ControlAction::Notify(ControlNotice::PeerInputFiltered)));
+        assert!(
+            actions.contains(&ControlAction::Inject(vec![InputEvent::Pointer(
+                PointerEvent::Button {
+                    button: PointerButton::Left,
+                    pressed: false,
+                }
+            )]))
+        );
+    }
 
     #[test]
     fn granted_input_is_injected_and_tracked() {

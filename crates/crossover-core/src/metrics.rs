@@ -243,6 +243,10 @@ pub struct Metrics {
     // read the same number.
     clipboard_files_sent: AtomicU64,
     clipboard_files_send_refused: AtomicU64,
+    clipboard_send_denied: AtomicU64,
+    clipboard_image_format_refused: AtomicU64,
+    clipboard_images_converted: AtomicU64,
+    clipboard_receive_denied: AtomicU64,
     clipboard_files_send_failed: AtomicU64,
     clipboard_file_sent_bytes: AtomicU64,
     clipboard_latency_ms: Mutex<Vec<u32>>,
@@ -479,6 +483,30 @@ impl Metrics {
         self.clipboard_files_send_refused
             .fetch_add(1, Ordering::Relaxed);
     }
+    /// A local text or image copy was not sent because the peer holds no
+    /// `clipboard_send` grant. Observed and kept on this clipboard; only the
+    /// transmission is refused.
+    pub fn record_clipboard_send_denied(&self) {
+        self.clipboard_send_denied.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A local image was not sent because no live peer can install its
+    /// format (ADR 0016).
+    pub fn record_clipboard_image_format_refused(&self) {
+        self.clipboard_image_format_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// A local image was converted into a format the peer installs and
+    /// sent (ADR 0016).
+    pub fn record_clipboard_image_converted(&self) {
+        self.clipboard_images_converted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// A peer item was refused because the peer holds no
+    /// `clipboard_receive` grant — nothing it sent reached this clipboard.
+    pub fn record_clipboard_receive_denied(&self) {
+        self.clipboard_receive_denied
+            .fetch_add(1, Ordering::Relaxed);
+    }
     /// An outbound file transaction that started and did not deliver: the
     /// peer declined it, the deadline expired, the session went, or the
     /// blob could not be read back.
@@ -662,6 +690,10 @@ impl Metrics {
             clipboard_file_bytes: load(&self.clipboard_file_bytes),
             clipboard_files_sent: load(&self.clipboard_files_sent),
             clipboard_files_send_refused: load(&self.clipboard_files_send_refused),
+            clipboard_send_denied: load(&self.clipboard_send_denied),
+            clipboard_image_format_refused: load(&self.clipboard_image_format_refused),
+            clipboard_images_converted: load(&self.clipboard_images_converted),
+            clipboard_receive_denied: load(&self.clipboard_receive_denied),
             clipboard_files_send_failed: load(&self.clipboard_files_send_failed),
             clipboard_file_sent_bytes: load(&self.clipboard_file_sent_bytes),
             clipboard_latency_dropped: load(&self.clipboard_latency_dropped),
@@ -800,6 +832,14 @@ pub struct Report {
     pub clipboard_files_sent: u64,
     /// Local file selections refused here before any of them travelled.
     pub clipboard_files_send_refused: u64,
+    /// Local text/image copies not sent for want of `clipboard_send`.
+    pub clipboard_send_denied: u64,
+    /// Local images not sent because no peer can install their format.
+    pub clipboard_image_format_refused: u64,
+    /// Local images converted into a format the peer installs.
+    pub clipboard_images_converted: u64,
+    /// Peer items refused for want of `clipboard_receive`.
+    pub clipboard_receive_denied: u64,
     /// Outbound file transactions that started and did not deliver.
     pub clipboard_files_send_failed: u64,
     /// Bytes of file content offered to the peer.
@@ -910,6 +950,10 @@ impl Report {
             clipboard_file_bytes = self.clipboard_file_bytes,
             clipboard_files_sent = self.clipboard_files_sent,
             clipboard_files_send_refused = self.clipboard_files_send_refused,
+            clipboard_send_denied = self.clipboard_send_denied,
+            clipboard_image_format_refused = self.clipboard_image_format_refused,
+            clipboard_images_converted = self.clipboard_images_converted,
+            clipboard_receive_denied = self.clipboard_receive_denied,
             clipboard_files_send_failed = self.clipboard_files_send_failed,
             clipboard_file_sent_bytes = self.clipboard_file_sent_bytes,
             latency_p50_ms = self.latency_p50,
@@ -1032,6 +1076,24 @@ impl Report {
         // sufficed has nothing to say, and the line exists to make the
         // rarer case legible — how many installs had to be parked, against
         // how many of them were nonetheless lost.
+        // Only when it happened: a permission doing its job is worth one
+        // line at shutdown, so a user who withdrew a grant can see it held,
+        // and one who did not can see why copies stopped travelling.
+        if self.clipboard_send_denied > 0 || self.clipboard_receive_denied > 0 {
+            writeln!(
+                f,
+                "                {} copies not sent (no clipboard-send grant),                  {} peer items refused (no clipboard-receive grant)",
+                self.clipboard_send_denied, self.clipboard_receive_denied,
+            )?;
+        }
+        if self.clipboard_image_format_refused > 0 || self.clipboard_images_converted > 0 {
+            writeln!(
+                f,
+                "                {} images converted for the peer, {} not sent (no format \
+                 the peer installs could be produced)",
+                self.clipboard_images_converted, self.clipboard_image_format_refused,
+            )?;
+        }
         if self.clipboard_installs_parked > 0 {
             writeln!(
                 f,

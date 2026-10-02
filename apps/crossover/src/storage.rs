@@ -9,10 +9,15 @@ use crossover_platform::SecureStorage;
 ///
 /// # Errors
 ///
-/// On Windows, if the per-user location cannot be determined. On other
-/// platforms, always — their `SecureStorage` backends arrive in Phase 7
-/// (docs/ROADMAP.md), and pretending otherwise would violate the
+/// On Windows, if the per-user location cannot be determined. On macOS,
+/// never at open — the Keychain is reached per call, and a locked or
+/// refusing keychain surfaces there (ADR 0020). On Linux, always: its
+/// `SecureStorage` backend arrives with the Linux port (docs/ROADMAP.md
+/// Phase 9.2), and pretending otherwise would violate the
 /// no-silent-plaintext-fallback contract.
+// One signature for every platform: on macOS the open itself cannot fail,
+// but on Windows and Linux it can, and callers handle one shape.
+#[cfg_attr(target_os = "macos", allow(clippy::unnecessary_wraps))]
 pub fn open_secure_storage() -> anyhow::Result<Box<dyn SecureStorage>> {
     #[cfg(windows)]
     {
@@ -21,11 +26,17 @@ pub fn open_secure_storage() -> anyhow::Result<Box<dyn SecureStorage>> {
             .context("locating per-user secure storage")?;
         Ok(Box::new(storage))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(
+            crossover_platform_macos::KeychainSecureStorage::for_current_user(),
+        ))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         anyhow::bail!(
             "secure storage is not implemented for this platform yet \
-             (Windows first; macOS/Linux arrive in Phase 7 — docs/ROADMAP.md)"
+             (the Linux port is Phase 9.2 — docs/ROADMAP.md)"
         )
     }
 }
@@ -53,7 +64,8 @@ pub fn open_link_state_probe() -> std::sync::Arc<dyn crossover_platform::LinkSta
 /// # Errors
 ///
 /// On Windows, if clipboard observation cannot be established. On other
-/// platforms, always — their providers arrive in Phase 7.
+/// platforms, always — their providers arrive with their ports
+/// (docs/ROADMAP.md Phase 9).
 pub fn open_clipboard_provider()
 -> anyhow::Result<std::sync::Arc<dyn crossover_platform::ClipboardProvider>> {
     #[cfg(windows)]
@@ -63,10 +75,18 @@ pub fn open_clipboard_provider()
             .context("starting clipboard observation")?;
         Ok(std::sync::Arc::new(provider))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        use anyhow::Context;
+        let provider = crossover_platform_macos::MacClipboard::new()
+            .context("starting clipboard observation")?;
+        Ok(std::sync::Arc::new(provider))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         anyhow::bail!(
-            "the clipboard is not implemented for this platform yet              (Windows first; macOS/Linux arrive in Phase 7 — docs/ROADMAP.md)"
+            "the clipboard is not implemented for this platform yet \
+             (the Linux port is Phase 9.2 — docs/ROADMAP.md)"
         )
     }
 }
@@ -221,23 +241,72 @@ pub fn open_display() -> anyhow::Result<std::sync::Arc<dyn crossover_platform::D
     ))
 }
 
+/// Open the platform's image converter (ADR 0016): what turns this
+/// machine's own clipboard image into a format a peer installs. `None`
+/// where there is none yet, which the clipboard driver answers by refusing
+/// such an image observably.
+#[must_use]
+// One signature for every platform: always `Some` on Windows today, `None`
+// where there is no converter yet.
+#[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
+pub fn open_image_converter() -> Option<std::sync::Arc<dyn crossover_platform::ImageConverter>> {
+    #[cfg(windows)]
+    {
+        Some(std::sync::Arc::new(
+            crossover_platform_windows::WicImageConverter,
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Open the platform display-info provider.
+///
+/// On macOS, until its display slice lands (docs/ROADMAP.md Phase 9.1): a
+/// backend that answers every query "unavailable". Nothing is stated to
+/// the peer about this machine's screens, so the peer derives no crossing
+/// into it — the right shape for a clipboard-only run
+/// ([`INPUT_AVAILABLE`]).
+#[cfg(target_os = "macos")]
+// Infallible here, like the Windows provider; the `Result` matches the
+// other platforms' signature.
+#[allow(clippy::unnecessary_wraps)]
+pub fn open_display() -> anyhow::Result<std::sync::Arc<dyn crossover_platform::DisplayInfo>> {
+    Ok(std::sync::Arc::new(
+        crossover_platform::UnavailableDisplayInfo,
+    ))
+}
+
 /// Open the platform display-info provider.
 ///
 /// # Errors
 ///
-/// Always, on non-Windows platforms (macOS/Linux arrive in later phases).
-#[cfg(not(windows))]
+/// Always, on Linux: its port is Phase 9.2 (docs/ROADMAP.md).
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn open_display() -> anyhow::Result<std::sync::Arc<dyn crossover_platform::DisplayInfo>> {
     anyhow::bail!(
         "display enumeration is not implemented for this platform yet \
-         (Windows first; macOS/Linux arrive in later phases — docs/ROADMAP.md)"
+         (the Linux port is Phase 9.2 — docs/ROADMAP.md)"
     )
 }
+
+/// Whether this platform can capture and inject input yet.
+///
+/// `false` on macOS until its input slice lands (docs/ROADMAP.md Phase
+/// 9.1): `crossover run` then starts **clipboard-only** — no control
+/// driver, no cursor mask, no screens stated to the peer — instead of
+/// refusing to start. A control request the peer sends goes unanswered and
+/// times out on the peer's side with its existing diagnostic, and this
+/// side logs why. Temporary by design (maintainer decision, 2026-09-28):
+/// it disappears with the input slice, and no wire change was made for it.
+pub const INPUT_AVAILABLE: bool = cfg!(windows);
 
 /// Open the platform pointer-input capture and injector.
 ///
 /// Returned together because control transfer needs both, and both are
-/// Windows-only until Phase 7 (docs/ROADMAP.md). The capture provider
+/// Windows-only until the Phase 9 ports (docs/ROADMAP.md). The capture provider
 /// owns a pump thread from construction; it installs no hook until the
 /// control engine first grants control.
 ///

@@ -83,9 +83,12 @@ pub enum TrustStoreError {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerPermissions {
-    /// May receive our keyboard input.
+    /// May inject keystrokes into **this** machine (ADR 0021). Until ADR
+    /// 0021 this field was documented as the other direction — the peer
+    /// receiving our input — and was never enforced either way, so the
+    /// stored value carries over unchanged.
     pub keyboard: bool,
-    /// May receive our pointer input.
+    /// May move and click the pointer on **this** machine (ADR 0021).
     pub mouse: bool,
     /// May be sent our clipboard contents.
     pub clipboard_send: bool,
@@ -241,6 +244,35 @@ impl TrustedPeer {
     /// mutation path can raise it (docs/SECURITY.md invariant 8).
     pub fn set_file_receive(&mut self, allowed: bool) -> bool {
         std::mem::replace(&mut self.permissions.file_receive, allowed)
+    }
+
+    /// Grant or revoke sending our clipboard to this peer
+    /// (`clipboard_send`), returning the value it replaced. A local call
+    /// with an explicit value, like [`Self::set_file_receive`]; pairing sets
+    /// it on (`PeerPermissions::FULL`) and nothing on the wire changes it.
+    pub fn set_clipboard_send(&mut self, allowed: bool) -> bool {
+        std::mem::replace(&mut self.permissions.clipboard_send, allowed)
+    }
+
+    /// Grant or revoke this peer writing into our clipboard
+    /// (`clipboard_receive`), returning the value it replaced. As
+    /// [`Self::set_clipboard_send`].
+    pub fn set_clipboard_receive(&mut self, allowed: bool) -> bool {
+        std::mem::replace(&mut self.permissions.clipboard_receive, allowed)
+    }
+
+    /// Grant or revoke this peer typing on this machine (`keyboard`, ADR
+    /// 0021), returning the value it replaced. A local call with an
+    /// explicit value; pairing sets it on and nothing on the wire changes
+    /// it.
+    pub fn set_keyboard(&mut self, allowed: bool) -> bool {
+        std::mem::replace(&mut self.permissions.keyboard, allowed)
+    }
+
+    /// Grant or revoke this peer pointing on this machine (`mouse`, ADR
+    /// 0021), returning the value it replaced.
+    pub fn set_mouse(&mut self, allowed: bool) -> bool {
+        std::mem::replace(&mut self.permissions.mouse, allowed)
     }
 
     /// Known addresses for reconnection attempts.
@@ -514,6 +546,35 @@ impl TrustStore {
     pub fn set_file_receive(&mut self, peer_id: Uuid, allowed: bool) -> Option<bool> {
         let peer = self.peers.iter_mut().find(|p| p.peer_id == peer_id)?;
         Some(peer.set_file_receive(allowed))
+    }
+
+    /// Grant or revoke sending our clipboard to a peer, returning the value
+    /// it replaced — or `None` if no peer has that device UUID. Addressed
+    /// and persisted exactly as [`Self::set_file_receive`].
+    pub fn set_clipboard_send(&mut self, peer_id: Uuid, allowed: bool) -> Option<bool> {
+        let peer = self.peers.iter_mut().find(|p| p.peer_id == peer_id)?;
+        Some(peer.set_clipboard_send(allowed))
+    }
+
+    /// Grant or revoke a peer writing into our clipboard, returning the
+    /// value it replaced — or `None` if no peer has that device UUID.
+    pub fn set_clipboard_receive(&mut self, peer_id: Uuid, allowed: bool) -> Option<bool> {
+        let peer = self.peers.iter_mut().find(|p| p.peer_id == peer_id)?;
+        Some(peer.set_clipboard_receive(allowed))
+    }
+
+    /// Grant or revoke a peer typing on this machine, returning the value
+    /// it replaced — or `None` if no peer has that device UUID.
+    pub fn set_keyboard(&mut self, peer_id: Uuid, allowed: bool) -> Option<bool> {
+        let peer = self.peers.iter_mut().find(|p| p.peer_id == peer_id)?;
+        Some(peer.set_keyboard(allowed))
+    }
+
+    /// Grant or revoke a peer pointing on this machine, returning the value
+    /// it replaced — or `None` if no peer has that device UUID.
+    pub fn set_mouse(&mut self, peer_id: Uuid, allowed: bool) -> Option<bool> {
+        let peer = self.peers.iter_mut().find(|p| p.peer_id == peer_id)?;
+        Some(peer.set_mouse(allowed))
     }
 
     /// Remove (revoke) a peer by device UUID, returning the removed record.
@@ -848,6 +909,90 @@ mod tests {
         const { assert!(!PeerPermissions::FULL.file_receive) };
         assert!(!PeerPermissions::default().file_receive);
         assert!(!peer(0xAA, "freshly-paired").may_receive_files());
+    }
+
+    /// The two clipboard directions are separate grants: withdrawing one
+    /// moves neither the other, nor `file_receive`, nor another peer — and
+    /// each survives a reload, since a running worker reads them from the
+    /// persisted store on its trust poll.
+    #[test]
+    fn clipboard_grants_are_independent_per_direction_and_survive_a_reload() {
+        let storage = InMemorySecureStorage::new();
+        let mut store = TrustStore::new();
+        let record = peer(0xAA, "desk");
+        let id = record.peer_id();
+        store.add_peer(record).unwrap();
+        store.add_peer(peer(0xBB, "bystander")).unwrap();
+        // Pairing grants both directions.
+        const { assert!(PeerPermissions::FULL.clipboard_send) };
+        const { assert!(PeerPermissions::FULL.clipboard_receive) };
+
+        assert_eq!(store.set_clipboard_receive(id, false), Some(true));
+        store.save(&storage).unwrap();
+        let reloaded = TrustStore::load(&storage).unwrap();
+        let permissions = reloaded.find_by_peer_id(id).unwrap().permissions();
+        assert!(!permissions.clipboard_receive);
+        assert!(permissions.clipboard_send, "the other direction moved");
+        assert!(!permissions.file_receive);
+        let bystander = reloaded
+            .find_by_fingerprint(fingerprint(0xBB))
+            .unwrap()
+            .permissions();
+        assert!(bystander.clipboard_send && bystander.clipboard_receive);
+
+        let mut store = reloaded;
+        assert_eq!(store.set_clipboard_send(id, false), Some(true));
+        assert_eq!(store.set_clipboard_receive(id, true), Some(false));
+        store.save(&storage).unwrap();
+        let permissions = TrustStore::load(&storage)
+            .unwrap()
+            .find_by_peer_id(id)
+            .unwrap()
+            .permissions();
+        assert!(!permissions.clipboard_send);
+        assert!(permissions.clipboard_receive);
+
+        assert_eq!(store.set_clipboard_send(Uuid::new_v4(), true), None);
+        assert_eq!(store.set_clipboard_receive(Uuid::new_v4(), true), None);
+    }
+
+    /// ADR 0021's two input grants move independently of each other and of
+    /// every other flag, and survive a reload — a running worker reads
+    /// them from the persisted store on its trust poll.
+    #[test]
+    fn input_grants_are_independent_per_kind_and_survive_a_reload() {
+        let storage = InMemorySecureStorage::new();
+        let mut store = TrustStore::new();
+        let record = peer(0xAA, "desk");
+        let id = record.peer_id();
+        store.add_peer(record).unwrap();
+        // Pairing grants both kinds.
+        const { assert!(PeerPermissions::FULL.keyboard) };
+        const { assert!(PeerPermissions::FULL.mouse) };
+
+        assert_eq!(store.set_keyboard(id, false), Some(true));
+        store.save(&storage).unwrap();
+        let permissions = TrustStore::load(&storage)
+            .unwrap()
+            .find_by_peer_id(id)
+            .unwrap()
+            .permissions();
+        assert!(!permissions.keyboard);
+        assert!(permissions.mouse, "the other kind moved");
+        assert!(permissions.clipboard_send && permissions.clipboard_receive);
+
+        assert_eq!(store.set_mouse(id, false), Some(true));
+        assert_eq!(store.set_keyboard(id, true), Some(false));
+        store.save(&storage).unwrap();
+        let permissions = TrustStore::load(&storage)
+            .unwrap()
+            .find_by_peer_id(id)
+            .unwrap()
+            .permissions();
+        assert!(permissions.keyboard && !permissions.mouse);
+
+        assert_eq!(store.set_keyboard(Uuid::new_v4(), true), None);
+        assert_eq!(store.set_mouse(Uuid::new_v4(), true), None);
     }
 
     #[test]

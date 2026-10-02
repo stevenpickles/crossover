@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::clipboard::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
+    ClipboardRead,
 };
 use crate::cursor::{CursorMask, CursorMaskError};
 use crate::display::{
@@ -95,7 +96,7 @@ pub enum ClipboardFailure {
 
 #[derive(Default)]
 struct ClipboardState {
-    content: Option<ClipboardContent>,
+    content: ClipboardRead,
     listener: Option<ClipboardListener>,
     fail_reads: (usize, Option<ClipboardFailure>),
     fail_writes: (usize, Option<ClipboardFailure>),
@@ -141,9 +142,27 @@ impl InMemoryClipboard {
 
     /// Simulate any local copy: set content and notify the listener.
     pub fn set_locally(&self, content: ClipboardContent) {
+        self.set_read_locally(ClipboardRead::Content(content));
+    }
+
+    /// Simulate a local copy in a format this build does not synchronize
+    /// — an application's private format, RTF-only content — and notify.
+    /// It reads back as [`ClipboardRead::Unreadable`], which is the user's
+    /// copy all the same (ADR 0005, addendum 2026-09-28).
+    pub fn set_unreadable_locally(&self) {
+        self.set_read_locally(ClipboardRead::Unreadable);
+    }
+
+    /// Simulate the clipboard being emptied by another application, and
+    /// notify.
+    pub fn clear_locally(&self) {
+        self.set_read_locally(ClipboardRead::Empty);
+    }
+
+    fn set_read_locally(&self, read: ClipboardRead) {
         let listener = {
             let mut state = lock(&self.state);
-            state.content = Some(content);
+            state.content = read;
             state.listener.take()
         };
         self.notify_and_restore(listener);
@@ -167,14 +186,14 @@ impl InMemoryClipboard {
     pub fn peek(&self) -> Option<String> {
         lock(&self.state)
             .content
-            .as_ref()
+            .content()
             .and_then(|content| content.as_text().map(str::to_owned))
     }
 
     /// Current typed content, bypassing failure injection.
     #[must_use]
     pub fn peek_content(&self) -> Option<ClipboardContent> {
-        lock(&self.state).content.clone()
+        lock(&self.state).content.content().cloned()
     }
 
     fn notify_and_restore(&self, listener: Option<ClipboardListener>) {
@@ -215,7 +234,7 @@ impl InMemoryClipboard {
 }
 
 impl ClipboardProvider for InMemoryClipboard {
-    fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+    fn read(&self) -> Result<ClipboardRead, ClipboardError> {
         let mut state = lock(&self.state);
         if let Some(kind) = Self::take_failure(&mut state.fail_reads) {
             return Err(Self::failure_error(kind));
@@ -229,7 +248,7 @@ impl ClipboardProvider for InMemoryClipboard {
             if let Some(kind) = Self::take_failure(&mut state.fail_writes) {
                 return Err(Self::failure_error(kind));
             }
-            state.content = Some(content.clone());
+            state.content = ClipboardRead::Content(content.clone());
             state.listener.take()
         };
         // Contract term under test everywhere: our own writes notify too.
@@ -243,6 +262,67 @@ impl ClipboardProvider for InMemoryClipboard {
     ) -> Result<(), ClipboardError> {
         lock(&self.state).listener = listener;
         Ok(())
+    }
+
+    /// Every format: the fake stores whatever it is given.
+    fn installable_image_formats(&self) -> &'static [ClipboardImageFormat] {
+        &[
+            ClipboardImageFormat::Dib,
+            ClipboardImageFormat::Png,
+            ClipboardImageFormat::Jpeg,
+        ]
+    }
+}
+
+/// A scriptable [`crate::ImageConverter`]: "converts" by tagging the input
+/// with the target format, so a test can tell a converted item from a
+/// verbatim one byte for byte, and can make the next conversion fail.
+#[derive(Debug, Default)]
+pub struct FakeImageConverter {
+    fail_next: Mutex<Option<crate::ImageConvertError>>,
+    conversions: Mutex<u32>,
+}
+
+impl FakeImageConverter {
+    /// A converter that succeeds.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What converting `bytes` to `to` produces: a tag naming the format,
+    /// then the input.
+    #[must_use]
+    pub fn converted(to: ClipboardImageFormat, bytes: &[u8]) -> Vec<u8> {
+        let mut out = format!("converted-to-{to:?}:").into_bytes();
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// Fail the next conversion with `error`.
+    pub fn fail_next(&self, error: crate::ImageConvertError) {
+        *lock(&self.fail_next) = Some(error);
+    }
+
+    /// How many conversions ran, failures included.
+    #[must_use]
+    pub fn conversions(&self) -> u32 {
+        *lock(&self.conversions)
+    }
+}
+
+impl crate::ImageConverter for FakeImageConverter {
+    fn convert(
+        &self,
+        _from: ClipboardImageFormat,
+        to: ClipboardImageFormat,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, crate::ImageConvertError> {
+        *lock(&self.conversions) += 1;
+        if let Some(error) = lock(&self.fail_next).take() {
+            return Err(error);
+        }
+        Ok(Self::converted(to, bytes))
     }
 }
 
@@ -1103,7 +1183,7 @@ mod clipboard_tests {
     /// byte-identical, including sequences no text path could survive.
     #[test]
     fn image_content_round_trips_verbatim_and_is_not_text() {
-        use crate::clipboard::{ClipboardContent, ClipboardImageFormat};
+        use crate::clipboard::{ClipboardContent, ClipboardImageFormat, ClipboardRead};
 
         let clipboard = InMemoryClipboard::new();
         let notifications = counting_listener(&clipboard);
@@ -1113,7 +1193,7 @@ mod clipboard_tests {
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
         assert_eq!(
             clipboard.read().unwrap(),
-            Some(ClipboardContent::Image {
+            ClipboardRead::Content(ClipboardContent::Image {
                 format: ClipboardImageFormat::Dib,
                 bytes: bytes.clone(),
             })
@@ -1145,7 +1225,7 @@ mod clipboard_tests {
     /// no OS clipboard.
     #[test]
     fn file_list_content_round_trips_and_is_not_text() {
-        use crate::clipboard::ClipboardContent;
+        use crate::clipboard::{ClipboardContent, ClipboardRead};
         use std::path::PathBuf;
 
         let clipboard = InMemoryClipboard::new();
@@ -1159,7 +1239,7 @@ mod clipboard_tests {
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
         assert_eq!(
             clipboard.read().unwrap(),
-            Some(ClipboardContent::FileList(paths))
+            ClipboardRead::Content(ClipboardContent::FileList(paths))
         );
         assert_eq!(clipboard.read_text().unwrap(), None);
         assert_eq!(clipboard.peek(), None);

@@ -1,6 +1,6 @@
 # 0016. Image interchange: the receiver names the format, the sender produces it
 
-Status: Proposed
+Status: Accepted (2026-09-28, with the amendment below)
 Date: 2026-08-16
 
 ## Context
@@ -162,3 +162,96 @@ install PNG breaks a peer that trusted it, exactly as a build advertising
 `CHUNKED_CLIPBOARD` prematurely would. The existing rule — advertise only
 what the code genuinely does — carries over, and the same
 advertisement-level test should cover the new bits.
+
+## Amendment (2026-09-28): accepted, with four conditions
+
+Accepted by the maintainer as a Phase 9.0 precondition. The core decision
+stands unchanged — the receiver names what it can install, PNG is the
+baseline, the sender converts its own local content, and **a receiver never
+decodes what a peer sent**. Reviewing it against what was built after it
+was drafted found four things it did not say, and each is now part of the
+decision.
+
+### 1. A sender produces the receiver's canonical form, or it starts a loop
+
+Loop prevention (FR-3.3) rests on a round trip: a receiver installs an item,
+remembers its hash, and when its own write raises a change notification the
+read that follows finds the same bytes and suppresses them. On Windows that
+only holds for a DIB already in the form the Windows reader returns —
+`canonical_dib` trims a blob to its header's own arithmetic precisely so
+that a read-back is a fixed point. A DIB produced elsewhere, with a V5
+header or trailing bytes, would install, read back under a different hash,
+look like a new local copy, and travel back: a clipboard sync loop, which is
+release-blocking.
+
+So: **every image format a platform advertises has a canonical form, defined
+by that platform's own reader, and a sender producing the format must
+produce exactly that form.** Each platform's port carries a conformance
+test — produce, install, read back, compare hashes — and a round trip that
+is not a fixed point fails the build, not a soak. The receiver still does
+nothing but install bytes; the obligation sits with the sender, where the
+conversion already is.
+
+### 2. The format bits move the protocol version
+
+The format bits are appended to `FeatureFlags`, and a v6 build advertises
+none of them. Rule 6 — no common format is a decline — would then stop
+images between a new build and a v6 one, silently from the user's side.
+[ADR 0017](0017-protocol-version-3.md)'s rule applies unchanged: peers are
+upgraded in lockstep, the floor moves with the ceiling, and a mixed pair is
+refused cleanly at `Hello` rather than half-working. The bump lands with the
+first build that advertises a format bit, not before.
+
+### 3. Local encoders: platform APIs where there are any, a fenced codec where there are not
+
+"Prefer platform imaging APIs" is right for Windows (WIC) and macOS
+(ImageIO / `NSBitmapImageRep`), and has no good answer on Linux: the nearest
+thing is GTK's gdk-pixbuf, a heavy dependency for a background service. A
+vetted pure-Rust PNG codec is permitted on Linux **for local content only**.
+It is fenced from the receive path the way the zip reader is fenced from
+production code today (`clippy.toml`'s `disallowed-types`, docs/SECURITY.md
+F9): its decode entry points are disallowed everywhere except the one module
+that reads this machine's own clipboard, so no path from the network can
+reach them without failing the build.
+
+A Windows sender needs no encoder at all in the common case: applications
+that publish `CF_DIB` usually publish a registered `"PNG"` rendering beside
+it, and when one is present it is sent verbatim instead of re-encoding the
+pixels.
+
+### 4. Conversion is off the driver loop, bounded before it starts, and refusable
+
+Encoding a 4K screenshot is hundreds of milliseconds of CPU. Conversion runs
+off the clipboard driver's loop, exactly as the file blob builder does
+([ADR 0015](0015-spooled-virtual-file-paste.md)), so a slow encode never
+stalls inbound verdicts. The source item's size is checked against its
+ceiling *before* conversion begins, and the converted result against the
+target type's ceiling after. A conversion that fails, or produces nothing
+the receiver advertises, is an observable refusal (FR-3.6) — logged,
+counted, and never a silent drop.
+
+### Implementation note (feature/179): the install bits are directional
+
+Built as decided, with one detail the decision left implicit. Every other
+capability bit is symmetric, and a session's capability set was the
+intersection of the two `Hello`s. The image-format bits cannot be: they say
+what the advertiser can *install*, and a sender needs its peer's list, not
+the part both share. A Mac that installs only PNG and a Windows machine
+that installs DIB and PNG would intersect to {PNG}, and the Mac would send
+Windows a format it does not prefer. `FeatureFlags::negotiate` therefore
+intersects the symmetric bits and takes the install bits from the peer, so
+`SessionInfo::features` stays "what may be sent to this peer"
+(docs/PROTOCOL.md §3.1). The protocol version moves to 7 with it, as
+condition 2 required.
+
+### What this makes explicit about "never decodes"
+
+The receive path installs bytes and checks their length; it parses nothing.
+One piece of image arithmetic *is* reachable by peer-originated bytes, and
+has been since images first travelled: after a peer's DIB is installed, the
+read-back runs `canonical_dib`'s header arithmetic over it. That is bounded
+header arithmetic, conservative by construction (anything it cannot describe
+confidently is kept whole), and property-tested — not a decoder. Each port's
+canonical-form reader inherits the same standing: bounded, no pixel or
+compressed-stream decoding, and tested as reachable input. A fuzz target for
+it is owed where the fuzz harness can build the platform crate.

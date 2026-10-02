@@ -115,17 +115,20 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use std::path::{Path, PathBuf};
 
+use crate::dib::canonical_dib;
 use crossover_platform::{
     ClipboardContent, ClipboardError, ClipboardImageFormat, ClipboardListener, ClipboardProvider,
-    MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
+    ClipboardRead, MAX_CLIPBOARD_FILE_ENTRIES, MAX_CLIPBOARD_IMAGE_BYTES,
 };
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::GlobalFree;
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, SetLastError, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::System::DataExchange::{
-    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
-    RemoveClipboardFormatListener, SetClipboardData,
+    AddClipboardFormatListener, CloseClipboard, CountClipboardFormats, EmptyClipboard,
+    GetClipboardData, GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
@@ -248,9 +251,12 @@ impl ClipboardProvider for WindowsClipboard {
     /// reads exactly as it always has.
     ///
     /// An image past [`MAX_CLIPBOARD_IMAGE_BYTES`], or a selection past
-    /// [`MAX_CLIPBOARD_FILE_ENTRIES`], reads as *absent* — the trait's
-    /// meaning for "nothing this backend represents" — refused before its
-    /// bytes (or its paths) are copied, never truncated (FR-3.6).
+    /// [`MAX_CLIPBOARD_FILE_ENTRIES`], reads as [`ClipboardRead::Unreadable`]
+    /// — the trait's meaning for "the user copied something this backend
+    /// does not represent" — refused before its bytes (or its paths) are
+    /// copied, never truncated (FR-3.6). So does any clipboard holding
+    /// formats but none of the three above; only a clipboard holding no
+    /// formats at all reads [`ClipboardRead::Empty`].
     ///
     /// A virtual file list this process itself placed (ADR 0015) never
     /// reaches here as `CF_HDROP` at all: the object we offer serves
@@ -262,7 +268,7 @@ impl ClipboardProvider for WindowsClipboard {
     ///
     /// All three probes happen inside one open, so the precedence above is
     /// decided from a single clipboard state ([`read_current`]).
-    fn read(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+    fn read(&self) -> Result<ClipboardRead, ClipboardError> {
         read_current(MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_FILE_ENTRIES)
     }
 
@@ -305,6 +311,14 @@ impl ClipboardProvider for WindowsClipboard {
         *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = listener;
         Ok(())
     }
+
+    /// `CF_DIB`, and the registered `"PNG"` format — the two [`write`]
+    /// installs. Not JPEG: [`write`] refuses it (ADR 0014).
+    ///
+    /// [`write`]: ClipboardProvider::write
+    fn installable_image_formats(&self) -> &'static [ClipboardImageFormat] {
+        &[ClipboardImageFormat::Dib, ClipboardImageFormat::Png]
+    }
 }
 
 /// Decide text-versus-file-list-versus-image from **one** clipboard state.
@@ -327,7 +341,8 @@ impl ClipboardProvider for WindowsClipboard {
 fn read_current(
     max_image_bytes: usize,
     max_file_entries: u32,
-) -> Result<Option<ClipboardContent>, ClipboardError> {
+) -> Result<ClipboardRead, ClipboardError> {
+    let holds_formats;
     let mut raw_image = None;
     let mut oversized_image = None;
     let mut file_list = None;
@@ -337,6 +352,7 @@ fn read_current(
     // guard has dropped and the machine-global lock is free.
     let units = {
         let open = OpenGuard::open("read")?;
+        holds_formats = probe_holds_formats(&open);
         match probe_unicode_text(&open)? {
             Some(units) if !units.is_empty() => Some(units),
             empty_or_absent => {
@@ -378,17 +394,45 @@ fn read_current(
         );
     }
     if let Some(paths) = file_list {
-        return Ok(Some(ClipboardContent::FileList(paths)));
+        return Ok(ClipboardRead::Content(ClipboardContent::FileList(paths)));
     }
     if let Some(blob) = raw_image {
-        return Ok(Some(ClipboardContent::Image {
+        return Ok(ClipboardRead::Content(ClipboardContent::Image {
             format: ClipboardImageFormat::Dib,
             bytes: canonical_dib(blob),
         }));
     }
-    // An oversized file list or image is *absent*, which leaves an empty
-    // text representation beside it reading as it always has.
-    Ok(units.map(|units| ClipboardContent::Text(String::from_utf16_lossy(&units))))
+    // An oversized file list or image is not content, which leaves an
+    // empty text representation beside it reading as it always has.
+    if let Some(units) = units {
+        return Ok(ClipboardRead::Content(ClipboardContent::Text(
+            String::from_utf16_lossy(&units),
+        )));
+    }
+    Ok(if holds_formats {
+        ClipboardRead::Unreadable
+    } else {
+        ClipboardRead::Empty
+    })
+}
+
+/// Whether the already-open clipboard holds any format at all — the one
+/// fact that separates [`ClipboardRead::Empty`] from
+/// [`ClipboardRead::Unreadable`] (ADR 0005, addendum 2026-09-28).
+///
+/// `CountClipboardFormats` answers 0 both for an empty clipboard and for a
+/// failure, so the thread's last error is cleared first and read after.
+/// A failure answers `true`: when this backend cannot tell, the trait
+/// asks for `Unreadable`, which costs a peer item superseded observably
+/// rather than a user's copy overwritten silently.
+fn probe_holds_formats(_open: &OpenGuard) -> bool {
+    // SAFETY: SetLastError/GetLastError touch only this thread's error
+    // slot; CountClipboardFormats takes no arguments and reads the
+    // clipboard this thread holds open (caller's guard).
+    unsafe {
+        SetLastError(WIN32_ERROR(0));
+        CountClipboardFormats() != 0 || GetLastError() != WIN32_ERROR(0)
+    }
 }
 
 /// Probe `CF_UNICODETEXT` on the already-open clipboard, yielding its
@@ -924,148 +968,6 @@ fn free_blocks(blocks: &[(u32, HGLOBAL)]) {
     }
 }
 
-/// Size of the `BITMAPINFOHEADER` that opens every `CF_DIB` blob. The
-/// larger V4/V5 headers belong to `CF_DIBV5`; Windows' synthesis hands
-/// `CF_DIB` requests this one.
-const BITMAPINFOHEADER_BYTES: u32 = 40;
-
-// `biCompression` values, from wingdi.h. Only the arithmetic each implies
-// is used; no pixel data is ever examined.
-const BI_RGB: u32 = 0;
-const BI_RLE8: u32 = 1;
-const BI_RLE4: u32 = 2;
-const BI_BITFIELDS: u32 = 3;
-const BI_JPEG: u32 = 4;
-const BI_PNG: u32 = 5;
-const BI_ALPHABITFIELDS: u32 = 6;
-
-/// Trim allocator slack from a `CF_DIB` blob, or keep it whole.
-///
-/// Verbatim means *the bitmap*, and a global block may be larger than the
-/// bitmap it carries. Trimming it is not cosmetic: loop prevention (FR-3.3)
-/// keys on the content hash, so a blob that gained pad bytes on every hop
-/// would read back as new content after Crossover's own write — a clipboard
-/// sync loop, which is release-blocking. Truncating to the header's own
-/// arithmetic makes the round trip a fixed point instead.
-///
-/// Conservative by construction: anything the header does not describe
-/// confidently, or any computed length the blob is too short for, keeps
-/// the blob exactly as the OS gave it. The failure mode is therefore "a
-/// few unused bytes travel", never "a valid image is cut short".
-fn canonical_dib(mut blob: Vec<u8>) -> Vec<u8> {
-    if let Some(logical) = dib_logical_len(&blob) {
-        blob.truncate(logical);
-    }
-    blob
-}
-
-/// The logical byte length of a `CF_DIB` blob: header + colour
-/// table/masks + pixel data, per the `BITMAPINFOHEADER` contract.
-///
-/// `None` means "do not trust this" — an unrecognized header, implausible
-/// dimensions, or arithmetic the blob cannot satisfy — and the caller then
-/// keeps the whole blob. Nothing here reads a single pixel; the fields
-/// consumed are the geometry ones that fix the layout.
-fn dib_logical_len(blob: &[u8]) -> Option<usize> {
-    if le_u32(blob, 0)? != BITMAPINFOHEADER_BYTES {
-        return None; // not a BITMAPINFOHEADER-shaped DIB
-    }
-    let width = le_i32(blob, 4)?;
-    let height = le_i32(blob, 8)?;
-    let planes = le_u16(blob, 12)?;
-    let bit_count = le_u16(blob, 14)?;
-    let compression = le_u32(blob, 16)?;
-    let size_image = u64::from(le_u32(blob, 20)?);
-    let clr_used = u64::from(le_u32(blob, 32)?);
-
-    // Plausibility, not validation: a DIB whose geometry we cannot trust
-    // is one whose length we must not compute.
-    if planes != 1 || width <= 0 || height == 0 {
-        return None;
-    }
-    if !matches!(bit_count, 1 | 4 | 8 | 16 | 24 | 32) {
-        return None;
-    }
-
-    // What sits between the header and the pixels. At <= 8 bpp that is a
-    // palette (biClrUsed entries, or the full 2^bpp when it is zero); at
-    // higher depths it is the bit-field masks, plus any optimization
-    // palette biClrUsed still claims. Over-counting here is safe: the
-    // total simply fails the length check below and the blob stays whole.
-    let table = if bit_count <= 8 {
-        let entries = if clr_used == 0 {
-            1u64 << bit_count
-        } else {
-            clr_used
-        };
-        if entries > 256 {
-            return None;
-        }
-        entries * 4
-    } else {
-        let masks = match compression {
-            BI_BITFIELDS => 12,
-            BI_ALPHABITFIELDS => 16,
-            _ => 0,
-        };
-        masks + clr_used * 4
-    };
-
-    let pixels = match compression {
-        BI_RGB | BI_BITFIELDS | BI_ALPHABITFIELDS => {
-            // Rows are padded to a 4-byte boundary; height may be
-            // negative for a top-down DIB, which changes the row order,
-            // not the size. `biSizeImage` is allowed to be 0 for
-            // uncompressed data, and is allowed to be larger than the
-            // strict minimum — take whichever is bigger so a producer
-            // that padded the buffer is not cut short.
-            let stride = (u64::from(width.unsigned_abs()) * u64::from(bit_count)).div_ceil(32) * 4;
-            let rows = u64::from(height.unsigned_abs());
-            stride.checked_mul(rows)?.max(size_image)
-        }
-        // Compressed payloads have no computable size: `biSizeImage` is
-        // the only statement of it, and is mandatory here.
-        BI_RLE4 | BI_RLE8 | BI_JPEG | BI_PNG => {
-            if size_image == 0 {
-                return None;
-            }
-            size_image
-        }
-        _ => return None, // an encoding this code does not model
-    };
-
-    let total = u64::from(BITMAPINFOHEADER_BYTES)
-        .checked_add(table)?
-        .checked_add(pixels)?;
-    let total = usize::try_from(total).ok()?;
-    // A blob shorter than its own header claims is either malformed or
-    // beyond this model; either way, hand it back untouched.
-    (total <= blob.len()).then_some(total)
-}
-
-/// Little-endian field readers. Bounds-checked, so a truncated blob is
-/// `None` rather than a panic (NFR-1: malformed input never panics).
-fn le_u16(blob: &[u8], at: usize) -> Option<u16> {
-    blob.get(at..at + 2)?
-        .try_into()
-        .ok()
-        .map(u16::from_le_bytes)
-}
-
-fn le_u32(blob: &[u8], at: usize) -> Option<u32> {
-    blob.get(at..at + 4)?
-        .try_into()
-        .ok()
-        .map(u32::from_le_bytes)
-}
-
-fn le_i32(blob: &[u8], at: usize) -> Option<i32> {
-    blob.get(at..at + 4)?
-        .try_into()
-        .ok()
-        .map(i32::from_le_bytes)
-}
-
 /// Which of our own call sites currently holds the clipboard open, if
 /// any — feature/162's answer to a gap the window-based lookup below
 /// cannot close on its own: every in-process open here uses a `NULL`
@@ -1483,7 +1385,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use crossover_platform::{ClipboardError, ClipboardProvider};
+    use crossover_platform::{ClipboardError, ClipboardProvider, ClipboardRead};
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+    use windows::core::w;
 
     use super::WindowsClipboard;
 
@@ -2058,7 +1962,7 @@ mod tests {
             bytes: dib(16, 16),
         };
         with_retry(|| clipboard.write(&image)).unwrap();
-        let read_back = with_retry(|| clipboard.read()).unwrap();
+        let read_back = with_retry(|| clipboard.read()).unwrap().into_content();
         assert!(
             read_back.as_ref() == Some(&image),
             "the image did not survive the clipboard verbatim (read back {:?} bytes)",
@@ -2117,7 +2021,7 @@ mod tests {
         // once. An unstable length would loop on the second hop instead
         // of the first.
         for attempt in 1..=2 {
-            match with_retry(|| clipboard.read()).unwrap() {
+            match with_retry(|| clipboard.read()).unwrap().into_content() {
                 Some(ClipboardContent::Image {
                     format: ClipboardImageFormat::Dib,
                     bytes: read_back,
@@ -2167,7 +2071,7 @@ mod tests {
         })
         .unwrap();
 
-        match with_retry(|| clipboard.read()).unwrap() {
+        match with_retry(|| clipboard.read()).unwrap().into_content() {
             Some(ClipboardContent::Text(read_back)) => assert_eq!(read_back, text),
             other => panic!(
                 "mixed content must read as text, got {:?}",
@@ -2211,7 +2115,7 @@ mod tests {
         })
         .unwrap();
 
-        match with_retry(|| clipboard.read()).unwrap() {
+        match with_retry(|| clipboard.read()).unwrap().into_content() {
             Some(ClipboardContent::Image { bytes, .. }) => assert_eq!(bytes, picture),
             other => panic!(
                 "empty text must not mask an image, got {:?}",
@@ -2230,7 +2134,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             with_retry(|| clipboard.read()).unwrap(),
-            Some(ClipboardContent::Text(String::new()))
+            ClipboardRead::Content(ClipboardContent::Text(String::new()))
         );
     }
 
@@ -2240,7 +2144,7 @@ mod tests {
     /// truncated. The ceiling is a parameter so the refusal is provable
     /// without putting a 64 MiB item on a live desktop's clipboard.
     #[test]
-    fn an_image_over_the_ceiling_reads_as_absent_rather_than_truncated() {
+    fn an_image_over_the_ceiling_reads_as_unreadable_rather_than_truncated() {
         let _serial = clipboard_lock();
         let clipboard = WindowsClipboard::new().unwrap();
 
@@ -2265,7 +2169,17 @@ mod tests {
             Some(picture.len())
         );
         // And the trait-level read agrees with the ceiling it applies.
-        assert!(with_retry(|| clipboard.read()).unwrap().is_some());
+        assert!(with_retry(|| clipboard.read()).unwrap().content().is_some());
+        // Under a ceiling below the item, the whole read is unreadable —
+        // the user's copy, not an empty clipboard.
+        assert_eq!(
+            with_retry(|| super::read_current(
+                picture.len() - 1,
+                crossover_platform::MAX_CLIPBOARD_FILE_ENTRIES
+            ))
+            .unwrap(),
+            ClipboardRead::Unreadable
+        );
     }
 
     /// PNG installs verbatim under the registered `"PNG"` format —
@@ -2320,7 +2234,7 @@ mod tests {
     #[test]
     fn the_canonical_length_of_a_well_formed_dib_is_its_whole_blob() {
         let blob = dib(8, 4);
-        assert_eq!(super::dib_logical_len(&blob), Some(blob.len()));
+        assert_eq!(crate::dib::dib_logical_len(&blob), Some(blob.len()));
         assert_eq!(super::canonical_dib(blob.clone()), blob);
     }
 
@@ -2361,7 +2275,7 @@ mod tests {
         paletted.extend_from_slice(&0u32.to_le_bytes());
         let expected = 40 + 256 * 4 + 8 * 3;
         paletted.resize(expected + 7, 0); // + slack
-        assert_eq!(super::dib_logical_len(&paletted), Some(expected));
+        assert_eq!(crate::dib::dib_logical_len(&paletted), Some(expected));
 
         // 16 bpp BI_BITFIELDS: three DWORD masks sit before the pixels.
         let mut masked = Vec::new();
@@ -2377,7 +2291,7 @@ mod tests {
         masked.extend_from_slice(&0u32.to_le_bytes());
         let expected = 40 + 12 + 8 * 2; // masks + stride(4×16bpp = 8) × 2 rows
         masked.resize(expected + 3, 0);
-        assert_eq!(super::dib_logical_len(&masked), Some(expected));
+        assert_eq!(crate::dib::dib_logical_len(&masked), Some(expected));
     }
 
     /// Conservative in the only direction that matters: anything this code
@@ -2388,24 +2302,24 @@ mod tests {
         // A V5 header (CF_DIBV5 shape) — not what CF_DIB hands back.
         let mut v5 = dib(4, 4);
         v5[0..4].copy_from_slice(&124u32.to_le_bytes());
-        assert_eq!(super::dib_logical_len(&v5), None);
+        assert_eq!(crate::dib::dib_logical_len(&v5), None);
         assert_eq!(super::canonical_dib(v5.clone()), v5);
 
         // Too short to hold a header at all.
-        assert_eq!(super::dib_logical_len(&[0u8; 12]), None);
-        assert_eq!(super::dib_logical_len(&[]), None);
+        assert_eq!(crate::dib::dib_logical_len(&[0u8; 12]), None);
+        assert_eq!(crate::dib::dib_logical_len(&[]), None);
 
         // Dimensions that claim far more than the blob holds.
         let mut liar = dib(4, 4);
         liar[4..8].copy_from_slice(&40_000i32.to_le_bytes());
-        assert_eq!(super::dib_logical_len(&liar), None);
+        assert_eq!(crate::dib::dib_logical_len(&liar), None);
         assert_eq!(super::canonical_dib(liar.clone()), liar);
 
         // A compressed encoding with no declared size cannot be measured.
         let mut rle = dib(4, 4);
         rle[16..20].copy_from_slice(&1u32.to_le_bytes()); // BI_RLE8
         rle[20..24].copy_from_slice(&0u32.to_le_bytes()); // biSizeImage = 0
-        assert_eq!(super::dib_logical_len(&rle), None);
+        assert_eq!(crate::dib::dib_logical_len(&rle), None);
     }
 
     /// A `BITMAPINFOHEADER` with every field under the test's control, so
@@ -2520,7 +2434,7 @@ mod tests {
             && expected <= blob.len()
         {
             assert_eq!(
-                super::dib_logical_len(blob),
+                crate::dib::dib_logical_len(blob),
                 Some(expected),
                 "the implementation and the textbook formula disagree \
                  (iteration {iteration})"
@@ -2528,7 +2442,7 @@ mod tests {
         }
 
         // 4: the loop guard, over blobs that describe themselves.
-        let self_describing = super::dib_logical_len(&once).is_some();
+        let self_describing = crate::dib::dib_logical_len(&once).is_some();
         if self_describing {
             for pad in [1usize, 7, 32] {
                 let mut padded = once.clone();
@@ -2748,7 +2662,7 @@ mod tests {
         set_hdrop(&paths);
 
         let clipboard = WindowsClipboard::new().unwrap();
-        match with_retry(|| clipboard.read()).unwrap() {
+        match with_retry(|| clipboard.read()).unwrap().into_content() {
             Some(ClipboardContent::FileList(observed)) => {
                 assert_eq!(
                     observed,
@@ -2765,10 +2679,12 @@ mod tests {
     }
 
     /// A selection past [`crossover_platform::MAX_CLIPBOARD_FILE_ENTRIES`]
-    /// reads as absent — refused before a single path is queried, never
-    /// truncated to the first N (FR-3.6, NFR-1).
+    /// reads as unreadable — refused before a single path is queried, never
+    /// truncated to the first N (FR-3.6, NFR-1) — and not as empty: the
+    /// user did copy something, and the engine protects it (ADR 0005,
+    /// addendum 2026-09-28).
     #[test]
-    fn a_selection_over_the_entry_ceiling_reads_as_absent() {
+    fn a_selection_over_the_entry_ceiling_reads_as_unreadable() {
         let _serial = clipboard_lock();
         let too_many: Vec<String> = (0..=crossover_platform::MAX_CLIPBOARD_FILE_ENTRIES)
             .map(|i| format!(r"C:\overflow\{i}.txt"))
@@ -2777,7 +2693,70 @@ mod tests {
         set_hdrop(&refs);
 
         let clipboard = WindowsClipboard::new().unwrap();
-        assert_eq!(with_retry(|| clipboard.read()).unwrap(), None);
+        assert_eq!(
+            with_retry(|| clipboard.read()).unwrap(),
+            ClipboardRead::Unreadable
+        );
+    }
+
+    /// Loop safety for a PNG a peer sends (ADR 0016's amendment): Windows
+    /// installs it under the registered `"PNG"` format, which this reader
+    /// never reads and Windows never synthesizes into `CF_DIB`. The read
+    /// that follows our own write therefore sees the clipboard as
+    /// unreadable — never as content to send back — so a received PNG
+    /// cannot echo, whatever its bytes.
+    #[test]
+    fn an_installed_png_reads_back_as_unreadable_and_cannot_echo() {
+        use crossover_platform::{ClipboardContent, ClipboardImageFormat};
+
+        let _serial = clipboard_lock();
+        let clipboard = WindowsClipboard::new().unwrap();
+        let png = b"\x89PNG\r\n\x1a\n not a real image, and it need not be".to_vec();
+        with_retry(|| {
+            clipboard.write(&ClipboardContent::Image {
+                format: ClipboardImageFormat::Png,
+                bytes: png.clone(),
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            with_retry(|| clipboard.read()).unwrap(),
+            ClipboardRead::Unreadable
+        );
+    }
+
+    /// A clipboard holding no formats at all is the one answer that reads
+    /// [`ClipboardRead::Empty`] (ADR 0005, addendum 2026-09-28).
+    #[test]
+    fn an_emptied_clipboard_reads_as_empty() {
+        let _serial = clipboard_lock();
+        with_retry(|| super::install_formats(&[])).unwrap();
+
+        let clipboard = WindowsClipboard::new().unwrap();
+        assert_eq!(
+            with_retry(|| clipboard.read()).unwrap(),
+            ClipboardRead::Empty
+        );
+    }
+
+    /// The residual this distinction exists to close: a copy made only in
+    /// a format this build does not synchronize — an application's private
+    /// format — is the user's content, and reads as
+    /// [`ClipboardRead::Unreadable`], never as [`ClipboardRead::Empty`].
+    #[test]
+    fn a_private_format_only_copy_reads_as_unreadable_not_empty() {
+        let _serial = clipboard_lock();
+        // SAFETY: registers (or looks up) a named format; no other effect.
+        let private = unsafe { RegisterClipboardFormatW(w!("Crossover.Test.PrivateFormat")) };
+        assert_ne!(private, 0, "registering the test format failed");
+        with_retry(|| super::install_formats(&[(private, b"application-private bytes")])).unwrap();
+
+        let clipboard = WindowsClipboard::new().unwrap();
+        assert_eq!(
+            with_retry(|| clipboard.read()).unwrap(),
+            ClipboardRead::Unreadable
+        );
+        assert_eq!(with_retry(|| clipboard.read_text()).unwrap(), None);
     }
 
     /// `ClipboardContent::FileList` is a local observation, not something
@@ -2819,7 +2798,7 @@ mod tests {
         let _serial = clipboard_lock();
         let clipboard = WindowsClipboard::new().unwrap();
 
-        let first = with_retry(|| clipboard.read()).unwrap();
+        let first = with_retry(|| clipboard.read()).unwrap().into_content();
         let Some(ClipboardContent::Image {
             format: ClipboardImageFormat::Dib,
             bytes,
@@ -2830,7 +2809,7 @@ mod tests {
         assert!(bytes.len() <= super::MAX_CLIPBOARD_IMAGE_BYTES);
         eprintln!("snip read as {} bytes of CF_DIB", bytes.len());
 
-        let again = with_retry(|| clipboard.read()).unwrap();
+        let again = with_retry(|| clipboard.read()).unwrap().into_content();
         assert!(
             again
                 == Some(ClipboardContent::Image {

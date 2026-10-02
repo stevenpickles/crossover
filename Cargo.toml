@@ -5,6 +5,7 @@ members = [
     "apps/crossover-svc",
     "crates/crossover-core",
     "crates/crossover-platform",
+    "crates/crossover-platform-macos",
     "crates/crossover-platform-windows",
     "crates/crossover-protocol",
     "crates/crossover-security",
@@ -29,7 +30,7 @@ resolver = "3"
 # installs as an upgrade; leaving it at 0.1.0 would make every development
 # build a *pre-release of the version already installed* and therefore
 # un-upgradeable.
-version = "0.2.0"
+version = "0.3.0"
 # Nothing here is published to crates.io: this is one application in one
 # repository, and the crate split exists for internal boundaries
 # (docs/ARCHITECTURE.md §3), not distribution. Declaring it prevents an
@@ -44,6 +45,7 @@ repository = "https://github.com/stevenpickles/crossover"
 [workspace.dependencies]
 crossover-core = { path = "crates/crossover-core" }
 crossover-platform = { path = "crates/crossover-platform" }
+crossover-platform-macos = { path = "crates/crossover-platform-macos" }
 crossover-platform-windows = { path = "crates/crossover-platform-windows" }
 crossover-protocol = { path = "crates/crossover-protocol" }
 crossover-security = { path = "crates/crossover-security" }
@@ -143,6 +145,16 @@ x509-parser = "0.18"
 # `::windows_core` paths, so the crate the `windows` façade already pulls in
 # has to be named directly. Same version, same source, no new tree.
 windows-core = "0.62"
+# The macOS port's bindings (ADR 0020): the objc2 family at the generation
+# winit already resolves for the layout editor, so the port adds framework
+# crates to a family already in the tree. default-features = false on each
+# framework crate, with only the features a slice uses — the defaults enable
+# every class and function in the framework.
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false }
+objc2-core-foundation = { version = "0.3.2", default-features = false }
+objc2-foundation = { version = "0.3.2", default-features = false }
+objc2-security = { version = "0.3.2", default-features = false }
 windows = { version = "0.62", features = [
     # Wdk_*: NtCreateFile plus OBJECT_ATTRIBUTES, the only Win32 way to
     # open a file *relative to an already-open directory handle*. The spool
@@ -169,6 +181,10 @@ windows = { version = "0.62", features = [
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    # The Windows Imaging Component: encoding this machine's own clipboard
+    # DIB as PNG for a peer that installs only PNG (ADR 0016). Never fed a
+    # peer's bytes: the sender converts, the receiver never decodes.
+    "Win32_Graphics_Imaging",
     # GetBestInterfaceEx + GetIfEntry2: which local interface carries a
     # given peer, and is its media connected. Two kernel-table reads on the
     # disconnect path, so a NIC that drops its link is not misreported as

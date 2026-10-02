@@ -59,15 +59,27 @@ use crate::ProtocolError;
 /// docs/PROTOCOL.md §7 — so the bump turns that into a refusal at `Hello`.
 /// Like the label before it the size is display-only and never identity;
 /// the bump is about the byte, not about what it means.
-pub const PROTOCOL_VERSION: u16 = 6;
+///
+/// v7 (Phase 9, [ADR 0016](../../../docs/adr/0016-image-interchange-format.md)
+/// and its 2026-09-28 amendment): `Hello` advertises the image formats a
+/// side can **install** (`FeatureFlags::IMAGE_*`), and an image is sent
+/// only in a format its receiver advertised. No byte on the wire changes
+/// shape — the bits ride the `u64` that already travels — but the
+/// *meaning* of an empty set does: a v6 build advertises none, and a v7
+/// sender reads that as "installs no images" and sends it none, silently
+/// from the user's side. ADR 0017's rule, applied as the amendment says:
+/// the floor moves with the ceiling, and a mixed pair is refused cleanly
+/// at `Hello` instead of losing images without a word.
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// The lowest protocol version this build accepts. Each bump has been an
 /// incompatible layout change (v1's control messages cannot be decoded by
 /// v2; v2's offers cannot be decoded by v3; v3's `entry` cannot be decoded
-/// by v4; v4's `MonitorTopology` cannot be decoded by v5, nor v5's by v6),
+/// by v4; v4's `MonitorTopology` cannot be decoded by v5, nor v5's by v6;
+/// a v6 peer's empty image-format set means something different to v7),
 /// and peers are deployed in lockstep, so the floor tracks the ceiling
 /// rather than carrying compatibility code for a version nobody runs.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 6;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 7;
 
 /// An inclusive range of supported protocol versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

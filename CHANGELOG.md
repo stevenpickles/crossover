@@ -9,8 +9,145 @@ session and versioned separately (`PROTOCOL_VERSION` in
 `crossover-protocol`); a release note says so whenever that number moves.
 
 Builds that are not tagged releases identify themselves as such —
-`0.2.0-dev.7.gabc1234` — and say where they came from. Run
+`0.3.0-dev.7.gabc1234` — and say where they came from. Run
 `crossover version` on any binary to see exactly what it is.
+
+## [0.3.0] — 2026-10-02
+
+Two Windows machines get a tighter grip on what a paired peer may do —
+clipboard in each direction, and keyboard and pointer on the machine being
+controlled — and the groundwork for macOS lands: the protocol now carries
+which image formats each side can install, Windows converts for a peer that
+needs PNG, and a Mac can pair and share text from source builds. Phase 8's
+drawn topology finished its soak; Phase 9 (macOS and Linux) is under way.
+
+**Protocol version 7, floor 7: upgrade both machines together.** A pair
+with one 0.2.0 machine is refused cleanly at the handshake, naming both
+version ranges.
+
+### Added
+
+- **`crossover peers allow-clipboard` / `deny-clipboard`.** Pairing lets
+  clipboard content flow both ways, and until now nothing could narrow that.
+  `deny-clipboard <device-id>` stops it in both directions; `--incoming`
+  keeps the peer's copies — and its files, which reach you through your
+  clipboard — out, and `--outgoing` keeps your copies on your machine.
+  `crossover peers` shows both directions for every peer, allowed or not. A
+  running Crossover applies a change within one trust-store poll, without a
+  reconnect.
+
+- **Each machine says which image formats it can install**, and an image
+  is sent only in a format its receiver named (ADR 0016). Between two
+  Windows machines nothing changes — both install the DIB format images
+  already travel in — but a machine that cannot install a format is no
+  longer sent it: the sender logs why and counts it instead. This is what
+  lets a Mac, which does not install Windows' DIB format, join image sync
+  when its image support lands.
+- **Windows converts an image for a peer that installs only PNG.** The
+  image is this machine's own clipboard content, encoded to PNG with the
+  Windows Imaging Component off the sync loop, so a large screenshot does
+  not delay anything else. Nothing a peer sends is ever decoded: the
+  sender converts, the receiver installs bytes as they are (ADR 0016).
+- **macOS, from source: pairing and the text clipboard** (a preview —
+  Phase 9.1, [ADR 0020](docs/adr/0020-macos-platform-bindings.md)). A Mac
+  built from this source keeps its identity and trusted peers in the login
+  keychain, pairs with a Windows machine, and shares **text** both ways;
+  `crossover run` on a Mac is **clipboard-only** — no input, no screens
+  shared — until the macOS input slice lands. Reading the clipboard on
+  current macOS is privacy-gated: the first copy asks, and a Mac set to
+  "always deny" says so in its log rather than syncing nothing silently.
+  Not yet checked on real Mac hardware, and no Mac binaries are published.
+
+### Security
+
+- **A paired peer may no longer drive this machine against your wishes.**
+  Until now any paired peer's request to control this machine was granted,
+  and the `keyboard` and `mouse` flags guarded the other direction, and only
+  on paper. They now guard the machine being controlled (ADR 0021): a peer
+  holding neither is refused, and told so; one holding one may only do that
+  (point but not type, say); and withdrawing a flag reaches control already
+  in progress within seconds, releasing anything it held down.
+  `crossover peers allow-input` / `deny-input <device-id> [--keyboard]
+  [--mouse]` set them, and `crossover peers` shows both for every peer.
+  Pairing still grants both, so nothing changes until you narrow it.
+- **Both clipboard permissions are enforced.** 0.2.0 enforced
+  `clipboard_send` for files only, and `clipboard_receive` nowhere, so
+  per-peer clipboard permissions — a mitigation `docs/SECURITY.md` names for
+  clipboard exfiltration (T9) — held in the store and were not consulted.
+  Now a copy the peer may not be sent stays on this machine (still observed,
+  so it still outranks a waiting peer item), and an item the peer may not
+  write here is refused — declined `NotPermitted` at the offer, answered
+  `ContentRejected` for inline text — before the conflict rule can let it
+  displace this machine's own copy. Both fail closed: no live peer, an
+  unknown peer, or an unreadable trust store grants nothing. Defaults are
+  unchanged, so a pair nobody has restricted behaves exactly as before.
+
+### Changed
+
+- **The drawn topology has completed its two-machine soak.** 0.2.0 listed
+  this as a known limitation; an extended soak on the standing pair
+  (three monitors on one machine, mixed DPI) closed it with no meaningful
+  issues, and Phase 8 is closed
+  ([docs/ROADMAP.md](docs/ROADMAP.md), [docs/SOAK.md](docs/SOAK.md)). The
+  per-check figures were not recorded individually, and the soak entry says
+  so.
+
+### Fixed
+
+- **Logging off no longer reads as a worker crash.** Windows ends the
+  worker at logoff with exit code `0x40010004` before the service hears
+  about the logoff; the service logged that as `crashed=true`, counted it
+  toward crash backoff, and relaunched into the session that was going
+  away. It is now classified as a system termination: not a crash, and
+  relaunched only after a short settle window in which the logoff cancels
+  it.
+- **A copy Crossover cannot read is no longer overwritten by a waiting peer
+  item.** 0.2.0 listed this as a known limitation: copying something in a
+  format Crossover does not sync — an application's private format,
+  RTF-only content, an image past the size cap — read the same as an empty
+  clipboard, so a peer item waiting out a busy clipboard was written over
+  it about a second later, with nothing logged. The clipboard read now
+  tells *empty* from *unreadable*, and an unreadable copy outranks a
+  waiting peer item exactly as any other local copy does; the peer is told
+  its item was `Superseded`
+  ([ADR 0005](docs/adr/0005-clipboard-transaction-flow.md)'s 2026-09-28
+  addendum).
+- **A peer item is no longer waved through as already present after the
+  clipboard moved on.** After an unreadable copy (or an emptied
+  clipboard), Crossover still believed the last content it could read was
+  on the clipboard, so the peer sending that same content again was
+  answered as applied without anything being written. It is now installed.
+
+### Known limitations
+
+- **macOS is a preview, and Linux has not started.** A Mac builds from
+  source, pairs, and shares text, but runs clipboard-only — images, files,
+  input, the background service and the layout editor arrive in later
+  Phase 9 slices — and none of it has been checked on Mac hardware yet:
+  how the clipboard-privacy prompt and the Keychain behave across a rebuild
+  are open questions ([docs/platform-risks-macos.md](docs/platform-risks-macos.md)
+  M-8, M-11). Release packages are Windows only.
+- **Two different unreadable copies across a disconnection can look
+  unchanged.** If you copy something Crossover cannot read, then a different
+  unreadable thing while the peer is away, a reconnect may install the
+  peer's re-announced item over the second copy. It needs both copies across
+  a disconnection with a peer item waiting at the moment of reconnect
+  ([ADR 0005](docs/adr/0005-clipboard-transaction-flow.md)'s 2026-09-28
+  addendum).
+- **Carried over from 0.2.0, unchanged:** two machines only; binaries are
+  not code-signed, so SmartScreen warns on first run (verify the published
+  SHA-256); no automatic updates; `crossover-layout.exe` must sit beside
+  `crossover.exe`; images are capped at 64 MiB and files at 256 MiB; a paste
+  target that cannot take an `IStream` cannot paste a received file; Windows
+  Cloud Clipboard sees what Crossover writes; a first-ever adopted
+  arrangement on a machine with none takes one restart; a layout whose
+  screens are all absent goes inert; no inbound preemption of a saturated
+  same-driver queue; responsiveness under a saturating transfer depends on
+  the link; and injection into an elevated window may be swallowed by UIPI.
+  Each is described in the
+  [0.2.0 release notes](https://github.com/stevenpickles/crossover/releases/tag/v0.2.0).
+
+[0.3.0]: https://github.com/stevenpickles/crossover/releases/tag/v0.3.0
 
 ## [0.2.0] — 2026-09-01
 
