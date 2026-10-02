@@ -126,9 +126,17 @@ addresses.
   install, so a grant withdrawn mid-transfer still stops the write. Both
   reach a running worker on its trust-store poll, fail closed when the store
   will not load, and are judged over every live peer, because the clipboard
-  engine cannot attribute an item to one peer. **`keyboard` and `mouse` are
-  not yet enforced**: stored and shown, but a trusted peer can still drive
-  input. That default-on latitude
+  engine cannot attribute an item to one peer. **The input flags are
+  enforced too** ([ADR 0021](adr/0021-input-permissions-guard-the-controlled-machine.md)),
+  on the machine being controlled, where the risk is: `keyboard` and `mouse`
+  on this machine's record of a peer decide whether that peer may type and
+  point *here*. A request from a peer holding neither is refused
+  `NotPermitted` ahead of every other rule; a grant applies only the kinds it
+  permits; and withdrawing one mid-control releases what that kind holds,
+  while withdrawing both ends the control as the escape chord does. Judged
+  per session, because the control engine knows which peer asks, and
+  published before the session is announced and on every trust poll. That
+  default-on latitude
   **stops at the filesystem**: `file_receive` defaults to **off** for every
   peer, existing records included, and only an explicit user grant turns it on
   (invariant 8, §7). A trust store written before file transfer existed reads
@@ -145,7 +153,9 @@ addresses.
 - `crossover peers` lists the store, including each peer's file permission;
   `crossover peers remove <device-id>` revokes trust entirely, and
   `crossover peers allow-files <device-id>` / `deny-files <device-id>` grant and
-  withdraw `file_receive`, and `crossover peers allow-clipboard` /
+  withdraw `file_receive`; `crossover peers allow-input` / `deny-input
+  <device-id> [--keyboard] [--mouse]` grant and withdraw the input flags; and
+  `crossover peers allow-clipboard` /
   `deny-clipboard <device-id> [--incoming] [--outgoing]` grant and withdraw
   `clipboard_receive` (incoming) and `clipboard_send` (outgoing), both when
   neither is named (a `show` subcommand can come later). Removal revokes
