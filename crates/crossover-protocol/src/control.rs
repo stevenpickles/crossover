@@ -165,6 +165,12 @@ pub enum DenyReason {
     Busy,
     /// The destination is already being controlled.
     AlreadyControlled,
+    /// The destination's user has not granted this peer input on that
+    /// machine — neither `keyboard` nor `mouse` on their record of it
+    /// (ADR 0021). Permanent until they grant it, and stated rather than
+    /// disguised as [`DenyReason::Busy`], so the requesting user learns
+    /// why nothing happened. Appended: discriminants are wire values.
+    NotPermitted,
 }
 
 /// The destination's verdict on a [`ControlRequest`].
@@ -352,6 +358,7 @@ mod tests {
             ControlVerdict::Granted,
             ControlVerdict::Denied(DenyReason::Busy),
             ControlVerdict::Denied(DenyReason::AlreadyControlled),
+            ControlVerdict::Denied(DenyReason::NotPermitted),
         ] {
             let response = ControlResponse {
                 request_id: 42,

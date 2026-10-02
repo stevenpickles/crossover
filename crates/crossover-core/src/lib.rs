@@ -34,7 +34,7 @@ pub use clipboard_driver::{ClipboardSyncDriver, SyncEvent, clipboard_sync};
 pub use command::{FrameTarget, SessionCommand};
 pub use control::{
     ControlAction, ControlConfig, ControlEngine, ControlEvent, ControlNotice, InboundControl,
-    OutboundControl,
+    InputGrant, OutboundControl,
 };
 pub use control_driver::{InputControlDriver, InputControlEvent, SeamlessInputs, input_control};
 pub use crossing::{

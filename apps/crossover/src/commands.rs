@@ -22,7 +22,7 @@ use crossover_core::supervision::{
 use crossover_core::{
     ClipboardConfig, ClipboardGrant, ControlConfig, ControlNotice, CrossingKind, CrossingMap,
     EdgeCrossing, EdgeDetectDriver, FileReceive, FileSend, FrameTarget, InputControlEvent,
-    LiveLayout, LocalNode, Metrics, OutboundSender, SeamlessInputs, SessionCommand,
+    InputGrant, LiveLayout, LocalNode, Metrics, OutboundSender, SeamlessInputs, SessionCommand,
     SessionListener, SessionOptions, SyncEvent, clipboard_sync, edge_detect,
     implicit_crossing_source, input_control, live_crossing_source, outbound_channel,
 };
@@ -206,6 +206,14 @@ pub fn peers_list() -> anyhow::Result<()> {
                 "DENIED (your copies stay here)"
             }
         );
+        // What the peer may do to *this* machine's input (ADR 0021), for
+        // every peer, granted or not.
+        let allowed = |granted: bool| if granted { "allowed" } else { "DENIED" };
+        println!(
+            "      input here:     keyboard {}, mouse {}",
+            allowed(permissions.keyboard),
+            allowed(permissions.mouse)
+        );
         if !peer.remembered_addresses().is_empty() {
             println!(
                 "      addresses:      {}",
@@ -223,6 +231,75 @@ pub fn peers_list() -> anyhow::Result<()> {
         "Stop the clipboard with a peer with `crossover peers deny-clipboard <device-id> \
          [--incoming] [--outgoing]` (`allow-clipboard` to restore)."
     );
+    println!(
+        "Stop a peer driving this machine with `crossover peers deny-input <device-id> \
+         [--keyboard] [--mouse]` (`allow-input` to restore)."
+    );
+    Ok(())
+}
+
+/// `crossover peers allow-input <device-id>` / `peers deny-input
+/// <device-id>`, each optionally narrowed with `--keyboard` / `--mouse`
+/// (ADR 0021).
+///
+/// Local and explicit: nothing on the wire reaches these flags. A running
+/// worker applies a change on its next trust poll — to a peer controlling
+/// this machine at that moment, too: losing both kinds ends its control,
+/// and losing one releases whatever of that kind it holds down.
+pub fn peers_set_input(
+    device_id: Uuid,
+    keyboard: bool,
+    mouse: bool,
+    allowed: bool,
+) -> anyhow::Result<()> {
+    let storage = open_secure_storage()?;
+    let mut store = TrustStore::load(&*storage).context("loading trust store")?;
+    let unknown = || {
+        anyhow::anyhow!("no trusted peer with device id {device_id}; `crossover peers` lists them")
+    };
+
+    let mut changed = false;
+    if keyboard {
+        let previous = store.set_keyboard(device_id, allowed).ok_or_else(unknown)?;
+        changed |= previous != allowed;
+    }
+    if mouse {
+        let previous = store.set_mouse(device_id, allowed).ok_or_else(unknown)?;
+        changed |= previous != allowed;
+    }
+    let name = store
+        .find_by_peer_id(device_id)
+        .map_or_else(String::new, |peer| peer.device_name().to_owned());
+    let which = match (keyboard, mouse) {
+        (true, true) => "the keyboard and the pointer",
+        (true, false) => "the keyboard",
+        _ => "the pointer",
+    };
+
+    if !changed {
+        println!(
+            "\"{name}\" ({device_id}) was already {} {which} on this machine; nothing changed.",
+            if allowed { "allowed" } else { "denied" }
+        );
+        return Ok(());
+    }
+    store.save(&*storage).context("persisting trust store")?;
+    // Who may drive this machine, and since when, belongs in the log as
+    // well as on the terminal (NFR-3).
+    tracing::info!(
+        peer = %device_id,
+        keyboard = keyboard.then_some(allowed),
+        mouse = mouse.then_some(allowed),
+        "input permission changed"
+    );
+    if allowed {
+        println!("\"{name}\" ({device_id}) may now use {which} on this machine.");
+    } else {
+        println!(
+            "\"{name}\" ({device_id}) may no longer use {which} on this machine. A running \
+             Crossover applies this within a few seconds, including to control in progress."
+        );
+    }
     Ok(())
 }
 
@@ -1207,7 +1284,6 @@ pub async fn run(
 
     // Session lifecycle and frames fan out to every driver; every driver's
     // commands merge back into the two priority lanes (ADR 0013).
-    let policy_events = sync_events.clone();
     let fanout = SessionFanout {
         sync: sync_events,
         control: control_events.clone(),
@@ -1269,7 +1345,7 @@ pub async fn run(
         ) => {}
         // Act on trust-store edits made while this run is up: revocation
         // (ADR 0010) and the file-receive grant (ADR 0015).
-        () = apply_trust_changes(&storage, &registry, &policy_events, file_paste_ready) => {}
+        () = apply_trust_changes(&fanout) => {}
         // Re-read config.toml for a changed [layout] and drive the state
         // file's heartbeat (ADR 0018). A changed, valid, explicit layout
         // is offered to the layout-sync hub, which decides whether it is
@@ -1571,6 +1647,15 @@ impl SessionFanout {
         // re-announcement would be refused. The session is already in the
         // registry, so the grants include it.
         self.publish_clipboard_grants().await;
+        // The input grant for this session's peer, before the control
+        // driver hears of the session, for the reason the clipboard grants
+        // go first: nothing about the session may be judged against a
+        // closed default it was never meant to meet (ADR 0021).
+        let grant = input_grant(&*self.storage, info.peer_fingerprint);
+        let _ = self
+            .control
+            .send(InputControlEvent::InputGrant { session, grant })
+            .await;
         self.fan_out(
             SyncEvent::SessionEstablished,
             InputControlEvent::SessionEstablished { session },
@@ -2123,6 +2208,21 @@ fn describe_notice(notice: ControlNotice) -> String {
              neither machine now controls the other."
                 .to_owned()
         }
+        ControlNotice::PeerRequestNotPermitted => {
+            "The peer asked to control this machine and was refused: it holds no input \
+             grant here (`crossover peers allow-input`)."
+                .to_owned()
+        }
+        ControlNotice::PeerInputFiltered => {
+            "The peer sent input of a kind it is not granted on this machine; it was \
+             dropped (`crossover peers` shows its grants)."
+                .to_owned()
+        }
+        ControlNotice::PeerControlNotPermitted => {
+            "The peer's control of this machine ended: its input grant was withdrawn; \
+             input released."
+                .to_owned()
+        }
     }
 }
 
@@ -2350,6 +2450,26 @@ fn clipboard_grants(
     )
 }
 
+/// What `fingerprint`'s peer may do to this machine's input (ADR 0021):
+/// the `keyboard` and `mouse` flags on this machine's record of it. Judged
+/// for one peer, because the control engine knows which session asks —
+/// unlike the clipboard grants, which must hold for every live peer. An
+/// unknown peer, or a store that will not load, grants nothing.
+fn input_grant(storage: &dyn SecureStorage, fingerprint: SpkiFingerprint) -> InputGrant {
+    let Ok(trust) = TrustStore::load(storage) else {
+        return InputGrant::default();
+    };
+    trust
+        .find_by_fingerprint(fingerprint)
+        .map_or_else(InputGrant::default, |peer| {
+            let permissions = peer.permissions();
+            InputGrant {
+                keyboard: permissions.keyboard,
+                mouse: permissions.mouse,
+            }
+        })
+}
+
 /// Whether peer files may be received right now (ADR 0015).
 ///
 /// Fail-closed at every step, and deliberately judged over **all** live
@@ -2469,12 +2589,18 @@ fn terminate_on_revocation(route: &SessionRoute) {
 /// poll, and without waiting for a reconnect.
 ///
 /// Never returns — runs as a branch of the foreground select.
-async fn apply_trust_changes(
-    storage: &Arc<dyn SecureStorage>,
-    registry: &SessionRegistry,
-    sync: &mpsc::Sender<SyncEvent>,
-    spool_open: bool,
-) {
+async fn apply_trust_changes(fanout: &SessionFanout) {
+    // The fan-out already holds everything the poll needs: the store, the
+    // live sessions, and the two drivers' channels the policies go to.
+    let SessionFanout {
+        storage,
+        registry,
+        sync,
+        control,
+        spool_open,
+        ..
+    } = fanout;
+    let spool_open = *spool_open;
     let mut ticker = tokio::time::interval(REVOCATION_POLL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -2511,6 +2637,19 @@ async fn apply_trust_changes(
         let _ = sync
             .send(SyncEvent::ClipboardGrants { send, receive })
             .await;
+        // Each live session's input grant, judged for its own peer: a
+        // withdrawn grant reaches a peer controlling this machine within one
+        // poll, and the engine gives the grant up or releases what it held
+        // (ADR 0021).
+        for (session, fingerprint) in &live {
+            let grant = input_grant(&**storage, *fingerprint);
+            let _ = control
+                .send(InputControlEvent::InputGrant {
+                    session: *session,
+                    grant,
+                })
+                .await;
+        }
         for id in revoked_session_ids(&live, &trust) {
             // Remove and terminate under the same intent; the session's own
             // teardown also removes by id (a harmless no-op) and fans out
@@ -3840,7 +3979,9 @@ mod tests {
         use std::sync::Mutex;
         use std::time::Instant;
 
-        use crossover_core::{ClipboardGrant, SessionInfo, SyncEvent};
+        use crossover_core::{
+            ClipboardGrant, InputControlEvent, InputGrant, SessionInfo, SyncEvent,
+        };
         use crossover_platform::fakes::InMemorySecureStorage;
         use crossover_protocol::hello::{FeatureFlags, OsFamily};
         use crossover_security::{SpkiFingerprint, TrustStore, TrustedPeer};
@@ -3871,7 +4012,7 @@ mod tests {
             },
         )])));
         let (sync, mut sync_rx) = tokio::sync::mpsc::channel(16);
-        let (control, _control_rx) = tokio::sync::mpsc::channel(16);
+        let (control, mut control_rx) = tokio::sync::mpsc::channel(16);
         let (topology, _topology_rx) = tokio::sync::mpsc::channel(16);
         let fanout = SessionFanout {
             sync,
@@ -3923,6 +4064,27 @@ mod tests {
         assert!(
             matches!((formats, established), (Some(f), Some(e)) if f < e),
             "the peer's image formats must precede the session announcement: {order:?}"
+        );
+
+        // And on the control driver's channel, the session's input grant
+        // precedes its announcement (ADR 0021) — what pairing grants, both
+        // kinds, for this paired peer.
+        let mut control_order = Vec::new();
+        while let Ok(event) = control_rx.try_recv() {
+            control_order.push(event);
+        }
+        let input = control_order.iter().position(|event| {
+            matches!(
+                event,
+                InputControlEvent::InputGrant { session: s, grant } if *s == session && *grant == InputGrant::FULL
+            )
+        });
+        let announced = control_order
+            .iter()
+            .position(|event| matches!(event, InputControlEvent::SessionEstablished { .. }));
+        assert!(
+            matches!((input, announced), (Some(g), Some(e)) if g < e),
+            "the input grant must precede the session announcement: {control_order:?}"
         );
     }
 
@@ -4469,6 +4631,47 @@ mod tests {
         assert_eq!(
             file_send_policy(&storage, &[(fingerprint(1), negotiated)]),
             FileSend::Denied
+        );
+    }
+
+    /// ADR 0021's grant, judged for one peer: what pairing grants is both
+    /// kinds, each kind follows its own flag, and an unknown peer or an
+    /// unreadable store grants nothing.
+    #[test]
+    fn the_input_grant_follows_this_peers_record_and_fails_closed() {
+        use crossover_core::InputGrant;
+        use crossover_platform::fakes::InMemorySecureStorage;
+        use crossover_security::{SpkiFingerprint, TrustStore, TrustedPeer};
+
+        use super::input_grant;
+
+        let storage = InMemorySecureStorage::new();
+        let id = Uuid::from_bytes([1; 16]);
+        let fingerprint = SpkiFingerprint::from([1; 32]);
+        let mut trust = TrustStore::default();
+        trust
+            .add_peer(TrustedPeer::new(id, "paired", fingerprint).unwrap())
+            .unwrap();
+        trust.save(&storage).unwrap();
+        assert_eq!(input_grant(&storage, fingerprint), InputGrant::FULL);
+
+        trust.set_keyboard(id, false).unwrap();
+        trust.save(&storage).unwrap();
+        assert_eq!(
+            input_grant(&storage, fingerprint),
+            InputGrant {
+                keyboard: false,
+                mouse: true,
+            }
+        );
+
+        assert_eq!(
+            input_grant(&storage, SpkiFingerprint::from([9; 32])),
+            InputGrant::default()
+        );
+        assert_eq!(
+            input_grant(&InMemorySecureStorage::new(), fingerprint),
+            InputGrant::default()
         );
     }
 

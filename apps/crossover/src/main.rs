@@ -192,6 +192,47 @@ enum PeersAction {
         #[command(flatten)]
         directions: ClipboardDirections,
     },
+    /// Let a trusted peer drive this machine's keyboard and pointer again.
+    /// Both unless one is named; pairing grants both (ADR 0021).
+    AllowInput {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+        #[command(flatten)]
+        kinds: InputKinds,
+    },
+    /// Stop a trusted peer driving this machine's keyboard and pointer.
+    /// Both unless one is named. Takes effect within seconds, including on
+    /// a peer controlling this machine right now.
+    DenyInput {
+        /// The peer's device id (UUID).
+        device_id: Uuid,
+        #[command(flatten)]
+        kinds: InputKinds,
+    },
+}
+
+/// Which kinds of input a grant verb acts on (ADR 0021). Neither flag
+/// means both: the common intent is "this peer and my machine", and naming
+/// a kind is the refinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Args)]
+struct InputKinds {
+    /// Typing on this machine (`keyboard`).
+    #[arg(long)]
+    keyboard: bool,
+    /// Moving and clicking the pointer on this machine (`mouse`).
+    #[arg(long)]
+    mouse: bool,
+}
+
+impl InputKinds {
+    /// `(keyboard, mouse)`, with "neither named" meaning both.
+    fn resolve(self) -> (bool, bool) {
+        if self.keyboard || self.mouse {
+            (self.keyboard, self.mouse)
+        } else {
+            (true, true)
+        }
+    }
 }
 
 /// Which clipboard directions a grant verb acts on. Neither flag means
@@ -333,6 +374,14 @@ fn dispatch_peers(action: Option<PeersAction>) -> anyhow::Result<()> {
         }) => {
             let (incoming, outgoing) = directions.resolve();
             commands::peers_set_clipboard(device_id, incoming, outgoing, false)
+        }
+        Some(PeersAction::AllowInput { device_id, kinds }) => {
+            let (keyboard, mouse) = kinds.resolve();
+            commands::peers_set_input(device_id, keyboard, mouse, true)
+        }
+        Some(PeersAction::DenyInput { device_id, kinds }) => {
+            let (keyboard, mouse) = kinds.resolve();
+            commands::peers_set_input(device_id, keyboard, mouse, false)
         }
     }
 }
@@ -705,6 +754,40 @@ mod tests {
                 (true, true)
             );
             // One peer, by device id, as the file verbs require.
+            assert!(Cli::try_parse_from(["crossover", "peers", verb]).is_err());
+            assert!(Cli::try_parse_from(["crossover", "peers", verb, "all"]).is_err());
+        }
+    }
+
+    #[test]
+    fn input_permission_verbs_name_one_peer_and_default_to_both_kinds() {
+        let id: Uuid = "8f8b1a2c-3d4e-5f60-7182-93a4b5c6d7e8".parse().unwrap();
+        let id_text = id.to_string();
+        let kinds = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Peers {
+                action:
+                    Some(
+                        PeersAction::AllowInput { device_id, kinds }
+                        | PeersAction::DenyInput { device_id, kinds },
+                    ),
+            } = cli.command
+            else {
+                panic!("expected an input verb for {args:?}");
+            };
+            assert_eq!(device_id, id);
+            kinds.resolve()
+        };
+        for verb in ["allow-input", "deny-input"] {
+            assert_eq!(kinds(&["crossover", "peers", verb, &id_text]), (true, true));
+            assert_eq!(
+                kinds(&["crossover", "peers", verb, &id_text, "--keyboard"]),
+                (true, false)
+            );
+            assert_eq!(
+                kinds(&["crossover", "peers", verb, &id_text, "--mouse"]),
+                (false, true)
+            );
             assert!(Cli::try_parse_from(["crossover", "peers", verb]).is_err());
             assert!(Cli::try_parse_from(["crossover", "peers", verb, "all"]).is_err());
         }
