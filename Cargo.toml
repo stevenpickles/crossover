@@ -144,7 +144,7 @@ x509-parser = "0.18"
 # The COM plumbing behind `#[implement]`: the macro emits absolute
 # `::windows_core` paths, so the crate the `windows` façade already pulls in
 # has to be named directly. Same version, same source, no new tree.
-windows-core = "0.62"
+windows-core = "0.100"
 # The macOS port's bindings (ADR 0020): the objc2 family at the generation
 # winit already resolves for the layout editor, so the port adds framework
 # crates to a family already in the tree. default-features = false on each
