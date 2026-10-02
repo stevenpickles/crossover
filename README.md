@@ -46,8 +46,6 @@ larger workstation, without weakening the security boundary between them.
 
 ## What it does not do yet
 
-- Per-peer **keyboard and mouse** permissions — they are stored, and shown,
-  but not enforced: a trusted peer can drive input
 - macOS and Linux — the platform boundary exists and the core compiles on
   all three, but only the Windows implementations are written. That is
   Phase 9, which starts next: macOS first, then Linux (Ubuntu 24.04)
@@ -124,6 +122,15 @@ crossover peers allow-clipboard <id>             # restore; takes the same flags
 ```
 
 A running Crossover applies the change within a few seconds.
+
+So is input — a paired peer may type and point on this machine — and you can
+narrow that too, even while it is in control:
+
+```powershell
+crossover peers deny-input <id>                  # it may not drive this machine
+crossover peers deny-input <id> --keyboard       # it may point but not type
+crossover peers allow-input <id>                 # restore; takes the same flags
+```
 
 ## Documentation
 

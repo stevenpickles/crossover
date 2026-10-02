@@ -16,8 +16,9 @@
 > **While the lab Mac is unavailable** (from 2026-09-29, maintainer):
 > the macOS slices wait for their hardware checks (SOAK.md, Phase 9.1)
 > rather than stacking unverified work, and what needs no Mac proceeds —
-> the Windows half of ADR 0016, the security backlog, and the designs for
-> the later macOS slices. A deliberate deviation from "each validated
+> the Windows half of ADR 0016, the security backlog (input permissions,
+> ADR 0021, accepted and built), and the designs for the later macOS
+> slices. A deliberate deviation from "each validated
 > before the next", recorded rather than drifted into.
 >
 > **Next, in order** (Phase 9's milestones, detailed below):

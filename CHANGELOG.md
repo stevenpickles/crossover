@@ -44,6 +44,16 @@ version ranges.
 
 ### Security
 
+- **A paired peer may no longer drive this machine against your wishes.**
+  Until now any paired peer's request to control this machine was granted,
+  and the `keyboard` and `mouse` flags guarded the other direction, and only
+  on paper. They now guard the machine being controlled (ADR 0021): a peer
+  holding neither is refused, and told so; one holding one may only do that
+  (point but not type, say); and withdrawing a flag reaches control already
+  in progress within seconds, releasing anything it held down.
+  `crossover peers allow-input` / `deny-input <device-id> [--keyboard]
+  [--mouse]` set them, and `crossover peers` shows both for every peer.
+  Pairing still grants both, so nothing changes until you narrow it.
 - **Both clipboard permissions are enforced.** 0.2.0 enforced
   `clipboard_send` for files only, and `clipboard_receive` nowhere, so
   per-peer clipboard permissions — a mitigation `docs/SECURITY.md` names for

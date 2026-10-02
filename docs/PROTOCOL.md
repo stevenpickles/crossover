@@ -229,7 +229,9 @@ an *empty* image set means. A v6 build advertises no install bits, and a v7
 sender reads that as "installs no images" and sends it none — silently from
 the user's side. So the rule applies to meaning as well as bytes: both ends
 of the range move to 7, and a mixed pair is refused at `Hello` instead of
-losing images without a word.
+losing images without a word. v7 also appends `DenyReason::NotPermitted`
+(ADR 0021) — a change of shape, which v7 absorbs because it had not yet
+shipped.
 
 ## 4. Message classes
 
@@ -503,6 +505,9 @@ A -> B   ControlRelease   { entry }                    // relationship ends
 
 Rules, all fail-closed:
 
+- A peer the destination's user has not granted input answers `Denied`
+  with `NotPermitted`, ahead of every rule below (ADR 0021; appended in v7).
+  A granted peer's batches are applied only for the kinds it is granted.
 - Exactly one control relationship may exist (FR-5.1). A peer that is
   controlling, requesting, or already controlled answers `Denied` with the
   reason — so simultaneous requests from both sides deterministically

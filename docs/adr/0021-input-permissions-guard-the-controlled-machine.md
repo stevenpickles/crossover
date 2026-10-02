@@ -1,6 +1,6 @@
 # 0021. Input permissions guard the machine being controlled
 
-Status: Proposed
+Status: Accepted (2026-10-02, maintainer)
 Date: 2026-09-29
 
 ## Context
@@ -117,3 +117,23 @@ the control engine takes from the application. It is sans-io like the
 clipboard engine's grants, so every rule above is a unit test over the
 action list, including the mid-control withdrawal paths that must never
 leave a key down.
+
+## Implementation note (feature/183)
+
+Built as decided, in protocol version 7 beside ADR 0016's format bits: v7
+had not shipped, so the new `DenyReason` needs no second bump. A dev build
+of v7 from before this change cannot decode `NotPermitted`, so dev builds
+on both machines must be from the same commit, as ADR 0017 already
+requires of any pair.
+
+- `ControlEngine` holds an `InputGrant { keyboard, mouse }` per session,
+  absent meaning none. The grant is checked first in `on_peer_request`,
+  ahead of the busy and single-holder rules.
+- `on_peer_batch` applies only the permitted kinds and reports a drop
+  once per grant.
+- `on_input_grant` gives the grant up when both kinds are withdrawn, and
+  when one is withdrawn releases only what that kind holds.
+- The application publishes each session's grant to the control driver
+  before `SessionEstablished`, and again on every trust-store poll.
+- `crossover peers allow-input` / `deny-input [--keyboard] [--mouse]` set
+  the flags, and `crossover peers` shows them for every peer.
