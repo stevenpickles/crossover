@@ -609,7 +609,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossover"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crossover-platform",
  "crossover-protocol",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-layout"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crossover-topology",
  "eframe",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-platform"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.20",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-platform-macos"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crossover-platform",
  "objc2 0.6.4",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-platform-windows"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crossover-platform",
  "crossover-topology",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crossover-topology",
  "postcard",
@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-security"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crossover-platform",
  "ed25519-dalek",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-svc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crossover-platform-windows",
  "tracing",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-test-peer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "crossover-core",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "crossover-topology"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "serde",
