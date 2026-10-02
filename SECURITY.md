@@ -8,7 +8,8 @@ and earlier tags are not patched.
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.0   | ✅ |
+| 0.3.0   | ✅ |
+| 0.2.0   | ❌ |
 | 0.1.0   | ❌ (the first release) |
 
 Because the wire protocol's minimum accepted version moves with its maximum
@@ -38,4 +39,7 @@ invariants are documented in [docs/SECURITY.md](docs/SECURITY.md).
 Since 0.2.0 a paired peer can, **with an explicit per-peer grant that is off
 by default**, cause files to be written into a protected spool directory;
 [docs/SECURITY.md](docs/SECURITY.md) §7 documents that surface and its
-invariants.
+invariants. Since 0.3.0 every other per-peer permission is enforced too —
+clipboard in each direction, and keyboard and pointer on the machine being
+controlled — each on by default at pairing and narrowed with `crossover
+peers` (docs/SECURITY.md §4).

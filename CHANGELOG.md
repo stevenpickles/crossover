@@ -9,10 +9,17 @@ session and versioned separately (`PROTOCOL_VERSION` in
 `crossover-protocol`); a release note says so whenever that number moves.
 
 Builds that are not tagged releases identify themselves as such —
-`0.2.0-dev.7.gabc1234` — and say where they came from. Run
+`0.3.0-dev.7.gabc1234` — and say where they came from. Run
 `crossover version` on any binary to see exactly what it is.
 
-## [Unreleased]
+## [0.3.0] — 2026-10-02
+
+Two Windows machines get a tighter grip on what a paired peer may do —
+clipboard in each direction, and keyboard and pointer on the machine being
+controlled — and the groundwork for macOS lands: the protocol now carries
+which image formats each side can install, Windows converts for a peer that
+needs PNG, and a Mac can pair and share text from source builds. Phase 8's
+drawn topology finished its soak; Phase 9 (macOS and Linux) is under way.
 
 **Protocol version 7, floor 7: upgrade both machines together.** A pair
 with one 0.2.0 machine is refused cleanly at the handshake, naming both
@@ -41,6 +48,15 @@ version ranges.
   Windows Imaging Component off the sync loop, so a large screenshot does
   not delay anything else. Nothing a peer sends is ever decoded: the
   sender converts, the receiver installs bytes as they are (ADR 0016).
+- **macOS, from source: pairing and the text clipboard** (a preview —
+  Phase 9.1, [ADR 0020](docs/adr/0020-macos-platform-bindings.md)). A Mac
+  built from this source keeps its identity and trusted peers in the login
+  keychain, pairs with a Windows machine, and shares **text** both ways;
+  `crossover run` on a Mac is **clipboard-only** — no input, no screens
+  shared — until the macOS input slice lands. Reading the clipboard on
+  current macOS is privacy-gated: the first copy asks, and a Mac set to
+  "always deny" says so in its log rather than syncing nothing silently.
+  Not yet checked on real Mac hardware, and no Mac binaries are published.
 
 ### Security
 
@@ -101,6 +117,37 @@ version ranges.
   clipboard), Crossover still believed the last content it could read was
   on the clipboard, so the peer sending that same content again was
   answered as applied without anything being written. It is now installed.
+
+### Known limitations
+
+- **macOS is a preview, and Linux has not started.** A Mac builds from
+  source, pairs, and shares text, but runs clipboard-only — images, files,
+  input, the background service and the layout editor arrive in later
+  Phase 9 slices — and none of it has been checked on Mac hardware yet:
+  how the clipboard-privacy prompt and the Keychain behave across a rebuild
+  are open questions ([docs/platform-risks-macos.md](docs/platform-risks-macos.md)
+  M-8, M-11). Release packages are Windows only.
+- **Two different unreadable copies across a disconnection can look
+  unchanged.** If you copy something Crossover cannot read, then a different
+  unreadable thing while the peer is away, a reconnect may install the
+  peer's re-announced item over the second copy. It needs both copies across
+  a disconnection with a peer item waiting at the moment of reconnect
+  ([ADR 0005](docs/adr/0005-clipboard-transaction-flow.md)'s 2026-09-28
+  addendum).
+- **Carried over from 0.2.0, unchanged:** two machines only; binaries are
+  not code-signed, so SmartScreen warns on first run (verify the published
+  SHA-256); no automatic updates; `crossover-layout.exe` must sit beside
+  `crossover.exe`; images are capped at 64 MiB and files at 256 MiB; a paste
+  target that cannot take an `IStream` cannot paste a received file; Windows
+  Cloud Clipboard sees what Crossover writes; a first-ever adopted
+  arrangement on a machine with none takes one restart; a layout whose
+  screens are all absent goes inert; no inbound preemption of a saturated
+  same-driver queue; responsiveness under a saturating transfer depends on
+  the link; and injection into an elevated window may be swallowed by UIPI.
+  Each is described in the
+  [0.2.0 release notes](https://github.com/stevenpickles/crossover/releases/tag/v0.2.0).
+
+[0.3.0]: https://github.com/stevenpickles/crossover/releases/tag/v0.3.0
 
 ## [0.2.0] — 2026-09-01
 

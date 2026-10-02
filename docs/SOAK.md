@@ -1413,7 +1413,7 @@ count entry-point warnings.
 Five things to do before starting, each of which has cost time when
 skipped:
 
-1. **Build both machines from the same commit.** Protocol v6 raises the
+1. **Build both machines from the same commit.** Protocol v7 raises the
    floor as well as the ceiling (ADR 0018, ADR 0017's rule), so any peer
    below v6 — including v0.1.0 — is refused at `Hello` with a
    version-range mismatch and the session never establishes. A mixed pair does not connect at all — that is the
