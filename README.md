@@ -10,15 +10,16 @@ larger workstation, without weakening the security boundary between them.
 
 **Move. Type. Copy. Paste.**
 
-> **Status: v0.2.0 — text, images, files and folders, and a screen
-> arrangement you draw.** Two Windows machines pair with a typed one-time
-> code, hold a mutually authenticated TLS 1.3 session with automatic
+> **Status: v0.3.0 — text, images, files and folders, a screen
+> arrangement you draw, and per-peer control of clipboard and input.** Two
+> Windows machines pair with a typed one-time code, hold a mutually authenticated TLS 1.3 session with automatic
 > reconnection, share one keyboard and mouse across screen edges derived
 > from an arrangement drawn in `crossover layout`, run unattended as a
 > background service, and synchronize the clipboard in both directions —
 > **text, images, and files and folders** — all validated on two machines
 > over a wired link, and the drawn topology through an extended two-machine
-> soak. **Next is Phase 9: macOS and Linux**, to full parity with Windows.
+> soak. **Phase 9, macOS and Linux to full parity with Windows, is under
+> way**: a Mac built from source pairs and shares text today.
 > The [roadmap](docs/ROADMAP.md) carries the authoritative current-phase
 > marker.
 
@@ -81,7 +82,7 @@ crossover version --json   # the same, for scripts
 crossover -V               # just the version string
 ```
 
-A build that is not a tagged release says so — `0.2.0-dev.7.gabc1234.dirty`
+A build that is not a tagged release says so — `0.3.0-dev.7.gabc1234.dirty`
 names the commit it came from and admits to uncommitted edits.
 
 ## Arranging your screens

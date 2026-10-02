@@ -3,6 +3,10 @@
 > **Current phase: 9 — Cross-Platform Validation** (in progress; 9.0 done
 > 2026-09-28, 9.1 macOS started the same day.)
 >
+> **Released:** [v0.3.0](../CHANGELOG.md), 2026-10-02 — mid-phase, so the
+> pair can be tested on hardware with Phase 9.0 and the Windows half of ADR
+> 0016 in place.
+>
 > **Last closed:** Phase 8 (Dynamic Display Topology), 2026-09-28 — the
 > drawn layout, shipped in [v0.2.0](../CHANGELOG.md) on 2026-09-01, passed
 > its extended two-machine soak. The record is in Phase 8's section below.
