@@ -66,10 +66,10 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         if: matrix.language == 'rust'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        uses: github/codeql-action/init@0911ee96d2d6c8def97122c36c5cadd93829a4b4 # v4
         with:
           languages: ${{ matrix.language }}
           # security-and-quality over the default suite: this codebase is
@@ -85,6 +85,6 @@ jobs:
         run: cargo build --workspace
 
       - name: Analyze
-        uses: github/codeql-action/analyze@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        uses: github/codeql-action/analyze@0911ee96d2d6c8def97122c36c5cadd93829a4b4 # v4
         with:
           category: /language:${{ matrix.language }}${{ matrix.category_suffix }}
